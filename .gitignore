@@ -1,0 +1,28 @@
+data/
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+dist/
+build/
+data_backup_*/
+.env
+
+# 自动备份与运行日志
+backend/backups/
+*.log
+
+# 根目录开发过程截图（不进公开仓库）
+/*.png
+
+# 工作区标记与系统文件
+.asc_start_ts.txt
+Thumbs.db
+.DS_Store
+
+# 浏览器测试快照
+.playwright-cli/
+
+# 验证构建与 vite 临时产物
+frontend/dist-*/
+frontend/vite.config.js.timestamp-*.mjs
