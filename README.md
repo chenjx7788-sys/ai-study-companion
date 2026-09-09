@@ -6,6 +6,9 @@
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
 ![version](https://img.shields.io/badge/version-v0.1.2-purple)
 ![local](https://img.shields.io/badge/data-100%25%20local-brightgreen)
+[![download](https://img.shields.io/badge/%E4%B8%8B%E8%BD%BD-v0.1.2%20zip-orange)](https://github.com/chenjx7788-sys/ai-study-companion/releases/latest)
+
+> 👉 **下载 Windows 版**：点击上方橙色「下载」徽章，或到 [Releases 页面](https://github.com/chenjx7788-sys/ai-study-companion/releases/latest) 下载 `AIStudyCompanion-v0.1.2-win.zip`，解压后双击 `AIStudyCompanion.exe` 即可运行。
 
 ---
 
