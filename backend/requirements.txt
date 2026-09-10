@@ -12,7 +12,9 @@ chromadb>=1.5
 # 本地向量 / ASR 运行时（此前遗漏，打包分发前补齐）
 faster-whisper>=1.2
 ctranslate2>=4.8
-onnxruntime>=1.29
+# onnxruntime 自 1.24 起不再提供 macOS x86_64 (Intel) wheel，1.23.2 是 Intel 可用的最后版本；
+# 取 1.23.2 为下限：arm64 仍装最新 1.29，Intel 装 1.23.2（InferenceSession API 两者兼容）
+onnxruntime>=1.23.2
 huggingface-hub>=1.29
 tokenizers>=0.23
 # OCR（扫描件 / 图片识别）：RapidOCR（ONNX 版 PaddleOCR）+ PDF 页渲染
