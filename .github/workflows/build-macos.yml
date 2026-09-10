@@ -15,6 +15,9 @@ jobs:
     # 如需 Intel (x86_64) 包，另加一个 job 用 macos-13（若该 runner 已下线则改用自建）
     runs-on: macos-14
     timeout-minutes: 60
+    # 允许 GITHUB_TOKEN 创建 release（默认只读，否则 softprops/action-gh-release 报 "Resource not accessible by integration"）
+    permissions:
+      contents: write
 
     steps:
       - name: 检出代码
