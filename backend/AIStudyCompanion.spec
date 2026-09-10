@@ -74,3 +74,15 @@ coll = COLLECT(
     upx=False,
     name='AIStudyCompanion',
 )
+
+# macOS：把 onedir 目录包装成 .app bundle（pywebview 原生窗口依赖 .app 运行环境）
+if _sys.platform == 'darwin':
+    app = BUNDLE(
+        coll,
+        name='AIStudyCompanion.app',
+        icon=_ICON,
+        bundle_identifier='com.aistudy.companion',
+        info_plist={
+            'NSHighResolutionCapable': True,
+        },
+    )
