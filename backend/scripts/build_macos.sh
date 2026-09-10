@@ -100,7 +100,7 @@ rm -f "$ZIP_NAME"
 # 保留符号链接与权限（zip 默认会展开 symlink，这里用 -y 存符号链接）
 zip -qry "$ZIP_NAME" "AIStudyCompanion.app"
 ZIP_PATH="$BACKEND_DIR/dist/$ZIP_NAME"
-echo "产物：$ZIP_PATH（$(du -sh "$ZIP_PATH" | cut -f1)）"
+echo "产物：${ZIP_PATH}（$(du -sh "$ZIP_PATH" | cut -f1)）"
 
 echo ""
 echo "=== 打包完成 ==="
