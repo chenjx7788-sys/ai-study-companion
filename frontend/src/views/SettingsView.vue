@@ -37,21 +37,27 @@
         </div>
       </div>
 
+      <!-- 有模型但未指定用途：引导选择（未指定时对应功能无法调用） -->
+      <el-alert v-if="models.length && (!summaryModelId || !chatModelId)" type="warning" :closable="false" class="pick-tip">
+        已添加模型，请为下方「总结模型」和「问答模型」分别指定用途 —— 未指定时对应功能将无法调用。
+      </el-alert>
       <el-form label-width="120px" style="max-width: 710px">
-        <el-form-item label="总结模型">
-          <el-select v-model="summaryModelId" placeholder="从模型列表选择" style="width: 100%">
+        <el-form-item label="总结模型" required>
+          <el-select v-model="summaryModelId" placeholder="请选择（必填）" style="width: 100%"
+            :class="{ 'pick-empty': !summaryModelId }">
             <el-option v-for="m in models" :key="m.id" :label="`${m.name}（${m.model}）`" :value="m.id" />
           </el-select>
           <div class="field-hint" style="margin-left:0; margin-top:4px;">用于摘要 / 知识点 / 划线解读 / 复习出题</div>
         </el-form-item>
-        <el-form-item label="问答模型">
-          <el-select v-model="chatModelId" placeholder="从模型列表选择" style="width: 100%">
+        <el-form-item label="问答模型" required>
+          <el-select v-model="chatModelId" placeholder="请选择（必填）" style="width: 100%"
+            :class="{ 'pick-empty': !chatModelId }">
             <el-option v-for="m in models" :key="m.id" :label="`${m.name}（${m.model}）`" :value="m.id" />
           </el-select>
           <div class="field-hint" style="margin-left:0; margin-top:4px;">问答页默认模型，可在输入区切换</div>
         </el-form-item>
         <el-form-item style="margin-top: 12px">
-          <el-button type="primary" :loading="saving" @click="save">保存</el-button>
+          <el-button type="primary" :loading="saving" @click="save()">保存</el-button>
         </el-form-item>
       </el-form>
     </el-card>
@@ -125,7 +131,7 @@
           </div>
         </el-form-item>
         <el-form-item style="margin-top: 12px">
-          <el-button type="primary" :loading="saving" @click="save">保存</el-button>
+          <el-button type="primary" :loading="saving" @click="save()">保存</el-button>
         </el-form-item>
       </el-form>
     </el-card>
@@ -180,7 +186,15 @@
     </el-card>
 
     <!-- 模型编辑弹窗 -->
-    <el-dialog v-model="modelDialog.show" :title="modelDialog.id ? '编辑模型' : '添加模型'" width="480px" append-to-body>
+    <el-dialog v-model="modelDialog.show" :title="modelDialog.id ? '编辑模型' : '添加模型'" width="550px" append-to-body>
+      <!-- 快速选择厂商：一键填充 Base URL 与模型名，降低填写门槛 -->
+      <div class="vendor-picker">
+        <div class="vp-label">快速选择厂商<span class="vp-hint">自动填充下方 Base URL 与模型名，可修改</span></div>
+        <div class="vp-chips">
+          <button v-for="v in VENDORS" :key="v.key" type="button"
+            class="vp-chip" :class="{ on: vendorKey === v.key, 'vp-chip-custom': v.custom }" @click="applyVendor(v)">{{ v.name }}</button>
+        </div>
+      </div>
       <el-form label-width="90px">
         <el-form-item label="名称" required>
           <el-input v-model="modelDialog.name" placeholder="如 DeepSeek-V3" />
@@ -191,6 +205,10 @@
         <el-form-item label="API Key">
           <el-input v-model="modelDialog.api_key" type="password" show-password
             placeholder="sk-...（已保存时显示掩码，不修改请保持原样）" />
+          <div v-if="currentVendor && currentVendor.apply" class="field-hint" style="margin-left:0; margin-top:4px;">
+            还没有 Key？<a :href="currentVendor.apply" target="_blank" rel="noopener" class="vendor-link">去 {{ currentVendor.name }} {{ currentVendor.applyHint || '领免费额度' }} →</a>
+          </div>
+          <div v-if="currentVendor && currentVendor.note" class="vendor-note">{{ currentVendor.note }}</div>
         </el-form-item>
         <el-form-item label="模型名" required>
           <div class="model-picker">
@@ -206,7 +224,7 @@
       </el-form>
       <template #footer>
         <el-button @click="modelDialog.show = false">取消</el-button>
-        <el-button type="primary" @click="saveModel">保存</el-button>
+        <el-button type="primary" @click="saveModel()">保存</el-button>
       </template>
     </el-dialog>
       </el-tab-pane>
@@ -231,7 +249,7 @@
         <el-input v-model="prompts[p.key]" type="textarea" :rows="prompts[p.key] ? 6 : 2"
           :placeholder="promptDefaults[p.key]" />
       </div>
-      <el-button type="primary" :loading="saving" @click="save">保存提示词</el-button>
+      <el-button type="primary" :loading="saving" @click="save()">保存提示词</el-button>
     </el-card>
       </el-tab-pane>
 
@@ -294,7 +312,8 @@
 
 <script setup>
 import { reactive, ref, computed, onMounted } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
+import { useRouter, useRoute } from 'vue-router'
 import { settingsApi } from '../api'
 import http from '../api/http'
 import { useAsr } from '../composables/useAsr'
@@ -315,10 +334,26 @@ const {
   error: asrError, load: loadAsr, download: downloadAsr,
 } = useAsr()
 
+const router = useRouter()
+const route = useRoute()
 const form = reactive({
   llm_base_url: '', llm_api_key: '', summary_model: '', chat_model: '',
   embedding_model: '', embedding_base_url: '', embedding_api_key: '', configured: false,
 })
+
+// 首次配置完成：给一次「去导入材料」的正反馈引导（localStorage 去重，仅弹一次）
+const SETUP_DONE_KEY = 'asc_setup_guided'
+function maybeGuideAfterSetup() {
+  if (!form.configured || localStorage.getItem(SETUP_DONE_KEY)) return
+  localStorage.setItem(SETUP_DONE_KEY, '1')
+  ElNotification({
+    title: '模型已就绪 🎉',
+    message: '现在去导入第一份材料，开始你的 AI 伴学 · 点此前往材料库',
+    type: 'success',
+    duration: 9000,
+    onClick: () => router.push('/'),
+  })
+}
 
 // 多模型：模型列表 + 用途引用
 const models = ref([])
@@ -328,7 +363,49 @@ const modelDialog = reactive({ show: false, id: null, name: '', base_url: '', ap
 const modelOptions = ref([])      // 弹窗内「模型名」下拉选项（由服务商拉取/当前值兜底）
 const fetchingModels = ref(false)
 
+// 主流厂商预设：一键填充 Base URL / 模型名，降低配置门槛
+// ⚠️ 链接与模型名可能随厂商调整，上线前需逐个实测「获取模型」能否成功
+const VENDORS = [
+  { key: 'deepseek', name: 'DeepSeek', base_url: 'https://api.deepseek.com', model: 'deepseek-chat', apply: 'https://platform.deepseek.com/api_keys' },
+  { key: 'kimi', name: 'Kimi', base_url: 'https://api.moonshot.cn/v1', model: 'kimi-k2-thinking', apply: 'https://platform.moonshot.cn/console/api-keys' },
+  { key: 'kimicode', name: 'Kimi For Coding', base_url: 'https://api.kimi.com/coding/v1', model: 'kimi-for-coding', apply: 'https://www.kimi.com/code/console', applyHint: '获取 API Key', note: '⚠️ 需 Kimi Code 会员（订阅制，非开放平台）；模型 ID 固定填 kimi-for-coding；官方限定编程场景使用，请勿篡改客户端标识' },
+  { key: 'zhipu', name: '智谱 GLM', base_url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4-flash', apply: 'https://open.bigmodel.cn/usercenter/apikeys' },
+  { key: 'qwen', name: '通义千问', base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus', apply: 'https://bailian.console.aliyun.com/' },
+  { key: 'doubao', name: '豆包', base_url: 'https://ark.cn-beijing.volces.com/api/v3', model: '', apply: 'https://console.volcengine.com/ark', note: '⚠️ 模型名需填「推理接入点 ID」（在火山方舟创建后获得），不是模型名本身' },
+  { key: 'hunyuan', name: '腾讯混元', base_url: 'https://api.hunyuan.cloud.tencent.com/v1', model: 'hunyuan-turbos-latest', apply: 'https://console.cloud.tencent.com/hunyuan' },
+  { key: 'ernie', name: '百度文心', base_url: 'https://qianfan.baidubce.com/v2', model: 'ernie-4.5-turbo-128k', apply: 'https://console.bce.baidu.com/qianfan/' },
+  { key: 'minimax', name: 'MiniMax', base_url: 'https://api.minimax.chat/v1', model: 'MiniMax-Text-01', apply: 'https://platform.minimaxi.com/' },
+  { key: 'yi', name: '零一万物', base_url: 'https://api.lingyiwanwu.com/v1', model: 'yi-lightning', apply: 'https://platform.lingyiwanwu.com/' },
+  { key: 'openai', name: 'OpenAI', base_url: 'https://api.openai.com/v1', model: 'gpt-5', apply: 'https://platform.openai.com/api-keys', note: '⚠️ 需可访问外网；国内直连通常不可用' },
+  { key: 'siliconflow', name: '硅基流动', base_url: 'https://api.siliconflow.cn/v1', model: 'Qwen/Qwen2.5-7B-Instruct', apply: 'https://cloud.siliconflow.cn/account/ak' },
+  { key: 'custom', name: '自定义', base_url: '', model: '', apply: '', custom: true, note: 'ℹ️ 自填服务商提供的 Base URL 与模型名，需兼容 OpenAI 协议；多数地址需以 /v1 结尾（如 https://xxx.com/v1）——漏写会返回网页而无法问答' },
+]
+const vendorKey = ref('')
+const currentVendor = computed(() => VENDORS.find(v => v.key === vendorKey.value) || null)
+
+// 选中厂商：自动填充 Base URL 与模型名（名称仅当为空或同为厂商名时覆盖，避免冲掉用户自定义）
+function applyVendor(v) {
+  vendorKey.value = v.key
+  if (v.custom) {
+    // 自定义：清空预填，全部交由用户手填
+    modelDialog.name = ''
+    modelDialog.base_url = ''
+    modelDialog.model = ''
+    modelOptions.value = []
+    return
+  }
+  if (!modelDialog.name.trim() || VENDORS.some(x => x.name === modelDialog.name.trim())) {
+    modelDialog.name = v.name
+  }
+  modelDialog.base_url = v.base_url
+  if (v.model) {
+    modelDialog.model = v.model
+    modelOptions.value = [v.model]
+  }
+}
+
 function openModelEditor(m) {
+  vendorKey.value = ''   // 每次打开重置厂商选择态
   if (m) {
     modelDialog.id = m.id
     modelDialog.name = m.name
@@ -369,7 +446,7 @@ async function fetchModelList() {
   }
 }
 
-function saveModel() {
+async function saveModel() {
   if (!modelDialog.name.trim() || !modelDialog.model.trim()) {
     ElMessage.warning('请填写名称和模型名')
     return
@@ -388,16 +465,27 @@ function saveModel() {
     models.value.push(payload)
   }
   modelDialog.show = false
-  ElMessage.success('模型已保存，记得点底部「保存」持久化')
+  // 保存即持久化：避免「还要点底部保存」的两步困惑，并给出明确的成功提示
+  try {
+    await save('保存成功', true)
+  } catch {
+    ElMessage.warning('已加入列表，请点底部「保存」持久化')
+  }
 }
 
 function removeModel(m) {
   ElMessageBox.confirm(`删除模型「${m.name}」？`, '删除确认', { type: 'warning' })
-    .then(() => {
+    .then(async () => {
       models.value = models.value.filter(x => x.id !== m.id)
       delete modelTestResults[m.id]
       if (summaryModelId.value === m.id) summaryModelId.value = ''
       if (chatModelId.value === m.id) chatModelId.value = ''
+      // 删除即持久化：否则用户刷新后模型会重新出现（看起来像「删不掉」）
+      try {
+        await save(`已删除模型「${m.name}」`, true)
+      } catch {
+        ElMessage.warning('已从列表移除，请点底部「保存」持久化')
+      }
     })
     .catch(() => {})
 }
@@ -564,9 +652,11 @@ onMounted(async () => {
   loadStorage()
   loadUsage()
   loadAsr()
+  // 从问答页「前往配置模型」跳入（/settings?add=1）：直接打开添加模型弹窗
+  if (route.query.add) openModelEditor(null)
 })
 
-async function save() {
+async function save(successMsg = '保存成功', skipGuide = false) {
   saving.value = true
   try {
     const { data } = await settingsApi.update({
@@ -601,7 +691,8 @@ async function save() {
     })
     Object.assign(form, data)
     models.value = data.llm_models || []
-    ElMessage.success('已保存')
+    ElMessage.success(successMsg)
+    if (!skipGuide) maybeGuideAfterSetup()
   } finally {
     saving.value = false
   }
@@ -667,6 +758,22 @@ async function rebuildAll() {
 .model-ops { flex-shrink: 0; }
 .model-picker { display: flex; gap: 8px; align-items: center; width: 100%; }
 .model-add { width: 100%; border-style: dashed; }
+/* 快速选择厂商（模型编辑弹窗） */
+.vendor-picker { margin-bottom: 16px; padding: 12px 14px; background: var(--asc-surface-2); border-radius: 10px; }
+.vp-label { font-size: 12.5px; color: var(--asc-text-2); font-weight: 500; margin-bottom: 9px; }
+.vp-hint { font-weight: 400; color: var(--asc-text-3); margin-left: 8px; font-size: 11.5px; }
+.vp-chips { display: flex; flex-wrap: wrap; gap: 7px; }
+.vp-chip { border: 1px solid var(--asc-border); background: #fff; color: var(--asc-text-2); font-size: 12.5px; padding: 5px 12px; border-radius: 20px; cursor: pointer; transition: .16s; font-family: inherit; }
+.vp-chip:hover { border-color: var(--asc-primary); color: var(--asc-primary); }
+.vp-chip.on { background: var(--asc-primary); border-color: var(--asc-primary); color: #fff; font-weight: 500; }
+.vp-chip-custom { border-style: dashed; }
+.vp-chip-custom.on { border-style: solid; }
+.vendor-link { color: var(--asc-primary); text-decoration: none; font-weight: 500; }
+.vendor-link:hover { text-decoration: underline; }
+.vendor-note { margin: 6px 0 0; font-size: 11.5px; color: #e6a23c; line-height: 1.5; }
+/* 模型用途未选择：引导提示 + 采集态警告 */
+.pick-tip { margin: 0 0 14px; }
+.pick-empty :deep(.el-select__wrapper) { box-shadow: 0 0 0 1px #f0a020 inset; }
 .storage-tip { font-size: 13px; color: var(--asc-text-3); margin: 10px 0 0; }
 .embed-tip { margin-bottom: 4px; }
 .embed-tip :deep(.el-alert__content) { display: flex; align-items: center; gap: 12px; }

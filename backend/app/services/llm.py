@@ -103,7 +103,9 @@ def chat_stream(messages: list[dict], model_id: str | None = None, reasoning_eff
     reasoning_effort：None=关闭推理（默认，thinking=disabled），low/high/max=开启推理。
     kind：记账业务场景（全局问答默认 chat；解读/提问/文本加工等流式入口需显式传入对应 kind）"""
     conf = settings_store.load()
-    base_url, api_key, model = settings_store.resolve_model(model_id)
+    # 未显式指定模型时回退到「问答模型」chat_model_id —— 不能直接传空给 resolve_model，
+    # 否则会回退到全局 llm_base_url/llm_api_key（多模型模式下为空）而报 400。
+    base_url, api_key, model = settings_store.resolve_model(model_id or conf.get("chat_model_id"))
     use_model = model or conf["chat_model"]
     thinking = "enabled" if reasoning_effort else "disabled"
     try:

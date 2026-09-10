@@ -24,7 +24,11 @@ FIELDS = ["llm_base_url", "llm_api_key", "summary_model", "chat_model",
 
 
 def _ensure_models(conf: dict) -> dict:
-    """保证 conf 含 llm_models（兼容旧单套配置 → 迁移为模型列表，惰性幂等）"""
+    """保证 conf 含 llm_models（兼容旧单套配置 → 迁移为模型列表，惰性幂等）
+
+    注意：迁移出的模型**不自动引用**为总结/问答模型 —— 二者留空，由用户在设置页主动
+    选择（前端对「未选择」态有明确引导）。避免用户「莫名被指定了某个模型」。
+    """
     if conf.get("llm_models"):
         return conf
 
@@ -36,20 +40,16 @@ def _ensure_models(conf: dict) -> dict:
 
     # 仅当配置过旧 key 或模型名时迁移；否则留空列表等用户新建
     if key or chat_model:
-        chat_id = "legacy-chat"
-        models.append({"id": chat_id, "name": "默认模型", "base_url": base,
+        models.append({"id": "legacy-chat", "name": "默认模型", "base_url": base,
                        "api_key": key, "model": chat_model})
-        summary_id = chat_id
         if summary_model and summary_model != chat_model:
             models.append({"id": "legacy-summary", "name": "总结模型", "base_url": base,
                            "api_key": key, "model": summary_model})
-            summary_id = "legacy-summary"
-    else:
-        chat_id = summary_id = None
 
     conf["llm_models"] = models
-    conf["summary_model_id"] = conf.get("summary_model_id") or summary_id
-    conf["chat_model_id"] = conf.get("chat_model_id") or chat_id
+    # 不自动引用：总结/问答模型留空，由用户主动选择
+    conf["summary_model_id"] = conf.get("summary_model_id") or ""
+    conf["chat_model_id"] = conf.get("chat_model_id") or ""
     return conf
 
 

@@ -59,17 +59,29 @@
           <div class="mascot-hero">
             <img :src="mascot" class="empty-mascot" alt="伴学猫头鹰" />
           </div>
-          <h1 class="greet-title">你好，我是伴伴</h1>
-          <p class="greet-sub">你的 AI 学习搭子 · 向知识库提问，我来帮你答疑解惑</p>
-          <div class="example-list">
-            <div class="example-q" v-for="q in examples" :key="q" @click="askSuggestion(q)">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
-                stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
-              </svg>
-              {{ q }}
+          <!-- 未配置模型：先引导配置（替代示例问题，避免点击直撞后端「请先配置」报错） -->
+          <template v-if="!configured">
+            <h1 class="greet-title">你好，我是伴伴</h1>
+            <p class="greet-sub">开始前只差一步：配置一个 AI 模型<br>1 分钟搞定，多数厂商新用户送免费额度</p>
+            <div class="setup-cta">
+              <el-button type="primary" size="large" @click="router.push('/settings?add=1')">前往配置模型</el-button>
             </div>
-          </div>
+            <p class="setup-note">配置后即可向知识库提问，回答会引用你的材料</p>
+          </template>
+          <!-- 已配置：正常空态 -->
+          <template v-else>
+            <h1 class="greet-title">你好，我是伴伴</h1>
+            <p class="greet-sub">你的 AI 学习搭子 · 向知识库提问，我来帮你答疑解惑</p>
+            <div class="example-list">
+              <div class="example-q" v-for="q in examples" :key="q" @click="askSuggestion(q)">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+                  stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+                </svg>
+                {{ q }}
+              </div>
+            </div>
+          </template>
         </div>
 
         <template v-for="(m, i) in messages" :key="m.id ?? m._tmp">
@@ -458,6 +470,7 @@ const sessionSearch = ref('')
 // 模型切换：从配置的模型列表选，默认用问答模型
 const chatModels = ref([])
 const selectedModelId = ref('')
+const configured = ref(true)   // 是否已配置 LLM 模型：未配置时空态给「配置引导」，默认 true 避免首屏闪烁
 const reasoningEffort = ref('low')   // 推理：默认快速（low），''=关闭，high/max=更强
 
 // 相对时间：无时区 ISO 视为 UTC（后端 datetime.utcnow）
@@ -1012,6 +1025,7 @@ onMounted(async () => {
     const { data: st } = await settingsApi.get()
     chatModels.value = st.llm_models || []
     selectedModelId.value = st.chat_model_id || (chatModels.value[0]?.id || '')
+    configured.value = st.configured !== false
   } catch { /* 静默 */ }
   // 从资料详情页进入：自动关联当前资料为检索范围
   const mid = route.query.material_id
@@ -1150,6 +1164,10 @@ function closeCitePop(e) {
   transform: translateY(-2px); box-shadow: 0 6px 16px rgba(124, 92, 252, .16);
 }
 .example-q:hover svg { color: var(--asc-primary); }
+/* 未配置模型：空态配置引导 */
+.setup-cta { margin: 0 0 16px; }
+.setup-cta .el-button { padding: 12px 30px; font-size: 14px; }
+.setup-note { font-size: 12.5px; color: var(--asc-text-3); }
 
 /* 消息行 */
 .msg-row { display: flex; margin-bottom: 30px; }

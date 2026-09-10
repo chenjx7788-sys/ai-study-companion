@@ -124,13 +124,18 @@ def test_model(payload: dict):
     client = OpenAI(base_url=base_url or conf["llm_base_url"] or None, api_key=api_key, timeout=15)
     t0 = time.time()
     try:
-        client.chat.completions.create(
+        r = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "ping"}],
             max_tokens=1,
         )
     except Exception as e:
         raise HTTPException(400, f"连接失败：{str(e)[:200]}")
+    # 校验响应结构：部分站点（尤其 Base URL 漏填 /v1 时）会返回 HTML 首页且状态码仍是 200，
+    # 仅判断「没抛异常」会把不可用的端点误报为「连接成功」，导致用户配好了却问不出内容。
+    if not getattr(r, "choices", None):
+        raise HTTPException(400, "连接失败：返回内容不是有效的 OpenAI 兼容响应"
+                                 "（请检查 Base URL 是否需以 /v1 结尾）")
     return {"ok": True, "latency_ms": int((time.time() - t0) * 1000), "model": model}
 
 

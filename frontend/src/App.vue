@@ -47,17 +47,23 @@
 
     <!-- 首次使用分步引导 -->
     <el-tour v-model="tourOpen" placement="right" @close="onTourClose">
-      <el-tour-step target="[data-nav='/']" placement="right" title="① 导入材料">
+      <!-- 未配置模型：把「配置模型」作为第一步（已配置用户不显示此步） -->
+      <el-tour-step v-if="needSetup" target="[data-nav='/settings']" placement="right" title="① 先配置 AI 模型">
+        <template #default>
+          首次使用需配置一个 AI 模型（1 分钟）。点这里前往管理中心：选厂商 → 填 API Key 即可，多数厂商新用户送免费额度。
+        </template>
+      </el-tour-step>
+      <el-tour-step target="[data-nav='/']" placement="right" :title="(needSetup ? '②' : '①') + ' 导入材料'">
         <template #default>
           上传你的第一份学习材料，PDF / PPT / Word / 音视频都行，系统会自动解析。
         </template>
       </el-tour-step>
-      <el-tour-step target="[data-nav='/chat']" placement="right" title="② 理解 & 提问">
+      <el-tour-step target="[data-nav='/chat']" placement="right" :title="(needSetup ? '③' : '②') + ' 理解 & 提问'">
         <template #default>
           在学习页做 AI 总结、划线解读，或随时打开 AI 问答向你的知识库提问。
         </template>
       </el-tour-step>
-      <el-tour-step target="[data-nav='/review']" placement="right" title="③ 沉淀 & 抗遗忘">
+      <el-tour-step target="[data-nav='/review']" placement="right" :title="(needSetup ? '④' : '③') + ' 沉淀 & 抗遗忘'">
         <template #default>
           把重点转成笔记进知识库，用复习巩固翻卡，让学过的内容不遗忘。
         </template>
@@ -115,10 +121,12 @@ async function checkSetup() {
 onMounted(() => {
   refreshDue()
   dueTimer = setInterval(refreshDue, 60000)
-  checkSetup()
-  if (!localStorage.getItem(ONBOARD_KEY)) {
-    setTimeout(() => { tourOpen.value = true }, 600)
-  }
+  // 先等配置状态就绪，再决定首次引导内容（未配置时第一步为「配置模型」）
+  checkSetup().then(() => {
+    if (!localStorage.getItem(ONBOARD_KEY)) {
+      setTimeout(() => { tourOpen.value = true }, 600)
+    }
+  })
 })
 onUnmounted(() => dueTimer && clearInterval(dueTimer))
 watch(() => route.path, refreshDue)
