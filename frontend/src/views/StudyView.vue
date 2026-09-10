@@ -782,7 +782,11 @@ function downloadFile() {
 // 原文视图 URL：带时间戳，重定位后 fileTs 变化触发图片/音视频重载（不丢阅读位置）
 const fileTs = ref(0)
 function fileUrl(id) {
-  return materialApi.fileUrl(id) + (fileTs.value ? '?v=' + fileTs.value : '')
+  // v 参数用于避开浏览器/WebView 的「启发式缓存」：材料删除后 id 会被复用，
+  // 若 URL 只含 id，换材料后会命中旧缓存、渲染出上一个材料的内容。
+  // fileTs = 重定位后的刷新标识；material.created_at = 本材料的稳定版本标识。
+  const tag = fileTs.value || (material.value && material.value.created_at) || ''
+  return materialApi.fileUrl(id) + (tag ? '?v=' + encodeURIComponent(tag) : '')
 }
 
 // 重新定位：引用材料源文件被移动/改名后，重新指向新路径

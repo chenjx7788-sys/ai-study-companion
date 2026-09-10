@@ -558,8 +558,14 @@ def get_file(material_id: int, download: bool = False, db: Session = Depends(get
             "webp": "image/webp", "bmp": "image/bmp",
         }
     media = media_map.get(m.format, "application/octet-stream")
+    # Cache-Control: no-cache —— 必须显式声明，否则浏览器/WebView 会启用「启发式缓存」
+    # （缓存时长 ≈ 距今 × 10%）。源文件常是较早期下载的（Last-Modified 可能是一年前），
+    # 启发式缓存可达数十天；而本接口 URL 只含 material_id，材料删除后 id 会被复用，
+    # 于是换材料后仍渲染缓存里的旧文件（表现为「原文视图显示成别的材料」）。
+    # no-cache 允许缓存但每次使用前必须向服务端校验，配合 ETag 未变时返回 304，兼顾正确与性能。
     return FileResponse(m.file_path, media_type=media,
                         filename=f"{m.title}.{m.format}",
+                        headers={"Cache-Control": "no-cache"},
                         content_disposition_type="attachment" if download else "inline")
 
 
