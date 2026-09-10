@@ -11,9 +11,17 @@ on:
 
 jobs:
   build-macos:
-    # Apple Silicon (arm64)：覆盖当前绝大多数 Mac 用户
-    # 如需 Intel (x86_64) 包，另加一个 job 用 macos-13（若该 runner 已下线则改用自建）
-    runs-on: macos-14
+    strategy:
+      fail-fast: false   # 双架构互不影响：一个失败不取消另一个
+      matrix:
+        include:
+          - os: macos-14        # Apple Silicon (arm64)
+            arch: arm64
+            label: Apple Silicon
+          - os: macos-15-intel  # Intel (x86_64)，GitHub 最后一个 x86_64 macOS 镜像（可用到 2027-08）
+            arch: x86_64
+            label: Intel
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     # 允许 GITHUB_TOKEN 创建 release（默认只读，否则 softprops/action-gh-release 报 "Resource not accessible by integration"）
     permissions:
@@ -42,9 +50,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt pyinstaller
 
-      - name: 打包 macOS 应用
+      - name: 打包 macOS 应用（${{ matrix.label }}）
         env:
-          ARCH: arm64
+          ARCH: ${{ matrix.arch }}
           # 若 HuggingFace 直连不稳，可切换国内镜像：
           # HF_ENDPOINT: https://hf-mirror.com
         run: bash backend/scripts/build_macos.sh
@@ -52,14 +60,14 @@ jobs:
       - name: 上传打包产物（artifact）
         uses: actions/upload-artifact@v4
         with:
-          name: ai-study-companion-macos-arm64
-          path: backend/dist/ai-study-companion-macos-arm64.zip
+          name: ai-study-companion-macos-${{ matrix.arch }}
+          path: backend/dist/ai-study-companion-macos-${{ matrix.arch }}.zip
           if-no-files-found: error
 
       - name: 发布到 GitHub Releases（仅 tag 触发时）
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: backend/dist/ai-study-companion-macos-arm64.zip
+          files: backend/dist/ai-study-companion-macos-${{ matrix.arch }}.zip
           fail_on_unmatched_files: true
           generate_release_notes: true
