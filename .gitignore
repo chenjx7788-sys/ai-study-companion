@@ -26,3 +26,8 @@ Thumbs.db
 # 验证构建与 vite 临时产物
 frontend/dist-*/
 frontend/vite.config.js.timestamp-*.mjs
+
+# macOS 打包临时产物（backend/scripts/build_macos.sh 生成）
+backend/mascot.png
+backend/mascot.icns
+backend/mascot.iconset/
