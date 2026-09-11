@@ -7,6 +7,7 @@ python-multipart>=0.0.32
 pypdf>=6.16
 python-docx>=1.2
 python-pptx>=1.0
+lxml>=5.0        # EPUB 章节 XHTML 容错解析（此前由依赖链间接带入，显式声明避免被上游移除）
 openai>=3.7
 chromadb>=1.5
 # 本地向量 / ASR 运行时（此前遗漏，打包分发前补齐）
@@ -22,3 +23,6 @@ rapidocr_onnxruntime>=1.2
 opencv-python-headless>=4.8   # 无 GUI 依赖，替代 rapidocr 默认带入的 opencv-python
 PyMuPDF>=1.24
 pywebview>=6.0   # 客户端原生窗口 + 原生文件/文件夹选择对话框（本地文件直引）
+# AI 播客 · 语音合成：edge-tts 免费、无需 API Key，输出 MPEG-2 Layer III / 24kHz / 48kbps / mono
+# 注意：依赖 aiohttp（自动带入）。聚合音频采用 MP3 帧字节拼接，无需 ffmpeg。
+edge-tts>=7.2

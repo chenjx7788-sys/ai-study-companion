@@ -1,6 +1,7 @@
-// SSE 流式读取：POST 请求 + 逐事件回调（meta/token/done/error）
+// SSE 流式读取：POST 请求 + 逐事件回调（meta/progress/token/done/error）
 // dev 模式直连后端，绕过 vite 代理（vite 代理会缓冲 SSE 流式响应导致一次性返回）
-export async function streamSSE(url, body, onToken, onDone, onError, onMeta) {
+// onProgress：分批任务（如长文档摘要的两段式）的进度回调，payload = {done, total}
+export async function streamSSE(url, body, onToken, onDone, onError, onMeta, onProgress) {
   const base = import.meta.env.DEV ? 'http://127.0.0.1:8000' : ''
   const resp = await fetch(base + url, {
     method: 'POST',
@@ -30,6 +31,7 @@ export async function streamSSE(url, body, onToken, onDone, onError, onMeta) {
       else if (ev === 'done') onDone?.(payload)
       else if (ev === 'error') onError?.(payload.message)
       else if (ev === 'meta') onMeta?.(payload)
+      else if (ev === 'progress') onProgress?.(payload)
     }
   }
 }

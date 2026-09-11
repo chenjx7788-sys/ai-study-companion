@@ -23,6 +23,7 @@ class NoteCreate(BaseModel):
 class NoteUpdate(BaseModel):
     title: str | None = None
     content: str | None = None
+    anchor: dict | None = None     # 摘要笔记「覆盖更新」时同步 version，用于判定「摘要已更新」
 
 class ChatNoteCreate(BaseModel):
     """AI 问答转笔记：材料无关（material_id=NULL, source_type=chat）
@@ -32,22 +33,40 @@ class ChatNoteCreate(BaseModel):
     sources: list[dict] | None = None    # 引用来源快照（仅展示，不挂靠材料）
 
 
-def note_to_dict(n: Note) -> dict:
-    return {
+def note_to_dict(n: Note, slim: bool = False) -> dict:
+    """slim=True 时**不下发正文**（见 list_notes 的口径说明）"""
+    d = {
         "id": n.id, "material_id": n.material_id, "title": n.title,
         "content": n.content, "source_type": n.source_type,
         "source_asset_id": n.source_asset_id, "anchor": n.anchor,
         "created_at": n.created_at.isoformat() if n.created_at else None,
         "updated_at": n.updated_at.isoformat() if n.updated_at else None,
     }
+    if slim:
+        d.pop("content", None)
+    return d
 
 
 @router.get("")
-def list_notes(material_id: int, db: Session = Depends(get_db)):
-    """C3 按材料隔离：只返回该材料的笔记"""
-    rows = (db.query(Note).filter(Note.material_id == material_id)
-            .order_by(Note.updated_at.desc()).all())
-    return [note_to_dict(n) for n in rows]
+def list_notes(material_id: int | None = None, slim: int = 0,
+               db: Session = Depends(get_db)):
+    """按材料隔离：只返回该材料的笔记。
+
+    ⚠️ **省略 material_id 时返回「材料无关笔记」（material_id 为 NULL）** ——
+    AI 问答、学习周报、播客脚本这类产物不归属任何单一材料，
+    但状态查询（「这个产物转过笔记没有」）需要一次拿到它们。
+    传了 material_id 的调用方行为完全不变（学习页仍只看到本材料的笔记）。
+
+    slim=1 时**不下发 content**：播客页 / 统计页只用 anchor 判断「这个产物转过笔记
+    没有」，却为此把全部周报 / 播客脚本 / 问答沉淀的正文一起下载了（笔记正文是
+    这批数据里最大的部分）。不需要正文的调用方都该带这个参数。
+    """
+    q = db.query(Note)
+    if material_id is None:
+        q = q.filter(Note.material_id.is_(None))
+    else:
+        q = q.filter(Note.material_id == material_id)
+    return [note_to_dict(n, slim=bool(slim)) for n in q.order_by(Note.updated_at.desc()).all()]
 
 
 @router.get("/{note_id}")
@@ -115,6 +134,58 @@ def create_chat_note(req: ChatNoteCreate, db: Session = Depends(get_db)):
     return {"note": d, "created": True}
 
 
+class AiNoteCreate(BaseModel):
+    """材料无关的 AI 产物转笔记（学习周报 / 播客脚本等）。
+
+    与 /from-chat 的区别：这里显式带 source_type 与 anchor。
+    幂等靠 `anchor["key"]`（稳定业务键，如 `weekly_report:2026-W37`）——
+    产物「再生成」往往换 id（周报每周只留最新一份），按 id 判重会让笔记重复沉淀。
+    """
+    title: str = ""
+    content: str = ""
+    source_type: str = "ai_asset"      # weekly_report / podcast_script / ai_asset
+    anchor: dict | None = None
+
+
+@router.post("/from-ai")
+def create_ai_note(req: AiNoteCreate, db: Session = Depends(get_db)):
+    """材料无关产物转笔记：带稳定业务键时幂等（重复转存返回既有笔记）。"""
+    content = (req.content or "").strip()
+    title = (req.title or "").strip()[:255]
+    if len(content) < 2:
+        raise HTTPException(400, "产物内容为空或过短，无法转成笔记")
+    if not title:
+        title = content[:24]
+
+    key = (req.anchor or {}).get("key")
+    if key:
+        # 只在同类产物里比对，避免不同类型产物撞键
+        for n in (db.query(Note)
+                  .filter(Note.material_id.is_(None), Note.source_type == req.source_type)
+                  .all()):
+            if (n.anchor or {}).get("key") == key:
+                return {"note": note_to_dict(n), "created": False}
+
+    n = Note(material_id=None, title=title, content=content,
+             source_type=req.source_type, anchor=req.anchor)
+    db.add(n)
+    db.commit()
+    db.refresh(n)
+    # 向量化入知识库（失败不阻断创建，但回传警告给前端提示）
+    reindex_warning = None
+    try:
+        from ..services import kb_index
+        kb_index.index_note(db, n)
+    except Exception as e:
+        import logging
+        reindex_warning = "已转存，但向量索引未建立，后续问答可能检索不到（可到知识库重建索引）"
+        logging.getLogger("uvicorn.error").warning(f"产物转笔记 {n.id} 索引失败: {e}")
+    d = note_to_dict(n)
+    if reindex_warning:
+        d["reindex_warning"] = reindex_warning
+    return {"note": d, "created": True}
+
+
 @router.post("")
 def create_note(req: NoteCreate, db: Session = Depends(get_db)):
     if not db.get(Material, req.material_id):
@@ -149,6 +220,8 @@ def update_note(note_id: int, req: NoteUpdate, db: Session = Depends(get_db)):
         if len(content) < 2:
             raise HTTPException(400, "内容过短（少于 2 字），请选择更完整的段落")
         n.content = content
+    if req.anchor is not None:
+        n.anchor = req.anchor
     db.commit()
     db.refresh(n)
     # 同步更新向量索引（失败不阻断保存，但回传警告给前端提示）

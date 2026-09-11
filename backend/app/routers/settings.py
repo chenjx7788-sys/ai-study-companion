@@ -44,18 +44,8 @@ def get_settings():
         # 笔记检索权重（检索打分时读取，改动即时生效）
         "note_weight": float(conf.get("note_weight") or 1.5),
         # 提示词：自定义值（空字符串 = 使用默认模板）
-        "prompt_summary": conf.get("prompt_summary", ""),
-        "prompt_keywords": conf.get("prompt_keywords", ""),
-        "prompt_explain": conf.get("prompt_explain", ""),
-        "prompt_kb_qa": conf.get("prompt_kb_qa", ""),
-        "prompt_general": conf.get("prompt_general", ""),
-        "prompt_suggest": conf.get("prompt_suggest", ""),
-        "prompt_quiz": conf.get("prompt_quiz", ""),
-        "prompt_recall": conf.get("prompt_recall", ""),
-        "prompt_note_rewrite": conf.get("prompt_note_rewrite", ""),
-        "prompt_note_expand": conf.get("prompt_note_expand", ""),
-        "prompt_note_summarize": conf.get("prompt_note_summarize", ""),
-        "prompt_note_continue": conf.get("prompt_note_continue", ""),
+        # 遍历 FIELDS 中所有 prompt_ 字段，确保新增提示词无需改此处
+        **{k: conf.get(k, "") for k in settings_store.FIELDS if k.startswith("prompt_")},
         "kb_hit_threshold": conf.get("kb_hit_threshold", 0.15),
         # 预设标签库（材料库可先建标签，再打给材料）
         "preset_tags": conf.get("preset_tags") or [],

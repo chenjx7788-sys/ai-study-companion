@@ -1,10 +1,12 @@
 <template>
   <div class="page review-page" v-loading="loading">
-    <div class="page-header">
-      <div class="header-title">
-        <h2>复习巩固</h2>
-        <p class="header-sub">用间隔重复对抗遗忘 · 每天清空待复习卡片</p>
-      </div>
+    <PageHead title="复习巩固" sub="用间隔重复对抗遗忘 · 每天清空待复习卡片">
+      <template #icon>
+        <svg viewBox="0 0 16 16" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" />
+          <path d="M13.5 1.8v2.6h-2.6" />
+        </svg>
+      </template>
       <div class="stats-row" v-if="stats.total">
         <span class="stat-chip due clickable" title="点击查看待复习卡片" @click="openStatus('due')"><b>{{ stats.due }}</b><i>待复习</i></span>
         <span class="stat-chip clickable" title="点击查看今日已复习" @click="openStatus('reviewed_today')"><b>{{ stats.reviewed_today }}</b><i>今日已复习</i></span>
@@ -12,7 +14,7 @@
         <span class="stat-chip mastered clickable" title="点击查看已掌握卡片" @click="openStatus('mastered')"><b>{{ stats.mastered }}</b><i>已掌握</i></span>
         <span v-if="stats.weak" class="stat-chip weak clickable" title="点击查看易忘卡片" @click="openStatus('weak')"><b>{{ stats.weak }}</b><i>易忘</i></span>
       </div>
-    </div>
+    </PageHead>
 
     <!-- 筛选栏：按资料 / 按分类 -->
     <div v-if="stats.total" class="filter-bar">
@@ -166,17 +168,18 @@
       <p class="done-title">今日复习完成，伴伴为你点赞</p>
       <p class="done-sub">知识又巩固了一层，明天见</p>
       <p v-if="stats.reviewed_today" class="done-stats">今日复习 {{ stats.reviewed_today }} 次 · 今日记得率 {{ todayRate }}%</p>
-        <el-button @click="showAll = !showAll">{{ showAll ? '收起全部卡片' : '查看全部卡片' }}</el-button>
+        <el-button @click="toggleAllCards">{{ showAll ? '收起全部卡片' : '查看全部卡片' }}</el-button>
       </div>
 
       <!-- 复习卡 -->
-      <div v-else-if="current" class="card-stage">
+      <div v-else-if="current" ref="cardStageRef" class="card-stage">
       <div class="stage-progress">
         <div class="stage-progress-fill" :style="{ width: progressPct + '%' }"></div>
       </div>
       <div class="card-meta-row">
         <span class="card-src">{{ current.material_title || '笔记' }}</span>
         <span class="card-type">{{ { choice: '选择题', recall: '复述卡' }[current.type] || '简答' }}</span>
+        <span class="card-progress">第 {{ idx + 1 }} / {{ queue.length }} 张</span>
         <span class="card-level">
           <span class="lv-dots" :title="'第 ' + (current.level + 1) + ' 级 / 共 6 级'">
             <i v-for="n in 6" :key="n" :class="{ on: n <= current.level + 1 }"></i>
@@ -195,7 +198,7 @@
       </div>
 
       <!-- 选择题选项 -->
-      <div v-if="current.type === 'choice'" class="choice-opts">
+      <div v-if="current.type === 'choice'" ref="choiceOptsRef" class="choice-opts">
         <div v-for="(opt, i) in current.options" :key="i" class="opt"
           :class="{
             correct: picked !== null && i === current.correct_index,
@@ -209,7 +212,7 @@
       </div>
 
       <!-- 简答/复述卡：翻面看答案 -->
-      <div v-else class="qa-body">
+      <div v-else ref="qaBodyRef" class="qa-body">
         <div v-if="flipped" class="qa-answer md-body" v-html="renderMd(current.answer)"></div>
         <div v-else class="qa-hint">{{ current.type === 'recall' ? '先自己讲一遍，再对照参考答案' : '按空格 / 点击下方按钮查看答案' }}</div>
       </div>
@@ -233,42 +236,45 @@
           {{ current.type === 'recall' ? '我讲完了，看答案（空格）' : '查看答案（空格）' }}
         </el-button>
       </div>
-      <div class="queue-progress">第 {{ idx + 1 }} / {{ queue.length }} 张<span v-if="quota > queue.length">（今日上限 {{ limit }} 张，剩余 {{ quota - queue.length }} 张顺延）</span></div>
-      <div class="kbd-hint"><span class="kbd">空格</span>翻卡 · <span class="kbd">1</span>忘了 <span class="kbd">2</span>模糊 <span class="kbd">3</span>记得 <span class="kbd">4</span>简单</div>
+      <div class="queue-progress" v-if="quota > queue.length">今日上限 {{ limit }} 张，剩余 {{ quota - queue.length }} 张顺延</div>
       </div>
-      </div>
-    </div>
 
-    <!-- 全部卡片列表 -->
-    <div v-if="showAll && allCards.length" class="all-list">
-      <div class="all-head">
-        <span class="all-title">全部卡片（{{ allCards.length }}）</span>
-        <el-input v-model="allSearch" size="small" placeholder="搜索题干关键词" clearable style="width: 220px" />
-      </div>
-      <div v-if="!filteredCards.length" class="all-empty">没有匹配的卡片</div>
-      <div v-for="c in filteredCards" :key="c.id" class="all-item">
-        <div class="all-q">{{ c.question }}</div>
-        <div class="all-meta">
-          <el-tag size="small" :type="c.type === 'choice' ? 'primary' : 'info'" effect="plain">
-            {{ { choice: '选择题', recall: '复述卡' }[c.type] || '简答' }}
-          </el-tag>
-          <span>{{ c.material_title }}</span>
-          <span class="lv-dots" :title="'第 ' + (c.level + 1) + ' 级 / 共 6 级'">
-            <i v-for="n in 6" :key="'l' + n" :class="{ on: n <= c.level + 1 }"></i>
-          </span>
-          <el-tag v-if="isWeak(c)" size="small" type="danger" effect="plain">易忘</el-tag>
-          <span>下次复习 {{ c.next_review_at?.slice(0, 10) }}</span>
-          <el-button v-if="c.type === 'qa'" size="small" text type="primary"
-            :loading="convertingId === c.id" @click.stop="convertCard(c)">转选择题</el-button>
-          <el-button size="small" text type="primary" @click.stop="openEdit(c)">编辑</el-button>
-          <el-popconfirm title="删除这张复习卡片？（笔记本身保留）" width="240"
-            confirm-button-text="删除" confirm-button-type="danger" cancel-button-text="取消"
-            @confirm="removeCard(c.id)">
-            <template #reference>
-              <el-button size="small" text type="danger" @click.stop>删除</el-button>
-            </template>
-          </el-popconfirm>
+      <!-- 全部卡片列表（移动到"今日复习完成"卡片下方） -->
+      <div v-if="!current && showAll && allCards.length" ref="allListRef" class="all-list">
+        <div class="all-head">
+          <span class="all-title">全部卡片（{{ allCards.length }}）</span>
+          <el-input v-model="allSearch" size="small" placeholder="搜索题干关键词" clearable class="all-search" />
         </div>
+        <div v-if="!filteredCards.length" class="all-empty">没有匹配的卡片</div>
+        <div v-for="c in filteredCards" :key="c.id" class="all-item">
+          <div class="all-q">{{ c.question }}</div>
+          <div class="all-foot">
+            <div class="all-info">
+              <el-tag class="type-tag" size="small" :type="c.type === 'choice' ? 'primary' : 'info'" effect="plain">
+                {{ { choice: '选择题', recall: '复述卡' }[c.type] || '简答' }}
+              </el-tag>
+              <span class="all-src" :title="c.material_title">{{ c.material_title }}</span>
+              <span class="lv-dots" :title="'第 ' + (c.level + 1) + ' 级 / 共 6 级'">
+                <i v-for="n in 6" :key="'l' + n" :class="{ on: n <= c.level + 1 }"></i>
+              </span>
+              <el-tag v-if="isWeak(c)" size="small" type="danger" effect="plain">易忘</el-tag>
+              <span class="all-next">下次复习 {{ c.next_review_at?.slice(0, 10) }}</span>
+            </div>
+            <div class="all-ops">
+              <el-button v-if="c.type !== 'choice'" size="small" text type="primary"
+                :loading="convertingId === c.id" @click.stop="convertCard(c)">转选择题</el-button>
+              <el-button size="small" text type="primary" @click.stop="openEdit(c)">编辑</el-button>
+              <el-popconfirm title="删除这张复习卡片？（笔记本身保留）" width="240"
+                confirm-button-text="删除" confirm-button-type="danger" cancel-button-text="取消"
+                @confirm="removeCard(c.id)">
+                <template #reference>
+                  <el-button size="small" text type="danger" @click.stop>删除</el-button>
+                </template>
+              </el-popconfirm>
+            </div>
+          </div>
+        </div>
+      </div>
       </div>
     </div>
 
@@ -316,7 +322,7 @@
             <span class="status-q-arrow">{{ expandedId === c.id ? '收起' : '展开复习' }}</span>
           </div>
           <div class="status-meta">
-            <el-tag size="small" :type="c.type === 'choice' ? 'primary' : 'info'" effect="plain">
+            <el-tag class="type-tag" size="small" :type="c.type === 'choice' ? 'primary' : 'info'" effect="plain">
               {{ { choice: '选择题', recall: '复述卡' }[c.type] || '简答' }}
             </el-tag>
             <span>{{ c.material_title || '笔记' }}</span>
@@ -326,6 +332,16 @@
             <span>已复习 {{ c.review_count }} 次</span>
             <el-tag v-if="isWeak(c)" size="small" type="danger" effect="plain">易忘</el-tag>
             <span v-if="c.next_review_at">下次 {{ c.next_review_at.slice(0, 10) }}</span>
+            <span class="status-ops">
+              <el-button size="small" text type="primary" @click.stop="openEdit(c)">编辑</el-button>
+              <el-popconfirm title="删除这张复习卡片？（笔记本身保留）" width="240"
+                confirm-button-text="删除" confirm-button-type="danger" cancel-button-text="取消"
+                @confirm="removeCard(c.id)">
+                <template #reference>
+                  <el-button size="small" text type="danger" @click.stop>删除</el-button>
+                </template>
+              </el-popconfirm>
+            </span>
           </div>
 
           <!-- 展开的复习区 -->
@@ -365,12 +381,13 @@
 </template>
 
 <script setup>
-import { ref, computed, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, computed, reactive, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import MarkdownIt from 'markdown-it'
 import mascot from '../assets/mascot.png'
 import { reviewApi } from '../api'
 import { errMsg } from '../api/http'
+import PageHead from '../components/PageHead.vue'
 
 const md = new MarkdownIt({ breaks: true })
 const renderMd = (t) => md.render(t || '')
@@ -388,7 +405,12 @@ const STATUS_LABELS = { due: '待复习', reviewed_today: '今日已复习', all
 const idx = ref(0)
 const flipped = ref(false)
 const picked = ref(null)       // 选择题已选下标
+const choiceOptsRef = ref(null)  // 选择题选项区：作答后滚动定位到此处
+const qaBodyRef = ref(null)      // 简答/复述卡答案区：翻面后滚动定位到此处
+const cardStageRef = ref(null)   // 复习卡舞台：换卡后滚动回到卡片顶部
 const showAll = ref(false)
+const allListRef = ref(null)     // 全部卡片列表：展开时滚动定位锚点
+let allListScrollPos = null      // 展开前的滚动位置：收起时还原
 const convertingId = ref(null)
 const quota = ref(0)       // 到期总卡数
 const limit = ref(30)      // 每日上限
@@ -449,10 +471,23 @@ async function refreshStats() {
 function pick(i) {
   if (picked.value !== null) return   // 已作答
   picked.value = i
+  // 小屏作答后自动定位到选项区：避免手动滚动才能看到对错标记与解析
+  nextTick(() => {
+    choiceOptsRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
 }
 
+// 简答/复述卡翻面后自动定位到答案区（与选择题作答后定位对齐）
+watch(flipped, (v) => {
+  if (!v) return
+  nextTick(() => {
+    qaBodyRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
+})
+
 function reveal() {
-  if (current.value?.type === 'qa') flipped.value = true
+  // 选择题无需翻面；其余（复述卡 recall / 简答卡 qa）按空格即翻面
+  if (current.value && current.value.type !== 'choice') flipped.value = true
 }
 
 async function grade(result) {
@@ -472,6 +507,10 @@ async function grade(result) {
   idx.value += 1
   refreshStats()   // 复习后刷新完整统计（reviewed_today/due/mastered/weak/streak/daily）
   if (idx.value >= queue.value.length) loadAll()
+  // 换到下一张后回到卡片顶部：避免上一张"作答后已滚到选项区"导致新卡题干停在视口上方（小屏尤其明显）
+  nextTick(() => {
+    cardStageRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
 }
 
 // ===== 评分撤销（防误触）：评分后 5 秒内可撤销 =====
@@ -494,14 +533,15 @@ async function undoLast() {
   clearTimeout(undoTimer)
   undoBar.show = false
   try {
-    await reviewApi.undoGrade(undoBar.cardId)
     if (fromDialog) {
       // 弹窗场景撤销：卡已回到到期 → 全量刷新主队列与弹窗列表，保证两边口径一致
+      await reviewApi.undoGrade(undoBar.cardId)
       await load()
       if (statusDialog.show) await openStatus(statusKey || 'due')
       ElMessage.success('已撤销上一次评分')
       return
     }
+    // 主卡片场景撤销：卡回到当前，重建队列状态（只调用一次，避免二次撤销报「没有可撤销的记录」）
     const { data } = await reviewApi.undoGrade(undoBar.cardId)
     const i = queue.value.findIndex(x => x.id === undoBar.cardId)
     if (i >= 0) queue.value[i] = data
@@ -521,7 +561,7 @@ async function undoLast() {
 
 // 键盘快捷键：空格翻卡/作答，1-4 自评（下钻弹窗打开时不响应，避免误评主队列卡片）
 function onKey(e) {
-  if (statusDialog.show) return
+  if (statusDialog.show || editDialog.show) return   // 弹窗打开时不响应全局快捷键，避免误评分
   if (!current.value) return
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
   if (e.code === 'Space') { e.preventDefault(); reveal() }
@@ -536,6 +576,28 @@ const isWeak = (c) => c.review_count >= 2 && c.level <= 1
 async function loadAll() {
   const { data } = await reviewApi.cards(filterParams())
   allCards.value = data
+}
+// 展开/收起「全部卡片」：展开时定位到列表，收起时回到展开前的位置
+function contentScroller() {
+  // 内容区滚动容器 = Element Plus 的 el-main（.app-main），兜底 window
+  return document.querySelector('.app-main') || window
+}
+function toggleAllCards() {
+  const box = contentScroller()
+  if (!showAll.value) {
+    allListScrollPos = box === window ? (window.pageYOffset || 0) : box.scrollTop
+    showAll.value = true
+    nextTick(() => {
+      allListRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  } else {
+    showAll.value = false
+    nextTick(() => {
+      if (allListScrollPos == null) return
+      if (box === window) window.scrollTo({ top: allListScrollPos, behavior: 'smooth' })
+      else box.scrollTo({ top: allListScrollPos, behavior: 'smooth' })
+    })
+  }
 }
 // 全部卡片列表：题干关键词搜索（纯前端过滤）
 const allSearch = ref('')
@@ -711,7 +773,11 @@ async function saveEdit() {
     const { data } = await reviewApi.update(editDialog.id, payload)
     const upd = (list) => { const i = list.findIndex(x => x.id === data.id); if (i >= 0) list[i] = data }
     upd(allCards.value); upd(queue.value)
+    // 弹窗内若正显示该卡，同步更新内容（保留展开/作答等临时状态）
+    const si = statusCards.value.findIndex(x => x.id === data.id)
+    if (si >= 0) statusCards.value[si] = { ...statusCards.value[si], ...data }
     editDialog.show = false
+    refreshStats()
     ElMessage.success('已保存')
   } catch (e) {
     ElMessage.error(errMsg(e, '保存失败'))
@@ -721,10 +787,22 @@ async function saveEdit() {
 }
 
 async function removeCard(id) {
-  await reviewApi.remove(id)
-  allCards.value = allCards.value.filter(c => c.id !== id)
-  stats.value.total -= 1
-  ElMessage.success('已删除')
+  try {
+    await reviewApi.remove(id)
+    allCards.value = allCards.value.filter(c => c.id !== id)
+    statusCards.value = statusCards.value.filter(c => c.id !== id)   // 弹窗列表同步
+    // 主队列快照同步：删掉该卡并校准序号（不改用 load()，避免打断主流程进度）
+    const qi = queue.value.findIndex(x => x.id === id)
+    if (qi >= 0) {
+      queue.value.splice(qi, 1)
+      if (qi < idx.value) idx.value -= 1
+    }
+    if (expandedId.value === id) expandedId.value = null
+    refreshStats()   // 统计重算：总数 / 待复习 / 已掌握 / 易忘等
+    ElMessage.success('已删除')
+  } catch (e) {
+    ElMessage.error(errMsg(e, '删除失败'))
+  }
 }
 
 onMounted(async () => {
@@ -737,12 +815,6 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
 </script>
 
 <style scoped>
-/* ===== 页头：标题在左、统计在右，靠留白分层（去掉分割线，减少线框感） ===== */
-.page-header { display: flex; justify-content: space-between; align-items: flex-end; gap: 18px; flex-wrap: wrap; margin-bottom: 22px; }
-.page-header h2 { margin: 0; font-size: 21px; font-weight: 700; letter-spacing: .2px; }
-.header-title { display: flex; flex-direction: column; gap: 5px; }
-.header-sub { margin: 0; font-size: 13px; color: var(--asc-text-3); }
-
 /* ===== 统计块：大数字 + 小标签，轻边框浅投影，hover 浮起可下钻 ===== */
 .stats-row { display: flex; gap: 10px; flex-wrap: wrap; }
 .stat-chip {
@@ -779,6 +851,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
 .status-q-text { flex: 1; }
 .status-q-arrow { flex-shrink: 0; font-size: 11px; font-weight: 400; color: var(--asc-primary); }
 .status-meta { display: flex; gap: 10px; align-items: center; font-size: 12px; color: var(--asc-text-3); flex-wrap: wrap; }
+.status-ops { display: inline-flex; align-items: center; gap: 2px; flex-basis: 100%; margin-top: 2px; }
 .status-review { margin-top: 10px; padding-top: 12px; border-top: 1px dashed var(--asc-border); }
 .status-opts { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
 .status-opt {
@@ -809,7 +882,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
 
 /* ===== 复习卡舞台：整卡白底大卡，进度条贴顶融入卡片 ===== */
 .card-stage {
-  width: 100%; overflow: hidden;
+  width: 100%; overflow: hidden; scroll-margin-top: 12px;
   background: var(--asc-card); border-radius: 18px;
   border: 1px solid rgba(227, 227, 230, .6);
   box-shadow: 0 8px 28px rgba(31, 24, 68, .07);
@@ -827,6 +900,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
 .card-meta-row { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
 .card-src { font-size: 12px; color: var(--asc-primary); background: var(--asc-primary-soft); border-radius: 6px; padding: 2px 8px; }
 .card-type { font-size: 11px; color: var(--asc-text-2); }
+.card-progress { font-size: 11px; color: var(--asc-text-3); margin-left: 20px; }
 .card-level { font-size: 11px; color: var(--asc-text-3); margin-left: auto; }
 
 /* 题干：浅紫渐变焦点区，无边框、无投影，与选项拉开层级 */
@@ -840,7 +914,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
 .q-text { font-size: 19px; font-weight: 600; line-height: 1.75; color: var(--asc-text); }
 
 /* 选择题选项 */
-.choice-opts { display: flex; flex-direction: column; gap: 10px; }
+.choice-opts { display: flex; flex-direction: column; gap: 10px; scroll-margin-top: 80px; }
 .opt {
   display: flex; align-items: center; gap: 12px;
   background: var(--asc-card); border: 1px solid rgba(227, 227, 230, .8);
@@ -869,7 +943,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
 @keyframes shake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-4px); } 75% { transform: translateX(4px); } }
 
 /* 简答/复述卡答案区：灰底与白卡区分 */
-.qa-body { margin-bottom: 6px; }
+.qa-body { margin-bottom: 6px; scroll-margin-top: 80px; }
 .qa-answer {
   background: var(--asc-surface-2);
   border-radius: 12px; padding: 16px 18px; font-size: 14px; line-height: 1.8;
@@ -894,9 +968,11 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
 .reveal-hint { text-align: center; margin-top: 12px; }
 
 /* 自评按钮：语义色浅底填充，实体按键感 */
-.grade-row { display: flex; gap: 10px; margin-top: 22px; }
+/* 允许换行 + 最小宽度：窄屏自动折成 2×2，避免四个按钮被挤压显示不全、难点击 */
+.grade-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 22px; }
 .grade-btn {
-  flex: 1; height: 62px; display: flex; flex-direction: column; gap: 3px;
+  flex: 1 1 130px; min-width: 130px; height: 62px;
+  display: flex; flex-direction: column; gap: 3px;
   font-size: 15px; font-weight: 600; border-radius: 12px; border: none;
   transition: all .18s cubic-bezier(.4, 0, .2, 1);
 }
@@ -914,15 +990,22 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
 .queue-progress { text-align: center; font-size: 12px; color: var(--asc-text-3); margin-top: 16px; }
 
 /* ===== 全部卡片列表 ===== */
-.all-list { max-width: 760px; margin: 26px auto 0; }
+.all-list { margin: 18px 0 0; scroll-margin-top: 20px; }
 .all-item {
-  background: var(--asc-card); border: 1px solid rgba(227, 227, 230, .6);
-  border-radius: 12px; padding: 14px 18px; margin-bottom: 10px;
-  transition: box-shadow .16s ease, transform .16s ease;
+  position: relative;
+  background: var(--asc-card); border: 1px solid rgba(227, 227, 230, .7);
+  border-radius: 12px; padding: 13px 16px; margin-bottom: 10px;
+  transition: box-shadow .16s ease, transform .16s ease, border-color .16s ease;
 }
-.all-item:hover { box-shadow: var(--asc-shadow-hover); transform: translateY(-1px); }
-.all-q { font-size: 14px; font-weight: 500; margin-bottom: 6px; }
-.all-meta { display: flex; gap: 12px; align-items: center; font-size: 12px; color: var(--asc-text-3); flex-wrap: wrap; }
+.all-item:hover { box-shadow: var(--asc-shadow-hover); transform: translateY(-1px); border-color: rgba(124, 92, 252, .35); }
+.all-q { font-size: 14px; font-weight: 500; line-height: 1.6; margin-bottom: 10px; color: var(--asc-text); }
+.all-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; }
+.all-info { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; color: var(--asc-text-3); min-width: 0; }
+/* 题型标签：恢复被全局 .el-tag{border:none} 去掉的边框，突出题型（边框跟随类型色） */
+.type-tag { border: 1px solid currentColor; }
+.all-src { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.all-next { white-space: nowrap; }
+.all-ops { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
 
 /* ===== 左右两栏布局：左=数据洞察，右=问答测试题（自然高度） ===== */
 .review-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start; }
@@ -1031,23 +1114,13 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
 .lv-dots i { width: 7px; height: 7px; border-radius: 50%; background: var(--asc-border); transition: background .2s ease; }
 .lv-dots i.on { background: linear-gradient(135deg, #8f7bff, #7c5cfc); }
 
-/* ===== 快捷键提示 ===== */
-.kbd-hint { text-align: center; font-size: 11px; color: var(--asc-text-3); margin-top: 10px; }
-.kbd {
-  display: inline-block; min-width: 16px; padding: 0 4px; margin: 0 1px 0 6px;
-  font-size: 10px; line-height: 16px; text-align: center;
-  background: var(--asc-surface-2); border: 1px solid var(--asc-border);
-  border-bottom-width: 2px; border-radius: 4px; color: var(--asc-text-2);
-}
-.kbd:first-of-type { margin-left: 0; }
-.kbd-hint .kbd + .kbd { margin-left: 4px; }
-
 /* ===== 完成页小结 ===== */
 .done-stats { font-size: 13px; color: var(--asc-primary); font-weight: 600; margin: -8px 0 20px; font-variant-numeric: tabular-nums; }
 
 /* ===== 全部卡片列表（搜索头） ===== */
-.all-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; padding: 0 2px; }
-.all-title { font-size: 13px; font-weight: 600; color: var(--asc-text-2); }
+.all-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; padding: 0 2px; }
+.all-title { font-size: 13px; font-weight: 600; color: var(--asc-text-2); white-space: nowrap; }
+.all-search { flex: 1; max-width: 240px; }
 .all-empty { text-align: center; padding: 26px 0; font-size: 12.5px; color: var(--asc-text-3); background: var(--asc-card); border: 1px dashed var(--asc-border); border-radius: 12px; }
 
 /* ===== 评分撤销条（悬浮底部） ===== */

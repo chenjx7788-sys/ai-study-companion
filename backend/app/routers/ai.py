@@ -4,6 +4,7 @@
 - 解读/追问以 AIAsset 树存储：explain 为根，qa 为子（parent_id 串联）
 """
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -260,6 +261,12 @@ def _sse_event(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _err_text(e: Exception) -> str:
+    """错误文案归一：HTTPException 取 detail，避免前端看到「502: xxx」这种带状态码前缀的串"""
+    detail = getattr(e, "detail", None)
+    return str(detail) if detail else str(e)
+
+
 @router.post("/explain/stream")
 def explain_stream(req: ExplainReq, db: Session = Depends(get_db)):
     """SSE 流式解读/追问：逐 token 输出，完成后落库"""
@@ -371,10 +378,33 @@ def summary_stream(req: SummaryReq, db: Session = Depends(get_db)):
         return a
 
     if total > llm.MAX_SINGLE_CHARS:
-        content = llm.generate_summary(chunks, req.instruction)
-        a = _save(content)
+        groups = llm.split_groups(chunks)
 
         def gen_long():
+            # 逐组回传进度：长文档要串行跑 N 组 + 1 次汇总，全程无输出会让用户以为卡死
+            # （实测 24.7 万字的书 = 21 组，改前前端 149 秒收不到任何字节，只能反复点重试）
+            # 分组阶段并发（SUMMARY_CONCURRENCY 路）：耗时由生成主导，串行改并发才能
+            # 成比例压缩；进度按「已完成数」回传，完成顺序与分组序号无关，
+            # 但 partials 按序号落位，汇总时的「第 N 部分」顺序仍然正确。
+            partials: list = [None] * len(groups)
+            pool = ThreadPoolExecutor(max_workers=llm.SUMMARY_CONCURRENCY)
+            try:
+                yield _sse_event("progress", {"done": 0, "total": len(groups)})
+                futures = {pool.submit(llm.map_group_safe, g, i, len(groups)): i
+                           for i, g in enumerate(groups)}
+                done = 0
+                for fut in as_completed(futures):
+                    partials[futures[fut]] = fut.result()
+                    done += 1
+                    yield _sse_event("progress", {"done": done, "total": len(groups)})
+                content = llm.reduce_summary([p for p in partials if p], req.instruction)
+            except Exception as e:
+                yield _sse_event("error", {"message": _err_text(e)[:200]})
+                return
+            finally:
+                # 出错时不等剩余分组跑完（cancel_futures 取消排队中的），尽快把错误回给前端
+                pool.shutdown(wait=False, cancel_futures=True)
+            a = _save(content)
             yield _sse_event("token", {"t": content})
             yield _sse_event("done", {"asset": asset_to_dict(a)})
 
@@ -392,7 +422,7 @@ def summary_stream(req: SummaryReq, db: Session = Depends(get_db)):
                 full += text
                 yield _sse_event("token", {"t": text})
         except Exception as e:
-            yield _sse_event("error", {"message": str(e)[:200]})
+            yield _sse_event("error", {"message": _err_text(e)[:200]})
             return
         a = _save(full)
         yield _sse_event("done", {"asset": asset_to_dict(a)})

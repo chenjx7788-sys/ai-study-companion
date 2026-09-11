@@ -381,17 +381,37 @@ def _prepare_report_context(db: Session) -> dict:
     }
 
 
+def _report_week(r: dict) -> str | None:
+    """报告的 ISO 周键（如 2026-W37）。
+
+    ⚠️ 周报是「同一周只留最新一份」——重新生成会换 id 但周不变，
+    所以「转笔记」的幂等键必须用 week，不能用 report id。
+    老报告（加分数字段前落盘的）没有 week，按创建时间回推。
+    """
+    w = r.get("week")
+    if w:
+        return w
+    try:
+        dt = (datetime.fromisoformat((r.get("created_at") or "").replace("Z", "+00:00"))
+              .replace(tzinfo=None) + CN)
+        iso = dt.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}"
+    except Exception:
+        return None
+
+
 def _save_report(title: str, summary_text: str, issues_detail: list, content: str) -> dict:
     """保存报告：同一 ISO 周只保留最新一份（手动重新生成 = 刷新本周报告，不再堆积）"""
+    current_week = (datetime.utcnow() + CN).isocalendar()[:2]
     report = {
         "id": str(int(time.time() * 1000)),
         "title": title,
+        "week": f"{current_week[0]}-W{current_week[1]:02d}",
         "summary": summary_text,
         "issues": issues_detail,
         "content": content,
         "created_at": datetime.utcnow().isoformat() + "Z",
     }
-    current_week = (datetime.utcnow() + CN).isocalendar()[:2]
     def _week_of(r):
         try:
             return (datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")).replace(tzinfo=None) + CN).isocalendar()[:2]
@@ -474,8 +494,9 @@ def maybe_generate_weekly_report(db: Session) -> dict | None:
 @router.get("/reports")
 def list_reports():
     """报告历史列表（倒序）"""
-    return [{"id": r["id"], "title": r["title"], "summary": r["summary"],
-             "issues": r.get("issues", []), "created_at": r["created_at"]}
+    return [{"id": r["id"], "title": r["title"], "week": _report_week(r),
+             "summary": r["summary"], "issues": r.get("issues", []),
+             "created_at": r["created_at"]}
             for r in _load_reports()]
 
 
@@ -484,5 +505,5 @@ def get_report(report_id: str):
     """单份报告详情"""
     for r in _load_reports():
         if r["id"] == report_id:
-            return r
+            return {**r, "week": _report_week(r)}
     raise HTTPException(404, "报告不存在")

@@ -1,16 +1,22 @@
-"""文件解析服务：PDF / Word / PPT / Markdown / 图片 / 音视频 → 结构化文本块（含页码与章节路径）
+"""文件解析服务：PDF / Word / PPT / Markdown / EPUB / 图片 / 音视频 → 结构化文本块（含页码与章节路径）
 
 输出统一为 [{"content": str, "page_no": int, "section_path": str}, ...]
 扫描版 PDF（无文本层）与图片走 RapidOCR 本地识别；OCR 失败/依赖缺失时返回空，由上层标记"扫描件"。
 音视频走 faster-whisper 本地 ASR 转写，page_no = 分钟序号（第 N 分钟）。
 Markdown 按空行分段落，page_no = 段落序号，标题作为 section_path。
+EPUB 按 spine 章节顺序解析，page_no = 章节序号，章节标题作为 section_path；
+正文按结构块（段落/标题/列表/表格）逐块产出，块内不再预打包（切块交 RAG 层 split_text）。
 """
 from pathlib import Path
 from bisect import bisect_right
+import re
 import threading
 
 from pypdf import PdfReader
 from docx import Document
+from docx.oxml.ns import qn
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from pptx import Presentation
 
 
@@ -119,23 +125,186 @@ def _docx_page_breaks(para) -> int:
     return xml.count('w:type="page"') + xml.count("lastRenderedPageBreak")
 
 
+def _docx_iter_blocks(doc):
+    """按文档顺序产出段落与表格。
+
+    python-docx 的 doc.paragraphs **不包含表格内的段落**，表格必须走 doc.tables；
+    但若只分别遍历两者，会丢失「段落 ↔ 表格」的原始先后顺序（表格会被挪到最后）。
+    因此这里直接遍历 body 子元素，保证顺序与原文一致。
+    """
+    for child in doc.element.body.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, doc)
+        elif child.tag == qn("w:tbl"):
+            yield Table(child, doc)
+
+
+def _docx_heading_level(style_name: str) -> int:
+    """标题级别：Heading 1/标题 1 → 1..6；非标题返回 0"""
+    name = (style_name or "").strip()
+    m = re.match(r"^(?:Heading|标题)\s*(\d+)$", name, re.I)
+    if m:
+        return max(1, min(int(m.group(1)), 6))
+    if name in ("Title", "标题", "Subtitle", "副标题"):
+        return 1 if name in ("Title", "标题") else 2
+    return 0
+
+
+def _docx_numbering_kinds(doc) -> dict:
+    """numId → 'bullet' | 'number'（按 abstractNum 首个 level 的 numFmt 判定）。
+
+    列表的项目符号/编号并不体现在 para.text 里，需要从 numbering.xml 反查，
+    否则有序/无序列表会退化成无标记的普通段落。
+    """
+    kinds: dict[str, str] = {}
+    try:
+        numbering = doc.part.numbering_part.element
+    except Exception:
+        return kinds
+    abstracts: dict[str, str] = {}
+    for an in numbering.findall(qn("w:abstractNum")):
+        aid = an.get(qn("w:abstractNumId"))
+        fmt = None
+        for lvl in an.findall(qn("w:lvl")):
+            nf = lvl.find(qn("w:numFmt"))
+            if nf is not None:
+                fmt = nf.get(qn("w:val"))
+                break
+        abstracts[aid] = fmt or "bullet"
+    for num in numbering.findall(qn("w:num")):
+        nid = num.get(qn("w:numId"))
+        ref = num.find(qn("w:abstractNumId"))
+        aid = ref.get(qn("w:val")) if ref is not None else None
+        fmt = abstracts.get(aid, "bullet")
+        kinds[nid] = "bullet" if fmt in ("bullet", "none") else "number"
+    return kinds
+
+
+def _docx_list_marker(para, num_kinds: dict) -> tuple[str, int]:
+    """返回 (marker, level)：('-'|'1.'|'', 缩进级别)。非列表返回 ('', 0)"""
+    pPr = para._p.pPr
+    numPr = pPr.numPr if pPr is not None else None
+    if numPr is not None and numPr.numId is not None:
+        ilvl = int(numPr.ilvl.val) if numPr.ilvl is not None else 0
+        kind = num_kinds.get(str(numPr.numId.val), "bullet")
+        return ("-" if kind == "bullet" else "1."), ilvl
+    name = (para.style.name or "").lower()
+    if "list bullet" in name:
+        return "-", 0
+    if "list number" in name:
+        return "1.", 0
+    return "", 0
+
+
+def _md_cell(text: str) -> str:
+    """单元格文本 → 单行 Markdown 安全文本。
+
+    表格语法里 `|` 是列分隔符、换行会断行，都必须处理；由于前端 markdown-it 关闭了
+    html（防注入），不能用 <br>（会被转义成字面量），改用 " / " 合并多行。
+    """
+    parts = [re.sub(r"[ \t]+", " ", p).strip() for p in (text or "").splitlines()]
+    t = " / ".join([p for p in parts if p])
+    # 段落边界自带 "/" 时（如「…微信公众号」+「/朋友圈…」）会拼出 " / /"，归一为单个分隔符
+    t = re.sub(r"\s*/(?:\s*/)+\s*", " / ", t)
+    t = re.sub(r"\s{2,}", " ", t).strip().strip(" /")
+    return t.replace("|", "\\|")
+
+
+_MAX_TABLE_CHARS = 1200      # 单块表格上限，超出则按行拆分并重复表头（便于检索与阅读）
+
+
+def _docx_table_markdown(tbl, cell_text) -> list[str]:
+    """表格 → Markdown 表格文本（可能拆成多段，每段都带表头）。
+
+    cell_text(cell) -> str 由调用方提供，以兼容 python-docx（Word）与 python-pptx（PPT）。
+    """
+    rows: list[list[str]] = []
+    for row in tbl.rows:
+        cells, seen = [], set()
+        for cell in row.cells:
+            key = id(getattr(cell, "_tc", cell))
+            if key in seen:
+                cells.append("")            # 合并单元格：占位以保持列对齐
+                continue
+            seen.add(key)
+            cells.append(cell_text(cell))
+        rows.append(cells)
+    return _rows_to_md_tables(rows)
+
+
+def _rows_to_md_tables(rows: list[list[str]]) -> list[str]:
+    """二维单元格数组 → Markdown 表格文本（超长时按行拆分并重复表头）。
+
+    与来源解耦：Word / PPT（python-docx / python-pptx）与 EPUB（lxml）各自抽出行列，
+    表格语法的拼接与拆分逻辑只有这一份实现。
+    """
+    rows = [r for r in rows if any(c for c in r)]
+    if not rows:
+        return []
+
+    # 列数对齐：markdown-it 要求各行等列，否则整张表会退化成普通段落
+    ncols = max(len(r) for r in rows)
+    rows = [r + [""] * (ncols - len(r)) for r in rows]
+    header, body = rows[0], rows[1:]
+    if not any(header):
+        header = [f"列{i + 1}" if ncols > 1 else "内容" for i in range(ncols)]
+
+    sep = "| " + " | ".join(["---"] * ncols) + " |"
+    head = "| " + " | ".join(header) + " |"
+    out, buf = [], []
+    for r in body:
+        line = "| " + " | ".join(r) + " |"
+        if buf and sum(len(x) + 1 for x in buf) + len(line) > _MAX_TABLE_CHARS:
+            out.append("\n".join([head, sep, *buf]))
+            buf = []
+        buf.append(line)
+    if buf:
+        out.append("\n".join([head, sep, *buf]))
+    # 表格只有表头行（无数据行）时也要输出，否则该表会整块丢失
+    return out or ["\n".join([head, sep])]
+
+
 def parse_docx(path: str) -> list[dict]:
-    """DOCX 按段落出块。page_no 修复：优先按显式分页符翻页；
-    文档无分页符时按 ~700 字/页估算（python-docx 拿不到真实页码，估算供定位参考）"""
+    """DOCX → Markdown 文本块：段落 / 标题 / 列表 / **表格** 均按原文顺序产出。
+
+    修复点：此前仅遍历 doc.paragraphs，表格内容被整段丢弃（正文写在表格里的文档几乎解析不出内容）。
+    page_no 说明：优先按显式分页符翻页；无分页符时按 ~700 字/页估算（python-docx 拿不到真实页码）。
+    """
     doc = Document(path)
-    has_breaks = any(_docx_page_breaks(p) for p in doc.paragraphs)
+    blocks = list(_docx_iter_blocks(doc))
+    has_breaks = any(_docx_page_breaks(b) for b in blocks if isinstance(b, Paragraph))
+    num_kinds = _docx_numbering_kinds(doc)
+
     chunks, page, section, chars = [], 1, "", 0
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        n_breaks = _docx_page_breaks(para)
-        if text:
-            if para.style.name.startswith("Heading"):
-                section = text
-            chunks.append({"content": text, "page_no": page, "section_path": section})
-            chars += len(text)
-            if not has_breaks:
-                page = 1 + chars // 700   # 估算页码
-        page += n_breaks   # 分页符通常在段落末尾/空段落，文本归属当前页后翻页
+
+    def _emit(text: str, bump: int = 0):
+        """写入一块，并按估算方式推进页码"""
+        nonlocal page, chars
+        chunks.append({"content": text, "page_no": page, "section_path": section})
+        chars += len(text)
+        if not has_breaks:
+            page = 1 + chars // 700
+        page += bump
+
+    for b in blocks:
+        if isinstance(b, Paragraph):
+            text = b.text.strip()
+            n_breaks = _docx_page_breaks(b)
+            if text:
+                level = _docx_heading_level(b.style.name if b.style else "")
+                marker, indent = _docx_list_marker(b, num_kinds)
+                if level:
+                    section = text                       # 章节路径用纯文本
+                    _emit(f"{'#' * level} {text}", n_breaks)
+                elif marker:
+                    _emit(f"{'  ' * indent}{marker} {text}", n_breaks)
+                else:
+                    _emit(text, n_breaks)
+            else:
+                page += n_breaks
+        else:                                            # Table
+            for md_table in _docx_table_markdown(b, lambda c: _md_cell(c.text)):
+                _emit(md_table)
     return chunks
 
 
@@ -143,9 +312,15 @@ def parse_pptx(path: str) -> list[dict]:
     prs = Presentation(path)
     chunks = []
     for i, slide in enumerate(prs.slides):
-        texts = [s.text_frame.text.strip() for s in slide.shapes if s.has_text_frame and s.text_frame.text.strip()]
+        texts = [s.text_frame.text.strip() for s in slide.shapes
+                 if s.has_text_frame and s.text_frame.text.strip()]
         if texts:
             chunks.append({"content": "\n".join(texts), "page_no": i + 1, "section_path": f"第{i+1}页"})
+        # 幻灯片内表格：此前被完全忽略，与 Word 属同一类缺陷
+        for s in slide.shapes:
+            if getattr(s, "has_table", False):
+                for md_table in _docx_table_markdown(s.table, lambda c: _md_cell(c.text)):
+                    chunks.append({"content": md_table, "page_no": i + 1, "section_path": f"第{i+1}页"})
     return chunks
 
 
@@ -166,6 +341,40 @@ def parse_md(path: str) -> list[dict]:
             section = first_line.lstrip("#").strip()
         chunks.append({"content": block, "page_no": page, "section_path": section})
         page += 1
+    return chunks
+
+
+# ---------- EPUB ----------
+
+def parse_epub(path: str, on_progress=None) -> list[dict]:
+    """EPUB → 按 spine 章节顺序的文本块（page_no = 章节序号，section_path = 章节标题）
+
+    正文抽成 Markdown 风格块行（标题 / 列表 / 表格 / 引用），与 docx 同形态：
+    **一个结构块行 = 一个 chunk**，不做二次预打包。
+    理由：切块职责在 RAG 层（vector.split_text 已按段落/句边界贪婪打包到 chunk_size
+    并做句级重叠），parser 层再打包会形成两层切分、重叠内容重复入库；
+    且标题若与正文并进同一 chunk，前端 renderBlock 的多行判定会让 `#` 标记现出原形。
+    含 DRM 或结构损坏时抛 ValueError（中文原因，上层标记 failed 直接展示给用户）。
+    """
+    from . import epub as epub_svc
+
+    with epub_svc.EpubBook(path) as book:
+        chapters = book.chapters()
+        if on_progress:
+            on_progress(5)
+        total = len(chapters) or 1
+        chunks: list[dict] = []
+        for ch in chapters:
+            lines = book.blocks(ch["href"])
+            # 目录没给标题时：用正文首个标题兜底，再退化为「第 N 章」
+            title = ch["title"]
+            if not title:
+                title = next((ln.lstrip("#").strip() for ln in lines if ln.startswith("#")), "")
+            title = title or f"第 {ch['index']} 章"
+            chunks.extend({"content": ln, "page_no": ch["index"], "section_path": title}
+                          for ln in lines if ln.strip())
+            if on_progress:
+                on_progress(min(99, int(ch["index"] / total * 100)))
     return chunks
 
 
@@ -301,7 +510,7 @@ def parse_media(path: str, on_progress=None) -> list[dict]:
 
 
 PARSERS = {"pdf": parse_pdf, "docx": parse_docx, "doc": parse_docx, "pptx": parse_pptx, "ppt": parse_pptx,
-           "md": parse_md, "markdown": parse_md,
+           "md": parse_md, "markdown": parse_md, "epub": parse_epub,
            "mp3": parse_media, "wav": parse_media, "m4a": parse_media, "mp4": parse_media,
            "jpg": parse_image, "jpeg": parse_image, "png": parse_image, "webp": parse_image, "bmp": parse_image}
 

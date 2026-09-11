@@ -7,12 +7,38 @@ prompt 原则：
 """
 import json
 import re
+import time
 from fastapi import HTTPException
 from openai import OpenAI
 from . import settings_store
 
 MAX_SINGLE_CHARS = 24000   # 超过则两段式摘要
-GROUP_CHARS = 12000        # 两段式每组大小
+# 两段式每组大小。
+# ⚠️ 实测结论：不要靠放大分组来提速——摘要耗时由**输出 token 数**决定
+# （实测约 144 tok/s：7k 输入/1.2k 输出的单次约 5s，28k 输入/8.2k 输出的单次约 57s），
+# 分组越大，模型对每组要写的局部摘要越长（还会顶到服务商 max_tokens 上限被截断），
+# 单次耗时涨的幅度远超组数下降的幅度。曾把此值调到 40000 验证：
+# 24.7 万字的书组数 21 → 7，但单次 5s → 57s，总时长反而从 149s 涨到 ~400s，已回退。
+# 真要提速应走「减少输出」或「分组并行」，而不是加大分组。
+GROUP_CHARS = 12000
+
+# 两段式「分组摘要」阶段的并发路数。
+# 耗时由串行等待生成主导（见上），并发是唯一能成比例压缩总时长的杠杆：
+# 21 组 × ~5s 串行 ≈ 149s，4 路并发 ≈ 6 轮 ≈ 30-40s。
+# ⚠️ 若所用中转站并发限流（表现为 429「模型服务限流」），把这个值降到 2 或 1。
+SUMMARY_CONCURRENCY = 4
+
+# 摘要输出字数上限。为什么必须写死绝对字数：
+# 1) 代码从不设置 max_tokens → 走服务商默认上限，实测输出**正好 8192 tokens**（≈1.2 万字）
+#    即被截断，而提示词只写了「不超过原文 10%」这种比例约束——24.7 万字的书
+#    期望 2.5 万字，必然超限，摘要尾部直接丢失；
+# 2) 比例约束模型基本不遵守（实测每组 12000 字却输出 3300+ tokens ≈ 原文的 40%）；
+# 3) 摘要耗时由输出 token 驱动，压输出即提速。
+# ⚠️ 光写「字数上限」还不够：遇到**重复型/清单型**内容，模型会逐节罗列而不收敛
+#    （实测 12000 字输入输出 5400 字，是上限的 5 倍）→ 必须同时写「按主题归纳，不要逐节罗列」，
+#    实测同一输入 5400 字 → 82 字。两句缺一不可。
+MAP_SUMMARY_CHARS = 1000     # 长文档分组时，每组的局部摘要上限
+FINAL_SUMMARY_CHARS = 1500   # 合并后的全文摘要上限（单次调用路径同用）
 
 
 def get_client(base_url: str | None = None, api_key: str | None = None) -> OpenAI:
@@ -201,7 +227,7 @@ DEFAULT_PROMPTS = {
 1. 按文档原有章节结构组织，输出层级大纲（Markdown：## 章节，- 要点，子要点缩进两个空格）；
 2. 每条要点末尾用 (P页码) 标注出处，页码取自原文中的 [P数字] 标记；
 3. 要点是对内容的提炼压缩，不是照抄原文；
-4. 总长度控制在原文的 10% 以内。""",
+4. 精炼优先，不照抄原文；篇幅以用户消息中给出的字数上限为准（未给上限时不超过原文的 10%）。""",
     "prompt_keywords": """你是一名学习助手。请从文档中提炼核心知识点，严格输出 JSON 数组，不要输出其他任何内容：
 [{"concept": "概念名", "explanation": "一句话解释（≤60字）", "page_no": 页码数字}]
 要求：
@@ -243,6 +269,98 @@ DEFAULT_PROMPTS = {
 ## 四、进阶方法
 结合用户的学习主题，推荐一条进阶学习路径。
 要求：语气温和鼓励、建议具体可执行、不编造数据、每段标题用 ## 开头。""",
+    # ---- AI 播客 ----
+    "prompt_podcast_brief": """你是一名知识提炼专家。请把下面的学习素材提炼成一份「知识简报」，供后续改写成播客对话脚本。
+
+严格按以下结构输出 Markdown，不要输出任何额外说明：
+## 核心主题
+一句话说清这份素材在讲什么（≤40 字）
+## 核心观点
+3-5 条，每条为「一个明确判断句 + 简要论据」（每条 ≤60 字）
+## 关键论据
+2-4 条支撑上述观点的证据、数据或案例（每条 ≤60 字）
+## 结论
+这份素材最终要读者记住什么（1-2 条）
+## 值得追问
+2-3 个听众可能会追问的问题
+
+要求：
+1. 只提炼，不照抄原文；不按原文章节结构复述
+2. 舍弃次要细节，保住信息量最大的判断
+3. 不编造素材中没有的数据或事实
+4. 全文总字数控制在 {brief_chars} 字以内（硬约束）""",
+    "prompt_podcast_script": """你是一名播客编剧。请把「知识简报」改写成一段双人对话播客脚本。
+
+两个角色：
+- host（主持人）：代表听众提问，负责推进节奏、追问、适时小结
+- expert（专家）：负责解答，讲清原理、举具体例子、给出结论
+
+严格输出 JSON 数组，不要输出其他任何内容（不要 Markdown 代码块）：
+[{"speaker": "host", "text": "..."}, {"speaker": "expert", "text": "..."}]
+
+要求：
+1. 开场用具体问题或反常识切入，禁止「大家好，欢迎收听」这类套话
+2. 主持人提问要像真人：短、具体、有追问感；禁止「能不能详细讲讲」这类空问题
+3. 专家回答要口语化：多用短句、比喻和具体例子，避免书面语和超长并列句
+4. 自然穿插举例、反问、阶段性小结；中段至少有一次「举个例子」式的展开
+5. 结尾由主持人用一句话收束，不要「下期再见」式客套
+6. 每句 20-80 字，适合朗读；不要出现 Markdown 符号、括号注释、表情符号
+7. 【最重要的约束】全文总字数必须控制在 {script_chars} 字左右，且不得超过 {max_chars} 字；
+   共 {seg_count} 句，每句平均约 {avg_chars} 字。
+   写超和写少都视为不合格 —— 落笔前先规划好每句承载多少信息，宁可少讲一个点，
+   也不要为了显得完整而堆句子。
+8. 只讲知识简报里的内容，不额外发挥""",
+    "prompt_podcast_script_direct": """你是一名播客编剧。请把下面的学习素材直接改写成一段双人对话播客脚本。
+
+两个角色：
+- host（主持人）：代表听众提问，负责推进节奏、追问、适时小结
+- expert（专家）：负责解答，讲清原理、举具体例子、给出结论
+
+严格输出 JSON 数组，不要输出其他任何内容（不要 Markdown 代码块）：
+[{"speaker": "host", "text": "..."}, {"speaker": "expert", "text": "..."}]
+
+要求：
+1. 先在心里提炼素材的核心观点与关键论据，再改写成对话；不要逐段复述原文
+2. 开场用具体问题或反常识切入，禁止「大家好，欢迎收听」这类套话
+3. 主持人提问要短、具体、有追问感；专家回答要口语化，多举例
+4. 【最重要的约束】全文总字数必须控制在 {script_chars} 字左右，且不得超过 {max_chars} 字；
+   共 {seg_count} 句，每句平均约 {avg_chars} 字。写超和写少都视为不合格。
+5. 每句 20-80 字，适合朗读；不要出现 Markdown 符号、括号注释、表情符号
+6. 不编造素材中没有的事实和数据""",
+    "prompt_podcast_script_solo": """你是一名播客主播。请把「知识简报」改写成一段**单人精讲**口播稿。
+
+只有一个说话人：speaker 恒为 "host"，全文不要出现第二个人，也不要自问自答式的角色切换。
+
+严格输出 JSON 数组，不要输出其他任何内容（不要 Markdown 代码块）：
+[{"speaker": "host", "text": "..."}, {"speaker": "host", "text": "..."}]
+
+要求：
+1. 开场用具体问题或反常识切入，禁止「大家好，欢迎收听」这类套话
+2. 全程第一人称讲解，像在给一个朋友把这件事讲透：先给结论，再讲为什么
+3. 语言口语化：多用短句、比喻和具体例子，避免书面语和超长并列句
+4. 每个要点讲完用一句话收束，再自然过渡到下一个要点；禁止小标题式罗列
+5. 结尾用一句话收束，不要「下期再见」式客套
+6. 每句 20-120 字，适合朗读；不要出现 Markdown 符号、括号注释、表情符号
+7. 【最重要的约束】全文总字数必须控制在 {script_chars} 字左右，且不得超过 {max_chars} 字；
+   共 {seg_count} 句，每句平均约 {avg_chars} 字。
+   写超和写少都视为不合格 —— 落笔前先规划好每句承载多少信息，宁可少讲一个点，
+   也不要为了显得完整而堆句子。
+8. 只讲知识简报里的内容，不额外发挥""",
+    "prompt_podcast_script_solo_direct": """你是一名播客主播。请把下面的学习素材直接改写成一段**单人精讲**口播稿。
+
+只有一个说话人：speaker 恒为 "host"，全文不要出现第二个人。
+
+严格输出 JSON 数组，不要输出其他任何内容（不要 Markdown 代码块）：
+[{"speaker": "host", "text": "..."}, {"speaker": "host", "text": "..."}]
+
+要求：
+1. 先在心里提炼素材的核心观点与关键论据，再改写成口播；不要逐段复述原文
+2. 开场用具体问题或反常识切入，禁止「大家好，欢迎收听」这类套话
+3. 全程第一人称讲解：先给结论，再讲为什么，多用短句、比喻和具体例子
+4. 【最重要的约束】全文总字数必须控制在 {script_chars} 字左右，且不得超过 {max_chars} 字；
+   共 {seg_count} 句，每句平均约 {avg_chars} 字。写超和写少都视为不合格。
+5. 每句 20-120 字，适合朗读；不要出现 Markdown 符号、括号注释、表情符号
+6. 不编造素材中没有的事实和数据""",
 }
 
 
@@ -256,7 +374,54 @@ def get_prompt(key: str) -> str:
 # ---------- 摘要（B2） ----------
 
 
+def map_summary_group(group: list[dict], index: int, total: int, kind: str = "summary") -> str:
+    """两段式的第一段：单个分组的局部摘要（index 从 0 起）
+
+    单独暴露是为了让流式接口自己驱动循环、每完成一组回传一次进度——
+    长文档要串行跑 N 组，全程无输出会让用户以为卡死。
+    """
+    return summary_chat([
+        {"role": "system", "content": get_prompt("prompt_summary")},
+        {"role": "user", "content": f"以下是长文档的第 {index + 1} 部分（含页码标记），请只梳理本部分，"
+                                    f"严格控制在 {MAP_SUMMARY_CHARS} 字以内："
+                                    f"按主题归纳，不要逐节/逐条罗列"
+                                    f"（同一主题的多个小节合并为一条要点），不展开、不照抄：\n\n{format_chunks(group)}"},
+    ], kind=kind)
+
+
+def map_group_safe(group: list[dict], index: int, total: int, kind: str = "summary") -> str:
+    """分组调用（失败重试一次）：并发场景下单组的偶发网络抖动/429
+    不该让整篇摘要前功尽弃，重试一次后再失败才向上抛。"""
+    last: Exception | None = None
+    for attempt in range(2):
+        try:
+            return map_summary_group(group, index, total, kind)
+        except Exception as e:   # HTTPException 也在此列（_llm_error 已转成可读文案）
+            last = e
+            if attempt == 0:
+                time.sleep(1.5)
+    raise last  # type: ignore[misc]
+
+
+def reduce_summary(partials: list[str], instruction: str | None = None, kind: str = "summary") -> str:
+    """两段式的第二段：把各分组摘要合并成一份完整、不重复的全文脉络大纲"""
+    extra = f"\n补充要求：{instruction}" if instruction else ""
+    combined = "\n\n".join(f"=== 第{i+1}部分摘要 ===\n{p}" for i, p in enumerate(partials))
+    return summary_chat([
+        {"role": "system", "content": get_prompt("prompt_summary")
+         + "\n5. 现在给你的是各部分的分段摘要，请合并为一份完整、不重复的全文脉络大纲。"},
+        {"role": "user", "content": combined
+         + f"\n\n（合并后的全文摘要严格控制在 {FINAL_SUMMARY_CHARS} 字以内，按章节层级组织，不要逐条罗列）"
+         + extra},
+    ], kind=kind)
+
+
 def generate_summary(chunks: list[dict], instruction: str | None = None, kind: str = "summary") -> str:
+    """摘要（同步版）：短文档单次调用；长文档两段式（分组摘要 → 汇总）
+
+    行为与拆分前一致。流式接口不走这里，而是自己驱动 map_summary_group /
+    reduce_summary 的循环，以便逐组回传进度。
+    """
     total = sum(len(c["content"]) for c in chunks)
     extra = f"\n补充要求：{instruction}" if instruction else ""
     sys_prompt = get_prompt("prompt_summary")
@@ -264,22 +429,14 @@ def generate_summary(chunks: list[dict], instruction: str | None = None, kind: s
     if total <= MAX_SINGLE_CHARS:
         return summary_chat([
             {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": f"以下是文档全文（含页码标记）：\n\n{format_chunks(chunks)}{extra}"},
+            {"role": "user", "content": f"以下是文档全文（含页码标记）：\n\n{format_chunks(chunks)}\n\n"
+                                        f"（全文摘要不超过原文的 10%，且最多 {FINAL_SUMMARY_CHARS} 字）{extra}"},
         ], kind=kind)
 
     # 两段式：分组摘要 → 汇总
-    partials = []
-    for i, group in enumerate(split_groups(chunks)):
-        part = summary_chat([
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": f"以下是长文档的第 {i+1} 部分（含页码标记），请只梳理本部分：\n\n{format_chunks(group)}"},
-        ], kind=kind)
-        partials.append(part)
-    combined = "\n\n".join(f"=== 第{i+1}部分摘要 ===\n{p}" for i, p in enumerate(partials))
-    return summary_chat([
-        {"role": "system", "content": sys_prompt + "\n5. 现在给你的是各部分的分段摘要，请合并为一份完整、不重复的全文脉络大纲。"},
-        {"role": "user", "content": combined + extra},
-    ], kind=kind)
+    groups = split_groups(chunks)
+    partials = [map_summary_group(g, i, len(groups), kind) for i, g in enumerate(groups)]
+    return reduce_summary(partials, instruction, kind)
 
 
 # ---------- 知识点（B3） ----------
@@ -471,3 +628,105 @@ def stats_report_messages(summary_text: str, issues_text: str, topics_text: str)
 def generate_stats_report(summary_text: str, issues_text: str, topics_text: str) -> str:
     """生成四段式学习分析报告（数据摘要 / 问题诊断 / 行动建议 / 进阶方法）"""
     return summary_chat(stats_report_messages(summary_text, issues_text, topics_text), kind="stats_report")
+
+
+# ---------- AI 播客（模块 I） ----------
+
+SCRIPT_SPEAKERS = ("host", "expert")
+
+
+def _strip_code_fence(raw: str) -> str:
+    """剥离 LLM 可能输出的 ```json ... ``` 包裹"""
+    txt = (raw or "").strip()
+    if txt.startswith("```"):
+        txt = re.sub(r"^```[a-zA-Z]*\s*", "", txt)
+        txt = re.sub(r"\s*```$", "", txt)
+    return txt.strip()
+
+
+def _parse_podcast_script(raw: str) -> list[dict]:
+    """解析对话脚本 JSON 数组；容错代码块包裹、speaker 别名、空文本条目"""
+    txt = _strip_code_fence(raw)
+    start, end = txt.find("["), txt.rfind("]")
+    if start < 0 or end <= start:
+        raise HTTPException(500, "脚本解析失败，请重试")
+    try:
+        items = json.loads(txt[start:end + 1])
+    except Exception:
+        raise HTTPException(500, "脚本解析失败，请重试")
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        sp = str(it.get("speaker") or "").strip().lower()
+        if sp not in SCRIPT_SPEAKERS:
+            # 模型偶尔用 guest / 嘉宾 / speaker2 等别名，统一归一到 expert
+            sp = "expert" if sp in ("guest", "speaker2", "speaker_2", "b", "2", "专家", "嘉宾") else "host"
+        text = str(it.get("text") or "").strip()
+        if text:
+            out.append({"speaker": sp, "text": text})
+    if not out:
+        raise HTTPException(500, "脚本解析失败，请重试")
+    return out
+
+
+def generate_podcast_brief(source_title: str, source_text: str, brief_chars: int = 360) -> str:
+    """提炼层：素材 → 结构化知识简报（可单独复用为笔记）"""
+    raw = summary_chat([
+        {"role": "system", "content": get_prompt("prompt_podcast_brief").replace("{brief_chars}", str(brief_chars))},
+        {"role": "user", "content": f"素材标题：{source_title}\n\n素材内容：\n{source_text}"},
+    ], kind="podcast_brief")
+    return _strip_code_fence(raw)
+
+
+# 脚本提示词：风格 × 是否跳过简报，四选一（单人稿有独立模板 —— 双人模板会写进
+# 「主持人提问 / 专家解答」的角色轮转，光靠一句附加要求改不掉）
+_SCRIPT_PROMPT_KEYS = {
+    ("dialogue", False): "prompt_podcast_script",
+    ("solo", False): "prompt_podcast_script_solo",
+    ("dialogue", True): "prompt_podcast_script_direct",
+    ("solo", True): "prompt_podcast_script_solo_direct",
+}
+
+
+def _script_prompt_key(style: str, direct: bool) -> str:
+    st = style if style in ("dialogue", "solo") else "dialogue"
+    return _SCRIPT_PROMPT_KEYS[(st, bool(direct))]
+
+
+def generate_podcast_script(brief: str, script_chars: int = 750, seg_count: int = 16,
+                            topic: str = "", instruction: str = "",
+                            style: str = "dialogue") -> list[dict]:
+    """演绎层：知识简报 → 口播脚本（dialogue 双人 / solo 单人精讲）"""
+    extra = f"\n\n本期主题：{topic}" if topic else ""
+    if instruction:
+        extra += f"\n\n用户额外要求：{instruction}"
+    avg = max(20, round(script_chars / max(1, seg_count)))
+    prompt = (get_prompt(_script_prompt_key(style, False))
+              .replace("{script_chars}", str(script_chars))
+              .replace("{max_chars}", str(round(script_chars * 1.1)))
+              .replace("{seg_count}", str(seg_count))
+              .replace("{avg_chars}", str(avg)))
+    raw = summary_chat([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": f"知识简报：\n\n{brief}{extra}"},
+    ], kind="podcast_script")
+    return _parse_podcast_script(raw)
+
+
+def generate_podcast_script_direct(source_title: str, source_text: str,
+                                   script_chars: int = 750, seg_count: int = 16,
+                                   instruction: str = "", style: str = "dialogue") -> list[dict]:
+    """快速模式：跳过简报，素材 → 脚本一步到位（省一次 LLM 调用，信息密度略降）"""
+    extra = f"\n\n用户额外要求：{instruction}" if instruction else ""
+    avg = max(20, round(script_chars / max(1, seg_count)))
+    prompt = (get_prompt(_script_prompt_key(style, True))
+              .replace("{script_chars}", str(script_chars))
+              .replace("{max_chars}", str(round(script_chars * 1.1)))
+              .replace("{seg_count}", str(seg_count))
+              .replace("{avg_chars}", str(avg)))
+    raw = summary_chat([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": f"素材标题：{source_title}\n\n素材内容：\n{source_text}{extra}"},
+    ], kind="podcast_script")
+    return _parse_podcast_script(raw)

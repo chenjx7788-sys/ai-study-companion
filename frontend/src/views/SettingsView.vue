@@ -1,6 +1,13 @@
 <template>
   <div class="page settings-page">
-    <h2>管理中心</h2>
+    <PageHead title="管理中心" sub="管理 LLM、向量模型与本地数据配置">
+      <template #icon>
+        <svg viewBox="0 0 16 16" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round">
+          <circle cx="8" cy="8" r="2.2" />
+          <path d="M8 1.8v1.7M8 12.5v1.7M1.8 8h1.7M12.5 8h1.7M3.6 3.6l1.2 1.2M11.2 11.2l1.2 1.2M12.4 3.6l-1.2 1.2M4.8 11.2l-1.2 1.2" />
+        </svg>
+      </template>
+    </PageHead>
 
     <el-tabs v-model="activeTab" class="settings-tabs">
       <el-tab-pane label="大模型配置" name="llm">
@@ -230,27 +237,88 @@
       </el-tab-pane>
 
       <el-tab-pane label="智能体提示词" name="prompts">
-      <el-card class="set-card" shadow="never">
-      <template #header>
-        <div class="card-head">
-          <span>智能体提示词</span>
-          <span class="card-head-tip">留空 = 使用默认模板，修改后即时生效</span>
+        <div class="prompts-page-header">
+          <div>
+            <p class="prompts-page-subtitle">留空即使用默认模板；修改后即时生效</p>
+          </div>
+          <el-input
+            v-model="promptSearch"
+            class="prompts-search"
+            placeholder="搜索提示词"
+            clearable
+            :prefix-icon="Search"
+          />
         </div>
-      </template>
-      <div v-for="p in promptFields" :key="p.key" class="prompt-item">
-        <div class="prompt-head">
-          <span class="prompt-label">{{ p.label }}</span>
-          <span class="prompt-desc">{{ p.desc }}</span>
-          <el-button v-if="prompts[p.key]" size="small" text type="warning"
-            @click="prompts[p.key] = ''">恢复默认</el-button>
-          <el-button v-else size="small" text type="primary"
-            @click="fillDefault(p.key)">基于默认修改</el-button>
+
+        <div class="prompts-layout">
+          <nav class="prompts-nav">
+            <div class="prompts-nav-label">分类</div>
+            <div
+              v-for="cat in promptCategories"
+              :key="cat.key"
+              class="prompts-nav-item"
+              :class="{ active: activePromptCategory === cat.key }"
+              @click="activePromptCategory = cat.key"
+            >
+              <span>{{ cat.label }}</span>
+              <span class="prompts-nav-count">{{ cat.count }}</span>
+            </div>
+          </nav>
+
+          <div class="prompts-content">
+            <div v-for="group in groupedPromptFields" :key="group.category" class="prompts-section">
+              <h4 class="prompts-section-title">{{ group.label }}</h4>
+              <div
+                v-for="p in group.items"
+                :key="p.key"
+                class="prompt-card"
+                :class="{ customized: prompts[p.key] }"
+              >
+                <div class="prompt-card-head">
+                  <div class="prompt-card-title-row">
+                    <span class="prompt-label">{{ p.label }}</span>
+                    <span class="prompt-status-badge" :class="{ customized: prompts[p.key] }">
+                      {{ prompts[p.key] ? '已自定义' : '默认' }}
+                    </span>
+                  </div>
+                  <div class="prompt-card-desc">{{ p.desc }}</div>
+                </div>
+                <div class="prompt-card-actions">
+                  <el-button
+                    v-if="prompts[p.key]"
+                    size="small"
+                    text
+                    type="warning"
+                    @click="prompts[p.key] = ''"
+                  >恢复默认</el-button>
+                  <el-button
+                    v-else
+                    size="small"
+                    text
+                    type="primary"
+                    @click="fillDefault(p.key)"
+                  >基于默认修改</el-button>
+                </div>
+                <el-input
+                  v-model="prompts[p.key]"
+                  class="prompt-textarea"
+                  type="textarea"
+                  :rows="prompts[p.key] ? 6 : 3"
+                  :placeholder="promptDefaults[p.key]"
+                />
+              </div>
+            </div>
+
+            <el-empty v-if="groupedPromptFields.length === 0" description="未找到匹配的提示词" :image-size="60" />
+          </div>
         </div>
-        <el-input v-model="prompts[p.key]" type="textarea" :rows="prompts[p.key] ? 6 : 2"
-          :placeholder="promptDefaults[p.key]" />
-      </div>
-      <el-button type="primary" :loading="saving" @click="save()">保存提示词</el-button>
-    </el-card>
+
+        <div class="sticky-action-bar">
+          <span class="sticky-action-hint">
+            已自定义 <strong>{{ customizedCount }}</strong> 项
+          </span>
+          <el-button type="primary" :loading="saving" @click="save()">保存提示词</el-button>
+        </div>
       </el-tab-pane>
 
       <el-tab-pane label="存储管理" name="storage">
@@ -312,11 +380,13 @@
 
 <script setup>
 import { reactive, ref, computed, onMounted } from 'vue'
+import { Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { useRouter, useRoute } from 'vue-router'
 import { settingsApi } from '../api'
 import http from '../api/http'
 import { useAsr } from '../composables/useAsr'
+import PageHead from '../components/PageHead.vue'
 
 const embedOptions = [
   'BAAI/bge-large-zh-v1.5',        // 硅基流动（免费）
@@ -535,18 +605,24 @@ const embedTestResult = ref('')
 const rebuildingAll = ref(false)
 
 const promptFields = [
-  { key: 'prompt_summary', label: '脉络摘要', desc: '生成全文层级大纲（摘要 Tab / 分章总结）' },
-  { key: 'prompt_keywords', label: '知识点提炼', desc: '提炼核心概念（注意保留 JSON 输出格式说明）' },
-  { key: 'prompt_explain', label: '划线解读 / 追问', desc: '选中文本后的解释与多轮追问' },
-  { key: 'prompt_kb_qa', label: '知识库问答（命中时）', desc: '问答页检索到相关内容时的回答风格' },
-  { key: 'prompt_general', label: '通用回答（未命中时）', desc: '知识库未命中时的兜底回答风格' },
-  { key: 'prompt_review', label: '复习出题', desc: '从笔记生成自测卡片（保留 JSON 输出格式说明）' },
-  { key: 'prompt_suggest', label: '相关问题推荐', desc: '问答回答后生成 3 个追问建议（保留 JSON 数组格式）' },
-  { key: 'prompt_quiz', label: '测一测出题', desc: '基于资料核心内容生成测试题（保留 JSON 数组格式）' },
-  { key: 'prompt_note_rewrite', label: '文本改写', desc: '改写选中文字或整条内容（笔记 / 材料文本共用，更通顺/专业/简洁）' },
-  { key: 'prompt_note_expand', label: '文本扩写', desc: '补充背景/例子/细节，展开要点（笔记 / 材料文本共用）' },
-  { key: 'prompt_note_summarize', label: '文本总结', desc: '提炼压缩为精炼要点（笔记 / 材料文本共用）' },
-  { key: 'prompt_note_continue', label: '文本续写', desc: '接着已有内容往下续写（笔记 / 材料文本共用）' },
+  { key: 'prompt_summary', label: '脉络摘要', desc: '生成全文层级大纲（摘要 Tab / 分章总结）', category: 'study' },
+  { key: 'prompt_keywords', label: '知识点提炼', desc: '提炼核心概念（注意保留 JSON 输出格式说明）', category: 'study' },
+  { key: 'prompt_explain', label: '划线解读 / 追问', desc: '选中文本后的解释与多轮追问', category: 'study' },
+  { key: 'prompt_kb_qa', label: '知识库问答（命中时）', desc: '问答页检索到相关内容时的回答风格', category: 'study' },
+  { key: 'prompt_general', label: '通用回答（未命中时）', desc: '知识库未命中时的兜底回答风格', category: 'study' },
+  { key: 'prompt_review', label: '复习出题', desc: '从笔记生成自测卡片（保留 JSON 输出格式说明）', category: 'study' },
+  { key: 'prompt_suggest', label: '相关问题推荐', desc: '问答回答后生成 3 个追问建议（保留 JSON 数组格式）', category: 'study' },
+  { key: 'prompt_quiz', label: '测一测出题', desc: '基于资料核心内容生成测试题（保留 JSON 数组格式）', category: 'study' },
+  { key: 'prompt_note_rewrite', label: '文本改写', desc: '改写选中文字或整条内容（笔记 / 材料文本共用，更通顺/专业/简洁）', category: 'note' },
+  { key: 'prompt_note_expand', label: '文本扩写', desc: '补充背景/例子/细节，展开要点（笔记 / 材料文本共用）', category: 'note' },
+  { key: 'prompt_note_summarize', label: '文本总结', desc: '提炼压缩为精炼要点（笔记 / 材料文本共用）', category: 'note' },
+  { key: 'prompt_note_continue', label: '文本续写', desc: '接着已有内容往下续写（笔记 / 材料文本共用）', category: 'note' },
+  // ---- AI 播客 / 周报（快速模式 direct 版提示词刻意不开放 UI，走默认模板；需要时再加回）----
+  { key: 'prompt_podcast_brief', label: 'AI 播客 · 知识简报', desc: '素材提炼成结构化简报（提炼层，可单独转笔记）。注意保留 {brief_chars} 字数占位符', category: 'podcast' },
+  { key: 'prompt_podcast_script', label: 'AI 播客 · 对话脚本', desc: '知识简报改写成双人对话（两步式）。保留 JSON 数组输出说明与 {script_chars} / {max_chars} / {seg_count} / {avg_chars} 占位符', category: 'podcast' },
+  { key: 'prompt_podcast_script_solo', label: 'AI 播客 · 单人精讲脚本', desc: '知识简报改写成单人精讲口播（两步式）。保留 JSON 数组输出说明与 {script_chars} / {max_chars} / {seg_count} / {avg_chars} 占位符', category: 'podcast' },
+  { key: 'prompt_stats_report', label: '学习周报', desc: '统计页周报：按数据摘要 / 问题诊断 / 行动建议 / 进阶方法四段输出', category: 'other' },
+  { key: 'prompt_recall', label: '复述卡', desc: '从笔记生成自我复述提示（保留 JSON 输出格式说明）', category: 'other' },
 ]
 const prompts = reactive({
   prompt_summary: '', prompt_keywords: '', prompt_explain: '',
@@ -555,6 +631,53 @@ const prompts = reactive({
 })
 const promptDefaults = reactive({})
 const saving = ref(false)
+
+// 智能体提示词页：搜索、分类与状态
+const promptSearch = ref('')
+const activePromptCategory = ref('all')
+
+const CATEGORY_LABELS = {
+  study: '学习理解',
+  note: '笔记加工',
+  podcast: 'AI 播客',
+  other: '其他工具',
+}
+
+const promptCategories = computed(() => {
+  const counts = { all: promptFields.length }
+  for (const p of promptFields) {
+    counts[p.category] = (counts[p.category] || 0) + 1
+  }
+  return [
+    { key: 'all', label: '全部', count: counts.all },
+    { key: 'study', label: CATEGORY_LABELS.study, count: counts.study },
+    { key: 'note', label: CATEGORY_LABELS.note, count: counts.note },
+    { key: 'podcast', label: CATEGORY_LABELS.podcast, count: counts.podcast },
+    { key: 'other', label: CATEGORY_LABELS.other, count: counts.other },
+  ]
+})
+
+const filteredPromptFields = computed(() => {
+  const q = promptSearch.value.trim().toLowerCase()
+  return promptFields.filter(p => {
+    const matchCategory = activePromptCategory.value === 'all' || p.category === activePromptCategory.value
+    const matchSearch = !q || p.label.toLowerCase().includes(q) || p.desc.toLowerCase().includes(q)
+    return matchCategory && matchSearch
+  })
+})
+
+const groupedPromptFields = computed(() => {
+  const groups = {}
+  for (const p of filteredPromptFields.value) {
+    if (!groups[p.category]) {
+      groups[p.category] = { category: p.category, label: CATEGORY_LABELS[p.category], items: [] }
+    }
+    groups[p.category].items.push(p)
+  }
+  return Object.values(groups)
+})
+
+const customizedCount = computed(() => promptFields.filter(p => prompts[p.key]).length)
 
 // 基于默认模板修改：把默认提示词填入输入框，供在此基础上微调
 function fillDefault(key) {
@@ -588,7 +711,8 @@ const usage = reactive({ today: { _total: { calls: 0, tokens: 0 } }, all: { _tot
 
 // Token 统计业务展示顺序（按业务流），未收录的新 kind 自动排在最后
 const KIND_ORDER = ['summary', 'section_summary', 'keywords', 'explain', 'ask', 'transform',
-                    'chat', 'suggest', 'review', 'quiz', 'stats_report']
+                    'chat', 'suggest', 'review', 'quiz', 'stats_report',
+                    'podcast_brief', 'podcast_script']
 const usageKinds = computed(() => {
   const { _total, ...rest } = usage.all
   const ordered = {}
@@ -604,7 +728,7 @@ const kindLabel = (k) => ({
   summary: '摘要', section_summary: '分章总结', keywords: '知识点',
   explain: '解读/追问', ask: '材料提问', transform: '文本加工',
   chat: '问答', suggest: '追问建议', review: '复习出题', quiz: '测一测',
-  stats_report: '学习报告', polish: '润色',
+  stats_report: '学习报告', podcast_brief: '播客简报', podcast_script: '播客脚本',
 }[k] || k)
 const fmtTokens = (n) => n >= 10000 ? (n / 10000).toFixed(1) + 'w' : (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n))
 
@@ -668,19 +792,8 @@ async function save(successMsg = '保存成功', skipGuide = false) {
       embedding_base_url: embeddingMode.value === 'api' ? form.embedding_base_url : '',
       embedding_api_key: embeddingMode.value === 'api' ? form.embedding_api_key : '',
       asr_model_size: asrModelSize.value,
-      // 提示词（空字符串 = 恢复默认模板）
-      prompt_summary: prompts.prompt_summary,
-      prompt_keywords: prompts.prompt_keywords,
-      prompt_explain: prompts.prompt_explain,
-      prompt_kb_qa: prompts.prompt_kb_qa,
-      prompt_general: prompts.prompt_general,
-      prompt_review: prompts.prompt_review,
-      prompt_suggest: prompts.prompt_suggest,
-      prompt_quiz: prompts.prompt_quiz,
-      prompt_note_rewrite: prompts.prompt_note_rewrite,
-      prompt_note_expand: prompts.prompt_note_expand,
-      prompt_note_summarize: prompts.prompt_note_summarize,
-      prompt_note_continue: prompts.prompt_note_continue,
+      // 提示词（空字符串 = 恢复默认模板）— 遍历 promptFields，确保新增项自动包含
+      ...Object.fromEntries(promptFields.map(p => [p.key, prompts[p.key] || ''])),
       kb_hit_threshold: threshold.value,
       chunk_size: chunkSize.value,
       chunk_overlap: chunkOverlap.value,
@@ -728,7 +841,6 @@ async function rebuildAll() {
 </script>
 
 <style scoped>
-.settings-page h2 { margin-top: 0; font-size: 20px; font-weight: 600; }
 .settings-tabs :deep(.el-tabs__header) { margin-bottom: 16px; }
 .settings-tabs :deep(.el-tabs__item) { font-size: 14px; }
 .set-card {
@@ -784,10 +896,7 @@ async function rebuildAll() {
 .storage-num { font-size: 22px; font-weight: 600; color: var(--asc-primary); }
 .storage-label { font-size: 12px; color: var(--asc-text-3); }
 .card-head-tip { font-size: 12px; color: var(--asc-text-3); font-weight: 400; }
-.prompt-item { margin-bottom: 18px; }
-.prompt-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
 .prompt-label { font-size: 14px; font-weight: 600; }
-.prompt-desc { font-size: 12px; color: var(--asc-text-3); flex: 1; }
 
 .usage-body { display: flex; flex-direction: column; gap: 12px; }
 .usage-totals { display: flex; gap: 32px; }
@@ -823,4 +932,97 @@ async function rebuildAll() {
   background: rgba(245, 108, 108, .08); color: #f56c6c; font-size: 13px;
 }
 .asr-error-text { flex: 1; }
+/* ===== 智能体提示词页 redesign ===== */
+.prompts-page-header {
+  display: flex; justify-content: space-between; align-items: flex-end;
+  gap: 16px; margin-bottom: 22px;
+}
+.prompts-page-subtitle { margin: 0; font-size: 13px; color: var(--asc-text-2); }
+.prompts-search { width: 260px; }
+.prompts-search :deep(.el-input__wrapper) { border-radius: 8px; }
+
+.prompts-layout { display: flex; align-items: flex-start; gap: 24px; }
+.prompts-nav {
+  width: 170px; flex-shrink: 0; position: sticky; top: 16px;
+  background: var(--asc-card); border: 1px solid var(--asc-border);
+  border-radius: var(--asc-radius); padding: 12px 10px;
+}
+.prompts-nav-label {
+  font-size: 11px; color: var(--asc-text-3); font-weight: 500;
+  margin-bottom: 8px; padding-left: 10px; letter-spacing: .3px;
+}
+.prompts-nav-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 10px; border-radius: 8px; cursor: pointer;
+  font-size: 13px; color: var(--asc-text-2);
+  transition: all .15s ease;
+}
+.prompts-nav-item:hover { background: var(--asc-surface-2); color: var(--asc-text); }
+.prompts-nav-item.active { background: var(--asc-primary-soft); color: var(--asc-primary); font-weight: 500; }
+.prompts-nav-count { font-size: 12px; color: inherit; opacity: .8; }
+
+.prompts-content { flex: 1; min-width: 0; padding-bottom: 12px; }
+.prompts-section { margin-bottom: 28px; }
+.prompts-section-title {
+  margin: 0 0 14px; font-size: 15px; font-weight: 600; color: var(--asc-text);
+}
+
+.prompt-card {
+  background: var(--asc-card); border: 1px solid var(--asc-border);
+  border-radius: var(--asc-radius); padding: 18px 20px; margin-bottom: 14px;
+  position: relative; overflow: hidden;
+  transition: border-color .18s ease, box-shadow .18s ease;
+}
+.prompt-card::before {
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: transparent; transition: background .18s ease;
+}
+.prompt-card:hover { border-color: var(--asc-primary); box-shadow: var(--asc-shadow-hover); }
+.prompt-card.customized::before { background: var(--asc-primary); }
+
+.prompt-card-head { margin-bottom: 12px; }
+.prompt-card-title-row {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+}
+.prompt-card .prompt-label { font-size: 14px; font-weight: 600; color: var(--asc-text); }
+.prompt-card-desc { font-size: 12px; color: var(--asc-text-2); line-height: 1.5; }
+.prompt-status-badge {
+  font-size: 11px; font-weight: 500;
+  padding: 2px 7px; border-radius: 4px;
+  background: var(--asc-surface-2); color: var(--asc-text-3);
+}
+.prompt-status-badge.customized { background: var(--asc-primary-soft); color: var(--asc-primary); }
+
+.prompt-card-actions {
+  position: absolute; top: 16px; right: 18px;
+}
+.prompt-card-actions .el-button { padding: 4px 6px; }
+
+.prompt-textarea :deep(.el-textarea__inner) {
+  min-height: 90px !important; font-size: 13px; line-height: 1.65;
+  color: var(--asc-text);
+}
+
+.sticky-action-bar {
+  position: sticky; bottom: 0;
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--asc-card); border-top: 1px solid var(--asc-border);
+  margin: 18px -32px -28px; padding: 14px 32px;
+}
+.sticky-action-hint { font-size: 13px; color: var(--asc-text-2); }
+.sticky-action-hint strong { color: var(--asc-text); font-weight: 600; }
+
+@media (max-width: 860px) {
+  .prompts-layout { flex-direction: column; }
+  .prompts-nav {
+    position: static; width: 100%; display: flex; gap: 6px; overflow-x: auto;
+    padding: 10px;
+  }
+  .prompts-nav-label { display: none; }
+  .prompts-nav-item { white-space: nowrap; flex-shrink: 0; }
+  .prompts-search { width: 100%; }
+  .prompts-page-header { flex-direction: column; align-items: flex-start; }
+  .prompt-card-actions { position: static; margin-bottom: 10px; }
+}
+
 </style>

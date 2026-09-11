@@ -13,6 +13,9 @@ export const materialApi = {
   updateHighlight: (materialId, highlightId, data) => http.put(`/materials/${materialId}/highlights/${highlightId}`, data),
   deleteHighlight: (materialId, highlightId) => http.delete(`/materials/${materialId}/highlights/${highlightId}`),
   fileUrl: (id) => `/api/materials/${id}/file`,
+  // EPUB 原文视图：章节清单（index 与 chunk.page_no 对齐）+ zip 资源镜像前缀
+  epubChapters: (id) => http.get(`/materials/${id}/epub`),
+  epubResBase: (id) => `/api/materials/${id}/epub-res/`,
   upload: (formData, onProgress) => http.post('/materials', formData, {
     onUploadProgress: (ev) => onProgress && ev.total && onProgress(Math.round(ev.loaded / ev.total * 100)),
   }),
@@ -40,11 +43,18 @@ export const aiApi = {
 
 // 笔记（PRD 模块 C）
 export const noteApi = {
-  list: (materialId) => http.get('/notes', { params: { material_id: materialId } }),
+  // 不传 materialId 时返回「材料无关笔记」（AI 问答 / 学习周报 / 播客脚本），
+  // 供统计页、播客页查询「这个产物转过笔记没有」
+  // ⚠️ 只用 anchor 做状态查询的调用方请带 { slim: 1 }：不带的话会把所有笔记的
+  // 正文一起拉下来（播客脚本 / 周报 / 问答的全文是这批数据里最大的一块）
+  list: (materialId, params) => http.get('/notes', {
+    params: { ...(materialId ? { material_id: materialId } : {}), ...(params || {}) },
+  }),
   create: (data) => http.post('/notes', data),
   update: (id, data) => http.put(`/notes/${id}`, data),
   remove: (id) => http.delete(`/notes/${id}`),
   fromChat: (data) => http.post('/notes/from-chat', data),   // AI 问答转笔记（标题=问题，内容=回答）
+  fromAi: (data) => http.post('/notes/from-ai', data),       // 材料无关 AI 产物转笔记（周报 / 播客脚本），按 anchor.key 幂等
 }
 
 // 知识库（PRD 模块 D）
@@ -121,4 +131,37 @@ export const statsApi = {
   report: () => http.post('/stats/report', {}, { timeout: 180000 }),
   reports: () => http.get('/stats/reports'),
   getReport: (id) => http.get(`/stats/reports/${id}`)
+}
+
+// AI 播客（模块 I）：素材 → 知识简报 → 对话脚本（可编辑确认）→ 本地音频
+// 生成与合成均耗时较长（含 LLM 两次调用 / 逐句 TTS），超时放宽到 600s
+export const podcastApi = {
+  options: () => http.get('/podcasts/options'),
+  list: () => http.get('/podcasts'),
+  detail: (id) => http.get(`/podcasts/${id}`),
+  generate: (payload) => http.post('/podcasts/generate', payload, { timeout: 600000 }),
+  regenerate: (id, payload) => http.post(`/podcasts/${id}/regenerate`, payload, { timeout: 600000 }),
+  // SSE 流式生成脚本（带阶段进度）。streamSSE 要完整路径，不走 axios 的 /api 前缀
+  generateStreamUrl: () => '/api/podcasts/generate/stream',
+  regenerateStreamUrl: (id) => `/api/podcasts/${id}/regenerate/stream`,
+  saveScript: (id, payload) => http.put(`/podcasts/${id}/script`, payload),
+  synthesize: (id, payload) => http.post(`/podcasts/${id}/synthesize`, payload || {}, { timeout: 600000 }),
+  // SSE 流式合成（带逐句进度）。streamSSE 要完整路径，不走 axios 的 /api 前缀
+  synthesizeStreamUrl: (id) => `/api/podcasts/${id}/synthesize/stream`,
+  rename: (id, title) => http.put(`/podcasts/${id}`, { title }),
+  remove: (id) => http.delete(`/podcasts/${id}`),
+  // v 传音频字节数：重新合成后字节数变化 → URL 变化 → <audio> 才会丢掉旧缓冲
+  audioUrl: (id, v) => `/api/podcasts/${id}/audio${v ? `?v=${v}` : ''}`,
+  reveal: (id) => http.post(`/podcasts/${id}/reveal`),
+  audioPath: (id) => http.get(`/podcasts/${id}/path`),
+  exportUrl: (id) => `/api/podcasts/${id}/export`,
+  srtUrl: (id) => `/api/podcasts/${id}/srt`,
+  voicePreviewUrl: (voiceId) => `/api/podcasts/voices/${encodeURIComponent(voiceId)}/preview`,
+  // 背景音乐
+  bgmList: () => http.get('/podcasts/bgm'),
+  bgmPreviewUrl: (bgmId) => `/api/podcasts/bgm/${encodeURIComponent(bgmId)}/preview`,
+  uploadBgm: (formData) => http.post('/podcasts/bgm/upload', formData, { timeout: 300000 }),
+  removeBgm: (bgmId) => http.delete(`/podcasts/bgm/${encodeURIComponent(bgmId)}`),
+  setBgm: (id, payload) => http.put(`/podcasts/${id}`, payload),
+  testVoice: () => http.post('/podcasts/test-voice', {}, { timeout: 120000 })
 }

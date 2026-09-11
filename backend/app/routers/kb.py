@@ -45,6 +45,12 @@ def kb_overview(search: str | None = None, db: Session = Depends(get_db)):
                    .filter(KbEntry.ref_type == "note", KbEntry.ref_id == n.id).count()) > 0
         if n.source_type == "chat":
             src_label = "AI 问答"          # 问答转存的材料无关笔记
+        elif n.source_type == "weekly_report":
+            src_label = "AI 学习周报"       # 数据统计页的 AI 分析报告
+        elif n.source_type == "podcast_script":
+            src_label = "AI 播客脚本"       # 播客页的对话脚本（演绎层）
+        elif n.source_type == "podcast_brief":
+            src_label = "AI 播客简报"       # 播客页的知识简报（提炼层）
         elif n.material_id:
             material = db.get(Material, n.material_id)
             src_label = material.title if material else "（材料已删除）"

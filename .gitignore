@@ -5,6 +5,9 @@ __pycache__/
 node_modules/
 dist/
 build/
+# 历史构建目录（改名保留时产生，不应进仓库）
+dist.*/
+dist-*/
 data_backup_*/
 .env
 

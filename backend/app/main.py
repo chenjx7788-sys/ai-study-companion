@@ -6,8 +6,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from app_version import __version__ as APP_VERSION
 from .database import Base, engine
-from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats
+from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats, podcasts
 
 Base.metadata.create_all(bind=engine)
 
@@ -32,8 +33,70 @@ def _migrate_columns():
             if "folder_id" not in cols:
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE materials ADD COLUMN folder_id INTEGER"))
+        if "podcasts" in insp.get_table_names():
+            cols = {c["name"] for c in insp.get_columns("podcasts")}
+            if "audio_sig" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE podcasts ADD COLUMN audio_sig VARCHAR(32) DEFAULT ''"))
+                # 回填：已有音频视为与其当前脚本一致（否则升级后所有旧播客都会被标成「音频过期」）
+                _backfill_podcast_audio_sig()
+            if "instruction" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE podcasts ADD COLUMN instruction TEXT DEFAULT ''"))
+            # 背景音乐（默认关闭）。旧记录 bgm_id 为空串 → 指纹不变，不会被误判过期。
+            if "bgm_id" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE podcasts ADD COLUMN bgm_id VARCHAR(64) DEFAULT ''"))
+            if "bgm_volume" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE podcasts ADD COLUMN bgm_volume INTEGER DEFAULT -20"))
+            # 记住曲名：素材被删后 bgm_id 仍指向它（不静默改作品），但 track_name()
+            # 会返回空 → 界面只能显示「已失效」。存下最后一次成功选择时的曲名。
+            if "bgm_label" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE podcasts ADD COLUMN bgm_label VARCHAR(64) DEFAULT ''"))
+                _backfill_podcast_bgm_label()
     except Exception:
         pass
+
+
+def _backfill_podcast_audio_sig():
+    """为升级前已合成的播客回填 audio_sig（幂等）"""
+    from .database import SessionLocal
+    from .models import Podcast
+    from .services.podcast import script_signature
+    db = SessionLocal()
+    try:
+        rows = db.query(Podcast).filter(Podcast.audio_name != "").all()
+        for p in rows:
+            if not (p.audio_sig or "").strip():
+                p.audio_sig = script_signature(p.script or [], p.voice_map or {})
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _backfill_podcast_bgm_label():
+    """为已有记录回填 BGM 曲名（幂等）。
+
+    必须在**升级时**做：等曲目被删掉之后再想回填，名字就已经查不到了。
+    """
+    from .database import SessionLocal
+    from .models import Podcast
+    from .services import bgm
+    db = SessionLocal()
+    try:
+        rows = db.query(Podcast).filter(Podcast.bgm_id != "").all()
+        for p in rows:
+            if not (p.bgm_label or "").strip():
+                p.bgm_label = bgm.track_name(p.bgm_id or "")
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 def _migrate_source_folder_to_folder():
@@ -71,7 +134,7 @@ def _migrate_source_folder_to_folder():
 _migrate_columns()
 _migrate_source_folder_to_folder()
 
-app = FastAPI(title="AI 伴学助手", version="0.1.2")
+app = FastAPI(title="AI 伴学助手", version="0.1.3")
 
 # 自动定时备份（启动后延迟 30s 首备，此后每日一次，保留最近 7 份）
 from .services import auto_backup
@@ -170,14 +233,12 @@ app.include_router(settings_router.router, prefix="/api")
 app.include_router(asr.router, prefix="/api")
 app.include_router(folders.router, prefix="/api")
 app.include_router(stats.router, prefix="/api")
+app.include_router(podcasts.router, prefix="/api")
 
 
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
-
-
-APP_VERSION = "0.1.2"
 
 
 @app.get("/api/version")
@@ -195,7 +256,24 @@ else:
     _DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
 
 if _DIST.exists():
-    app.mount("/assets", StaticFiles(directory=_DIST / "assets"), name="assets")
+    class _HashedAssets(StaticFiles):
+        """Vite 产物文件名含内容哈希 → 可长期强缓存。
+
+        若不显式声明 Cache-Control，浏览器/WebView 会按 RFC 7234 走「启发式缓存」
+        （时长≈(now-Last-Modified)×10%）。升级后旧 index.html 仍可能被直接复用，
+        从而去请求已不存在的旧分片（404）→ 路由懒加载静默失败 → 表现为「点击没反应」。
+        """
+
+        def file_response(self, *args, **kwargs):
+            resp = super().file_response(*args, **kwargs)
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            return resp
+
+    app.mount("/assets", _HashedAssets(directory=_DIST / "assets"), name="assets")
+
+    # index.html 等非哈希文件：必须每次回源校验（配合 ETag 走 304，开销可忽略），
+    # 否则升级后 WebView 会继续用旧入口，导致新旧分片错配。
+    NO_CACHE = {"Cache-Control": "no-cache, must-revalidate"}
 
     @app.get("/{full_path:path}")
     async def spa_fallback(full_path: str):
@@ -205,5 +283,5 @@ if _DIST.exists():
         # 具体静态文件（如 mascot.png、favicon）优先返回，否则回退到 SPA 入口
         candidate = _DIST / full_path
         if full_path and candidate.is_file():
-            return FileResponse(candidate)
-        return FileResponse(_DIST / "index.html")
+            return FileResponse(candidate, headers=NO_CACHE)
+        return FileResponse(_DIST / "index.html", headers=NO_CACHE)

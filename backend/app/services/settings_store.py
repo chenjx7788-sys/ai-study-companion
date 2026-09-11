@@ -19,6 +19,10 @@ FIELDS = ["llm_base_url", "llm_api_key", "summary_model", "chat_model",
           # 笔记检索权重（默认 1.5，检索打分时生效，改动无需重建索引）
           "note_weight",
           "prompt_summary", "prompt_keywords", "prompt_explain", "prompt_kb_qa", "prompt_general", "prompt_review", "prompt_suggest", "prompt_quiz", "prompt_recall", "prompt_note_rewrite", "prompt_note_expand", "prompt_note_summarize", "prompt_note_continue", "prompt_stats_report", "kb_hit_threshold",
+          "prompt_podcast_brief", "prompt_podcast_script", "prompt_podcast_script_direct",
+          "prompt_podcast_script_solo", "prompt_podcast_script_solo_direct",
+          # AI 播客 · 语音合成（edge-tts 免费音色，无需 Key）
+          "tts_provider", "tts_voice_host", "tts_voice_expert", "tts_rate", "tts_gap_ms",
           # 预设标签库（材料库可先建标签再打给材料）
           "preset_tags"]
 

@@ -55,7 +55,7 @@
       </el-tour-step>
       <el-tour-step target="[data-nav='/']" placement="right" :title="(needSetup ? '②' : '①') + ' 导入材料'">
         <template #default>
-          上传你的第一份学习材料，PDF / PPT / Word / 音视频都行，系统会自动解析。
+          上传你的第一份学习材料，PDF / PPT / Word / EPUB / 音视频都行，系统会自动解析。
         </template>
       </el-tour-step>
       <el-tour-step target="[data-nav='/chat']" placement="right" :title="(needSetup ? '③' : '②') + ' 理解 & 提问'">
@@ -74,6 +74,9 @@
         </template>
       </el-tour-step>
     </el-tour>
+
+    <!-- 引导可随时跳过：遮罩会拦截其余区域点击，若无显式出口，用户会误以为「界面点不动」 -->
+    <div v-if="tourOpen" class="tour-skip" title="关闭引导，直接开始使用" @click="skipTour">跳过引导</div>
   </el-container>
 </template>
 
@@ -81,7 +84,7 @@
 import { ref, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import mascot from './assets/mascot.png'
-import { reviewApi, settingsApi } from './api'
+import { reviewApi, settingsApi, materialApi } from './api'
 
 const route = useRoute()
 const router = useRouter()
@@ -122,11 +125,20 @@ onMounted(() => {
   refreshDue()
   dueTimer = setInterval(refreshDue, 60000)
   // 先等配置状态就绪，再决定首次引导内容（未配置时第一步为「配置模型」）
-  checkSetup().then(() => {
-    if (!localStorage.getItem(ONBOARD_KEY)) {
-      setTimeout(() => { tourOpen.value = true }, 600)
-    }
+  checkSetup().then(async () => {
+    if (localStorage.getItem(ONBOARD_KEY)) return
+    // 已有材料 → 说明不是首次使用（例如清过 WebView 缓存导致标记丢失），不再弹引导
+    try {
+      const { data } = await materialApi.list()
+      if (Array.isArray(data) && data.length > 0) {
+        localStorage.setItem(ONBOARD_KEY, '1')
+        return
+      }
+    } catch { /* 静默：取不到就仍按首次处理 */ }
+    setTimeout(() => { tourOpen.value = true }, 600)
   })
+  // 点击遮罩空白处 = 跳过引导（否则遮罩会拦下所有点击，造成「界面卡死」的错觉）
+  document.addEventListener('click', onMaskClick, true)
 })
 onUnmounted(() => dueTimer && clearInterval(dueTimer))
 watch(() => route.path, refreshDue)
@@ -135,6 +147,7 @@ const navItems = [
   { path: '/', label: '材料库', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="2" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="2" y="9" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="9" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/></svg>' },
   { path: '/knowledge', label: '知识库', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2.5c-1.2-.9-3-1.2-5-.8v10.6c2-.4 3.8-.1 5 .8 1.2-.9 3-1.2 5-.8V1.7c-2-.4-3.8-.1-5 .8z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 2.5v10.6" stroke="currentColor" stroke-width="1.3"/></svg>' },
   { path: '/chat', label: 'AI 问答', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v6a1.5 1.5 0 0 1-1.5 1.5H8l-3.5 3v-3h-1A1.5 1.5 0 0 1 2 9.5v-6z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>' },
+  { path: '/podcast', label: 'AI 播客', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.6 9.4V8a5.4 5.4 0 0 1 10.8 0v1.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><rect x="1.7" y="8.7" width="3.1" height="4.5" rx="1.55" stroke="currentColor" stroke-width="1.3"/><rect x="11.2" y="8.7" width="3.1" height="4.5" rx="1.55" stroke="currentColor" stroke-width="1.3"/></svg>' },
   { path: '/review', label: '复习巩固', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M13.5 1.8v2.6h-2.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>' },
   { path: '/stats', label: '数据统计', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 13h2V8H3v5zM7 13h2V3H7v10zM11 13h2V6h-2v7z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>' },
   { path: '/settings', label: '管理中心', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.3"/><path d="M8 1.8v1.7M8 12.5v1.7M1.8 8h1.7M12.5 8h1.7M3.6 3.6l1.2 1.2M11.2 11.2l1.2 1.2M12.4 3.6l-1.2 1.2M4.8 11.2l-1.2 1.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>' },
@@ -147,6 +160,17 @@ const tourOpen = ref(false)
 const ONBOARD_KEY = 'asc_onboarded'
 function restartTour() { tourOpen.value = true }
 function onTourClose() { localStorage.setItem(ONBOARD_KEY, '1') }
+// 跳过引导：显式写入标记（v-model 置 false 不会触发 close 事件）
+function skipTour() {
+  localStorage.setItem(ONBOARD_KEY, '1')
+  tourOpen.value = false
+}
+// 遮罩空白区点击 → 跳过
+function onMaskClick(e) {
+  if (!tourOpen.value) return
+  const cls = e.target && e.target.classList
+  if (cls && (cls.contains('el-tour__hollow') || cls.contains('el-tour__mask'))) skipTour()
+}
 
 const isActive = (path) => path === '/' ? route.path === '/' : route.path.startsWith(path)
 
@@ -157,11 +181,15 @@ function toggleSidebar() {
   localStorage.setItem('asc_sidebar_collapsed', sidebarCollapsed.value ? '1' : '0')
 }
 // 进入材料详情页默认折叠菜单（给阅读区腾空间），离开后恢复 localStorage 记忆状态
+// 离开学习页时错开一帧再展开：先让当前帧完成 StudyView 卸载（PDF canvas / Word 原文 DOM）与目标页挂载，
+// 再触发侧边栏 width 过渡，避免主线程争抢导致「菜单展开卡顿」
 watch(() => route.path, (path) => {
   if (path.startsWith('/study')) {
     sidebarCollapsed.value = true
   } else {
-    sidebarCollapsed.value = localStorage.getItem('asc_sidebar_collapsed') === '1'
+    requestAnimationFrame(() => {
+      sidebarCollapsed.value = localStorage.getItem('asc_sidebar_collapsed') === '1'
+    })
   }
 }, { immediate: true })
 </script>
@@ -293,4 +321,13 @@ watch(() => route.path, (path) => {
   0%, 100% { transform: scale(1); opacity: .7; }
   50% { transform: scale(1.12); opacity: 1; }
 }
+/* 引导跳过按钮：需位于 el-tour 遮罩（z-index 2001）之上，保证始终可点 */
+.tour-skip {
+  position: fixed; right: 24px; bottom: 100px; z-index: 2020;
+  padding: 8px 16px; border-radius: 999px; cursor: pointer;
+  background: var(--asc-card); border: 1px solid var(--asc-border);
+  color: var(--asc-text-2); font-size: 13px; box-shadow: 0 4px 14px rgba(0, 0, 0, .12);
+  transition: all .2s ease;
+}
+.tour-skip:hover { color: var(--asc-primary); border-color: var(--asc-primary); }
 </style>

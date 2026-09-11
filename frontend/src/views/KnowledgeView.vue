@@ -107,7 +107,7 @@
             :aria-pressed="typeFilter === 'all'" @click="typeFilter = 'all'">
             全部<b>{{ data.notes.length }}</b>
           </button>
-          <button v-for="t in NOTE_TYPE_FILTERS" :key="t.key" type="button"
+          <button v-for="t in visibleTypeFilters" :key="t.key" type="button"
             class="kb-type-chip" :class="{ active: typeFilter === t.key }"
             :aria-pressed="typeFilter === t.key" @click="typeFilter = t.key">
             {{ t.label }}<b>{{ typeCount(t.key) }}</b>
@@ -118,8 +118,8 @@
             :style="{ animationDelay: Math.min(i, 11) * 35 + 'ms' }" @click="openNote(n)">
             <div class="kb-note-head">
               <span class="kb-note-title">{{ n.title }}</span>
-              <span class="kb-src-pill" :class="{ ai: n.source_type === 'ai_asset', chat: n.source_type === 'chat' }">
-                {{ n.source_type === 'ai_asset' ? 'AI' : (n.source_type === 'chat' ? '问答' : '手动') }}
+              <span class="kb-src-pill" :class="srcPillClass(n.source_type)">
+                {{ srcPillLabel(n.source_type) }}
               </span>
             </div>
             <div class="kb-note-content">{{ n.content }}</div>
@@ -150,9 +150,8 @@
         <div class="nd-header">
           <div class="nd-title-row">
             <span class="nd-title">编辑笔记</span>
-            <span class="nd-src-tag"
-              :class="noteDialog.sourceType === 'ai_asset' ? 'is-ai' : (noteDialog.sourceType === 'chat' ? 'is-chat' : '')">
-              {{ noteDialog.sourceType === 'ai_asset' ? 'AI 生成' : (noteDialog.sourceType === 'chat' ? '问答笔记' : '手动') }}
+            <span class="nd-src-tag" :class="noteTagClass(noteDialog.sourceType)">
+              {{ noteTagLabel(noteDialog.sourceType) }}
             </span>
           </div>
           <div class="nd-sub">{{ noteDialog.materialTitle }}</div>
@@ -266,15 +265,16 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { Search, Document, Picture, Headset, VideoPlay } from '@element-plus/icons-vue'
+import { Search, Document, Picture, Headset, VideoPlay, Reading } from '@element-plus/icons-vue'
 import MarkdownIt from 'markdown-it'
 import mascot from '../assets/mascot.png'
 import { kbApi, noteApi, reviewApi, settingsApi } from '../api'
 import http, { errMsg } from '../api/http'
 
 const router = useRouter()
+const route = useRoute()
 const md = new MarkdownIt({ breaks: true })
 const renderMd = (t) => md.render(t || '')
 const noteDialog = reactive({
@@ -341,6 +341,29 @@ async function openNote(n) {
     noteDialog.content = data.content
     noteDialog.anchor = data.anchor || null
   } catch { /* 拉全文失败则用列表截断内容 */ }
+}
+
+// 从别处跳转过来直接打开某条笔记（统计页 / 播客页的「已转笔记 · 查看」）。
+// 这些笔记是材料无关的，列表里能查到来源标签；查不到（如刚转存、列表未刷新）则留空。
+async function openNoteById(id) {
+  // ⚠️ 这里的响应变量绝不能叫 data —— 外层 `const data = reactive({...})` 是笔记列表，
+  // 用 const { data } 解构会把它整个遮蔽掉。
+  const item = (data.notes || []).find(n => n.id === Number(id))
+  try {
+    const res = await http.get(`/notes/${id}`)
+    const d = res.data
+    noteDialog.id = d.id
+    noteDialog.title = d.title
+    noteDialog.content = d.content
+    noteDialog.sourceType = d.source_type || 'manual'
+    noteDialog.materialId = d.material_id
+    noteDialog.materialTitle = item?.material_title || ''
+    noteDialog.anchor = d.anchor || null
+    noteDialog.mode = 'edit'
+    noteDialog.show = true
+  } catch {
+    ElMessage.error('笔记打开失败，可能已被删除')
+  }
 }
 
 function jumpToOriginal() {
@@ -520,9 +543,34 @@ const pendingCount = computed(() => data.materials.filter(m => !m.indexed && m.p
 const NOTE_TYPE_FILTERS = [
   { key: 'chat', label: '问答' },
   { key: 'ai_asset', label: 'AI' },
+  { key: 'weekly_report', label: '周报' },
+  { key: 'podcast_script', label: '播客' },
+  { key: 'podcast_brief', label: '简报' },
   { key: 'manual', label: '手动' },
 ]
 const typeFilter = ref('all')
+// 计数为 0 的类型不占位（新增产物类型后，用户不会看到一排「周报 0」）
+const visibleTypeFilters = computed(() => NOTE_TYPE_FILTERS.filter(t => typeCount(t.key) > 0))
+
+// 来源徽章：卡片上短标签 / 弹窗里长标签，共用一份映射，避免两处口径漂移
+const SRC_PILL = { chat: '问答', ai_asset: 'AI', weekly_report: '周报', podcast_script: '播客', podcast_brief: '简报' }
+const srcPillLabel = (t) => SRC_PILL[t] || '手动'
+const srcPillClass = (t) => ({
+  ai: t === 'ai_asset', chat: t === 'chat',
+  report: t === 'weekly_report', podcast: t === 'podcast_script',
+  brief: t === 'podcast_brief',
+})
+const NOTE_TAG = {
+  chat: '问答笔记', ai_asset: 'AI 生成',
+  weekly_report: 'AI 周报', podcast_script: 'AI 播客脚本',
+  podcast_brief: 'AI 播客简报',
+}
+const noteTagLabel = (t) => NOTE_TAG[t] || '手动'
+const noteTagClass = (t) => ({
+  'is-ai': t === 'ai_asset', 'is-chat': t === 'chat',
+  'is-report': t === 'weekly_report', 'is-podcast': t === 'podcast_script',
+  'is-brief': t === 'podcast_brief',
+})
 const filteredNotes = computed(() =>
   typeFilter.value === 'all'
     ? data.notes
@@ -530,7 +578,7 @@ const filteredNotes = computed(() =>
 const typeCount = (key) => data.notes.filter(n => n.source_type === key).length
 
 // ---------- 格式徽章（与材料库卡片同一配色体系） ----------
-const fmtLabel = (f) => ({ pdf: 'PDF', ppt: 'PPT', pptx: 'PPT', doc: 'WORD', docx: 'WORD', md: 'MD', markdown: 'MD', mp3: '音频', wav: '音频', m4a: '音频', mp4: '视频', jpg: '图片', jpeg: '图片', png: '图片', webp: '图片', bmp: '图片' }[f] || (f || '').toUpperCase())
+const fmtLabel = (f) => ({ pdf: 'PDF', ppt: 'PPT', pptx: 'PPT', doc: 'WORD', docx: 'WORD', epub: 'EPUB', md: 'MD', markdown: 'MD', mp3: '音频', wav: '音频', m4a: '音频', mp4: '视频', jpg: '图片', jpeg: '图片', png: '图片', webp: '图片', bmp: '图片' }[f] || (f || '').toUpperCase())
 const fmtGroup = (f) => {
   if (['jpg', 'jpeg', 'png', 'webp', 'bmp'].includes(f)) return 'img'
   if (['mp3', 'wav', 'm4a'].includes(f)) return 'audio'
@@ -538,9 +586,10 @@ const fmtGroup = (f) => {
   if (['ppt', 'pptx'].includes(f)) return 'ppt'
   if (['doc', 'docx'].includes(f)) return 'doc'
   if (['md', 'markdown'].includes(f)) return 'md'
+  if (f === 'epub') return 'epub'
   return 'pdf'
 }
-const fmtIcon = (f) => ({ img: Picture, audio: Headset, video: VideoPlay }[fmtGroup(f)] || Document)
+const fmtIcon = (f) => ({ img: Picture, audio: Headset, video: VideoPlay, epub: Reading }[fmtGroup(f)] || Document)
 
 // ---------- 入库状态（dot pill，弱化标签噪音） ----------
 function statusOf(row) {
@@ -574,9 +623,14 @@ async function rebuild(row) {
   }
 }
 
-onMounted(() => {
-  load()
-  loadNoteWeight()
+onMounted(async () => {
+  await Promise.all([load(), loadNoteWeight()])
+  // 从「已转笔记 · 查看」跳转过来：加载完列表再打开，这样能拿到来源标签
+  const qid = route.query.note
+  if (qid) {
+    await openNoteById(qid)
+    router.replace({ path: '/knowledge' })   // 清掉 query，避免刷新页面又弹一次
+  }
 })
 </script>
 
@@ -654,6 +708,7 @@ onMounted(() => {
 .fmt-audio { background: #e5f6f3; color: #0f9488; }
 .fmt-video { background: #f1ebfd; color: #7c5cfc; }
 .fmt-img { background: #e6f7fb; color: #0891b2; }
+.fmt-epub { background: #e7f5ec; color: #15803d; }
 .kb-m-title { font-size: 14px; font-weight: 500; min-width: 0; }
 .kb-m-title :deep(.el-link__inner) {
   display: inline-block; max-width: 46vw;
@@ -717,6 +772,10 @@ onMounted(() => {
 }
 .kb-src-pill.ai { background: var(--asc-primary-soft); color: var(--asc-primary); }
 .kb-src-pill.chat { background: rgba(28, 145, 138, .12); color: #12837c; }
+.kb-src-pill.report { background: rgba(217, 119, 6, .12); color: #b45309; }
+.kb-src-pill.podcast { background: rgba(74, 114, 212, .12); color: #3f63c4; }
+/* 简报：与「播客脚本」同属播客产物但必须能一眼分开 → 用品红（白底 5.3:1） */
+.kb-src-pill.brief { background: rgba(162, 28, 175, .12); color: #a21caf; }
 .kb-note-content {
   flex: 1; font-size: 13px; color: var(--asc-text-2); line-height: 1.7; margin-bottom: 12px;
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
@@ -756,6 +815,9 @@ onMounted(() => {
 }
 .nd-src-tag.is-ai { background: var(--asc-primary-soft); color: var(--asc-primary); }
 .nd-src-tag.is-chat { background: rgba(28, 145, 138, .12); color: #12837c; }
+.nd-src-tag.is-report { background: rgba(217, 119, 6, .12); color: #b45309; }
+.nd-src-tag.is-podcast { background: rgba(74, 114, 212, .12); color: #3f63c4; }
+.nd-src-tag.is-brief { background: rgba(162, 28, 175, .12); color: #a21caf; }
 .nd-sub { font-size: 12px; color: var(--asc-text-3); }
 
 .nd-body { display: flex; flex-direction: column; gap: 16px; }

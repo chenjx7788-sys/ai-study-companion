@@ -70,7 +70,7 @@ class Note(Base):
     material_id = Column(Integer, ForeignKey("materials.id"), index=True)
     title = Column(String(255), default="未命名笔记")
     content = Column(Text, default="")
-    source_type = Column(String(16), default="manual")  # manual / ai_asset
+    source_type = Column(String(16), default="manual")  # manual / ai_asset / chat / weekly_report / podcast_script
     source_asset_id = Column(Integer, ForeignKey("ai_assets.id"), nullable=True)
     anchor = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -165,6 +165,52 @@ class ReviewCard(Base):
     review_count = Column(Integer, default=0)
     history = Column(JSON, default=list)        # 复习记录 [{r: result, t: iso, l: level}]
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Podcast(Base):
+    """AI 播客：材料/笔记 → 知识简报 → 双人对话脚本 → 本地音频
+
+    两阶段产物分开存：
+    - brief  = 提炼层产物（结构化知识简报，可单独复用为笔记）
+    - script = 演绎层产物（对话脚本，逐句含说话人与时间戳）
+    改脚本不必重新提炼，换音色不必重新生成脚本。
+    """
+    __tablename__ = "podcasts"
+    id = Column(Integer, primary_key=True)
+    title = Column(String(255), default="未命名播客")
+    source_type = Column(String(16), default="article")   # article / notes / highlights / review / mixed
+    source_refs = Column(JSON, default=list)              # [{type, id, title}] 来源快照
+    style = Column(String(24), default="dialogue")        # dialogue 知识对谈 / solo 单人精讲
+    voice_map = Column(JSON, default=dict)                # {"host": 音色id, "expert": 音色id}
+    target_minutes = Column(Integer, default=3)           # 目标时长（分钟）
+    # 生成时用户填写的「附加要求」。必须持久化：选中作品时生成台要能完整还原，
+    # 否则基于原作品重新生成会丢掉这条自定义要求，产出风格与原来不一致。
+    instruction = Column(Text, default="")
+    brief = Column(Text, default="")                      # 知识简报（提炼层）
+    script = Column(JSON, default=list)                   # [{speaker, name, text, start_ms, end_ms}]
+    # ⚠️ 只存相对文件名，不存绝对路径 —— 开发态(backend/data)与打包版(~/.ai-study-companion)
+    # 数据目录不同，存绝对路径会让切换环境后历史记录全部失效。
+    audio_name = Column(String(255), default="")
+    audio_bytes = Column(Integer, default=0)
+    duration_sec = Column(Integer, default=0)             # 合成后回读的实际时长
+    # 已合成音频对应的脚本文本指纹。与当前 script 算出的指纹不一致 → 音频是上一版，
+    # 界面需显式标注「音频对应的是修改前的文案」，避免用户以为听到的就是当前文案。
+    audio_sig = Column(String(32), default="")
+    # 背景音乐配置。bgm_id="" 表示不配背景音乐（默认）；
+    # bgm_volume 是 BGM 相对人声的基准音量（dB），说话时会再按 ducking 压低。
+    # ⚠️ 二者都要进音频指纹（见 podcast.script_signature）：换 BGM 或调音量后，
+    # 已合成的音频就不再对应当前配置，界面必须能标出「音频是上一版」。
+    bgm_id = Column(String(64), default="")
+    bgm_volume = Column(Integer, default=-20)
+    # 记住这首曲子「叫什么」。素材被删除后 bgm_id 仍指向它（不静默改作品），
+    # 但 bgm.track_name() 查不到名字 → 界面只能显示一句「已失效」，用户根本
+    # 不知道原本配的是哪首。存下最后一次成功选择时的曲名，删曲后仍能显示原曲名。
+    # ⚠️ 纯展示用元数据，**不进音频指纹**（见 podcast.script_signature）。
+    bgm_label = Column(String(64), default="")
+    status = Column(String(16), default="draft")          # draft / script_ready / done / failed
+    error = Column(String(255), default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class ActivityLog(Base):

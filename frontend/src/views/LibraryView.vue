@@ -7,7 +7,7 @@
     <div v-if="dragging" class="drop-mask">
       <div class="drop-tip">
         <el-icon class="drop-tip-icon"><Upload /></el-icon>
-        松开鼠标上传材料（PDF / PPT / Word / Markdown / 图片 / 音视频，≤100MB）
+        松开鼠标上传材料（PDF / PPT / Word / Markdown / EPUB / 图片 / 音视频，≤100MB）
       </div>
     </div>
 
@@ -27,7 +27,7 @@
             :placeholder="searchMode === 'fulltext' ? '搜索全部材料正文内容' : '搜索材料标题'"
             clearable style="width: 240px" />
         </div>
-        <el-upload :show-file-list="false" :http-request="onUpload" accept=".pdf,.ppt,.pptx,.doc,.docx,.md,.jpg,.jpeg,.png,.webp,.bmp,.mp3,.wav,.m4a,.mp4" multiple>
+        <el-upload :show-file-list="false" :http-request="onUpload" accept=".pdf,.ppt,.pptx,.doc,.docx,.md,.markdown,.epub,.jpg,.jpeg,.png,.webp,.bmp,.mp3,.wav,.m4a,.mp4" multiple>
           <el-button type="primary" :icon="Upload">上传材料</el-button>
         </el-upload>
         <el-popover ref="importPop" placement="bottom-end" :width="232" trigger="click" popper-class="import-popper">
@@ -71,23 +71,33 @@
       </div>
     </div>
 
-    <!-- 标签筛选 + 视图切换 -->
-    <div class="filter-bar">
+    <!-- 视图切换：页头下方第一行，与标签行左对齐（用户反馈「不知道在哪切换浏览方式」，故提到标签之前） -->
+    <div v-if="materials.length || folders.length" class="view-bar">
+      <el-radio-group v-model="viewMode" size="small" class="view-toggle">
+        <el-radio-button value="flat" title="平铺看全部材料（含子文件夹里的文件）">
+          <span class="vt-label"><el-icon :size="13"><Grid /></el-icon>全部材料</span>
+        </el-radio-button>
+        <el-radio-button value="folder" title="按文件夹层级浏览，可新建 / 移动文件夹">
+          <span class="vt-label"><el-icon :size="13"><FolderOpened /></el-icon>按文件夹</span>
+        </el-radio-button>
+      </el-radio-group>
+    </div>
+
+    <!-- 标签筛选：仅「全部材料」模式（按文件夹浏览时层级即筛选，标签不参与过滤） -->
+    <div v-if="viewMode === 'flat'" class="filter-bar">
       <div class="tag-bar">
         <template v-if="allTags.length">
           <span class="tag-chip" :class="{ on: !activeTag }" @click="activeTag = ''">全部</span>
           <span v-for="tag in allTags" :key="tag" class="tag-chip"
-            :class="{ on: activeTag === tag }" @click="activeTag = tag">{{ tag }}</span>
+            :class="{ on: activeTag === tag }" @click="activeTag = tag">
+            {{ tag }}<el-icon v-if="presetTags.includes(tag)" class="tag-del" title="删除标签" @click.stop="removePresetTag(tag)"><Close /></el-icon>
+          </span>
         </template>
         <span v-else class="tag-bar-empty">还没有标签</span>
-        <span class="tag-add" @click="addPresetTag">
-          <el-icon class="tag-add-icon"><Plus /></el-icon>新增标签
-        </span>
       </div>
-      <el-radio-group v-model="viewMode" size="small" class="view-toggle">
-        <el-radio-button value="flat">平铺</el-radio-button>
-        <el-radio-button value="folder">文件夹</el-radio-button>
-      </el-radio-group>
+      <span class="tag-add" @click="addPresetTag">
+        <el-icon class="tag-add-icon"><Plus /></el-icon>新增标签
+      </span>
     </div>
 
     <!-- 文件夹面包屑（folder 视图） -->
@@ -156,22 +166,21 @@
             <div class="card-meta">
               <span class="fmt-name" :class="'ftn-' + fmtGroup(m.format)">{{ fmtLabel(m.format) }}</span>
               <span v-if="m.storage_mode === 'reference'" class="ref-badge">引用</span>
-              <span v-if="m.page_count">{{ m.page_count }} 页</span>
+              <span v-if="m.page_count">{{ m.page_count }}{{ countUnit(m.format) }}</span>
               <span>{{ formatTime(m.created_at) }}</span>
             </div>
-          </div>
-          <div class="card-status" @click.stop>
-            <el-tag v-if="m.parsed_status === 'parsing'" size="small" effect="light" round>
-              <el-icon class="is-loading"><Loading /></el-icon>
-              {{ isSlowFmt(m.format) ? `${slowLabel(m.format)} ${m.parse_progress || 0}%` : '解析中' }}
-            </el-tag>
-            <el-tag v-else-if="m.parsed_status === 'failed'" type="danger" size="small" effect="light" round :title="m.parse_error">解析失败</el-tag>
-            <el-tag v-else-if="m.parsed_status === 'scanned'" type="warning" size="small" effect="light" round :title="m.parse_error">扫描件</el-tag>
-            <el-tag v-else-if="m.has_ai" type="success" size="small" effect="light" round>已总结</el-tag>
           </div>
         </div>
         <div class="card-body">
           <div class="card-tags-row">
+            <!-- 材料状态：与标签同行、置于行首，避免右侧标签变宽挤压标题/日期行 -->
+            <div v-if="statusTag(m)" class="card-status" @click.stop>
+              <el-tag :type="statusTag(m).type" size="small" effect="light" round :title="statusTag(m).title">
+                <el-icon v-if="statusTag(m).loading" class="is-loading"><Loading /></el-icon>
+                {{ statusTag(m).text }}
+              </el-tag>
+            </div>
+            <!-- 标签块：「+ 标签」默认紧随状态标签，添加标签后自动跟到标签之后 -->
             <div v-if="m.tags?.length" class="card-tags">
               <span v-for="t in m.tags" :key="t" class="mini-tag">{{ t }}</span>
             </div>
@@ -197,6 +206,14 @@
               <div class="progress-fill" :style="{ width: Math.min(m.last_read_page / m.page_count * 100, 100) + '%' }"></div>
             </div>
             <span class="progress-text">读到 P{{ m.last_read_page }}</span>
+          </div>
+          <!-- 平铺模式：材料归属的文件夹，点击进入该文件夹（位于阅读进度下方）-->
+          <div v-if="viewMode === 'flat' && m.folder_id" class="card-folder-row">
+            <span class="folder-chip" :title="`点击进入文件夹：${folderPath(m.folder_id)}`"
+              @click.stop="enterFolder(m.folder_id)">
+              <el-icon :size="12"><Folder /></el-icon>
+              <span class="folder-chip-name">{{ folderName(m.folder_id) }}</span>
+            </span>
           </div>
           <div class="card-footer">
             <span class="note-count">笔记 {{ m.note_count }}</span>
@@ -243,7 +260,7 @@
 import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Loading, ArrowDown, Folder, FolderAdd, Plus, Search, Upload, Document, Picture, Headset, VideoPlay } from '@element-plus/icons-vue'
+import { Loading, ArrowDown, Folder, FolderAdd, FolderOpened, Grid, Plus, Close, Search, Upload, Document, Picture, Headset, VideoPlay, Reading } from '@element-plus/icons-vue'
 import { materialApi, foldersApi, settingsApi } from '../api'
 import mascot from '../assets/mascot.png'
 
@@ -326,6 +343,29 @@ async function addPresetTag() {
   }
 }
 
+// 删除预设标签（先校验是否有关联材料，未关联则二次确认后删除）
+async function removePresetTag(tag) {
+  const linked = materials.value.filter(m => (m.tags || []).includes(tag)).length
+  if (linked > 0) {
+    ElMessage.warning(`标签「${tag}」已关联 ${linked} 份材料，请先解除关联后再删除`)
+    return
+  }
+  try {
+    await ElMessageBox.confirm(`确认删除标签「${tag}」？删除后不可恢复。`, '删除标签', {
+      confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning'
+    })
+  } catch { return }
+  try {
+    const next = presetTags.value.filter(t => t !== tag)
+    await settingsApi.update({ preset_tags: next })
+    presetTags.value = next
+    if (activeTag.value === tag) activeTag.value = ''
+    ElMessage.success(`已删除标签「${tag}」`)
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || e.message || '删除失败')
+  }
+}
+
 const filtered = computed(() => {
   let list = materials.value
   if (activeTag.value) list = list.filter(m => (m.tags || []).includes(activeTag.value))
@@ -392,9 +432,44 @@ const crumbPath = computed(() => {
   return path
 })
 
+// 文件夹 id → 对象（平铺模式显示「归属文件夹」用）
+const folderById = computed(() => {
+  const map = new Map()
+  for (const f of folders.value) map.set(f.id, f)
+  return map
+})
+
+function folderName(id) {
+  return folderById.value.get(id)?.name || '文件夹'
+}
+
+// 完整路径（根 → … → 当前），供 title 提示
+function folderPath(id) {
+  const names = []
+  let cur = id
+  const guard = new Set()
+  while (cur != null && !guard.has(cur)) {
+    guard.add(cur)
+    const f = folderById.value.get(cur)
+    if (!f) break
+    names.unshift(f.name)
+    cur = f.parent_id
+  }
+  return names.length ? names.join(' / ') : '根目录'
+}
+
 function openFolder(id) { activeFolderId.value = id }
 function goRoot() { activeFolderId.value = null }
-watch(viewMode, () => { activeFolderId.value = null })
+
+// 平铺模式下点击材料的归属文件夹 → 进入该文件夹（folder 视图即文件夹详情：子文件夹 + 文件 + 面包屑）
+function enterFolder(id) {
+  if (id == null) return
+  activeFolderId.value = id
+  viewMode.value = 'folder'
+}
+
+// 仅切回平铺时清空所在文件夹；进入 folder 视图需保留（否则 enterFolder 会被重置为根目录）
+watch(viewMode, (v) => { if (v === 'flat') activeFolderId.value = null })
 
 // 新建文件夹
 async function createFolder() {
@@ -513,7 +588,19 @@ const isMediaFmt = (f) => ['mp3', 'wav', 'm4a', 'mp4'].includes(f)
 const isImageFmt = (f) => ['jpg', 'jpeg', 'png', 'webp', 'bmp'].includes(f)
 const isSlowFmt = (f) => isMediaFmt(f) || isImageFmt(f) || f === 'pdf'
 const slowLabel = (f) => isMediaFmt(f) ? '转写中' : '识别中'
-const fmtLabel = (f) => ({ pdf: 'PDF', ppt: 'PPT', pptx: 'PPT', doc: 'WORD', docx: 'WORD', md: 'MD', markdown: 'MD', mp3: '音频', wav: '音频', m4a: '音频', mp4: '视频', jpg: '图片', jpeg: '图片', png: '图片', webp: '图片', bmp: '图片' }[f] || (f || '').toUpperCase())
+
+// 材料状态标签：解析中（转写/识别带百分比）/ 解析失败 / 扫描件 / 已总结，无状态返回 null
+function statusTag(m) {
+  if (m.parsed_status === 'parsing') {
+    const pct = m.parse_progress || 0
+    return { type: 'primary', loading: true, text: isSlowFmt(m.format) ? `${slowLabel(m.format)} ${pct}%` : '解析中', title: '' }
+  }
+  if (m.parsed_status === 'failed') return { type: 'danger', text: '解析失败', title: m.parse_error || '' }
+  if (m.parsed_status === 'scanned') return { type: 'warning', text: '扫描件', title: m.parse_error || '' }
+  if (m.has_ai) return { type: 'success', text: '已总结', title: '' }
+  return null
+}
+const fmtLabel = (f) => ({ pdf: 'PDF', ppt: 'PPT', pptx: 'PPT', doc: 'WORD', docx: 'WORD', epub: 'EPUB', md: 'MD', markdown: 'MD', mp3: '音频', wav: '音频', m4a: '音频', mp4: '视频', jpg: '图片', jpeg: '图片', png: '图片', webp: '图片', bmp: '图片' }[f] || (f || '').toUpperCase())
 
 // 格式 → 图标分组（决定图标与徽章配色）
 const fmtGroup = (f) => {
@@ -522,9 +609,12 @@ const fmtGroup = (f) => {
   if (['ppt', 'pptx'].includes(f)) return 'ppt'
   if (['doc', 'docx'].includes(f)) return 'doc'
   if (['md', 'markdown'].includes(f)) return 'md'
+  if (f === 'epub') return 'epub'
   return 'pdf'
 }
-const fmtIcon = (f) => ({ img: Picture, audio: Headset, video: VideoPlay }[fmtGroup(f)] || Document)
+// EPUB 的计数单位是「章」（章节序号即 page_no），其余格式仍是「页」
+const countUnit = (f) => (f === 'epub' ? ' 章' : ' 页')
+const fmtIcon = (f) => ({ img: Picture, audio: Headset, video: VideoPlay, epub: Reading }[fmtGroup(f)] || Document)
 
 function formatTime(iso) {
   if (!iso) return ''
@@ -547,8 +637,8 @@ async function refresh() {
 
 async function doUpload(file) {
   const ext = file.name.includes('.') ? file.name.split('.').pop().toLowerCase() : ''
-  if (!['pdf', 'ppt', 'pptx', 'doc', 'docx', 'md', 'markdown', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'mp3', 'wav', 'm4a', 'mp4'].includes(ext)) {
-    ElMessage.warning(`「${file.name}」格式不支持（PDF/PPT/Word/Markdown/图片/音视频）`)
+  if (!['pdf', 'ppt', 'pptx', 'doc', 'docx', 'md', 'markdown', 'epub', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'mp3', 'wav', 'm4a', 'mp4'].includes(ext)) {
+    ElMessage.warning(`「${file.name}」格式不支持（PDF/PPT/Word/Markdown/EPUB/图片/音视频）`)
     return
   }
   if (file.size > 100 * 1024 * 1024) {
@@ -724,29 +814,50 @@ onUnmounted(() => pollTimer && clearInterval(pollTimer))
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
-/* ===== 筛选条（标签 + 视图切换） ===== */
+/* ===== 筛选条（标签） ===== */
 .filter-bar {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 12px 16px; flex-wrap: wrap; margin-bottom: 18px;
+  display: flex; align-items: center; gap: 8px; margin-bottom: 18px;
 }
-.tag-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 28px; }
+/* 标签恒定单行（超出横向滚动、隐藏滚动条）——与「浏览方式」行等高，不因标签多/窗口窄折行。
+   宽度按内容自适应：标签放得下时「+ 新增标签」紧跟在最后一个标签之后；
+   标签超出时标签区收缩为可滚动，「+ 新增标签」仍留在行尾可见。 */
+.tag-bar {
+  min-width: 0; display: flex; align-items: center; gap: 8px;
+  flex-wrap: nowrap; overflow-x: auto; min-height: 28px;
+  scrollbar-width: none; -ms-overflow-style: none;
+}
+.tag-bar::-webkit-scrollbar { height: 0; display: none; }
 .tag-bar-empty { font-size: 12px; color: var(--asc-text-3); margin-right: 4px; }
+/* 行高统一 28px（与 .view-toggle 一致）：高度写死，避免不同环境字体度量把 chip 撑高导致两行不等高 */
 .tag-chip {
-  font-size: 12px; padding: 4px 12px; border-radius: 999px; cursor: pointer;
+  height: 28px; display: inline-flex; align-items: center; padding: 0 12px;
+  font-size: 12px; border-radius: 999px; cursor: pointer;
   background: var(--asc-card); border: 1px solid var(--asc-border); color: var(--asc-text-2);
   transition: all .15s;
 }
 .tag-chip:hover { border-color: var(--asc-primary); color: var(--asc-primary); }
 .tag-chip.on { background: var(--asc-primary); border-color: var(--asc-primary); color: #fff; }
+.tag-del {
+  margin-left: 6px; font-size: 12px; opacity: .5;
+  transition: opacity .15s, color .15s;
+}
+.tag-del:hover { opacity: 1; color: var(--el-color-danger); }
 .tag-add {
-  display: inline-flex; align-items: center; gap: 3px;
+  height: 28px; display: inline-flex; align-items: center; gap: 3px; padding: 0 10px; flex-shrink: 0;
   font-size: 12px; color: var(--asc-primary); cursor: pointer;
-  padding: 4px 10px; border: 1px dashed var(--asc-primary);
-  border-radius: 999px; transition: all .15s;
+  border: 1px dashed var(--asc-primary); border-radius: 999px; transition: all .15s;
 }
 .tag-add:hover { background: var(--asc-primary-soft); }
 .tag-add-icon { font-size: 12px; }
+/* 视图切换条：页头下方第一行、左对齐（与标签行同一起始边；两个视图下位置一致，切换时不跳动） */
+.view-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 .view-toggle { flex-shrink: 0; }
+/* 与标签行等高（28px，同 .tag-chip）：两边都写死高度，两行在任意环境下都一致 */
+.view-toggle :deep(.el-radio-button__inner) {
+  height: 28px; padding: 0 12px; line-height: 1;
+  display: inline-flex; align-items: center;
+}
+.vt-label { display: inline-flex; align-items: center; gap: 5px; }
 
 /* ===== 面包屑（folder 视图） ===== */
 .crumb-bar {
@@ -792,7 +903,8 @@ onUnmounted(() => pollTimer && clearInterval(pollTimer))
 }
 .card-top { display: flex; align-items: flex-start; gap: 12px; padding: 16px 16px 0; }
 .card-head { flex: 1; min-width: 0; }
-.card-status { flex-shrink: 0; }
+/* 状态标签（在标签行行首）：不参与压缩，也不与标题/日期争抢行宽 */
+.card-status { display: inline-flex; flex-shrink: 0; }
 .card-status :deep(.el-tag) { border: none; }
 
 /* 格式图标徽章：低饱和浅色底 + 格式色图标 */
@@ -817,21 +929,38 @@ onUnmounted(() => pollTimer && clearInterval(pollTimer))
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   font-size: 12px; color: var(--asc-text-3); margin-top: 4px;
 }
+/* 元信息整体换行、不折行（避免日期被拆成两行显示） */
+.card-meta > span { white-space: nowrap; }
 .fmt-name { font-weight: 600; font-size: 11px; letter-spacing: .3px; }
 .ftn-pdf { color: #d85a30; } .ftn-ppt { color: #ba7517; } .ftn-doc { color: #378add; }
 .ftn-md { color: #64748b; } .ftn-audio { color: #0f9488; } .ftn-video { color: #7c5cfc; }
-.ftn-img { color: #0891b2; }
+.ftn-img { color: #0891b2; } .ftn-epub { color: #15803d; }
 .ref-badge {
   font-size: 11px; color: var(--asc-text-3); background: var(--asc-surface-2);
   border-radius: 4px; padding: 0 6px; line-height: 16px;
   display: inline-block; vertical-align: middle;
 }
+/* 平铺模式：材料归属的文件夹（位于阅读进度下方，可点击进入） */
+.card-folder-row { display: flex; align-items: center; margin-bottom: 8px; }
+.folder-chip {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  font-size: 12px; color: var(--asc-text-2);
+  background: var(--asc-surface-2); border: 1px solid var(--asc-divider);
+  border-radius: 5px; padding: 1px 8px; line-height: 18px;
+  cursor: pointer; transition: color .15s, border-color .15s, background .15s;
+}
+.folder-chip:hover {
+  color: var(--asc-primary); border-color: var(--asc-primary); background: var(--asc-primary-soft);
+}
+.folder-chip .el-icon { flex-shrink: 0; }
+.folder-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .card-body { padding: 10px 16px 12px; display: flex; flex-direction: column; flex: 1; }
 .card-tags-row {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 8px; min-height: 22px; margin-bottom: 8px;
+  display: flex; align-items: center; gap: 8px;
+  min-height: 22px; margin-bottom: 8px;
 }
+/* 标签块按内容宽度排列（不撑满整行）：无标签时「+ 标签」紧贴状态标签，有标签时跟在标签之后 */
 .card-tags { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
 .mini-tag {
   font-size: 11px; color: var(--asc-primary); background: var(--asc-primary-soft);

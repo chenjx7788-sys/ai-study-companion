@@ -26,10 +26,10 @@
         <div class="reader-title-wrap">
           <span v-if="material" class="reader-fmt" :class="'rfmt-' + material.format">{{ fmtLabel(material.format) }}</span>
           <span class="reader-title" :title="material?.title">{{ material?.title }}</span>
-          <span v-if="material?.page_count" class="reader-pages">{{ isMedia ? `约 ${material.page_count} 分钟` : `共 ${material.page_count} 页` }}</span>
+          <span v-if="material?.page_count" class="reader-pages">{{ pageUnitText }}</span>
         </div>
         <div class="reader-actions">
-          <el-radio-group v-if="['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'mp3', 'wav', 'm4a', 'mp4'].includes(material?.format)" v-model="viewMode" size="small">
+          <el-radio-group v-if="['pdf', 'docx', 'epub', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'mp3', 'wav', 'm4a', 'mp4'].includes(material?.format)" v-model="viewMode" size="small">
             <el-radio-button value="text">{{ isMedia ? '转写文本' : '文本视图' }}</el-radio-button>
             <el-radio-button value="origin">{{ isMedia ? '播放' : '原文视图' }}</el-radio-button>
           </el-radio-group>
@@ -37,12 +37,19 @@
           <el-button v-if="material?.storage_mode === 'reference'" size="small" text @click="relocateFile">重新定位</el-button>
           <el-button v-if="viewMode === 'text'" size="small" text
             @click="isMd ? editMdDocument() : toggleTranscriptEdit()">{{ isMd ? '编辑文本' : (transcriptEditing ? '完成' : (isMedia ? '编辑转写' : '编辑文本')) }}</el-button>
-          <el-button v-if="viewMode === 'origin' && material?.format === 'pdf'" size="small" text
+          <el-button v-if="viewMode === 'origin' && ['pdf', 'docx', 'epub'].includes(material?.format)" size="small" text
             @click="toggleFullscreen">{{ isFullscreen ? '退出全屏' : '全屏' }}</el-button>
         </div>
       </div>
 
       <PdfReader v-if="viewMode === 'origin' && material?.format === 'pdf'" :key="'pdf-' + fileTs" :url="fileUrl(material.id)" :footprints="fpByPage" :highlights="highlights" @mouseup="onSelect" @scroll.passive="onReaderScroll" />
+
+      <!-- Word「原文视图」：docx-preview 高保真还原版面（表格 / 图片 / 样式 / 分页） -->
+      <DocxReader v-else-if="viewMode === 'origin' && isDocx" :key="'docx-' + fileTs" :url="fileUrl(material.id)" />
+
+      <!-- EPUB「原文视图」：iframe 直出 zip 内章节，原书排版与插图原样生效 -->
+      <EpubReader v-else-if="viewMode === 'origin' && isEpub" :chapters="epubChapters"
+        :index="activePage" :base="epubBase" @change="onEpubChapterChange" />
 
       <!-- 图片「原文视图」：直接展示原图 -->
       <div v-else-if="viewMode === 'origin' && isImage" class="image-origin">
@@ -76,7 +83,7 @@
             </div>
           </div>
           <div v-else class="md-body">
-            <div v-for="c in chunks" :key="c.id" :id="'page-' + c.page_no" class="md-seg"
+            <div v-for="c in chunks" :key="c.id" :id="'page-' + c.page_no" :data-page="c.page_no" class="md-seg"
               :class="{ 'md-seg-flash': flashLocate && flashLocate.page === c.page_no }"
               v-html="renderMd(c.content)"></div>
           </div>
@@ -86,7 +93,7 @@
           <template v-for="group in pagedChunks" :key="group.page">
             <div v-if="!isImage" :id="'page-' + group.page" class="page-marker" :class="{ 'seekable': isMedia }"
              @click="isMedia && seekToMinute(group.page)">
-              <span>{{ isMedia ? `▶ 第 ${group.page} 分钟` : `第 ${group.page} 页` }}</span>
+              <span>{{ blockUnitText(group.page) }}</span>
               <el-button v-if="transcriptEditing" class="page-del-btn edit-del-btn" size="small" text type="danger"
                 @click.stop="deletePage(group.page)">删除本页</el-button>
             </div>
@@ -176,7 +183,19 @@
             <div class="pane-scroll">
               <div class="md-preview summary-text" v-html="renderMd(streamingSummary || summary.content)" @click="onSummaryClick"></div>
             </div>
-            <div v-if="summaryLoading" class="gen-tip"><span class="asking-dots"><i></i><i></i><i></i></span>正在重新生成摘要…</div>
+            <div v-if="summaryLoading" class="gen-tip"><span class="asking-dots"><i></i><i></i><i></i></span>{{ summaryProgressTip }}</div>
+            <el-progress v-if="summaryLoading && summaryProgress" class="gen-progress"
+              :percentage="summaryPercent" :stroke-width="8" :show-text="false" />
+            <div v-if="summary" class="summary-ops">
+              <el-button v-if="!summaryNote" size="small" text type="primary"
+                :disabled="summaryLoading" @click="summaryToNote">转笔记</el-button>
+              <template v-else>
+                <el-button size="small" text type="success"
+                  @click="openNoteEditor(summaryNote)">✓ 已转笔记 · 查看</el-button>
+                <el-button v-if="summaryStale" size="small" text type="warning"
+                  :disabled="summaryLoading" @click="summaryToNote">摘要已更新 · 更新笔记</el-button>
+              </template>
+            </div>
             <div class="regen-row">
               <el-input v-model="regenInstruction" type="textarea" :autosize="{ minRows: 1, maxRows: 4 }"
                 placeholder="补充指令，如：更精简 / 侧重数据" />
@@ -186,7 +205,9 @@
           <div v-else class="pane-empty">
             <p>生成全文层级大纲，每条要点标注出处页码</p>
             <el-button type="primary" :loading="summaryLoading" @click="genSummary(false)">生成脉络摘要</el-button>
-            <div v-if="summaryLoading" class="gen-tip"><span class="asking-dots"><i></i><i></i><i></i></span>正在生成摘要，长文档约需 1-2 分钟…</div>
+            <div v-if="summaryLoading" class="gen-tip"><span class="asking-dots"><i></i><i></i><i></i></span>{{ summaryProgressTip }}</div>
+            <el-progress v-if="summaryLoading && summaryProgress" class="gen-progress"
+              :percentage="summaryPercent" :stroke-width="8" :show-text="false" />
           </div>
         </el-tab-pane>
 
@@ -539,6 +560,8 @@ import MarkdownIt from 'markdown-it'
 import { materialApi, aiApi, noteApi, reviewApi, kbApi, statsApi } from '../api'
 import { errMsg } from '../api/http'
 import PdfReader from '../components/PdfReader.vue'
+import DocxReader from '../components/DocxReader.vue'
+import EpubReader from '../components/EpubReader.vue'
 import { useAsr } from '../composables/useAsr'
 import { streamSSE } from '../utils/sse'
 
@@ -557,6 +580,32 @@ const viewMode = ref('text')
 const isMedia = computed(() => ['mp3', 'wav', 'm4a', 'mp4'].includes(material.value?.format))
 const isImage = computed(() => ['jpg', 'jpeg', 'png', 'webp', 'bmp'].includes(material.value?.format))
 const isMd = computed(() => ['md', 'markdown'].includes(material.value?.format))
+// Word「原文视图」仅支持 OOXML（.docx）；旧版 .doc 无法在浏览器端还原版面
+const isDocx = computed(() => material.value?.format === 'docx')
+// EPUB「原文视图」：章节清单按 spine 解析，index 与 chunk.page_no 一一对应
+const isEpub = computed(() => material.value?.format === 'epub')
+const epubChapters = ref([])
+const epubBase = computed(() => materialApi.epubResBase(materialId))
+
+// 计数单位随格式变化：音视频是「分钟」、EPUB 是「章」、其余是「页」
+const pageUnitText = computed(() => {
+  const n = material.value?.page_count || 0
+  if (isMedia.value) return `约 ${n} 分钟`
+  return isEpub.value ? `共 ${n} 章` : `共 ${n} 页`
+})
+const blockUnitText = (page) => {
+  if (isMedia.value) return `▶ 第 ${page} 分钟`
+  return isEpub.value ? `第 ${page} 章` : `第 ${page} 页`
+}
+
+async function loadEpubChapters() {
+  try {
+    const { data } = await materialApi.epubChapters(materialId)
+    epubChapters.value = data.chapters || []
+  } catch {
+    epubChapters.value = []   // 清单取不到时原文视图给降级提示，不阻断文本视图
+  }
+}
 
 // 语音模型（Whisper）状态与下载
 const {
@@ -576,6 +625,18 @@ const activeTab = ref('summary')
 const summary = ref(null)
 const summaryLoading = ref(false)
 const summaryError = ref('')
+// 长文档摘要进度：后端逐组回传 progress 事件；短文档没有这个事件，走逐 token 流式
+const summaryProgress = ref(null)
+const summaryPercent = computed(() => {
+  const p = summaryProgress.value
+  return p && p.total ? Math.round(p.done / p.total * 100) : 0
+})
+const summaryProgressTip = computed(() => {
+  const p = summaryProgress.value
+  if (!p) return '正在生成摘要…'
+  if (!p.done) return `长文档需分 ${p.total} 部分并行梳理，正在准备…`
+  return `已完成 ${p.done} / ${p.total} 部分`
+})
 const streamingSummary = ref('')   // 流式生成中的摘要文本（逐字预览）
 const regenInstruction = ref('')
 const keywords = ref([])
@@ -700,19 +761,29 @@ const noteSnippet = (n) => (n.content || '')
 
 // B8 阅读进度：滚动时计算当前页（防抖 1.5s 落库）
 let progressTimer = null
+// 当前阅读页码：即时更新，供「文本视图 / 原文视图」切换时恢复位置
+const activePage = ref(1)
+// 计算滚动容器内当前所在页（距容器顶部 120px 内最后一个页元素为准）
+// 无页锚点时返回 0（不记录）：编辑态 / 图片原文视图等没有 [data-page]，若默认按第 1 页写入会把进度改坏
+function currentPageOf(scroller) {
+  const pages = scroller.querySelectorAll('[data-page]')
+  if (!pages.length) return 0
+  const scrollerTop = scroller.getBoundingClientRect().top
+  let current = 1
+  for (const el of pages) {
+    if (el.getBoundingClientRect().top - scrollerTop < 120) current = Number(el.dataset.page)
+    else break
+  }
+  return current
+}
 function onReaderScroll(e) {
   const scroller = e.target
   updateActiveSection(scroller)   // 即时更新目录「定位选择」高亮
+  const current = currentPageOf(scroller)
+  if (!current) return            // 该视图没有页锚点，不参与进度记录
+  activePage.value = current
   if (progressTimer) clearTimeout(progressTimer)
   progressTimer = setTimeout(() => {
-    const pages = scroller.querySelectorAll('[data-page]')
-    const scrollerTop = scroller.getBoundingClientRect().top
-    let current = 1
-    for (const el of pages) {
-      if (el.getBoundingClientRect().top - scrollerTop < 120) {
-        current = Number(el.dataset.page)
-      } else break
-    }
     if (material.value && current !== material.value.last_read_page) {
       material.value.last_read_page = current
       materialApi.update(materialId, { last_read_page: current })
@@ -825,7 +896,7 @@ async function relocateFile() {
     ElMessage.error(e.response?.data?.detail || e.message || '重新定位失败')
   }
 }
-const fmtLabel = (f) => ({ pdf: 'PDF', ppt: 'PPT', pptx: 'PPT', doc: 'WORD', docx: 'WORD', md: 'MD', markdown: 'MD', mp3: '音频', wav: '音频', m4a: '音频', mp4: '视频', jpg: '图片', jpeg: '图片', png: '图片', webp: '图片', bmp: '图片' }[f] || (f || '').toUpperCase())
+const fmtLabel = (f) => ({ pdf: 'PDF', ppt: 'PPT', pptx: 'PPT', doc: 'WORD', docx: 'WORD', epub: 'EPUB', md: 'MD', markdown: 'MD', mp3: '音频', wav: '音频', m4a: '音频', mp4: '视频', jpg: '图片', jpeg: '图片', png: '图片', webp: '图片', bmp: '图片' }[f] || (f || '').toUpperCase())
 
 // 音视频：点分钟标记跳转播放进度
 function seekToMinute(minute) {
@@ -836,6 +907,11 @@ function seekToMinute(minute) {
 }
 
 function scrollToPage(page) {
+  // EPUB 原文视图：page_no 即章节序号，切章即可（iframe 由 activePage 驱动）
+  if (viewMode.value === 'origin' && isEpub.value) {
+    onEpubChapterChange(page)
+    return
+  }
   // PDF 原文视图：直接定位到对应页（页面容器常驻，可滚动）
   const pdfPage = document.querySelector('.pdf-page[data-page="' + page + '"]')
   if (viewMode.value === 'origin' && pdfPage) {
@@ -845,6 +921,47 @@ function scrollToPage(page) {
   viewMode.value = 'text'
   nextTick(() => document.getElementById('page-' + page)?.scrollIntoView({ behavior: 'smooth' }))
 }
+
+// EPUB 原文视图切章：与阅读进度共用 activePage，章节号即页码，切完直接落库
+function onEpubChapterChange(page) {
+  const n = Number(page) || 1
+  activePage.value = n
+  if (material.value && n !== material.value.last_read_page) {
+    material.value.last_read_page = n
+    materialApi.update(materialId, { last_read_page: n })
+  }
+}
+
+// 切换「文本视图 / 原文视图」时保持阅读进度
+// （两个视图互斥渲染，切换即重建 DOM，不做处理就会回到顶部）
+async function restoreReadingPosition(view, page) {
+  if (!page) return
+  await nextTick()
+  if (view === 'origin' && material.value?.format === 'pdf') {
+    // PDF：页容器常驻但 canvas 懒渲染，页高随渲染变化 → 轮询校正，直到偏移连续两次不变
+    let lastTop = -1
+    let stable = 0
+    let tries = 0
+    const step = () => {
+      const el = document.querySelector('.pdf-page[data-page="' + page + '"]')
+      if (el) {
+        el.scrollIntoView({ behavior: 'auto', block: 'start' })
+        stable = el.offsetTop === lastTop ? stable + 1 : 0
+        lastTop = el.offsetTop
+        if (stable >= 2) return
+      }
+      if (++tries < 12) setTimeout(step, 150)
+    }
+    step()
+    return
+  }
+  // 文本视图：优先页锚点，图片材料没有锚点时回退到带 data-page 的首个块
+  const anchor = document.getElementById('page-' + page) ||
+    document.querySelector('.reader [data-page="' + page + '"]')
+  anchor?.scrollIntoView({ behavior: 'auto', block: 'start' })
+}
+
+watch(viewMode, (to) => { restoreReadingPosition(to, activePage.value) })
 
 // 跳转 + 目标文本临时高亮 3 秒（text 为空则整段高亮）
 const flashLocate = ref(null)
@@ -1001,11 +1118,64 @@ function findRanges(content, needle) {
   return ranges
 }
 
+// Word/PPT 解析出的表格以 Markdown（GFM）表格存放，需单独交给 markdown-it 渲染成真表格；
+// 其余文本继续走纯文本 + 高亮的渲染路径（保字符偏移语义）。
+const MD_TABLE_ROW = /^\s*\|.*\|\s*$/
+const MD_TABLE_SEP = /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/
+
+function splitTableBlocks(text) {
+  const lines = (text || '').split('\n')
+  const out = []
+  let buf = []
+  const flush = () => { if (buf.length) { out.push({ text: buf.join('\n'), table: false }); buf = [] } }
+  let i = 0
+  while (i < lines.length) {
+    const cur = lines[i]
+    const nxt = lines[i + 1]
+    // 表格 = 一行 |...| + 紧随的分隔行 |---|---|；其后连续的 |...| 行都算表体
+    if (MD_TABLE_ROW.test(cur) && nxt !== undefined && nxt.includes('-') && nxt.includes('|')
+      && MD_TABLE_SEP.test(nxt)) {
+      flush()
+      const tbl = [cur, nxt]
+      i += 2
+      while (i < lines.length && MD_TABLE_ROW.test(lines[i])) { tbl.push(lines[i]); i++ }
+      out.push({ text: tbl.join('\n'), table: true })
+    } else {
+      buf.push(cur)
+      i++
+    }
+  }
+  flush()
+  return out
+}
+
+const MD_HEADING = /^(#{1,6})\s+(.+)$/
+
 function renderChunk(c) {
+  const content = c.content || ''
+  const blocks = splitTableBlocks(content)
+  if (blocks.length === 1 && !blocks[0].table) return renderBlock(c, blocks[0].text)
+  return blocks.map(b => (b.table
+    ? `<div class="md-table">${md.render(b.text)}</div>`
+    : renderBlock(c, b.text))).join('')
+}
+
+// 单块渲染：标题 → 标题样式（去掉 # 标记后再定位高亮，保证偏移正确）；其余走纯文本 + 高亮
+function renderBlock(c, text) {
+  const t = (text || '').trim()
+  const m = t.includes('\n') ? null : t.match(MD_HEADING)
+  if (m) {
+    const lv = Math.min(m[1].length, 3)
+    return `<div class="chunk-h lv${lv}">${renderChunkPlain(c, m[2])}</div>`
+  }
+  return renderChunkPlain(c, text)
+}
+
+function renderChunkPlain(c, content) {
   const fl = flashLocate.value
   // 临时定位闪烁：无具体文本时整段高亮
   if (fl && fl.page === c.page_no && !fl.text) {
-    return `<span class="hl-flash-temp">${escapeHtml(c.content)}</span>`
+    return `<span class="hl-flash-temp">${escapeHtml(content)}</span>`
   }
   const marks = [...(hlByPage.value.get(c.page_no) || [])]
   marks.push(...(userHlByPage.value.get(c.page_no) || []))
@@ -1017,15 +1187,15 @@ function renderChunk(c) {
   }
   let ranges = []
   for (const m of marks) {
-    for (const [s, e] of findRanges(c.content, m.text)) ranges.push({ s, e, kind: m.kind, refId: m.refId })
+    for (const [s, e] of findRanges(content, m.text)) ranges.push({ s, e, kind: m.kind, refId: m.refId })
   }
-  if (!ranges.length) return escapeHtml(c.content)
+  if (!ranges.length) return escapeHtml(content)
   // 边界切分：重叠区间按优先级渲染（flash 来源跳转 > note 笔记 > chain 解读 > 用户划线），
   // 否则闪烁高亮会被已存在的常驻高亮吞掉
   const KIND_PRIORITY = { 'flash-temp': 4, flash: 3, note: 2, chain: 1, yellow: 0, green: 0, blue: 0 }
   const KIND_TIP = { chain: '已 AI 解读，点击查看追问', note: '已转笔记', flash: '来源定位', 'flash-temp': '' }
   const USER_COLORS = ['yellow', 'green', 'blue']
-  const points = new Set([0, c.content.length])
+  const points = new Set([0, content.length])
   for (const r of ranges) { points.add(r.s); points.add(r.e) }
   const sorted = [...points].sort((a, b) => a - b)
   let html = ''
@@ -1033,7 +1203,7 @@ function renderChunk(c) {
     const s = sorted[i], e = sorted[i + 1]
     if (s >= e) continue
     const covering = ranges.filter(r => r.s < e && r.e > s)
-    const seg = escapeHtml(c.content.slice(s, e))
+    const seg = escapeHtml(content.slice(s, e))
     if (!covering.length) { html += seg; continue }
     covering.sort((a, b) => KIND_PRIORITY[b.kind] - KIND_PRIORITY[a.kind])
     const kind = covering[0].kind
@@ -1380,12 +1550,15 @@ async function genSummary(regen) {
   summaryLoading.value = true
   streamingSummary.value = ''
   summaryError.value = ''
+  summaryProgress.value = null
   try {
     await streamSSE('/api/ai/summary/stream',
       { material_id: materialId, instruction: regen ? regenInstruction.value || undefined : undefined },
       (t) => { streamingSummary.value += t },
       (payload) => { summary.value = payload.asset },
       (msg) => { throw new Error(msg) },
+      undefined,   // onMeta：摘要链路不使用
+      (p) => { summaryProgress.value = p },   // onProgress：长文档逐组回传
     )
     ElMessage.success(regen ? `已再生成（V${summary.value.version}）` : '摘要生成完成')
   } catch (e) {
@@ -1393,6 +1566,7 @@ async function genSummary(regen) {
   } finally {
     summaryLoading.value = false
     streamingSummary.value = ''
+    summaryProgress.value = null
     // streamingSummary 清空后 v-html 切换到 summary.content，需重新包裹 (P数字) 为可点击
     nextTick(makeSummaryPageClickable)
   }
@@ -1447,6 +1621,47 @@ watch([() => summary.value?.content, activeTab], async () => {
   await nextTick()
   makeSummaryPageClickable()
 })
+
+// ---------- 材料全文摘要 → 笔记 ----------
+// 状态口径：notes 里 anchor.kind === 'summary' 的那条（同一材料只沉淀一条摘要笔记）。
+// ⚠️ 不要用 source_asset_id 判断：「再生成」会新建 AIAsset（version+1、id 变化），
+// 按 asset id 会让按钮在再生成后重置回「转笔记」，重复沉淀。
+const summaryNote = computed(
+  () => notes.value.find(n => n.source_type === 'ai_asset' && n.anchor?.kind === 'summary') || null)
+// 「摘要已更新」用 version 比对（不用正文比对——用户编辑过笔记会误判为过期）
+const summaryStale = computed(() => {
+  const n = summaryNote.value, sv = summary.value
+  if (!n || !sv) return false
+  return Number(n.anchor?.version) !== Number(sv.version)
+})
+
+async function summaryToNote() {
+  const sv = summary.value
+  if (!sv?.content) return
+  if (streamingSummary.value) { ElMessage.warning('摘要生成中，请稍候再转笔记'); return }
+  try {
+    if (summaryNote.value) {
+      await ElMessageBox.confirm(
+        `已存在该摘要的笔记「${summaryNote.value.title}」，用当前摘要覆盖它的内容？你在笔记里做过的编辑会被覆盖。`,
+        '更新摘要笔记', { confirmButtonText: '覆盖更新', cancelButtonText: '取消', type: 'warning' })
+      await noteApi.update(summaryNote.value.id, {
+        title: summaryNote.value.title,
+        content: sv.content,
+        // 同步更新 anchor.version，否则版本比对会一直判定「摘要已更新」
+        anchor: { ...(summaryNote.value.anchor || {}), kind: 'summary', version: sv.version },
+      })
+      await refreshNotes()
+      ElMessage.success('笔记已更新为当前摘要')
+    } else {
+      const title = `全文摘要：${(material.value?.title || '材料').slice(0, 40)}`
+      await createNote(title, sv.content, 'ai_asset', sv.id, { kind: 'summary', version: sv.version })
+      ElMessage.success('已转笔记')
+    }
+  } catch (e) {
+    if (e === 'cancel' || e === 'close') return   // ElMessageBox 取消
+    ElMessage.error(errMsg(e, '转笔记失败'))
+  }
+}
 
 async function genKeywords(regen) {
   keywordsLoading.value = true
@@ -2019,6 +2234,7 @@ onMounted(async () => {
     material.value = m
     chunks.value = c
     if (isMedia.value) loadAsr()
+    if (isEpub.value) loadEpubChapters()
     await Promise.all([refreshNotes(), loadChains(), loadQuiz(), loadHighlights()])
     const { data: assets } = await aiApi.assets(materialId)
     if (assets.summary) summary.value = assets.summary
@@ -2279,6 +2495,7 @@ onUnmounted(() => {
 .rfmt-pdf { background: #d85a30; }
 .rfmt-ppt, .rfmt-pptx { background: #ba7517; }
 .rfmt-doc, .rfmt-docx { background: #185fa5; }
+.rfmt-epub { background: #15803d; }
 .rfmt-md, .rfmt-markdown { background: #475569; }
 .rfmt-mp3, .rfmt-wav, .rfmt-m4a { background: #0f766e; }
 .rfmt-mp4 { background: #6d28d9; }
@@ -2305,6 +2522,36 @@ onUnmounted(() => {
 .chunk::selection { background: rgba(124, 92, 252, .22); }
 /* 图片材料：OCR 结果为多行文本，保留换行、左对齐（不拉伸短行） */
 .chunk-image { white-space: pre-line; text-align: left; }
+
+/* ---- 表格 / 标题：Word/PPT 解析产物由 v-html 注入，**不带 scoped 的 data-v 属性**，
+       所以不能以 .md-table / .chunk-h 自身当锚点（那样选择器永不匹配、表格会没有边框），
+       必须挂在模板元素 .chunk 上再用 :deep() 穿透 ---- */
+.chunk :deep(.md-table) { margin: 14px 0; }
+.chunk :deep(.md-table-flash) { animation: hl-flash-temp 3s ease forwards; border-radius: 6px; }
+.chunk :deep(table),
+.md-body :deep(table) {
+  border-collapse: collapse; display: block; overflow-x: auto; max-width: 100%;
+  font-size: 13.5px; line-height: 1.7; text-align: left;
+}
+.chunk :deep(th), .chunk :deep(td),
+.md-body :deep(th), .md-body :deep(td) {
+  border: 1px solid var(--asc-border); padding: 8px 12px;
+  vertical-align: top; word-break: break-word; text-align: left;
+}
+.chunk :deep(th), .md-body :deep(th) {
+  background: var(--asc-surface-2); font-weight: 600;
+}
+.chunk :deep(tbody tr:nth-child(even) td),
+.md-body :deep(tbody tr:nth-child(even) td) { background: rgba(124, 92, 252, .045); }
+
+/* Word 标题（解析时带 # 前缀，渲染为标题样式） */
+.chunk :deep(.chunk-h) {
+  font-weight: 600; color: var(--asc-text); line-height: 1.55;
+  text-align: left; letter-spacing: .2px;
+}
+.chunk :deep(.chunk-h.lv1) { font-size: 19px; margin: 26px 0 12px; }
+.chunk :deep(.chunk-h.lv2) { font-size: 16.5px; margin: 22px 0 10px; padding-left: 10px; border-left: 3px solid var(--asc-primary); }
+.chunk :deep(.chunk-h.lv3) { font-size: 15px; margin: 18px 0 8px; color: var(--asc-text-2); }
 
 /* 划线工具条 */
 .sel-toolbar {
@@ -2392,6 +2639,13 @@ onUnmounted(() => {
   border-bottom: 1px dashed var(--asc-primary); transition: background .15s;
 }
 .summary-text :deep(.sum-page-link):hover { background: rgba(124, 92, 252, .15); }
+/* 摘要操作行：与下方「补充指令 + 再生成」合并为同一块底栏（分隔线只留一条） */
+.summary-ops {
+  display: flex; align-items: center; gap: 4px; flex-shrink: 0;
+  padding: 8px 2px 0; background: var(--asc-bg);
+  border-top: 1px solid var(--asc-divider);
+}
+.summary-body .regen-row { border-top: none; padding-top: 6px; }
 /* 固定底栏：Tab 页 = 滚动区 + 底部固定操作行 */
 .pane-wrap { display: flex; flex-direction: column; height: 100%; }
 .pane-scroll { flex: 1; overflow-y: auto; padding: 4px 2px; }
@@ -2546,6 +2800,8 @@ onUnmounted(() => {
   background: var(--asc-primary-soft); border-radius: 8px;
   font-size: 13px; color: var(--asc-primary);
 }
+/* 长文档分组摘要的进度条：与 gen-tip 同区居中收窄，不撑满整栏 */
+.gen-progress { width: 240px; margin: 8px auto 0; flex-shrink: 0; }
 .chunk-edit-row { margin-bottom: 10px; }
 .edit-row-head {
   display: flex; align-items: center; justify-content: space-between;

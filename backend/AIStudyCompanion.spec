@@ -16,7 +16,10 @@ datas += [('../frontend/dist', 'dist')]
 # 收集依赖（动态库 + 数据文件 + 隐藏导入）
 for pkg in ['faster_whisper', 'ctranslate2', 'onnxruntime', 'tokenizers',
             'chromadb', 'uvicorn', 'openai', 'pypdf', 'docx', 'pptx', 'webview',
-            'rapidocr_onnxruntime', 'cv2', 'fitz', 'pymupdf', 'shapely', 'pyclipper', 'PIL']:
+            'lxml',   # EPUB 章节 XHTML 解析：此前靠依赖链偶然带入，显式收集保证两个平台都齐
+            'rapidocr_onnxruntime', 'cv2', 'fitz', 'pymupdf', 'shapely', 'pyclipper', 'PIL',
+            # AI 播客 TTS：edge-tts（免费音色）+ aiohttp（WebSocket 客户端，含 C 扩展，需显式收集）
+            'edge_tts', 'aiohttp', 'certifi']:
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b

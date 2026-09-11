@@ -9,6 +9,8 @@ import threading
 import time
 import webbrowser
 
+from app_version import __version__ as APP_VERSION
+
 PORT = int(os.environ.get("ASC_PORT", "8000"))
 
 # 启动 loading 页：内联 HTML，不依赖后端。窗口先显示它，前端轮询 /api/health 就绪后自动跳转主页。
@@ -88,6 +90,43 @@ def _webview_storage_path():
     return str(p)
 
 
+def _purge_webview_cache_on_upgrade():
+    """版本变化时清掉 WebView 的 HTTP/JS 缓存（保留 Local Storage）。
+
+    背景：前端静态资源此前无 Cache-Control，浏览器对 index.html 走「启发式缓存」，
+    升级后仍复用旧入口 → 去请求新包里已不存在的旧分片（404）→ 路由懒加载静默失败，
+    表现为「点菜单/按钮没反应」。此处在启动窗口创建前清理缓存，从根上避免。
+    """
+    import json
+    import shutil
+    from app.core.config import settings
+
+    state_path = settings.data_dir / "launcher_state.json"
+    try:
+        old = json.loads(state_path.read_text(encoding="utf-8")).get("version", "")
+    except Exception:
+        old = ""   # 无状态文件（含首次从旧版升级）→ 同样清理一次，代价只是首次冷启动
+    if old == APP_VERSION:
+        return
+
+    default_dir = settings.data_dir / "webview" / "EBWebView" / "Default"
+    for name in ("Cache", "Code Cache", "Service Worker"):
+        target = default_dir / name
+        if not target.exists():
+            continue
+        shutil.rmtree(target, ignore_errors=True)
+        if target.exists():   # 删除失败时改名（等效失效，且不影响运行）
+            try:
+                target.rename(target.with_name(f"{name}.old-{int(time.time())}"))
+            except Exception:
+                pass
+    try:
+        state_path.write_text(json.dumps({"version": APP_VERSION}), encoding="utf-8")
+        print(f"[launcher] 版本 {old or '(首次)'} → {APP_VERSION}，已清理 WebView 旧缓存")
+    except Exception as e:
+        print(f"[launcher] 写入版本状态失败：{e}")
+
+
 class _Api:
     """pywebview js_api：暴露原生文件/文件夹选择，前端拿到真实路径后做「本地文件直引」"""
 
@@ -112,6 +151,7 @@ class _Api:
 
 def main():
     _ensure_models()
+    _purge_webview_cache_on_upgrade()   # 升级后清 WebView 旧缓存（须在窗口创建前）
 
     import uvicorn
 

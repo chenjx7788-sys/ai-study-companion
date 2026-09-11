@@ -6,6 +6,7 @@ const routes = [
   { path: '/knowledge', name: 'knowledge', component: () => import('../views/KnowledgeView.vue'), meta: { title: '知识库' } },
   { path: '/chat', name: 'chat', component: () => import('../views/ChatView.vue'), meta: { title: 'AI 问答' } },
   { path: '/review', name: 'review', component: () => import('../views/ReviewView.vue'), meta: { title: '复习巩固' } },
+  { path: '/podcast', name: 'podcast', component: () => import('../views/PodcastView.vue'), meta: { title: 'AI 播客' } },
   { path: '/stats', name: 'stats', component: () => import('../views/StatsView.vue'), meta: { title: '数据统计' } },
   { path: '/settings', name: 'settings', component: () => import('../views/SettingsView.vue'), meta: { title: '管理中心' } },
   { path: '/editor', name: 'editor', component: () => import('../views/EditorView.vue'), meta: { title: '新增文档' } },

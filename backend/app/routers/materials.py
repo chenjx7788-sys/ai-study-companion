@@ -2,9 +2,12 @@
 
 解析状态机：parsing → success / failed / scanned（无文本层的扫描件）
 """
+import posixpath
+import re
 import shutil
 import threading
 from pathlib import Path
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel
@@ -17,9 +20,12 @@ from ..services import parser as parser_svc
 
 router = APIRouter(prefix="/materials", tags=["materials"])
 
-ALLOWED_FORMATS = {"pdf", "ppt", "pptx", "doc", "docx", "md", "markdown",
+ALLOWED_FORMATS = {"pdf", "ppt", "pptx", "doc", "docx", "md", "markdown", "epub",
                    "mp3", "wav", "m4a", "mp4",
                    "jpg", "jpeg", "png", "webp", "bmp"}
+
+# 支持列表文案：多处提示共用，避免改格式时漏改某一处
+FORMAT_HINT = "PDF/PPT/Word/Markdown/EPUB/图片/音视频"
 
 
 # ---------- 序列化 ----------
@@ -106,6 +112,9 @@ def _parse_material(material_id: int):
             else:
                 if m.format in parser_svc.IMAGE_FORMATS or m.format == "pdf":
                     m.parse_error = "OCR 未识别到文字（图片可能模糊/空白，或为手写内容）"
+                elif m.format == "epub":
+                    m.parse_error = ("未提取到文本：该 EPUB 正文可能是纯图片（漫画 / 影印版），"
+                                     "可在「原文视图」翻看原书页面")
                 else:
                     m.parse_error = "未提取到文本，可能是扫描件"
             db.commit()
@@ -151,7 +160,7 @@ async def upload_material(file: UploadFile = File(...), db: Session = Depends(ge
     filename = file.filename or "未命名"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext not in ALLOWED_FORMATS:
-        raise HTTPException(400, "暂支持 PDF/PPT/Word/Markdown/图片（jpg/png/webp/bmp）/音频（mp3/wav/m4a）/视频（mp4）格式")
+        raise HTTPException(400, f"暂支持 {FORMAT_HINT} 格式")
 
     content = await file.read()
     if len(content) > settings.max_file_mb * 1024 * 1024:
@@ -320,7 +329,7 @@ def import_local(req: ImportLocalReq, db: Session = Depends(get_db)):
                 failed.append(fail)
 
     if not found:
-        raise HTTPException(400, "未找到支持格式的文件（PDF/PPT/Word/Markdown/图片/音视频）")
+        raise HTTPException(400, f"未找到支持格式的文件（{FORMAT_HINT}）")
     return {"created": created, "failed": failed}
 
 
@@ -553,6 +562,7 @@ def get_file(material_id: int, download: bool = False, db: Session = Depends(get
     media_map = {
             "pdf": "application/pdf", "mp3": "audio/mpeg", "wav": "audio/wav",
             "m4a": "audio/mp4", "mp4": "video/mp4",
+            "epub": "application/epub+zip",
             "md": "text/markdown", "markdown": "text/markdown",
             "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
             "webp": "image/webp", "bmp": "image/bmp",
@@ -567,6 +577,96 @@ def get_file(material_id: int, download: bool = False, db: Session = Depends(get
                         filename=f"{m.title}.{m.format}",
                         headers={"Cache-Control": "no-cache"},
                         content_disposition_type="attachment" if download else "inline")
+
+
+# ---------- EPUB 原文视图（章节清单 + zip 资源镜像） ----------
+
+# 服务端剥脚本：iframe 已禁用脚本，这里再做一层兜底（防用户拿到 /epub-res 直链时执行）
+_SCRIPT_RE = re.compile(r"<script\b[^>]*>.*?</script\s*>", re.I | re.S)
+_SCRIPT_SELF_RE = re.compile(r"<script\b[^>]*/\s*>", re.I)
+
+
+def _strip_script(text: str) -> str:
+    return _SCRIPT_SELF_RE.sub("", _SCRIPT_RE.sub("", text))
+
+
+def _epub_material(db: Session, material_id: int) -> Material:
+    """取 EPUB 材料并校验状态（章节清单与资源接口共用）"""
+    m = db.get(Material, material_id)
+    if not m:
+        raise HTTPException(404, "材料不存在")
+    if (m.format or "").lower() != "epub":
+        raise HTTPException(400, "该材料不是 EPUB")
+    if not Path(m.file_path).exists():
+        raise HTTPException(404, "源文件已丢失")
+    return m
+
+
+@router.get("/{material_id}/epub")
+def epub_chapters(material_id: int, db: Session = Depends(get_db)):
+    """EPUB 章节清单：原文视图的分章导航
+
+    index 与 MaterialChunk.page_no 一一对应，前端据此把「左栏目录」和 iframe 章节对齐。
+    href 为 zip 内相对路径，前端拼上 /epub-res/ 前缀即得章节 URL。
+    """
+    from ..services import epub as epub_svc
+    m = _epub_material(db, material_id)
+    try:
+        with epub_svc.EpubBook(m.file_path) as book:
+            return {"chapters": book.chapters()}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.get("/{material_id}/epub-res/{res_path:path}")
+def epub_resource(material_id: int, res_path: str, db: Session = Depends(get_db)):
+    """EPUB 原文视图资源镜像：按 zip 内原始路径回吐章节 XHTML / 图片 / CSS / 字体
+
+    为什么镜像 zip 目录结构而不是「按章号取正文」：章节 XHTML 里的相对引用
+    （../Images/a.png、../Styles/main.css，以及 CSS 内的 url()）会随路径自然解析到本接口，
+    服务端无需重写任何链接，书内样式与插图得以原样生效。
+
+    路径安全：normalpath 后必须留在 zip 内（拒绝 .. 越界）；zip 名集合本身也是白名单，
+    未命中即 404，不会读出归档外的东西。
+    """
+    from fastapi.responses import Response
+    from ..services import epub as epub_svc
+    m = _epub_material(db, material_id)
+
+    # uvicorn 已对 path 做过一次百分号解码，但前端可能又编码过一次 → 两种形态都试
+    candidates: list[str] = []
+    for raw in (res_path, unquote(res_path)):
+        p = posixpath.normpath(raw).lstrip("/")
+        if p and p != "." and not p.startswith("..") and p not in candidates:
+            candidates.append(p)
+    if not candidates:
+        raise HTTPException(400, "非法资源路径")
+
+    try:
+        with epub_svc.EpubBook(m.file_path) as book:
+            data = None
+            for p in candidates:
+                try:
+                    data = book.read(p)
+                    break
+                except KeyError:
+                    continue
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if data is None:
+        raise HTTPException(404, "资源不存在")
+
+    media = epub_svc.media_type(candidates[0])
+    if epub_svc.is_html(candidates[0]):
+        # 章节统一「自行解码 → 剥脚本 → 以 UTF-8 重编码」后回吐，并显式声明 charset：
+        # 原样回吐字节时，若文件既无 XML 声明也无 <meta charset>，浏览器会按 windows-1252
+        # 猜编码，中文整篇乱码（服务端已有可靠解码链，不必让浏览器再猜一次）。
+        data = _strip_script(epub_svc.decode_text(data)).encode("utf-8")
+        media = "text/html; charset=utf-8"
+    return Response(content=data, media_type=media, headers={
+        "Cache-Control": "no-cache",            # 与 get_file 同理：id 复用会串档，必须每次校验
+        "X-Content-Type-Options": "nosniff",
+    })
 
 
 @router.patch("/{material_id}")

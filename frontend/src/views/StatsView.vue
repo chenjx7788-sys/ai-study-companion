@@ -1,12 +1,12 @@
 <template>
   <div class="page stats-page">
-    <!-- 页头 -->
-    <div class="page-header">
-      <div>
-        <div class="page-title">数据统计</div>
-        <div class="page-desc">你的学习成果，AI 来帮你分析 · 数据实时聚合自本机行为</div>
-      </div>
-    </div>
+    <PageHead title="数据统计" sub="你的学习成果，AI 来帮你分析 · 数据实时聚合自本机行为">
+      <template #icon>
+        <svg viewBox="0 0 16 16" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round">
+          <path d="M3 13h2V8H3v5zM7 13h2V3H7v10zM11 13h2V6h-2v7z" />
+        </svg>
+      </template>
+    </PageHead>
 
     <!-- L1 概览层 -->
     <div class="stats-hero" v-loading="loading">
@@ -174,6 +174,18 @@
           </div>
           <div class="md-preview" v-html="renderedReport"></div>
           <span v-if="reporting" class="stream-cursor"></span>
+
+          <!-- 转笔记：把这份 AI 报告沉淀成笔记（材料无关，落知识库「按笔记」） -->
+          <div class="report-ops" v-if="!reporting && currentReport">
+            <el-button v-if="!weeklyNote" size="small" text type="primary"
+              :disabled="noteBusy" @click="reportToNote">转笔记</el-button>
+            <template v-else>
+              <el-button size="small" text type="success"
+                @click="openWeeklyNote(weeklyNote.id)">✓ 已转笔记 · 查看</el-button>
+              <el-button v-if="weeklyStale" size="small" text type="warning"
+                :disabled="noteBusy" @click="reportToNote">报告已更新 · 更新笔记</el-button>
+            </template>
+          </div>
         </div>
       </div>
       <div class="report-history" v-if="history.length">
@@ -185,14 +197,19 @@
       </div>
     </div>
   </div>
+    <!-- 笔记查看弹窗：转笔记后「查看」在当前页打开，不再跳转知识库 -->
+    <NoteEditorDialog v-model="noteView.show" :note-id="noteView.id" @changed="loadAiNotes" />
 </template>
 
 <script setup>
 import { ref, reactive, computed, onMounted, h } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import MarkdownIt from 'markdown-it'
-import { statsApi, reviewApi } from '../api'
+import { statsApi, reviewApi, noteApi } from '../api'
+import { errMsg } from '../api/http'
+import NoteEditorDialog from '../components/NoteEditorDialog.vue'
 import { streamSSE } from '../utils/sse'
+import PageHead from '../components/PageHead.vue'
 
 const md = new MarkdownIt({ breaks: true })
 
@@ -439,6 +456,91 @@ const renderedReport = computed(() => {
   const content = displayReport.value?.content || ''
   return content ? md.render(content) : ''
 })
+
+// ---------- 报告转笔记 ----------
+// 报告是「材料无关」的产物（不归属任何单一材料），所以笔记落 material_id=NULL，
+// 只能在知识库「按笔记」里看到 —— 与 AI 问答转笔记同一类。
+const aiNotes = ref([])          // 材料无关笔记（问答 / 周报 / 播客脚本）
+const noteBusy = ref(false)
+// 「已转笔记 · 查看」→ 当前页弹窗打开（共用组件）
+const noteView = reactive({ show: false, id: null })
+
+async function loadAiNotes() {
+  try {
+    // ⚠️ 这里只用 anchor 判断「本周报告转过笔记没有」，不需要正文 →
+    // 带 slim=1，否则会把全部周报 / 播客脚本 / 问答沉淀的正文一起拉下来。
+    // （「查看」走 NoteEditorDialog，按 id 单独拉全文，不受影响。）
+    const { data } = await noteApi.list(null, { slim: 1 })
+    aiNotes.value = data
+  } catch { /* 静默：拿不到笔记列表不影响看统计 */ }
+}
+
+// 状态口径用「ISO 周」这个稳定业务键，**不是 report id** —— 周报「再生成」会换 id
+// （同一 ISO 周只保留最新一份），按 id 判重会让按钮重置回「转笔记」→ 笔记重复沉淀。
+const weeklyNote = computed(() => {
+  const wk = currentReport.value?.week
+  if (!wk) return null
+  return aiNotes.value.find(
+    n => n.anchor?.kind === 'weekly_report' && n.anchor?.week === wk) || null
+})
+// 「报告已更新」= 本周报告被重新生成过（id 变了）。用版本/指纹比对，不用正文比对 ——
+// 后者会被「用户编辑过笔记」误判为过期，覆盖时毁掉编辑。
+const weeklyStale = computed(() =>
+  !!weeklyNote.value && weeklyNote.value.anchor?.report_id !== currentReport.value?.id)
+
+function reportNoteContent(r) {
+  const parts = []
+  if (r?.summary) parts.push(`**本周概览**：${r.summary}`)
+  if (r?.content) parts.push(r.content)
+  return parts.join('\n\n')
+}
+
+async function reportToNote() {
+  const r = currentReport.value
+  if (!r) return
+  // 防御：没有 week 就没有稳定业务键，此时写下去会让不同周的报告撞同一个键
+  if (!r.week) return ElMessage.warning('这份报告缺少周次信息，请重新生成后再转笔记')
+  const content = reportNoteContent(r)
+  if (content.trim().length < 2) return ElMessage.warning('报告内容为空，无法转笔记')
+
+  const anchor = {
+    kind: 'weekly_report',
+    week: r.week,
+    report_id: r.id,
+    key: `weekly_report:${r.week}`,
+  }
+  noteBusy.value = true
+  try {
+    if (weeklyNote.value) {
+      // 覆盖更新：同一条笔记推进到最新版，不新建（避免重复沉淀）
+      await ElMessageBox.confirm(
+        '本周报告已重新生成。更新后，你在笔记里做过的编辑会被最新报告内容覆盖。',
+        '更新笔记', { type: 'warning', confirmButtonText: '覆盖更新', cancelButtonText: '取消' })
+      const { data } = await noteApi.update(weeklyNote.value.id, { content, anchor })
+      if (data?.reindex_warning) ElMessage.warning(data.reindex_warning)
+      else ElMessage.success('笔记已更新')
+    } else {
+      const { data } = await noteApi.fromAi({
+        title: r.title || '学习周报', content, source_type: 'weekly_report', anchor,
+      })
+      if (data?.note?.reindex_warning) ElMessage.warning(data.note.reindex_warning)
+      else ElMessage.success('已转成笔记')
+    }
+    await loadAiNotes()
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(errMsg(e, '转笔记失败'))
+  } finally {
+    noteBusy.value = false
+  }
+}
+
+// 「查看」跳转到知识库页并直接打开这条笔记的编辑器 ——
+// 复用那份功能最全的笔记编辑器（含 AI 改写），不必在这里再复制一份。
+// 转笔记后「查看」：在当前页弹窗打开该笔记（与知识库同一份编辑器组件）
+function openWeeklyNote(id) {
+  noteView.id = Number(id)
+  noteView.show = true
+}
 function issueTitles(issues) {
   return (issues || []).map(i => (typeof i === 'string' ? i : i.title)).join(' · ')
 }
@@ -504,16 +606,12 @@ onMounted(() => {
   loadOverview()
   loadReview()
   loadHistory()
+  loadAiNotes()
 })
 </script>
 
 <style scoped>
 .stats-page { max-width: 1280px; }
-
-/* ===== 页头：疏朗 ===== */
-.page-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 40px; }
-.page-title { font-size: 24px; font-weight: 600; letter-spacing: -0.01em; }
-.page-desc { font-size: 13px; color: var(--asc-text-3); margin-top: 6px; }
 
 /* ===== L1 概览层：留白分层，去卡片边框 ===== */
 .stats-hero { display: flex; gap: 56px; margin-bottom: 56px; align-items: stretch; }
@@ -648,6 +746,10 @@ onMounted(() => {
   background: #fff; border-radius: 4px; padding: 1px 8px;
 }
 .diag-chip-detail { font-size: 12.5px; color: #7c5a2a; line-height: 1.5; }
+.report-ops {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--asc-divider);
+}
 .report-history { margin-top: 20px; }
 .report-history h4 { font-size: 13px; font-weight: 600; color: var(--asc-text-2); margin: 0 0 10px; }
 .history-item {
