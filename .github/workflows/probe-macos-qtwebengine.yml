@@ -1,0 +1,126 @@
+name: Probe macOS QtWebEngine
+
+# 阶段 0 验证门 —— 只回答一个问题：
+#   pywebview 的 qt 后端在 macOS 上能不能跑起来，且**不会静默回落 cocoa**。
+# 判据 D1-D5 全绿 = 放行阶段 1（换 GUI 外壳）；D6（打包 + 冒烟）在阶段 1 单独验收。
+#
+# 触发方式**只有手动**（Actions 页 → Run workflow）：
+#   刻意不挂 tag、不挂 push —— 它与发布链路完全无关，不该被日常提交反复触发，
+#   也不该出现在 Releases 的触发路径里。
+#
+# 为什么值得单独跑这个门：阶段 0 的成本是 1-2 人日，而阶段 1（换外壳）是 18.5 人日。
+# 这个门把 R1/R7 两个高风险项压缩成一次 CI 跑批，让「路走不通」在投入之前就暴露。
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false          # 双架构互不影响：一个红不影响另一个出结论
+      matrix:
+        include:
+          - os: macos-14        # Apple Silicon (arm64)
+            arch: arm64
+            label: Apple Silicon
+          - os: macos-15-intel  # Intel (x86_64)
+            arch: x86_64
+            label: Intel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 只装探针自己需要的两个包，**不碰 backend/requirements.txt**：
+      # 阶段 0 是前置验证，不该在这一步改动生产依赖（新增 pywebview[pyside6] 属阶段 1）。
+      # 版本与 Windows 侧已实测的基线一致（PySide6 6.11.2 内嵌 Chromium 140），
+      # 便于两平台横向对比；要升级请当作一次有意识的改动，别顺手 latest。
+      - name: 安装探针依赖（PySide6 + QtPy，不入 requirements）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "PySide6==6.11.2" "QtPy==2.4.3"
+
+      # 两个未知里任选一个写死，都可能让这唯一一次跑批白费：
+      #   ① runner 到底有没有 GUI 会话（没验证过就当它没有 = 未经验证的假设）；
+      #   ② offscreen 平台下 QtWebEngine 能不能起来（同样没验证过）。
+      # 所以先**探测再决定**，并把选择结果写进日志（它本身是阶段 1 的一条风险输入）：
+      #   能起 → cocoa（= 真实产品形态，取到的证据更贴近生产）
+      #   起不来 → 退化 offscreen
+      # 写法注意：用 `if cmd; then` 而不是事后看 `$?` —— run 步骤默认 `bash -e`，
+      # 命令失败会直接中断整步，后面那半段根本不会执行。
+      # 另：默认平台起不来时进程可能直接 abort（SIGABRT），所以给这一步单独设超时。
+      - name: 选择 Qt 平台插件（默认优先 / offscreen 兜底）
+        id: qpa
+        timeout-minutes: 5
+        run: |
+          if QT_QPA_PLATFORM=cocoa python -c "import sys;from PySide6.QtWidgets import QApplication as A;from PySide6.QtWebEngineWidgets import QWebEngineView as V;A(sys.argv[:1]);V();print('cocoa smoke ok')"; then
+            echo "value=cocoa" >> "$GITHUB_OUTPUT"
+            echo "Qt 平台 = cocoa（默认平台可用，按真实产品形态取证）"
+          else
+            echo "value=offscreen" >> "$GITHUB_OUTPUT"
+            echo "Qt 平台 = offscreen（cocoa 起不来，已退化 —— 这本身是阶段 1 的风险输入）"
+          fi
+
+      - name: 跑阶段 0 探针（退出码即 go / no-go）
+        env:
+          # 0 = 放行 / 1 = 不放行 / 3 = 证据不足（非 no-go，请重跑）
+          QT_QPA_PLATFORM: ${{ steps.qpa.outputs.value }}
+          PROBE_TIMEOUT: "45"
+        run: |
+          set -o pipefail
+          python backend/scripts/probe_macos_qtwebengine.py \
+            --out "report-${{ matrix.arch }}.json" 2>&1 | tee "probe-${{ matrix.arch }}.log"
+
+      # 退出码为 0 也可能是「报告没写成」这类静默故障（例如 --out 路径不可写）。
+      # 这条断言把它挡住：没有证据的绿不算绿。
+      # 另外两件必须挡的事：
+      #   ① 判据组缺项（例：D1 早退时报告里只有 D1）→ 证据不完整，不得据此放行；
+      #   ② needs_rerun 非空（外网不可达导致判据没跑到）→ 那是环境问题，不是 no-go，
+      #      必须让人重跑而不是让人读到一句「不放行」。
+      - name: 校验报告（防「退出码绿但证据缺失」）
+        if: success()
+        run: |
+          test -s "report-${{ matrix.arch }}.json" || { echo "::error::判定报告缺失"; exit 1; }
+          python - <<'PY'
+          import json, sys
+          arch = "${{ matrix.arch }}"
+          with open("report-%s.json" % arch, encoding="utf-8") as f:
+              d = json.load(f)
+          rows = d.get("results", [])
+          judge = {r.get("judge") for r in rows}
+          missing = [j for j in ("D1", "D2", "D3", "D4", "D5") if j not in judge]
+          bad = [r for r in rows if r.get("status") == "FAIL"]
+          skips = [r for r in rows if r.get("status") == "SKIP"]
+          print("架构 %s ｜ QPA %s ｜ 判据项 %d ｜ FAIL %d ｜ SKIP %d"
+                % (arch, d.get("qpa"), len(rows), len(bad), len(skips)))
+          for r in bad:
+              print("  FAIL %s %s —— %s" % (r.get("judge"), r.get("name"), r.get("detail")))
+          for r in skips:
+              print("  SKIP %s %s —— %s" % (r.get("judge"), r.get("name"), r.get("detail")))
+          if not rows:
+              print("::error::报告里没有任何判据项")
+              sys.exit(1)
+          if missing:
+              print("::error::报告缺少判据组 %s —— 证据不完整，不得据此放行" % missing)
+              sys.exit(1)
+          if d.get("needs_rerun"):
+              print("::error::证据不足（不是 no-go），请重跑：%s" % d["needs_rerun"][0])
+              sys.exit(1)
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: 上传判定报告与日志
+        if: always()   # 红的时候更需要日志 —— 别让失败把证据一起丢掉
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-macos-qtwebengine-${{ matrix.arch }}
+          path: |
+            report-${{ matrix.arch }}.json
+            probe-${{ matrix.arch }}.log
+          if-no-files-found: warn
