@@ -36,12 +36,32 @@ if _sys.platform == 'darwin':
         except Exception:
             pass
 
-# ⚠️ 阶段 1（GUI 外壳换 Qt）必须在这里补 PySide6 / shiboken6 的 collect_all：
+# ⚠️ 阶段 1（GUI 外壳换 Qt）：必须显式收集 PySide6 / shiboken6 / qtpy。
 #    launcher.py 只 `import webview`，而 pywebview 的 qt 后端是**运行期**按需 import
 #    （webview/guilib.py 里 import webview.platforms.qt），PyInstaller 静态分析看不到 →
-#    不显式收集就会打成「装了 PySide6 但包里缺 QtWebEngine」，且要到真机运行才暴露。
-#    上方 macOS 的 pyobjc 收集（if _sys.platform == 'darwin'）在阶段 1 后可保留，不必删
+#    不显式收集就会打成「装了 PySide6 但包里缺 QtWebEngine」，且要到真机运行才暴露
+#    （症状：静默回落到 winforms/cocoa，浏览器能力整体不见）。
+#    ⚠️ 必须用 collect_all、不能只写 hiddenimports：QtWebEngine 还要 QtWebEngineProcess
+#    可执行文件与 resources/*.pak 等数据文件，只列模块名收集不到它们。
+#    上方 macOS 的 pyobjc 收集（if _sys.platform == 'darwin'）在阶段 1 后保留，不必删
 #    —— cocoa 仍是回落候选（webview/guilib.py 的 Darwin 分支是 [cocoa, qt]）。
+_QT_PKGS = ['PySide6', 'shiboken6', 'qtpy']
+# 显式列出后端真正会用到的子模块：qtpy 是**动态**选绑定，静态分析连 import 都看不见
+_QT_HIDDEN = ['PySide6.QtWebEngineWidgets', 'PySide6.QtWebEngineCore', 'PySide6.QtWebChannel',
+              'PySide6.QtWidgets', 'PySide6.QtGui', 'PySide6.QtNetwork', 'PySide6.QtCore',
+              'qtpy']
+for pkg in _QT_PKGS:
+    try:
+        d, b, h = collect_all(pkg)
+        datas += d
+        binaries += b
+        hiddenimports += h
+    except Exception as _e:
+        # ⚠️ 大声失败，绝不静默跳过 —— 静默跳过 = 打出一个「没有 QtWebEngine 的 Qt 客户端」
+        print('[spec] ⚠️ collect_all(%s) 失败：%s: %s' % (pkg, type(_e).__name__, _e))
+        print('[spec] ⚠️ 先装齐依赖再打包：pip install -r backend/requirements.txt'
+              '（含 pywebview[pyside6] 拉来的 PySide6 + qtpy）')
+hiddenimports += _QT_HIDDEN
 
 # BGE 向量模型随包（启动器首次启动时预置到用户目录）
 datas += [('data/models/bge-small-zh-v1.5', 'data/models/bge-small-zh-v1.5')]
