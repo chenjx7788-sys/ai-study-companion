@@ -85,6 +85,52 @@ def _open_browser():
     webbrowser.open(f"http://127.0.0.1:{PORT}")
 
 
+def _ensure_qt_backend():
+    """显式要求 Qt 后端，并在启动前预检依赖（阶段 1：外壳 WebView2/WKWebView → QtWebEngine）
+
+    ⚠️ 为什么不能只设环境变量就算切换 —— webview/guilib.py 的后端候选是**列表回退**：
+        Windows：PYWEBVIEW_GUI=qt → [import_qt, import_winforms]；未设 → [import_winforms]
+        Darwin ：PYWEBVIEW_GUI=qt → [import_qt, import_cocoa]；  未设 → [import_cocoa, import_qt]
+      即 qt 起不来时会**静默回落到旧后端**：不报错、不警告，表现成「应用一切正常，
+      只是浏览器相关能力不见」。所以「设了变量」不等于「切换成功」。
+    本函数只负责「表达意图 + 启动前预检」；真正的判据是启动后的
+    _report_webview_backend()（读 webview.guilib 的**实际**值）。
+    """
+    if "PYWEBVIEW_GUI" not in os.environ:
+        os.environ["PYWEBVIEW_GUI"] = "qt"      # setdefault 语义：尊重调用方已设的值
+    want = os.environ["PYWEBVIEW_GUI"].strip().lower()
+    if want != "qt":
+        print(f"[launcher] 后端由 PYWEBVIEW_GUI={want} 指定（非默认 qt），跳过 Qt 预检")
+        return
+    try:
+        import qtpy  # noqa: F401          # pywebview 的 qt 后端走 qtpy 抽象层（只随 extras 安装）
+        from qtpy.QtWebEngineWidgets import QWebEngineView  # noqa: F401
+        print("[launcher] Qt 后端预检通过（qtpy + QtWebEngine 可导入）")
+    except Exception as e:
+        print(f"[launcher] ⚠️ Qt 后端预检失败：{type(e).__name__}: {e}")
+        print("[launcher] ⚠️ pywebview 将静默回落到旧后端（Windows=WebView2 / macOS=WKWebView）——"
+              "打包版出现此警告即表示 spec 漏收 PySide6，见 AIStudyCompanion.spec")
+
+
+def _report_webview_backend():
+    """webview.start() 确定后端后回调：把**实际**后端写进日志，供事后核对（防静默回落）。
+
+    ⚠️ 只读 webview.guilib 的模块属性，不碰任何 Qt 控件 —— 本回调运行在工作线程
+    （实测 Thread-2）；跨线程操作 Qt 控件会挂死（阶段 0 阴性对照 rc=3）。
+    """
+    import webview
+    name = getattr(webview.guilib, "__name__", "unknown")
+    line = "%s  backend=%s  want=PYWEBVIEW_GUI=%s" % (
+        time.strftime("%Y-%m-%d %H:%M:%S"), name, os.environ.get("PYWEBVIEW_GUI", "<unset>"))
+    print(f"[launcher] webview {line}")
+    try:
+        from app.core.config import settings
+        with open(settings.data_dir / "launcher_backend.log", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        print(f"[launcher] 后端日志写入失败：{e}")
+
+
 def _webview_storage_path():
     """WebView 持久化存储目录：localStorage（新手引导/侧边栏折叠等本地记忆）
 
@@ -185,6 +231,7 @@ def main():
         try:
             import webview
             from mascot_b64 import MASCOT_B64
+            _ensure_qt_backend()   # 阶段 1：显式要求 Qt 后端（失败会被静默回落，见该函数注释）
             # 允许下载（导出笔记/备份等），否则 WebView2 默认静默取消下载，界面无任何反馈
             webview.settings['ALLOW_DOWNLOADS'] = True
             # 先显示 loading 窗口（内联 HTML，不依赖后端），后端在后台线程启动
@@ -201,7 +248,8 @@ def main():
             threading.Thread(target=start_backend, daemon=True).start()
             # private_mode=False + 持久化 storage_path：否则 localStorage 每次退出清空，
             # 新手引导、侧边栏折叠等本地记忆会失效（每次启动都重新弹出）
-            webview.start(private_mode=False, storage_path=_webview_storage_path())
+            webview.start(_report_webview_backend, private_mode=False,
+                          storage_path=_webview_storage_path())
             return
         except Exception as e:
             print(f"[launcher] 原生窗口启动失败，回退浏览器模式：{e}")
