@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS 签名授权（entitlements）—— 阶段 1 · WP8
+
+  【什么时候会被用到】
+  只有 `SIGN_IDENTITY` 是**真 Developer ID 证书**时，`build_macos.sh` 才会把它传给
+  macos_sign.py。ad-hoc 签名（默认 `-`）**不传**，原因：
+    - hardened runtime（`--options=runtime`）只在真身份时才开；
+    - 下面这些授权全是**针对 hardened runtime 的豁免**，没有 hardened runtime 时
+      它们不起作用，传了只会引入一个「CI 上从没验证过」的签名形态。
+
+  【为什么必须存在这份文件】
+  hardened runtime 默认禁止 JIT 与可写可执行内存。QtWebEngine 的渲染进程是 Chromium，
+  V8 必须 JIT —— 不开豁免的话，用户那边表现为**窗口打开、内容白屏**（渲染进程被内核拒了），
+  而签名与公证**都会通过**，CI 全绿。这是那种「验证全过、产品是坏的」的失败形态，
+  所以必须在启用真身份的同时把这份文件一起带上。
+
+  各项理由：
+    allow-jit                          V8 需要可执行内存页（Chromium 渲染进程的硬需求）
+    allow-unsigned-executable-memory   部分 JIT 路径仍走 unsigned 内存
+    allow-dyld-environment-variables   Qt 插件/框架在包内按相对路径加载
+    disable-library-validation         PyInstaller 把 Qt 框架放在 .app 内非标准位置，
+                                       库校验会拒绝加载（不豁免 → 启动即崩）
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>

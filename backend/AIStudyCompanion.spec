@@ -36,21 +36,38 @@ if _sys.platform == 'darwin':
         except Exception:
             pass
 
-# ⚠️ 阶段 1（GUI 外壳换 Qt）：必须显式收集 PySide6 / shiboken6 / qtpy。
+# ⚠️ 阶段 1（GUI 外壳换 Qt）：必须让包里有 PySide6 / shiboken6 / qtpy。
 #    launcher.py 只 `import webview`，而 pywebview 的 qt 后端是**运行期**按需 import
 #    （webview/guilib.py 里 import webview.platforms.qt），PyInstaller 静态分析看不到 →
 #    不显式收集就会打成「装了 PySide6 但包里缺 QtWebEngine」，且要到真机运行才暴露
 #    （症状：静默回落到 winforms/cocoa，浏览器能力整体不见）。
-#    ⚠️ 必须用 collect_all、不能只写 hiddenimports：QtWebEngine 还要 QtWebEngineProcess
-#    可执行文件与 resources/*.pak 等数据文件，只列模块名收集不到它们。
 #    上方 macOS 的 pyobjc 收集（if _sys.platform == 'darwin'）在阶段 1 后保留，不必删
 #    —— cocoa 仍是回落候选（webview/guilib.py 的 Darwin 分支是 [cocoa, qt]）。
-_QT_PKGS = ['PySide6', 'shiboken6', 'qtpy']
-# 显式列出后端真正会用到的子模块：qtpy 是**动态**选绑定，静态分析连 import 都看不见
+#
+# ⚠️⚠️ 为什么**不再用** collect_all('PySide6')（阶段 1 · WP10 实测后改的）
+#    collect_all 是**全量**收集，实测把包从 591.2 MB 撑到 1259.3 MB（PySide6 单项 632 MB），
+#    因为它把 Qt3D / QtCharts / QtDesigner / QtMultimedia / QML 全套风格 /
+#    VirtualKeyboard / 18 个 Qt 开发工具 exe（qmlls/assistant/designer/linguist…）全拖了进来。
+#    PyInstaller **自带** hook-PySide6.QtWebEngineWidgets / QtWebEngineCore / QtWidgets …
+#    （→ utils/hooks/qt/add_qt6_dependencies → qt_info.collect_module，**依赖驱动**）。
+#    只要模块名出现在 hiddenimports 里，对应 hook 就会跑，并带上运行期必需的
+#    QtWebEngineProcess 可执行文件、resources/*.pak、icudtl.dat
+#    （由 hook-PySide6.QtWebEngineCore 的 collect_qtwebengine_files 负责）——
+#    所以**不需要** collect_all。
+#    ⚠️ 唯一必须 collect_all 的是 **qtpy**：纯 Python 包（很小），且是**动态**选绑定，
+#       静态分析连 import 都看不见。shiboken6 是 PySide6 的绑定运行时，一并 collect_all。
+#
+# ⚠️ 关于「还能再删什么」：**不要**在这里手写 excludes 白名单。
+#    实测（_fetch_probe/_probe_qt_imports.py 读 PE 导入表）表明 Qt6WebEngineCore 直接依赖
+#    Qt6Quick / Qt6Qml / Qt6Positioning / Qt6WebChannel，Qt6WebEngineWidgets 还依赖
+#    Qt6PrintSupport / Qt6QuickWidgets —— 这些「看起来用不到」的模块其实是硬依赖，
+#    手写清单极容易自相矛盾，且错了只在运行期暴露（静默回落或启动即崩）。
+#    可再裁的候选见报告 §WP10（标注为待实测），要裁必须先跑导入表探针。
 _QT_HIDDEN = ['PySide6.QtWebEngineWidgets', 'PySide6.QtWebEngineCore', 'PySide6.QtWebChannel',
               'PySide6.QtWidgets', 'PySide6.QtGui', 'PySide6.QtNetwork', 'PySide6.QtCore',
               'qtpy']
-for pkg in _QT_PKGS:
+hiddenimports += _QT_HIDDEN
+for pkg in ['qtpy', 'shiboken6']:
     try:
         d, b, h = collect_all(pkg)
         datas += d
@@ -61,7 +78,6 @@ for pkg in _QT_PKGS:
         print('[spec] ⚠️ collect_all(%s) 失败：%s: %s' % (pkg, type(_e).__name__, _e))
         print('[spec] ⚠️ 先装齐依赖再打包：pip install -r backend/requirements.txt'
               '（含 pywebview[pyside6] 拉来的 PySide6 + qtpy）')
-hiddenimports += _QT_HIDDEN
 
 # BGE 向量模型随包（启动器首次启动时预置到用户目录）
 datas += [('data/models/bge-small-zh-v1.5', 'data/models/bge-small-zh-v1.5')]
