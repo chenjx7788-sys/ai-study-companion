@@ -36,6 +36,13 @@ if _sys.platform == 'darwin':
         except Exception:
             pass
 
+# ⚠️ 阶段 1（GUI 外壳换 Qt）必须在这里补 PySide6 / shiboken6 的 collect_all：
+#    launcher.py 只 `import webview`，而 pywebview 的 qt 后端是**运行期**按需 import
+#    （webview/guilib.py 里 import webview.platforms.qt），PyInstaller 静态分析看不到 →
+#    不显式收集就会打成「装了 PySide6 但包里缺 QtWebEngine」，且要到真机运行才暴露。
+#    上方 macOS 的 pyobjc 收集（if _sys.platform == 'darwin'）在阶段 1 后可保留，不必删
+#    —— cocoa 仍是回落候选（webview/guilib.py 的 Darwin 分支是 [cocoa, qt]）。
+
 # BGE 向量模型随包（启动器首次启动时预置到用户目录）
 datas += [('data/models/bge-small-zh-v1.5', 'data/models/bge-small-zh-v1.5')]
 

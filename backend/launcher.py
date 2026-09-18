@@ -44,7 +44,10 @@ LOADING_HTML = """<!DOCTYPE html>
   </div>
 <script>
   var PORT = '__PORT__';
-  function jump() { window.location.href = 'http://127.0.0.1:' + PORT + '/'; }
+  var VER = '__VER__';
+  // 入口 URL 带版本号：与 WebView 后端无关地保证「升级后不复用旧 index.html」
+  //（query 只影响缓存键，不影响 SPA 路由：前端用的是 createWebHistory）
+  function jump() { window.location.href = 'http://127.0.0.1:' + PORT + '/?v=' + VER; }
   function poll() {
     try {
       fetch('http://127.0.0.1:' + PORT + '/api/health')
@@ -83,7 +86,14 @@ def _open_browser():
 
 
 def _webview_storage_path():
-    """WebView2 用户数据目录：持久化 localStorage（新手引导/侧边栏折叠等本地记忆）"""
+    """WebView 持久化存储目录：localStorage（新手引导/侧边栏折叠等本地记忆）
+
+    ⚠️ 后端差异（阶段 1 换 Qt 后走第二支，别按 WebView2 的结构去推断路径）：
+      - WebView2：整个用户数据目录，缓存与 local storage 都在其下；
+      - Qt(QtWebEngine)：pywebview 只把它传给 QWebEngineProfile.setPersistentStoragePath()，
+        即**只管持久化存储**；HTTP 缓存另有位置（pywebview 未调 setCachePath），
+        故本目录下**不存在** Cache/Code Cache —— 见 _purge_webview_cache_on_upgrade 的边界说明。
+    """
     from app.core.config import settings
     p = settings.data_dir / "webview"
     p.mkdir(parents=True, exist_ok=True)
@@ -91,11 +101,22 @@ def _webview_storage_path():
 
 
 def _purge_webview_cache_on_upgrade():
-    """版本变化时清掉 WebView 的 HTTP/JS 缓存（保留 Local Storage）。
+    """版本变化时清掉 WebView2 的 HTTP/JS 缓存（保留 Local Storage）。
 
     背景：前端静态资源此前无 Cache-Control，浏览器对 index.html 走「启发式缓存」，
     升级后仍复用旧入口 → 去请求新包里已不存在的旧分片（404）→ 路由懒加载静默失败，
     表现为「点菜单/按钮没反应」。此处在启动窗口创建前清理缓存，从根上避免。
+
+    ⚠️ 生效范围：本函数**只对 WebView2（Windows 当前形态）有效** —— 清的是
+    webview/EBWebView/Default/{Cache,Code Cache,Service Worker}。
+    阶段 1 外壳换成 Qt(QtWebEngine) 后这里是**空操作**：pywebview 的 qt 后端只调用
+    setPersistentStoragePath()（webview/platforms/qt.py），**没有 setCachePath()**，
+    Qt 的 HTTP 缓存因此不在 storage_path 下（在 Qt 的 QStandardPaths::CacheLocation）。
+    ⚠️ 不要在这里补一个「猜出来的 Qt 缓存路径」—— 路径未实测，写错就是这个函数现在的样子
+    （看着在做事、实际什么都没清）。Qt 侧改由下面两道更靠前的机制保证，本函数保留仅为 WebView2 兜底：
+      ① 后端 main.py 给 index.html 发 `Cache-Control: no-cache, must-revalidate`
+         （哈希分片走 `immutable`）→ 入口每次回源校验，与新分片天然配套；
+      ② 入口 URL 自带版本号（见 LOADING_HTML 的 ?v=）→ 版本一变即全新缓存键，且与后端无关。
     """
     import json
     import shutil
@@ -169,7 +190,9 @@ def main():
             # 先显示 loading 窗口（内联 HTML，不依赖后端），后端在后台线程启动
             webview.create_window(
                 "AI 伴学助手",
-                html=LOADING_HTML.replace("__PORT__", str(PORT)).replace("__MASCOT_B64__", MASCOT_B64),
+                html=LOADING_HTML.replace("__PORT__", str(PORT))
+                                 .replace("__VER__", APP_VERSION)
+                                 .replace("__MASCOT_B64__", MASCOT_B64),
                 width=1200, height=800,
                 min_size=(960, 640),
                 text_select=True,   # 必须显式开启，否则客户端无法选中文字 → 划线/AI解读/转笔记/复制全部失效

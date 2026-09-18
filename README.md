@@ -46,13 +46,13 @@ AI 伴学助手把 **资料消化** 变成一条流水线：上传任何学习�
 
 ## 📥 下载与开始
 
-> 当前提供 **Windows 10 / 11（64 位）** 与 **macOS（Apple Silicon / Intel）** 绿色版，免安装。
+> 当前提供 **Windows 10 / 11（64 位）** 与 **macOS 13 或更高（Apple Silicon / Intel）** 绿色版，免安装。
 
 1. 到 [Releases](https://github.com/chenjx7788-sys/ai-study-companion/releases) 下载最新版 —— Windows：`AIStudyCompanion-v0.1.3-win.zip`（约 247 MB）；macOS：`ai-study-companion-macos-arm64.zip` / `ai-study-companion-macos-x86_64.zip`
 2. Windows 解压后双击 `AIStudyCompanion/AIStudyCompanion.exe`；macOS 解压后打开 `.app`（首次需右键 → 打开）。首次启动会自动就位内置向量模型（约 10 秒）
 3. 打开「管理中心 → 大模型配置」填入你的 **LLM API Key**（DeepSeek 等任意 OpenAI 兼容厂商，注册即得）即可使用全部 AI 能力
 
-> - 系统要求：Windows 10 / 11（64 位）· macOS（Apple Silicon 或 Intel），建议 8 GB 以上内存
+> - 系统要求：Windows 10 / 11（64 位）· macOS 13 Ventura 或更高（Apple Silicon 或 Intel），建议 8 GB 以上内存
 > - 语音转写模型（可选）首次使用时按需下载，界面有引导与进度；OCR 模型已内置
 > - 全程无需注册账号；数据默认保存在本机用户目录，卸载不影响源文件（引用模式不复制资料）
 

@@ -22,7 +22,14 @@ tokenizers>=0.23
 rapidocr_onnxruntime>=1.2
 opencv-python-headless>=4.8   # 无 GUI 依赖，替代 rapidocr 默认带入的 opencv-python
 PyMuPDF>=1.24
-pywebview>=6.0   # 客户端原生窗口 + 原生文件/文件夹选择对话框（本地文件直引）
+# 客户端原生窗口 + 原生文件/文件夹选择对话框（本地文件直引）。
+# [pyside6]：阶段 1「GUI 外壳从 cocoa(WKWebView) / WebView2 换到 Qt(QtWebEngine)」的运行时后端；
+#   下限取 6.2.1 = 阶段 0 探针实测基线（PySide6 6.11.2 / QtPy 2.4.3 / pywebview 6.2.1），
+#   不用 >=6.0：Qt 后端的 create_file_dialog / evaluate_js / load_url 在 6.x 早期版本行为不同。
+# ⚠️ 装了 PySide6 不会自动切 Qt —— Windows 上 pywebview 默认只试 winforms(WebView2)，
+#    只有 PYWEBVIEW_GUI=qt 才走 Qt（见 webview/guilib.py 的候选列表）。
+# ⚠️ 打包收集 PySide6 是「另一半」，见 AIStudyCompanion.spec（阶段 1 补，否则打进去也缺 QtWebEngine）。
+pywebview[pyside6]>=6.2.1
 # AI 播客 · 语音合成：edge-tts 免费、无需 API Key，输出 MPEG-2 Layer III / 24kHz / 48kbps / mono
 # 注意：依赖 aiohttp（自动带入）。聚合音频采用 MP3 帧字节拼接，无需 ffmpeg。
 edge-tts>=7.2
