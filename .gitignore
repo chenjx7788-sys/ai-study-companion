@@ -30,6 +30,10 @@ Thumbs.db
 frontend/dist-*/
 frontend/vite.config.js.timestamp-*.mjs
 
+# vditor 运行时资源（frontend/scripts/vendor-vditor.mjs 从 node_modules 复制，21.9MB）
+# ⚠️ 由 npm 的 predev/prebuild 自动生成，不进仓库；打包时随 dist/ 一起进产物
+frontend/public/vditor/
+
 # macOS 打包临时产物（backend/scripts/build_macos.sh 生成）
 backend/mascot.png
 backend/mascot.icns

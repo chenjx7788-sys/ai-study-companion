@@ -4,7 +4,10 @@
   "version": "0.1.3",
   "type": "module",
   "scripts": {
+    "vendor:vditor": "node scripts/vendor-vditor.mjs",
+    "predev": "npm run vendor:vditor",
     "dev": "vite",
+    "prebuild": "npm run vendor:vditor",
     "build": "vite build",
     "preview": "vite preview"
   },

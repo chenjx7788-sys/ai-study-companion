@@ -202,6 +202,14 @@ onMounted(async () => {
 
   vditor.value = new Vditor('vditor', {
     mode: 'wysiwyg',
+    // ⚠️⚠️ 必须显式指定 cdn，否则 vditor 用默认值 `https://unpkg.com/vditor@4.0.0`，
+    //    在**运行时**动态加载 lute(3.57MB)/语言包/图标/高亮/公式/图表 等资源。
+    //    本应用是**本地桌面应用**，依赖公网 = 离线 / 弱网 / unpkg 不可达时编辑器直接失效。
+    //    这里指向 Vite 的 public/ 目录（由 `npm run vendor:vditor` 在 predev/prebuild 生成，
+    //    见 frontend/scripts/vendor-vditor.mjs）→ 相对路径，跟随页面 origin（http://127.0.0.1:<port>）。
+    //    ⚠️ 不要写成绝对 URL（如 http://127.0.0.1:8000/...）：端口可被 ASC_PORT 改，
+    //       且打包版端口与源码版不同，写死会 404。
+    cdn: '/vditor',
     height: Math.max(360, window.innerHeight - 200),
     cache: { enable: false },
     placeholder: '在这里开始撰写正文…',
