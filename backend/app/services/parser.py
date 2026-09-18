@@ -324,13 +324,19 @@ def parse_pptx(path: str) -> list[dict]:
     return chunks
 
 
-def parse_md(path: str) -> list[dict]:
-    """Markdown 纯文本：按空行分段落，标题行（# 开头）更新 section_path，page_no=段落序号"""
-    try:
-        text = Path(path).read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        text = Path(path).read_text(encoding="gbk", errors="ignore")
+def split_markdown(text: str) -> list[dict]:
+    """Markdown 纯文本 → 文本块：按空行分段落，标题行（# 开头）更新 section_path，page_no=段落序号
 
+    ⚠️ 这里是 **唯一** 的 Markdown 切块实现，`parse_md`（落库路径）与「仅本次阅读」
+    （不落库路径）必须共用它。两条路径若各自切块，「同一篇文章在两种模式下段落数不同」
+    会被用户当成 bug 报上来。
+
+    ⚠️ 换行必须先规范化：本函数的分段依据是 `"\\n\\n"`，而**网页抓取的正文与 Windows
+    剪贴板内容普遍是 CRLF**。若不规范化，整篇会因找不到 `"\\n\\n"` 而退化成 1 个块
+    （分块语义全丢，AI 只能看到一大坨）。读文件时 `Path.read_text` 会隐式做这个转换，
+    所以此前只有文件来源、问题没暴露；一旦接入外部文本就是必现缺陷。
+    """
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     chunks, section, page = [], "", 1
     for block in text.split("\n\n"):
         block = block.strip()
@@ -342,6 +348,15 @@ def parse_md(path: str) -> list[dict]:
         chunks.append({"content": block, "page_no": page, "section_path": section})
         page += 1
     return chunks
+
+
+def parse_md(path: str) -> list[dict]:
+    """Markdown 文件 → 文本块（薄封装，切块逻辑见 split_markdown）"""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        text = Path(path).read_text(encoding="gbk", errors="ignore")
+    return split_markdown(text)
 
 
 # ---------- EPUB ----------

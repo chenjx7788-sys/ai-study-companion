@@ -3,6 +3,10 @@ import { createRouter, createWebHistory } from 'vue-router'
 const routes = [
   { path: '/', name: 'library', component: () => import('../views/LibraryView.vue'), meta: { title: '材料库' } },
   { path: '/study/:id', name: 'study', component: () => import('../views/StudyView.vue'), meta: { title: '学习页' } },
+  // 临时阅读（P0-6）：正文只进后端内存快照，不落库、不建索引。
+  // 进入姿势：候选列表「仅阅读」/ 最近阅读抽屉 / `?url=` 直接打开。
+  // 刻意**不放进左侧主导航** —— 它是从"浏览"到"沉淀"的中间态，不是并列的功能区。
+  { path: '/read', name: 'read', component: () => import('../views/EphemeralView.vue'), meta: { title: '临时阅读' } },
   { path: '/knowledge', name: 'knowledge', component: () => import('../views/KnowledgeView.vue'), meta: { title: '知识库' } },
   { path: '/chat', name: 'chat', component: () => import('../views/ChatView.vue'), meta: { title: 'AI 问答' } },
   { path: '/review', name: 'review', component: () => import('../views/ReviewView.vue'), meta: { title: '复习巩固' } },

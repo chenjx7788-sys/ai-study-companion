@@ -556,7 +556,7 @@
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import MarkdownIt from 'markdown-it'
+import { createMd } from '../utils/md'
 import { materialApi, aiApi, noteApi, reviewApi, kbApi, statsApi } from '../api'
 import { errMsg } from '../api/http'
 import PdfReader from '../components/PdfReader.vue'
@@ -565,7 +565,11 @@ import EpubReader from '../components/EpubReader.vue'
 import { useAsr } from '../composables/useAsr'
 import { streamSSE } from '../utils/sse'
 
-const md = new MarkdownIt({ breaks: true })
+// ⚠️ linkify 必开：剪藏正文首行是 `> 来源：https://…`，
+// 不开 linkify 时 markdown-it 把裸 URL 当普通文本渲染（连 <a> 都不生成）→ 点了没反应。
+// 实测：同一个 md 实例开 linkify 后该行即渲染成 <a href>。
+// ⚠️ 外链新窗口由 createMd 统一负责（桌面端会交给系统浏览器，同标签会把应用导航走）。
+const md = createMd({ breaks: true, linkify: true })
 const renderMd = (text) => md.render(text || '')
 
 const route = useRoute()
@@ -2843,6 +2847,31 @@ onUnmounted(() => {
 .md-body :deep(pre code) { background: transparent; padding: 0; }
 .md-body :deep(blockquote) { margin: 12px 0; padding: 8px 14px; border-left: 3px solid var(--asc-border); background: var(--asc-surface-2); border-radius: 0 8px 8px 0; color: var(--asc-text-2); }
 .md-body :deep(hr) { border: none; border-top: 1px solid var(--asc-divider); margin: 20px 0; }
+/* 正文外链（linkify 生成的，含剪藏正文首行「来源：URL」）：与主题一致，可点、看得出是链接。
+   ⚠️ 只加在本组件：global.css 的 .md-preview 暂无 a 规则，但那处有多会话并发风险，不在这里动。 */
+.md-body :deep(a), .md-preview :deep(a) {
+  color: var(--asc-primary); text-decoration: none;
+  border-bottom: 1px solid rgba(124, 92, 252, .38);
+  word-break: break-all;          /* 长 URL/中文查询串不撑破阅读栏 */
+  transition: border-color .15s;
+}
+.md-body :deep(a:hover), .md-preview :deep(a:hover) { border-bottom-color: var(--asc-primary); }
+/* 正文图片自适应：剪藏/公众号原图常达 1000~2200px 宽，而正文容器只有 ~688px，
+   不加约束时浏览器按**自然尺寸**渲染（实测最多溢出容器 1512px，必须横向滚动才能看全）。
+   ⚠️ v-html 注入的节点不带 scoped 的 data-v 属性 → 只能用 :deep()。 */
+.md-body :deep(img), .chunk :deep(img) {
+  max-width: 100%;
+  height: auto;            /* 只约束宽、不改宽高比，避免拉伸变形 */
+  border-radius: 8px;
+}
+/* 上图（被 <br> 换到独立一行的图，剪藏/公众号正文即此形态）：居中 + 与正文留白。
+   ⚠️ 必须用 `br + img` 相邻兄弟选择器，不能用 `img:only-child` ——
+   markdown-it 开了 breaks，软换行渲染成 <br>，该 <p> 里除 img 还有一个 <br>，
+   :only-child 永远不命中（已用真机 DOM 验证过）。 */
+.md-body :deep(br + img), .chunk :deep(br + img) {
+  display: block;
+  margin: 12px auto;
+}
 .md-edit-list { display: flex; flex-direction: column; }
 .transcript-save { display: flex; align-items: center; gap: 12px; padding: 10px 0 4px; }
 .transcript-hint { font-size: 12px; color: var(--asc-text-3); }

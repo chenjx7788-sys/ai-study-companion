@@ -410,6 +410,8 @@ import { ElMessage, ElNotification } from 'element-plus'
 import MarkdownIt from 'markdown-it'
 import { chatApi, materialApi, kbApi, settingsApi, foldersApi, noteApi, reviewApi } from '../api'
 import http, { errMsg } from '../api/http'
+// SSE 统一走共享 util（此前内联副本硬编码 127.0.0.1:8000，换端口即静默失效）
+import { streamSSE } from '../utils/sse'
 
 const md = new MarkdownIt({ breaks: true })
 const renderMd = (t) => md.render(t || '')
@@ -873,38 +875,6 @@ function adoptChatTransform() {
 }
 
 // SSE 流式读取（dev 直连后端，与知识库/资料详情页一致）
-async function streamSSE(url, body, onToken, onDone, onError) {
-  const base = import.meta.env.DEV ? 'http://127.0.0.1:8000' : ''
-  const resp = await fetch(base + url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}))
-    throw new Error(err.detail || `请求失败 ${resp.status}`)
-  }
-  const reader = resp.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    const events = buffer.split('\n\n')
-    buffer = events.pop()
-    for (const evt of events) {
-      const lines = evt.split('\n')
-      const ev = lines.find(l => l.startsWith('event:'))?.slice(6).trim()
-      const dataLine = lines.find(l => l.startsWith('data:'))?.slice(5)
-      if (!ev || !dataLine) continue
-      const payload = JSON.parse(dataLine)
-      if (ev === 'token') onToken?.(payload.t)
-      else if (ev === 'done') onDone?.(payload)
-      else if (ev === 'error') onError?.(payload.message)
-    }
-  }
-}
 
 function startEdit(m) {
   if (asking.value) return
@@ -943,9 +913,8 @@ async function send() {
   scrollBottom()
 
   try {
-    // dev 模式直连后端，绕过 vite 代理（代理会缓冲 SSE 流式响应）
-    const base = import.meta.env.DEV ? 'http://127.0.0.1:8000' : ''
-    const resp = await fetch(base + '/api/chat/ask/stream', {
+    // 同源请求：dev 走 vite proxy，生产由后端单端口托管（不要硬编码 127.0.0.1:8000，换端口即失效）
+    const resp = await fetch('/api/chat/ask/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

@@ -1,13 +1,24 @@
 // SSE 流式读取：POST 请求 + 逐事件回调（meta/progress/token/done/error）
-// dev 模式直连后端，绕过 vite 代理（vite 代理会缓冲 SSE 流式响应导致一次性返回）
+//
+// base 前缀：默认**同源**（''）——dev 走 vite proxy 转发 /api、生产由后端单端口托管，
+// 两者都同源。原实现 dev 下硬编码 'http://127.0.0.1:8000'，换端口（如 ASC_PORT=8010）
+// 即静默打错目标。如需覆盖可用 VITE_SSE_BASE。
+const SSE_BASE = import.meta.env.VITE_SSE_BASE || ''
+
 // onProgress：分批任务（如长文档摘要的两段式）的进度回调，payload = {done, total}
 export async function streamSSE(url, body, onToken, onDone, onError, onMeta, onProgress) {
-  const base = import.meta.env.DEV ? 'http://127.0.0.1:8000' : ''
-  const resp = await fetch(base + url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
+  const headers = { 'Content-Type': 'application/json' }
+  let resp
+  try {
+    resp = await fetch(SSE_BASE + url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    })
+  } catch (e) {
+    // 网络层失败（后端没起来 / 被拦截）→ 给出可读提示，不要让它看起来像"卡死"
+    throw new Error('无法连接服务，请确认后端已启动后重试')
+  }
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}))
     throw new Error(err.detail || `请求失败 ${resp.status}`)

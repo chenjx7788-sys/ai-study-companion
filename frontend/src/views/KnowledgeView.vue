@@ -272,6 +272,9 @@ import MarkdownIt from 'markdown-it'
 import mascot from '../assets/mascot.png'
 import { kbApi, noteApi, reviewApi, settingsApi } from '../api'
 import http, { errMsg } from '../api/http'
+// ⚠️ SSE 统一走共享 util：内联副本曾硬编码 127.0.0.1:8000（手机访问时打到手机自己）
+// 且不带令牌头（远程模式必 401）—— 方案 §8.2 缺陷 #1 的同类实现。
+import { streamSSE } from '../utils/sse'
 
 const router = useRouter()
 const route = useRoute()
@@ -293,38 +296,6 @@ const noteTransformTitle = computed(() => {
 })
 
 // SSE 流式读取（与资料详情页 streamSSE 一致）
-async function streamSSE(url, body, onToken, onDone, onError) {
-  const base = import.meta.env.DEV ? 'http://127.0.0.1:8000' : ''
-  const resp = await fetch(base + url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}))
-    throw new Error(err.detail || `请求失败 ${resp.status}`)
-  }
-  const reader = resp.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    const events = buffer.split('\n\n')
-    buffer = events.pop()
-    for (const evt of events) {
-      const lines = evt.split('\n')
-      const ev = lines.find(l => l.startsWith('event:'))?.slice(6).trim()
-      const dataLine = lines.find(l => l.startsWith('data:'))?.slice(5)
-      if (!ev || !dataLine) continue
-      const payload = JSON.parse(dataLine)
-      if (ev === 'token') onToken?.(payload.t)
-      else if (ev === 'done') onDone?.(payload)
-      else if (ev === 'error') onError?.(payload.message)
-    }
-  }
-}
 
 async function openNote(n) {
   noteDialog.id = n.id

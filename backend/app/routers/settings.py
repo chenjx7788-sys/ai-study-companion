@@ -1,13 +1,42 @@
 """设置路由（PRD 模块 F1，从 M4 提前：AI 功能依赖 API Key 配置）"""
 import time
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from sqlalchemy.orm import Session
 from ..database import get_db
 from ..services import settings_store
 
+
+def _is_loopback(host: str | None) -> bool:
+    """请求来源是否为本机回环地址。
+
+    仅服务于「非本机来源不得借用已存 API Key」这处防御。原实现取自
+    app/core/remote.py::is_loopback；多端访问（手机）方案已于 2026-09-16 放弃、
+    该模块整份删除，故就地内联这一段，**防护本身保留**。
+    """
+    if not host:
+        return True          # 拿不到来源（in-process TestClient 等）→ 按本机处理
+    h = host.strip().strip("[]").split("%")[0]   # 去掉 IPv6 的 zone id
+    return h in {"127.0.0.1", "::1", "localhost", "testclient"} or h.startswith("127.")
+
 router = APIRouter(prefix="/settings", tags=["settings"])
 
 MASK = "******"
+
+
+def _guard_mask_fallback(request: Request, model_id: str, has_key: bool):
+    """拦住「非本机来源借用已存 Key」这条盗用路径（方案 §8.2 缺陷 #3）。
+
+    本地回环：保持原行为（掩码/空 Key 回落已存真实 Key）—— 桌面端零回归。
+    非回环：只有携带**真实** Key 才放行；掩码/空一律 400。
+    """
+    client_host = request.client.host if request.client else None
+    if _is_loopback(client_host):
+        return
+    if not has_key:
+        raise HTTPException(
+            400,
+            "远程访问下不能使用已保存的 API Key 做连接测试，请填入完整 Key 后再试",
+        )
 
 
 @router.get("")
@@ -87,7 +116,7 @@ def update_settings(payload: dict):
 
 
 @router.post("/test-model")
-def test_model(payload: dict):
+def test_model(payload: dict, request: Request):
     """单个模型连接测试：按传入的 base_url/api_key/model 直接发一次最小调用。
     api_key 传掩码或留空时按 id 取已保存值 —— 支持列表里未保存的新模型也能直接测。
     """
@@ -97,6 +126,9 @@ def test_model(payload: dict):
     base_url = (payload.get("base_url") or "").strip()
     api_key = (payload.get("api_key") or "").strip()
     model = (payload.get("model") or "").strip()
+
+    # ⚠️ 非回环来源不允许靠掩码借用已存 Key（方案 §8.2 缺陷 #3）
+    _guard_mask_fallback(request, model_id, bool(api_key and api_key != MASK))
 
     if model_id and (api_key == MASK or not api_key or not base_url or not model):
         stored = {m["id"]: m for m in (conf.get("llm_models") or [])}.get(model_id)
@@ -130,13 +162,16 @@ def test_model(payload: dict):
 
 
 @router.post("/list-models")
-def list_models(payload: dict):
+def list_models(payload: dict, request: Request):
     """按 base_url + api_key 拉取服务商可用模型列表（OpenAI 兼容 /models）"""
     from openai import OpenAI
     conf = settings_store.load()
     model_id = payload.get("id") or ""
     base_url = (payload.get("base_url") or "").strip()
     api_key = (payload.get("api_key") or "").strip()
+
+    # ⚠️ 同 test-model：非回环来源不许借已存 Key
+    _guard_mask_fallback(request, model_id, bool(api_key and api_key != MASK))
 
     if model_id and (api_key == MASK or not api_key):
         stored = {m["id"]: m for m in (conf.get("llm_models") or [])}.get(model_id)

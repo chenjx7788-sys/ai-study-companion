@@ -30,6 +30,17 @@ export const materialApi = {
   relocate: (id, data) => http.post(`/materials/${id}/relocate`, data),   // 源文件重新定位
 }
 
+// 网页剪藏（P0-6）：抓取 → 预览 → **逐条确认**入库。
+// ⚠️ 合规边界：不提供「全部入库」按钮（方案 §6.2），批量接口只产出候选列表。
+export const clipApi = {
+  // 单篇预览：抓取并抽正文，不落库。传 text 即走「粘贴降级」（SPA 抓不到正文时）
+  preview: (payload) => http.post('/materials/clip/preview', payload, { timeout: 120000 }),
+  // 逐条入库：复用「新增文档」同一条解析/索引链路；同 URL 幂等（回传 duplicated=true）
+  save: (payload) => http.post('/materials/clip/save', payload, { timeout: 300000 }),
+  // 批量预览：只产出候选（ready / paste / blocked），入库必须逐条调 save
+  batchPreview: (payload) => http.post('/materials/clip/batch/preview', payload, { timeout: 300000 }),
+}
+
 // AI 理解（PRD 模块 B）；生成类接口长文档可能需数分钟，超时放宽到 300s
 export const aiApi = {
   summary: (materialId, instruction) => http.post(`/ai/summary`, { material_id: materialId, instruction }, { timeout: 300000 }),
@@ -39,6 +50,21 @@ export const aiApi = {
   ask: (materialId, question) => http.post(`/ai/ask`, { material_id: materialId, question }, { timeout: 180000 }),   // 直接对材料提问
   assets: (materialId) => http.get('/ai/assets', { params: { material_id: materialId } }),
   chains: (materialId) => http.get('/ai/chains', { params: { material_id: materialId } })
+}
+
+// 临时阅读（P0-5/P0-6）：正文只进内存快照，**不落库、不建索引**
+// 「最近阅读」是"本次使用期间"的语义 —— 关闭应用即清空（UI 要照实写，不能叫"历史记录"）
+export const ephemeralApi = {
+  // 打开链接：抓取（或粘贴降级）→ 写入内存快照 → 回传正文与 chunks 供渲染
+  open: (payload) => http.post('/ai/ephemeral/open', payload, { timeout: 120000 }),
+  // SSE 流式接口要完整路径（streamSSE 用 fetch，不走 axios 的 /api 前缀协商）
+  summaryStreamUrl: '/api/ai/ephemeral/summary/stream',
+  askStreamUrl: '/api/ai/ephemeral/ask/stream',
+  // 划线解读 / 追问（同步）：history 由前端携带 → 服务端无状态
+  explain: (payload) => http.post('/ai/ephemeral/explain', payload, { timeout: 180000 }),
+  recent: () => http.get('/ai/ephemeral/recent'),
+  recentOne: (key) => http.get(`/ai/ephemeral/recent/${encodeURIComponent(key)}`),
+  removeRecent: (key) => http.delete(`/ai/ephemeral/recent/${encodeURIComponent(key)}`),
 }
 
 // 笔记（PRD 模块 C）

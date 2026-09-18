@@ -14,9 +14,11 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..core.config import settings
+from ..core.filename import safe_stem
 from ..database import get_db, SessionLocal
 from ..models import Material, MaterialChunk, AIAsset, Note, Highlight, Folder
 from ..services import parser as parser_svc
+from ..services import external as external_svc
 
 router = APIRouter(prefix="/materials", tags=["materials"])
 
@@ -26,6 +28,51 @@ ALLOWED_FORMATS = {"pdf", "ppt", "pptx", "doc", "docx", "md", "markdown", "epub"
 
 # 支持列表文案：多处提示共用，避免改格式时漏改某一处
 FORMAT_HINT = "PDF/PPT/Word/Markdown/EPUB/图片/音视频"
+
+
+# ---------- 命名与路径（单一来源） ----------
+# 标题有三个来源：网页 <title>（剪藏）/ 用户输入（新建、重命名）/ 上传文件名。
+# 每处各写一遍清洗逻辑必然漂移，而漏掉任一处就在 Windows 上以
+# `OSError [Errno 22] Invalid argument` 收场（实测：标题含英文双引号即 500）。
+# 因此「标题去重 + 文件名安全化 + 文件名去重」统一收在这里。
+
+
+def _title_taken(db: Session, title: str, exclude_id: int | None = None) -> bool:
+    """DB 里是否已有同名材料（`exclude_id` 供「改标题」排除自身）"""
+    q = db.query(Material).filter(Material.title == title)
+    if exclude_id is not None:
+        q = q.filter(Material.id != exclude_id)
+    return q.first() is not None
+
+
+def _unique_title(db: Session, title: str, exclude_id: int | None = None) -> str:
+    """标题去重：撞车则按统一规则追加 `(n)`。
+
+    用于**不落盘**的场景（引用模式导入）：只保证 DB 标题唯一，不碰文件名 ——
+    也正因如此，它不该去看 files_dir（否则引用导入的标题会随磁盘状态漂移）。
+    """
+    base, n = title, 1
+    while _title_taken(db, title, exclude_id):
+        n += 1
+        title = f"{base}({n})"
+    return title
+
+
+def _unique_title_and_path(db: Session, title: str, ext: str,
+                           exclude_id: int | None = None) -> tuple[str, Path]:
+    """**写文件的地方一律用这个**：标题 + 落盘路径同时去重后的 `(title, path)`。
+
+    ⚠️ 两者必须一起判：`safe_stem` 会把 `a/b`、`a\b`、`a:b` 折叠成同一个 `a_b`，
+    只比 title 就会让三个材料指向**同一个文件**、后者静默覆盖前者。
+    """
+    base, n = title, 1
+    while True:
+        stem = safe_stem(title)
+        path = settings.files_dir / (f"{stem}.{ext}" if ext else stem)
+        if not _title_taken(db, title, exclude_id) and not path.exists():
+            return title, path
+        n += 1
+        title = f"{base}({n})"
 
 
 # ---------- 序列化 ----------
@@ -39,6 +86,11 @@ def material_to_dict(m: Material, db: Session) -> dict:
         "format": m.format,
         "storage_mode": m.storage_mode or "copy",
         "folder_id": m.folder_id,
+        # 来源渠道：列表/详情页据此显示徽章（本地上传/本地导入/网页剪藏/公众号/微信读书）。
+        # 缺省回退 upload，保证老库（迁移前建的记录）也不会出现 None 触发前端报错。
+        "origin": m.origin or "upload",
+        "origin_ref": m.origin_ref or "",
+        "origin_meta": m.origin_meta or {},
         "parsed_status": m.parsed_status,
         "parse_progress": m.parse_progress or 0,
         "parse_error": m.parse_error,
@@ -166,14 +218,8 @@ async def upload_material(file: UploadFile = File(...), db: Session = Depends(ge
     if len(content) > settings.max_file_mb * 1024 * 1024:
         raise HTTPException(400, f"文件超过 {settings.max_file_mb}MB，请压缩后上传")
 
-    stem = filename.rsplit(".", 1)[0]
-    # 同名处理：标题与文件名都追加 (n)
-    title, n = stem, 1
-    while db.query(Material).filter(Material.title == title).first():
-        n += 1
-        title = f"{stem}({n})"
-    save_name = f"{title}.{ext}"
-    save_path = settings.files_dir / save_name
+    # 同名处理：标题与文件名都追加 (n)；文件名另需安全化（上传文件名也可能带非法字符）
+    title, save_path = _unique_title_and_path(db, filename.rsplit(".", 1)[0], ext)
     save_path.write_bytes(content)
 
     m = Material(title=title, format=ext, file_path=str(save_path), parsed_status="parsing")
@@ -201,12 +247,9 @@ def create_document(req: DocumentCreateReq, db: Session = Depends(get_db)):
         raise HTTPException(400, "正文内容过短（少于 2 字）")
     if len(content) > 200000:
         raise HTTPException(400, "正文过长，请拆分后保存")
-    # 同名处理（与 upload_material 一致）
-    stem, n = title, 1
-    while db.query(Material).filter(Material.title == title).first():
-        n += 1
-        title = f"{stem}({n})"
-    save_path = settings.files_dir / f"{title}.md"
+    # 同名处理（与 upload_material 一致）+ 文件名安全化
+    # 顺带修掉一个隐性上限：原实现完全没有长度约束，超长标题会撑爆文件名而 500
+    title, save_path = _unique_title_and_path(db, title, "md")
     save_path.write_text(content, encoding="utf-8")
 
     m = Material(title=title, format="md", file_path=str(save_path), parsed_status="parsing")
@@ -225,24 +268,26 @@ class ImportLocalReq(BaseModel):
 def _import_single_file(db, p: Path, mode: str, folder_id: int | None):
     """导入单个文件，返回 (material_dict, None) 或 (None, fail_dict)"""
     ext = p.suffix.lower().lstrip(".")
-    # 同名处理：标题自动追加 (n)，与 upload_material 一致
-    stem, n, title = p.stem, 1, p.stem
-    while db.query(Material).filter(Material.title == title).first():
-        n += 1
-        title = f"{stem}({n})"
     save_path = None
     try:
         if mode == "copy":
             if p.stat().st_size > settings.max_file_mb * 1024 * 1024:
                 return None, {"path": str(p), "reason": f"超过 {settings.max_file_mb}MB"}
-            save_path = settings.files_dir / f"{title}.{ext}"
+            # 标题去重 + 文件名安全化（本地文件名同样可能来自别的系统，带非法字符）
+            title, save_path = _unique_title_and_path(db, p.stem, ext)
             shutil.copy2(p, save_path)
             storage, file_path = "copy", str(save_path)
         else:
+            # 引用模式不落盘 → 只需标题去重（不占文件名，也不必看 files_dir 是否同名）
+            title = _unique_title(db, p.stem)
             storage, file_path = "reference", str(p)   # 不复制，直接引用原路径
 
         m = Material(title=title, format=ext, file_path=file_path,
-                     storage_mode=storage, folder_id=folder_id, parsed_status="parsing")
+                     storage_mode=storage, folder_id=folder_id, parsed_status="parsing",
+                     # 来源渠道与 storage_mode 对齐：引用原文件 = local（原文件在用户磁盘上），
+                     # 复制副本 = upload（已进入本应用文件库）。这样「按来源筛选」时两种入口可分。
+                     origin="local" if storage == "reference" else "upload",
+                     origin_ref=str(p) if storage == "reference" else "")
         db.add(m)
         db.commit()
         db.refresh(m)
@@ -252,10 +297,8 @@ def _import_single_file(db, p: Path, mode: str, folder_id: int | None):
         db.rollback()
         # copy 模式已复制副本但建档失败 → 清理孤儿副本，避免 files_dir 残留无记录文件
         if save_path is not None and Path(save_path).exists():
-            try:
-                Path(save_path).unlink()
-            except OSError:
-                pass
+            # 同上：删不掉（含被 safe-delete 拦下的 SystemExit）也不能把原来的异常盖成 500
+            _unlink_in_files_dir(save_path)
         return None, {"path": str(p), "reason": str(e)[:200]}
 
 
@@ -381,6 +424,278 @@ def fulltext_search(q: str, folder_id: int | None = None, db: Session = Depends(
         if len(results) >= 20:
             break
     return results
+
+
+# ---------- 外部网页剪藏（P0-4） ----------
+#
+# ⚠️ 这三个路由**必须定义在 `GET /{material_id}` 之前**（本文件下方）。
+# 那条是 `material_id: int`，FastAPI 按声明顺序匹配 → 若在它之后，
+# `/clip/preview` 会被当作 material_id 解析失败并返回 422。`import-local` 已踩过同一个坑。
+#
+# 合规边界（方案 §2.1 / §6.2）：网页与公众号属"需用户逐条确认"的来源
+# （`external_svc.need_confirm`）。本组接口**只提供单篇预览与单篇落库**，
+# 刻意不提供"批量直接入库"的入口 —— 批量场景走 `batch/preview` 出候选列表，
+# 由前端逐条让用户点击 `save`。这不是交互偏好，是边界的实现方式。
+
+# 单篇正文上限：与「新增文档」的 200000 字上限保持一致的量级。
+# 网页正文正常在 5k~30k 字，超过 20 万字基本是异常页面（或抓错了整站索引）。
+MAX_CLIP_CHARS = 200000
+
+
+class ClipPreviewReq(BaseModel):
+    url: str
+    # ⚠️ 必须和 ClipSaveReq 一样支持 text —— SPA 降级通道是「粘贴正文 → 预览 → 入库」，
+    # 少了这个字段，粘贴后预览会退化成真去抓那个抓不到的 URL，用户看到 blocked，
+    # 以为粘贴没生效。实测踩过：preview(action=blocked) 而 save 却是好的。
+    text: str | None = None
+    title: str | None = None
+
+
+class ClipSaveReq(BaseModel):
+    url: str
+    # 允许前端直接带正文（SPA 降级时由用户粘贴正文）→ 不传 fetch，也不落"抓取失败"的锅
+    text: str | None = None
+    title: str | None = None
+
+
+class ClipBatchPreviewReq(BaseModel):
+    urls: list[str]
+
+
+def _clip_fetch(req_url: str, text: str | None, title: str | None) -> dict:
+    """剪藏路径的正文来源：优先用前端传来的正文（粘贴降级），否则抓取。
+
+    实现见 `external_svc.fetch_or_passthrough`（单一来源，临时阅读共用）。
+    长度策略留在本层：剪藏语义是**入库**，超长一律拒绝 ——
+    静默截断用户要保存的内容，比报错更糟。
+    """
+    body = (text or "").strip()
+    if body and len(body) > MAX_CLIP_CHARS:
+        raise HTTPException(400, f"正文过长（{len(body)} 字），请拆分后保存")
+    return external_svc.fetch_or_passthrough(req_url, text, title)
+
+
+def _clip_to_markdown(title: str, url: str, meta: dict, text: str) -> str:
+    """组装落库用的 Markdown：标题 + 来源信息 + 正文。
+
+    ⚠️ 标题必须作为 `# ` 首行落进正文，否则 `split_markdown` 的 section_path 从第一段就是空，
+    整篇没有章节名。来源信息放在正文**之前**的引用块里，便于溯源，也避免它被当成正文首段。
+    """
+    lines = [f"# {title}", ""]
+    src_bits = []
+    if meta.get("sitename"):
+        src_bits.append(meta["sitename"])
+    if meta.get("author"):
+        src_bits.append(meta["author"])
+    if meta.get("date"):
+        src_bits.append(meta["date"])
+    if src_bits:
+        lines.append("> " + " · ".join(str(b) for b in src_bits))
+        lines.append("")
+    if url:
+        lines.append(f"> 来源：{url}")
+        lines.append("")
+    lines.append(text.strip())
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _clip_existing(db: Session, norm_url: str) -> Material | None:
+    """幂等查重：同一 URL 是否已入库（实现见 external_svc.find_saved_material）。
+
+    保留本包装是为了 3 处调用点与既有验收脚本不动；口径只有 external.py 一份。
+    """
+    return external_svc.find_saved_material(db, norm_url)
+
+
+@router.post("/clip/preview")
+def clip_preview(req: ClipPreviewReq, db: Session = Depends(get_db)):
+    """预览单个链接：抓取并抽取正文，**不落库、不建索引**。
+
+    可选传 `text` 直接给正文（SPA 降级通道），此时跳过抓取。
+    """
+    url = (req.url or "").strip()
+    if not url:
+        raise HTTPException(400, "请输入网页链接")
+    # 传了 text → 走粘贴降级（不抓取）；否则抓取。两条路共用 _clip_fetch 保证口径一致。
+    r = _clip_fetch(url, req.text, req.title)
+    payload = external_svc.preview_payload(r)
+    # P2-4：预览阶段就把「超长」提示出来，而不是入库时才 400（否则用户白等一次抓取）。
+    # 与 clip_save 共用 MAX_CLIP_CHARS 口径，两侧一致。
+    if payload["chars"] > MAX_CLIP_CHARS:
+        payload["action"] = "blocked"
+        payload["reason"] = "TOO_LONG"
+        payload["hint"] = (f"正文超长（{payload['chars']} 字），超过单篇保存上限。"
+                          "请拆分后保存，或改为粘贴部分正文。")
+    # 已入库状态：用归一化后的 URL 查库（重启后仍准确，不用内存标记）
+    exist = _clip_existing(db, payload["url"])
+    payload["saved"] = exist is not None
+    payload["material_id"] = exist.id if exist else None
+    return payload
+
+
+@router.post("/clip/save")
+def clip_save(req: ClipSaveReq, db: Session = Depends(get_db)):
+    """把链接落库为材料：复用「新增文档」同一条解析/索引链路。
+
+    - 正文优先取前端传的 `text`（粘贴降级），否则现场抓取
+    - 幂等：同 URL 已存在 → 直接返回既有材料，`duplicated=True`，不重复入库
+    - **不新建解析路径**：写 .md → Material(format="md") → `_parse_material` → cleaner/chunk/kb_index
+    """
+    url = (req.url or "").strip()
+    if not url:
+        raise HTTPException(400, "请输入网页链接")
+
+    # ⚠️⚠️ 幂等查重**前移到抓取之前**（N3）。原先只有"抓取后的查重"，于是同一 URL 已入库时
+    #    仍会先完整抓一遍（网络层最长 20s）才发现"已存在"—— 而用户最常见的路径
+    #    「粘贴 → 预览 → 加入知识库」里，**预览已经抓过一次**，入库是第二次。
+    #    ⚠️ 这里只用**本地可判定**的归一化身份（不展开短链、不发任何请求）：
+    #       小红书短链场景会 miss → 落到下面那条"抓取后查重"兜底，**正确性不受影响**，
+    #       只是没省下那一次抓取（为它专门展开短链也是一次网络往返，不值得）。
+    exist_pre = _clip_existing(
+        db, external_svc.normalize_url(external_svc.extract_first_url(url) or url))
+    if exist_pre is not None:
+        d = material_to_dict(exist_pre, db)
+        d["duplicated"] = True
+        return d
+
+    r = _clip_fetch(url, req.text, req.title)
+    norm = r.get("url") or ""
+    if not r.get("ok"):
+        # 抓取失败但没有正文可落库 → 400 + 可读原因（前端已有 hint 可展示）
+        payload = external_svc.preview_payload(r)
+        raise HTTPException(status_code=400, detail={
+            "reason": payload["reason"], "hint": payload["hint"],
+            "action": payload["action"],
+        })
+
+    # 幂等兜底：上面的前置查重只覆盖"本地可判定"的身份；短链这类**展开后才确定**的身份
+    # 会走到这里（此时 `norm` 已是抓取路径归一化后的结果）。两处都调 `_clip_existing`，
+    # 口径仍是同一处实现，不是两份逻辑。
+    exist = _clip_existing(db, norm)
+    if exist is not None:
+        d = material_to_dict(exist, db)
+        d["duplicated"] = True
+        return d
+
+    kind = r["kind"]
+    if not external_svc.can_index(kind):
+        # 兜底：能力表说不允许建索引的来源，一律拒绝落库（防止将来加渠道时漏挡）
+        raise HTTPException(400, f"该来源（{external_svc.origin_label(kind)}）暂不支持加入知识库")
+
+    text = (r.get("text") or "").strip()
+    if len(text) < external_svc.MIN_CLIP_CHARS:
+        raise HTTPException(400, "正文内容过短，无法保存")
+    if len(text) > MAX_CLIP_CHARS:
+        raise HTTPException(400, f"正文过长（{len(text)} 字），请拆分后保存")
+
+    title = (req.title or "").strip() or (r.get("title") or "").strip() or "未命名网页"
+    title = title[:180]          # 防超长标题撑爆 String(255)
+
+    # 小红书图文：配图是**短时强签名直链**（实测改时间戳 / hash / 后缀任一处即 403），
+    # 必须是**落库这一刻**下载到本地并把正文里的外链换成站内地址，否则用户过两天
+    # 打开就是一片破图。取舍与实测见 `AI伴学助手_小红书图文抓取方案.md`。
+    # ⚠️ **只在这里调**：「仅本次阅读」的契约是**不落盘**，那边直接用原始 URL 外链即可
+    #    —— 当次阅读必然还在有效期内。见 `external.localize_images` 的说明。
+    meta = dict(r.get("meta") or {})
+    if kind == "xhs":
+        # ⚠️⚠️ 图片 URL 的来源**不能只看 `meta.image_urls`**（P1-2）：走「仅本次阅读 →
+        #    加入知识库」时是**粘贴降级**分支，那条路的 meta 只有 `{template, passthrough}`
+        #    → 旧写法直接跳过本地化 → 落库正文留着**短时签名外链** → 过几天整篇破图；
+        #    而同样一篇从候选列表直接点「加入知识库」（走抓取）图片却是好的
+        #    —— **同一资源两个入口给出不同产物**，正是本项目反复出现的缺陷模式。
+        #    改成「meta 有就用 meta，没有就从正文抽」：两条路径共用 `image_urls_in_markdown`。
+        img_urls = list(meta.get("image_urls") or []) or external_svc.image_urls_in_markdown(text)
+        # 子目录口径走单一函数（落库 / 删除共用）；note id 抽不到时用 URL 哈希兜底，
+        # ⚠️ 不能退化成固定串（多篇笔记会同目录同名、互相覆盖）
+        subdir = external_svc.assets_subdir_for(norm, meta)
+        meta["xhs_asset_dir"] = subdir
+        if img_urls:
+            text, _img_stat = external_svc.localize_images(text, img_urls, subdir=subdir)
+            # 签名 URL 会过期 → **不当稳定地址存**（留着只会让人以为还能用）
+            meta.pop("image_urls", None)
+            meta["image_paths"] = _img_stat.get("image_paths") or []
+            meta["images_saved"] = int(_img_stat.get("images_saved") or 0)
+            if _img_stat.get("images_failed"):
+                # 逐张容错：失败张数如实记账，而不是静默变少（正文里那条外链保留原 URL）
+                meta["images_failed"] = int(_img_stat["images_failed"])
+            # 正文里的图就是这篇的图：粘贴降级路径没有 meta.images，补上（前端显示「N 张图」）
+            if not meta.get("images"):
+                meta["images"] = len(img_urls)
+
+    markdown = _clip_to_markdown(title, norm, meta, text)
+
+    # 同名处理：与 upload_material / create_document 一致（标题追加 (n)）
+    # ⚠️ 这里只解决"标题撞车"，不解决"同 URL 重复" —— 后者由上面的 _clip_existing 负责。
+    # ⚠️ 网页 <title> 是**远端可控文本**，必过 safe_stem：
+    #    实测含英文双引号 → 500 [Errno 22]；含 `../` 更会把路径拼出 files_dir（路径穿越）。
+    title, save_path = _unique_title_and_path(db, title, "md")
+    try:
+        save_path.write_text(markdown, encoding="utf-8")
+    except OSError as e:
+        raise HTTPException(500, f"写入文件失败：{str(e)[:120]}")
+
+    # ⚠️ 用**本地化之后**的 meta：里面是 image_paths（站内地址），已不含会过期的签名 URL
+    meta_snapshot = dict(meta)
+    meta_snapshot["saved_from"] = "clip"
+    m = Material(
+        title=title, format="md", file_path=str(save_path), parsed_status="parsing",
+        origin=kind, origin_ref=norm, origin_meta=meta_snapshot,
+    )
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+    threading.Thread(target=_parse_material, args=(m.id,), daemon=True).start()
+    d = material_to_dict(m, db)
+    d["duplicated"] = False
+    return d
+
+
+@router.post("/clip/batch/preview")
+def clip_batch_preview(req: ClipBatchPreviewReq, db: Session = Depends(get_db)):
+    """批量链接：逐篇抓取，返回**候选列表**（含每篇状态与动作），**不入库**。
+
+    ⚠️ 刻意只做"预览"。入库必须由前端逐条调用 `/clip/save`（逐篇确认）。
+    本接口不返回任何"一键全部入库"的字段。
+    """
+    urls = [u.strip() for u in (req.urls or []) if (u or "").strip()]
+    if not urls:
+        raise HTTPException(400, "请粘贴至少一个链接")
+    if len(urls) > 20:
+        raise HTTPException(400, "一次最多处理 20 个链接，请分批粘贴")
+
+    items = []
+    for u in urls:
+        try:
+            # 批量场景一律走抓取（不接 text）—— 粘贴正文是单篇的降级动作，
+            # 批量里"哪一段正文属于哪个 URL"无法可靠对应，硬做会张冠李戴。
+            r = _clip_fetch(u, None, None)
+        except HTTPException as e:
+            items.append({
+                "ok": False, "kind": external_svc.detect_kind(u) or "url",
+                "kind_label": external_svc.origin_label(external_svc.detect_kind(u)),
+                "need_confirm": True, "url": "", "input_url": u, "title": "",
+                "chars": 0, "images": 0, "wx_image_post": False, "xhs_video_note": False,
+                "meta": {}, "reason": "BAD_URL",
+                "action": "blocked", "hint": str(e.detail), "wx_temp_link": False,
+                "saved": False, "material_id": None,
+            })
+            continue
+        p = external_svc.preview_payload(r)
+        exist = _clip_existing(db, p["url"])
+        p["saved"] = exist is not None
+        p["material_id"] = exist.id if exist else None
+        items.append(p)
+
+    return {
+        "items": items,
+        "total": len(items),
+        "ready": sum(1 for i in items if i["action"] == "ready"),
+        "need_paste": sum(1 for i in items if i["action"] == "paste"),
+        "blocked": sum(1 for i in items if i["action"] == "blocked"),
+        # 明示：本接口只产出候选，入库需逐条确认（也是给前端的契约提示）
+        "note": "逐条确认后才会入库；本接口不落库、不建索引。",
+    }
 
 
 @router.get("/{material_id}")
@@ -759,18 +1074,27 @@ def update_document(material_id: int, req: DocumentUpdateReq, db: Session = Depe
 
     # 标题变更（可选）：查重 + 重命名文件
     new_title = (req.title or "").strip() or m.title
-    if new_title != m.title:
-        stem, n = new_title, 1
-        while db.query(Material).filter(Material.title == new_title, Material.id != m.id).first():
-            n += 1
-            new_title = f"{stem}({n})"
-
     old_path = Path(m.file_path)
-    new_path = settings.files_dir / f"{new_title}.md"
+    is_ref = (m.storage_mode or "copy") == "reference"
+
+    if new_title == m.title or is_ref:
+        # ⚠️ 这两种情况都必须写回 **m.file_path 本身**，绝不能按标题重建路径：
+        # ① 标题没变：重建出的 files_dir/<title>.md 与真实 file_path 可能不是同一个文件
+        #    （引用模式导入的 .md 真实路径在用户磁盘上）→ 编辑写进没人看得见的孤儿文件，
+        #    而 m.file_path 仍指向旧内容 = **编辑静默丢失**。
+        # ② 引用模式：材料就是磁盘上那个文件 → 改标题只改 DB，
+        #    **绝不移动/删除用户的文件**（见 _delete_material_impl 的安全红线）。
+        new_path = old_path
+    else:
+        # 复制副本：跟随标题改名（沿用原行为），并过一遍安全化
+        new_title, new_path = _unique_title_and_path(db, new_title, "md", exclude_id=m.id)
+
     new_path.write_text(content, encoding="utf-8")
     if new_title != m.title:
-        if old_path.exists() and old_path != new_path:
-            old_path.unlink()
+        if not is_ref and old_path.exists() and old_path != new_path:
+            # 安全红线（与删除路径共用同一实现，不再各写一份）：
+            # 只删 files_dir 内的副本，路径在目录外一律跳过。
+            _unlink_in_files_dir(old_path)
         m.title = new_title
         m.file_path = str(new_path)
     m.parsed_status = "parsing"
@@ -778,6 +1102,64 @@ def update_document(material_id: int, req: DocumentUpdateReq, db: Session = Depe
     db.commit()
     threading.Thread(target=_parse_material, args=(m.id,), daemon=True).start()
     return material_to_dict(m, db)
+
+
+def _unlink_in_files_dir(p) -> bool:
+    """只在 `files_dir` **之内**物理删除一个文件；返回是否真的删了。
+
+    安全红线（两道，缺一不可）：
+      1. `relative_to(files_dir)` —— 不在目录内一律跳过。
+         否则"改个标题""删个材料"就可能把用户的**原始文件**删掉（引用模式尤其危险）。
+      2. `except BaseException` —— 环境注入的 safe-delete shim 在超配额时 `raise SystemExit`，
+         而 **SystemExit 不是 Exception 的子类**，`except OSError` 接不住。
+         实测：`DELETE /api/materials/30` 因此返回 **500，而 DB 记录其实已经删掉了** ——
+         用户看到"删除失败"、材料却不见了，是最糟的一类不一致。
+    ⚠️ 语义取舍：DB 是事实来源，**文件残留可接受**，但绝不能把异常抛给用户。
+    """
+    try:
+        Path(p).resolve().relative_to(settings.files_dir.resolve())
+    except BaseException:          # noqa: BLE001 不在 files_dir 内 → 跳过
+        return False
+    try:
+        Path(p).unlink()
+        return True
+    except BaseException:          # noqa: BLE001 删不掉（含 SystemExit）→ 跳过，不报错
+        return False
+
+
+def _material_asset_dir(m: Material) -> Path | None:
+    """材料所属的「本地化配图」目录（没有则 None）。
+
+    目前只有小红书图文会落这个目录。一个 note id 只可能对应一个材料
+    （`origin_ref` 归一化去重保证），所以目录归属唯一、可以整目录删。
+
+    ⚠️ 优先读 `xhs_asset_dir`（落库时写下的**实际子目录名**），回退老记录的 `xhs_note_id`；
+    后者在「note id 抽不到」时为空 → 目录清不掉、留下孤儿图片（P1-2 的连带修复）。
+    """
+    try:
+        meta = m.origin_meta or {}
+        sub = (str(meta.get("xhs_asset_dir") or "").strip()
+               or str(meta.get("xhs_note_id") or "").strip())
+        return external_svc.assets_dir(sub) if sub else None
+    except BaseException:      # noqa: BLE001 取不到就不清，绝不阻断删除
+        return None
+
+
+def _cleanup_material_assets(asset_dir) -> None:
+    """删除材料配图目录。**绝不向外抛**（清理失败不影响主删除流程）。
+
+    两道保险：
+      1. 只删 `data/assets/` 之内的目录（`relative_to` 校验，防路径穿越）
+      2. `except BaseException` —— 见本模块顶部说明（safe-delete shim 会抛 SystemExit）
+    """
+    try:
+        if not asset_dir or not asset_dir.exists():
+            return
+        asset_root = (Path(settings.data_dir) / "assets").resolve()
+        asset_dir.resolve().relative_to(asset_root)   # 不在 assets 内 → ValueError
+        shutil.rmtree(asset_dir, ignore_errors=True)
+    except BaseException:      # noqa: BLE001 清理是尽力而为，绝不影响删除结果
+        pass
 
 
 def _delete_material_impl(db, m: Material):
@@ -788,22 +1170,25 @@ def _delete_material_impl(db, m: Material):
     try:
         from ..services import kb_index
         kb_index.deindex_material(db, m.id)
-    except Exception:
-        pass  # 索引清理失败不阻断主删除流程
+    except BaseException:
+        # ⚠️ 必须 BaseException：safe-delete shim 超配额时抛 SystemExit（不是 Exception 子类）。
+        # 索引清理失败（含被拦）不阻断主删除流程。
+        pass
 
     # 提前取快照：db.delete 后实例属性会 expire，读取可能触发重载报错
     file_path = Path(m.file_path)
     storage_mode = m.storage_mode or "copy"
     material_id = m.id
+    # 配图目录同样要提前取（origin_meta 也会 expire）
+    asset_dir = _material_asset_dir(m)
     db.delete(m)  # cascade 清理 chunks / notes；AIAsset 手动清
     db.query(AIAsset).filter(AIAsset.material_id == material_id).delete()
     db.commit()
     if storage_mode != "reference" and file_path.exists():
-        try:
-            file_path.resolve().relative_to(settings.files_dir.resolve())
-            file_path.unlink()
-        except (ValueError, OSError):
-            pass   # 路径不在 files_dir 内，跳过删除（双保险）
+        _unlink_in_files_dir(file_path)
+    # 本地化配图（P0-3h）：小红书的图在 data/assets/<note id>/，随材料一起清。
+    # 顺序仍是「先删 DB、再清文件」—— 文件残留可接受，DB 残留不可接受。
+    _cleanup_material_assets(asset_dir)
 
 
 @router.delete("/{material_id}")

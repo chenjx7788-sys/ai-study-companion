@@ -22,7 +22,9 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        // 目标端口可覆盖：默认 8000；打包版 exe 常占用 8000，此时用 ASC_PORT=8010
+        // 跑源码版后端，并让 dev server 代理到同一端口（start.bat 会自动带上）。
+        target: process.env.ASC_API_TARGET || 'http://127.0.0.1:8000',
         changeOrigin: true
       }
     }

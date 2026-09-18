@@ -43,6 +43,17 @@
             <div class="import-item" @click="onPickLocal('folder')">
               <el-icon><Folder /></el-icon>导入文件夹
             </div>
+            <!-- 网页剪藏（P0-6）：先抓取预览 → **逐条确认**才入库。
+                 刻意不做"一键全量抓取"：合规边界见方案 §6.2。 -->
+            <div class="import-item" @click="openClip(false)">
+              <el-icon><Link /></el-icon>粘贴网页链接
+            </div>
+            <div class="import-item" @click="openClip(true)">
+              <el-icon><DocumentCopy /></el-icon>批量粘贴链接
+            </div>
+            <div class="import-item" @click="openRecentReading">
+              <el-icon><Clock /></el-icon>最近阅读
+            </div>
             <div class="import-divider"></div>
             <div class="import-mode">
               <div class="import-mode-head">
@@ -165,6 +176,10 @@
             <div class="card-title" :title="m.title">{{ m.title }}</div>
             <div class="card-meta">
               <span class="fmt-name" :class="'ftn-' + fmtGroup(m.format)">{{ fmtLabel(m.format) }}</span>
+              <!-- 来源渠道徽章：只标"外部来源"。upload 是默认值不标（否则每张卡都多一个无信息量的标签），
+                   local 已由下方「引用」标记表达，不重复。 -->
+              <span v-if="originLabel(m.origin)" class="origin-chip" :class="'o-' + m.origin"
+                :title="originTitle(m)">{{ originLabel(m.origin) }}</span>
               <span v-if="m.storage_mode === 'reference'" class="ref-badge">引用</span>
               <span v-if="m.page_count">{{ m.page_count }}{{ countUnit(m.format) }}</span>
               <span>{{ formatTime(m.created_at) }}</span>
@@ -239,6 +254,28 @@
         :image="mascot" :image-size="120" description="还没有文件夹，点击「新建文件夹」创建一个" />
     </template>
 
+    <!-- 网页剪藏：粘贴链接 → 候选列表 → 逐条确认（单篇/批量共用同一组件） -->
+    <el-dialog v-model="clipDialog.show" :close-on-click-modal="false"
+      :title="clipDialog.batch ? '批量粘贴链接' : '粘贴网页链接'" width="720px">
+      <template v-if="clipDialog.stage === 'input'">
+        <el-input v-if="!clipDialog.batch" v-model="clipDialog.url" clearable
+          placeholder="粘贴网页链接（支持博客 / 新闻站 / 公众号文章）"
+          @keydown.enter.exact="submitClip" />
+        <el-input v-else v-model="clipDialog.urls" type="textarea" :rows="6" resize="vertical"
+          placeholder="每行一个链接（可粘贴完整分享文案，自动提取其中链接），一次最多 20 个" />
+        <div class="clip-tip">
+          支持大部分博客、新闻站与公众号文章。<strong>动态渲染的页面</strong>抓不到正文时，
+          会让你手动粘贴正文继续，其余流程不变。
+        </div>
+      </template>
+      <CandidateList v-else :items="clipDialog.items" @done="onClipDone"
+        @saved="onClipSaved" @open-material="openClipMaterial" />
+      <template v-if="clipDialog.stage === 'input'" #footer>
+        <el-button @click="clipDialog.show = false">取消</el-button>
+        <el-button type="primary" :loading="clipDialog.loading" @click="submitClip">开始抓取</el-button>
+      </template>
+    </el-dialog>
+
     <!-- 移动目标选择对话框 -->
     <el-dialog v-model="moveDialog.show" :title="moveDialog.type === 'folder' ? `移动文件夹「${moveDialog.name}」` : `移动文件「${moveDialog.name}」`" width="420px">
       <div class="move-list">
@@ -260,8 +297,10 @@
 import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Loading, ArrowDown, Folder, FolderAdd, FolderOpened, Grid, Plus, Close, Search, Upload, Document, Picture, Headset, VideoPlay, Reading } from '@element-plus/icons-vue'
-import { materialApi, foldersApi, settingsApi } from '../api'
+import { Loading, ArrowDown, Folder, FolderAdd, FolderOpened, Grid, Plus, Close, Search, Upload, Document, Picture, Headset, VideoPlay, Reading, Link, DocumentCopy, Clock } from '@element-plus/icons-vue'
+import { materialApi, foldersApi, settingsApi, clipApi } from '../api'
+import CandidateList from '../components/CandidateList.vue'
+import { useReadingStore } from '../stores/reading'
 import mascot from '../assets/mascot.png'
 
 const router = useRouter()
@@ -674,6 +713,108 @@ const onDrop = (e) => {
   files.forEach(doUpload)   // 多文件并行上传，各自有进度条
 }
 
+// ───────── 网页剪藏（P0-6）：粘贴链接 → 候选列表 → 逐条确认入库 ─────────
+const reading = useReadingStore()
+const clipDialog = reactive({
+  show: false, batch: false, stage: 'input', url: '', urls: '', items: [], loading: false
+})
+
+function openClip(batch) {
+  importPop.value?.hide()
+  reading.clearClipDraft()   // N11：新开一轮剪藏 → 丢掉上一轮寄存的候选
+  Object.assign(clipDialog, { show: true, batch, stage: 'input', url: '', urls: '', items: [], loading: false })
+}
+
+/** 「最近阅读」入口：它是从"浏览"到"沉淀"的中间态，故不占左侧主导航，放这里进。 */
+function openRecentReading() {
+  importPop.value?.hide()
+  reading.clearHandoff()
+  router.push({ path: '/read', query: { recent: '1' } })
+}
+
+async function submitClip() {
+  if (clipDialog.batch) {
+    const urls = clipDialog.urls.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+    if (!urls.length) { ElMessage.warning('请粘贴至少一个链接'); return }
+    if (urls.length > 20) { ElMessage.warning('一次最多 20 个链接，请分批粘贴'); return }
+    clipDialog.loading = true
+    try {
+      const { data } = await clipApi.batchPreview({ urls })
+      clipDialog.items = data.items || []
+      clipDialog.stage = 'items'
+      stashClip()
+    } catch (e) {
+      ElMessage.error(clipErr(e))
+    } finally {
+      clipDialog.loading = false
+    }
+    return
+  }
+  const url = clipDialog.url.trim()
+  if (!url) { ElMessage.warning('请粘贴网页链接'); return }
+  clipDialog.loading = true
+  try {
+    const { data } = await clipApi.preview({ url })
+    clipDialog.items = [data]
+    clipDialog.stage = 'items'
+    stashClip()
+  } catch (e) {
+    ElMessage.error(clipErr(e))
+  } finally {
+    clipDialog.loading = false
+  }
+}
+
+/** N11：把「候选列表」整批寄存到 store。
+ *  ⚠️ 「仅阅读」会 router.push('/read') → LibraryView 卸载（App.vue 无 keep-alive）
+ *     → 组件内 reactive 全丢，**同批其余候选凭空消失**，用户得从头再粘一遍链接。
+ *     存的是同一个数组引用：条目上的 `_paste` 草稿 / `saved` / `material_id` 一并保住，
+ *     不需要序列化、不写盘（应用重启即空，与「最近阅读」同语义）。
+ */
+function stashClip() {
+  reading.setClipDraft({
+    batch: clipDialog.batch,
+    stage: clipDialog.stage,
+    url: clipDialog.url,
+    urls: clipDialog.urls,
+    items: clipDialog.items
+  })
+}
+
+function onClipSaved() { refresh() }   // 新条目正在后台解析 → 刷新列表即可看到进度
+
+function onClipDone() {
+  clipDialog.show = false
+  refresh()
+  // 候选列表里点「仅阅读」已把正文放进交接 store，这里负责导航
+  if (reading.handoff) {
+    stashClip()             // N11：整批候选先寄存，从阅读页回来时原样恢复
+    router.push('/read')
+    return
+  }
+  reading.clearClipDraft()  // 点「完成」= 本轮结束，清掉寄存
+}
+
+function openClipMaterial(it) {
+  if (it.material_id) router.push(`/study/${it.material_id}`)
+}
+
+function clipErr(e) {
+  const d = e?.response?.data?.detail
+  if (typeof d === 'string') return d
+  if (d && typeof d === 'object') return d.hint || d.reason || '抓取失败'
+  return e?.message || '抓取失败'
+}
+
+// 来源渠道徽章：只标外部来源（upload / local 不标，见卡片模板注释）
+const ORIGIN_LABELS = { url: '网页剪藏', wx: '公众号文章', xhs: '小红书笔记', weread: '微信读书' }
+const originLabel = (o) => ORIGIN_LABELS[o] || ''
+const originTitle = (m) => {
+  const meta = m.origin_meta || {}
+  const bits = [meta.sitename, meta.author, meta.date].filter(Boolean)
+  return bits.length ? `${originLabel(m.origin)} · ${bits.join(' · ')}` : originLabel(m.origin)
+}
+
 // 导入本地文件/文件夹：客户端走 pywebview 原生对话框，开发态（浏览器）粘贴路径兜底
 const importPop = ref(null)
 function onPickLocal(mode) {
@@ -741,6 +882,11 @@ async function onDelete(m) {
 }
 
 onMounted(async () => {
+  // N11：从阅读页返回时把寄存的候选列表还给对话框 —— 否则用户得重新粘一遍链接。
+  // ⚠️ 只有「仅阅读」会留下 draft（点「完成」时已清），所以这里弹出来正是「继续处理」。
+  if (reading.clipDraft) {
+    Object.assign(clipDialog, reading.clipDraft, { show: true, loading: false })
+  }
   loading.value = true
   await Promise.all([refresh(), loadFolders(), loadPresetTags()])
   loading.value = false
@@ -801,6 +947,19 @@ onUnmounted(() => pollTimer && clearInterval(pollTimer))
   font-size: 12px; color: var(--asc-text-2); margin-bottom: 6px;
 }
 .import-mode-tip { font-size: 11px; color: var(--asc-text-3); line-height: 1.5; }
+/* 剪藏对话框说明 */
+.clip-tip {
+  font-size: 12px; color: var(--asc-text-2); line-height: 1.7;
+  background: var(--asc-surface-2); border-radius: 6px; padding: 8px 10px; margin-top: 10px;
+}
+/* 卡片来源徽章（网页/公众号/微信读书）：与格式名同行的轻量标签 */
+.origin-chip {
+  font-size: 11px; font-weight: 600; border-radius: 4px;
+  padding: 0 6px; line-height: 16px; white-space: nowrap;
+}
+.o-url { color: #2563eb; background: #e8f0fd; }
+.o-wx { color: #15803d; background: #e8f6ed; }
+.o-weread { color: #15803d; background: #e8f6ed; }
 
 /* ===== 上传队列 ===== */
 .upload-list {

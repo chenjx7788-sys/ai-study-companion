@@ -24,6 +24,21 @@ class Material(Base):
     storage_mode = Column(String(16), default="copy")   # copy 复制副本 / reference 引用原文件
     source_folder = Column(String(255), default="")      # [废弃] 来源文件夹名，已迁移到 folder_id
     folder_id = Column(Integer, ForeignKey("folders.id"), nullable=True)   # 所属文件夹，NULL=未分组
+    # 来源渠道与溯源信息（外部内容接入用）。
+    # ⚠️ origin 决定「这份内容能不能建索引」——能力判定只认 services/external.py 的
+    # ORIGIN_RIGHTS 一张表，渠道侧不许各写一套（本项目反复踩过「漏一处就不一致」）。
+    # 取值：upload 本地上传 / local 本地导入 / url 网页剪藏 / wx 公众号文章 /
+    #       weread 微信读书 / feed 播客·RSS（暂缓，枚举值预留）。
+    # 存量记录默认 upload，零影响。
+    origin = Column(String(16), default="upload")
+    # 溯源稳定键：网页=URL，微信读书=bookId，本地导入=原文件绝对路径。
+    # 与 origin 组合唯一，用于「同一篇内容不重复入库」的幂等判定，
+    # 也用于「最近阅读」判定某条是否已沉淀为材料（重启后仍准确，不用内存标记）。
+    # ⚠️ 可能超过 255 字符，故用 Text 而非 String。
+    origin_ref = Column(Text, default="")
+    # 抽取到的元信息快照：{title, author, date, sitename, ...}。纯展示与溯源用，
+    # 不做业务判定（判定一律走 origin_ref）。
+    origin_meta = Column(JSON, default=dict)
     parsed_status = Column(String(16), default="parsing")  # parsing / success / failed
     parse_error = Column(String(255), nullable=True)
     parse_progress = Column(Integer, default=0)   # 解析进度 0-100（音视频转写有真实进度）

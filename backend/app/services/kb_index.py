@@ -20,10 +20,33 @@ def index_material(db: Session, material_id: int) -> int:
 
     不依赖 parsed_status（所有调用方均已保证材料解析成功），改为检查 chunks 是否存在，
     以支持「先建索引、后标记 success」的时序，避免 status=success 先于索引导致的删除竞态。
+
+    ⚠️ 写入前会先清掉本材料在 `kb_chunks` 里的**全部旧向量** —— 材料「重试解析」会删旧 chunk
+    建新 chunk，新的 id 与旧的必然不同，按 id 的「先删后增」删不到旧向量（详见函数体内说明）。
     """
     m = db.get(Material, material_id)
     if not m:
         return 0
+
+    # ⚠️ 先清本材料的全部旧块向量，再重建（顺序不能颠倒）：
+    #   `_parse_material` 重试时会「删旧 chunk → 建新 chunk」，新 chunk 的 id 与旧的**必然不同**
+    #   （SQLite 的 rowid 取 max+1，真实库里总有别的材料的块压在表尾，不会复用），
+    #   而 embedding_id 由 `chunk:{id}:{seq}` 派生 → `index_texts` 的「按 id 先删后增」
+    #   一条旧向量都删不到 → 旧向量留在 Chroma 被检索召回，AI 问答会引用**不存在的 chunk**、
+    #   知识库块数虚高。实测：重试解析一次后 向量 6 / 块 3。
+    #   ⚠️ 不能用 `vector.delete_by_material`：它遍历两个集合，会把该材料的**笔记向量**一起删
+    #      （笔记不随材料删除，只解绑）。
+    #   ⚠️ 必须放在「无块则返回」**之前**：材料被重解析成空（scanned）时同样要清。
+    try:
+        col = vector_svc.get_collection(vector_svc.CHUNK_COL)
+        stale = col.get(where={"material_id": material_id})
+        if stale and stale.get("ids"):
+            col.delete(ids=stale["ids"])
+    except BaseException as e:
+        # ⚠️ 用 BaseException 且绝不外抛：清旧向量是「卫生」步骤，失败也不能阻断建索引
+        #    （hnsw 索引残缺时 col.get 会抛 InternalError；宁可留孤儿，也不能让解析整体失败）
+        print(f"[kb_index] 清理材料 {material_id} 的旧向量失败（继续建索引）: {e}")
+
     chunks = (db.query(MaterialChunk)
               .filter(MaterialChunk.material_id == material_id)
               .order_by(MaterialChunk.page_no, MaterialChunk.id).all())

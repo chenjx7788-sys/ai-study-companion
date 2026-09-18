@@ -26,3 +26,7 @@ pywebview>=6.0   # 客户端原生窗口 + 原生文件/文件夹选择对话框
 # AI 播客 · 语音合成：edge-tts 免费、无需 API Key，输出 MPEG-2 Layer III / 24kHz / 48kbps / mono
 # 注意：依赖 aiohttp（自动带入）。聚合音频采用 MP3 帧字节拼接，无需 ffmpeg。
 edge-tts>=7.2
+# 网页剪藏：专业级正文抽取。⚠️ 安装体积 +39.8MB（其中 babel/locale-data 独占 28.5MB），
+# 打包时剔除 babel/locale-data 后降到 +11.3MB —— 实测中文抽取不依赖它（见 _fetch_probe/probe4_babel_trim.py）。
+# ⚠️ 打包后必须实测：静态抓取 + SPA 判定 + 公众号抓取三态都正常。
+trafilatura>=2.2

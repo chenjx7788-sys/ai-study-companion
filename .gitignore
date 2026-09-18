@@ -34,3 +34,6 @@ frontend/vite.config.js.timestamp-*.mjs
 backend/mascot.png
 backend/mascot.icns
 backend/mascot.iconset/
+
+# 补丁脚本的落地备份（*.bak-<批次>-<时间戳>，见技能 safe-source-patching）
+*.bak-*
