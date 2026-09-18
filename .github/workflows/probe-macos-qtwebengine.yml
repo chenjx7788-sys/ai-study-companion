@@ -37,14 +37,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 只装探针自己需要的两个包，**不碰 backend/requirements.txt**：
-      # 阶段 0 是前置验证，不该在这一步改动生产依赖（新增 pywebview[pyside6] 属阶段 1）。
-      # 版本与 Windows 侧已实测的基线一致（PySide6 6.11.2 内嵌 Chromium 140），
-      # 便于两平台横向对比；要升级请当作一次有意识的改动，别顺手 latest。
-      - name: 安装探针依赖（PySide6 + QtPy，不入 requirements）
+      # 装探针自己需要的三个包，**不碰 backend/requirements.txt**：
+      # 阶段 0 是前置验证，不该在这一步改动生产依赖（把 pywebview[pyside6] 写进
+      # requirements.txt 属阶段 1）。但 **pywebview 本体必须在这里装上**：
+      #   D4 判的就是「PYWEBVIEW_GUI=qt 是否真的生效」，没有 pywebview 就无从判起；
+      #   首轮跑批正是因此把 D4 判成 FAIL
+      #   （ModuleNotFoundError: No module named 'webview'）—— 那不是 macOS 的 no-go，
+      #   而是本步骤漏装了依赖。对应评据因果已记入下方注释。
+      # 版本与 Windows 侧已实测的基线一致（PySide6 6.11.2 内嵌 Chromium 140 /
+      # pywebview 6.2.1），便于两平台横向对比；要升级请当作一次有意识的改动。
+      - name: 安装探针依赖（PySide6 + QtPy + pywebview，不入 requirements）
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "PySide6==6.11.2" "QtPy==2.4.3"
+          python -m pip install "PySide6==6.11.2" "QtPy==2.4.3" "pywebview==6.2.1"
 
       # 两个未知里任选一个写死，都可能让这唯一一次跑批白费：
       #   ① runner 到底有没有 GUI 会话（没验证过就当它没有 = 未经验证的假设）；
