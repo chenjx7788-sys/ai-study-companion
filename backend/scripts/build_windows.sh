@@ -78,7 +78,7 @@ for pat in ('$DIST_DIR/out.old-*', '$BUILD_DIR/work.old-*'):
 
 APP_DIR="$DIST_DIR/AIStudyCompanion"
 [ -d "$APP_DIR" ] || { echo "[ERROR] 未找到产物 $APP_DIR"; exit 1; }
-echo "打包产物：$APP_DIR（$(du -sh "$APP_DIR" | cut -f1)）"
+echo "打包产物：${APP_DIR}（$(du -sh "$APP_DIR" | cut -f1)）"
 
 echo ""
 echo "=== [3/4] 冒烟测试（启动后验证 /api/health）==="
@@ -122,7 +122,7 @@ with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
 print(f"  已写入 {len(files)} 个文件，用时 {time.time()-t0:.0f}s")
 PY
 [ -f "$ZIP_PATH" ] || { echo "[ERROR] zip 生成失败"; exit 1; }
-echo "发布包：$ZIP_PATH（$(du -sh "$ZIP_PATH" | cut -f1)）"
+echo "发布包：${ZIP_PATH}（$(du -sh "$ZIP_PATH" | cut -f1)）"
 
 echo ""
 echo "=== 完成 ==="

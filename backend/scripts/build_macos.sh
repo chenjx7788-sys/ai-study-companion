@@ -109,7 +109,7 @@ kill "$APP_PID" 2>/dev/null || true
 wait "$APP_PID" 2>/dev/null || true
 if [ "$ok" != "1" ]; then
   echo "[ERROR] 后端健康冒烟失败：后端未在 60s 内响应 /api/health（打包产物可能缺原生库）" >&2
-  echo "        --- 应用输出尾部（完整文件：$SMOKE_OUT）---" >&2
+  echo "        --- 应用输出尾部（完整文件：${SMOKE_OUT}）---" >&2
   tail -n 40 "$SMOKE_OUT" >&2 2>/dev/null || true
   exit 1
 fi
@@ -168,7 +168,7 @@ else
       --identity "$SIGN_IDENTITY" \
       --report "$BACKEND_DIR/dist/sign_report.json"
   fi
-  echo "签名通过（identity=$SIGN_IDENTITY）；证据：$BACKEND_DIR/dist/sign_report.json"
+  echo "签名通过（identity=${SIGN_IDENTITY}）；证据：$BACKEND_DIR/dist/sign_report.json"
 fi
 
 echo ""
