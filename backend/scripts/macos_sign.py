@@ -63,6 +63,22 @@ MACHO_MAGICS = frozenset([
 
 BUNDLE_SUFFIXES = (".app", ".framework")
 
+# ⚠️ fat 容器 magic（32/64 位、两种字节序）—— **与 fat 静态库共用同一个 magic**，
+#    所以只读前 4 字节**必然**把 `*.a` 误判成 Mach-O。详见 is_macho()。
+#    值 = (字节序, fat_arch 条目大小, offset 字段大小)
+_FAT_MAGICS = {
+    b"\xca\xfe\xba\xbe": ("big", 20, 4),     # FAT_MAGIC     · fat_arch
+    b"\xbe\xba\xfe\xca": ("little", 20, 4),  # FAT_CIGAM
+    b"\xca\xfe\xba\xbf": ("big", 32, 8),     # FAT_MAGIC_64  · fat_arch_64
+    b"\xbf\xba\xfe\xca": ("little", 32, 8),  # FAT_CIGAM_64
+}
+# ar(1) 归档 magic —— 静态库/目标文件的真身
+_AR_MAGIC = b"!<arch>\n"
+
+# 「签名信息被写进扩展属性」的关键字（全小写后做子串比较）。
+# 这套 xattr 是 Apple **旧式**签名方案，codesign 只在「无法内嵌签名」的文件上才会用它。
+XATTR_SIGN_KEYS = ("com.apple.cs.", "com.apple.codesign")
+
 # 最小自测树：够覆盖「嵌套 .app / .framework / dylib / 可执行」四种形态与三层深度
 _SELFTEST_LAYOUT = [
     # (相对路径, 内容头 4 字节)
@@ -78,22 +94,89 @@ _SELFTEST_LAYOUT = [
 ]
 
 
-def is_macho(p: Path) -> bool:
-    """按 Mach-O magic 判定，不依赖 `file` 命令（跨平台可测）。"""
+def _fat_slices_are_archives(f) -> bool:
+    """f 是**已打开、定位在 0** 的 fat 容器；返回「它的每个切片都是 ar 归档」。
+
+    ⚠️⚠️ 这一条是 2026-09-20 run #12 的根因所在。
+    PySide6 的 macOS wheel 里带一个 **fat 静态库**：
+
+        PySide6/Qt/qml/Qt/labs/assetdownloader/libqmlassetdownloaderprivateplugin.a
+
+    它的文件头是 **FAT_MAGIC（0xcafebabe）—— 和 fat Mach-O 完全同一个 magic**，
+    所以「只读前 4 字节」的判定必然把它当成 Mach-O 去签名。而 codesign 对归档
+    **无法内嵌签名**，只能退回写 **xattr 型旧式签名**
+    （`com.apple.cs.CodeDirectory` / `CodeRequirements` / `CodeSignature`）——
+    恰好撞上本脚本自己的 xattr 检查（那条检查的本意是「签名若只存在于 xattr，
+    zip 一传就丢」）。于是脚本**自己制造了问题，再把它判成致命**，两条 job 全红。
+
+    实测证据（`diag-arm64` / `diag-x86_64` 的 `sign_report.json`）：
+    `xattr_hits = 4`，且 4 条**全落在同一个 `.a` 上**，两架构完全一致；
+    同一次运行 `sign_failed = 0`、`verify_failed = 0`、`order_problems = []`。
+
+    判法：解析 fat_header 的 nfat_arch，逐个 fat_arch 取 `offset`，看该偏移处
+    8 字节是不是 `!<arch>\\n`。**全部**切片都是归档才判定为归档。
+    切片里只要有任何一个像 Mach-O，就仍然按 Mach-O 签名（**失败安全**：
+    宁可不排除，也不要漏签真的代码）。
+    """
+    f.seek(0)
+    magic = f.read(4)
+    spec = _FAT_MAGICS.get(magic)
+    if not spec:
+        return False
+    endian, ent_size, off_size = spec
+    n = int.from_bytes(f.read(4), endian)
+    if n <= 0 or n > 64:
+        return False
+    for i in range(n):
+        f.seek(8 + i * ent_size + 8)          # cputype(4) + cpusubtype(4) 之后是 offset
+        off = int.from_bytes(f.read(off_size), endian)
+        if off < 8:
+            return False
+        f.seek(off)
+        if f.read(8) != _AR_MAGIC:
+            return False
+    return True
+
+
+def _classify_macho(p: Path) -> str:
+    """返回 'macho' | 'fat_archive' | 'no'。
+
+    只开一次文件就把「是不是可签名代码」和「为什么不是」都判出来，
+    供 collect_targets 一遍走完（避免为统计再开一遍全部文件）。
+    """
     try:
         with open(p, "rb") as f:
-            return f.read(4) in MACHO_MAGICS
+            magic = f.read(4)
+            if magic not in MACHO_MAGICS:
+                return "no"
+            if magic in _FAT_MAGICS:
+                return "fat_archive" if _fat_slices_are_archives(f) else "macho"
+            return "macho"                     # thin Mach-O
     except OSError:
-        return False
+        return "no"
 
 
-def collect_targets(app: Path):
+def is_macho(p: Path) -> bool:
+    """按 Mach-O magic 判定，不依赖 `file` 命令（跨平台可测）。
+
+    fat 容器要**再往里看一眼**：fat Mach-O 与 fat 静态库共用 FAT_MAGIC，
+    只有确认「所有切片都是 ar 归档」才排除（见 `_fat_slices_are_archives`）。
+    thin 归档（直接以 `!<arch>\\n` 开头）本就不在 MACHO_MAGICS 里，无此问题。
+    """
+    return _classify_macho(p) == "macho"
+
+
+def collect_targets(app: Path, skipped: list | None = None):
     """返回 (leaves, bundles)，均为 Path，且**已按由深到浅排好序**。
 
     leaves  = 所有 Mach-O 文件（dylib / so / 可执行 / 嵌套 .app 内的主可执行）
     bundles = 所有嵌套 .app / .framework 目录（**不含**最外层 app 自身）
 
     排序规则：路径层数降序（深的先签）。同层按字符串排序保证确定性。
+
+    传入 `skipped`（list）时，会把「因是 fat 静态库而被排除」的路径记进去 ——
+    用于写进报告并在日志里明示「本轮没签哪些、为什么」（run #12 的教训：
+    一个不做记录的隐式排除，会让人在下一次红的时候无从下手）。
     """
     root = app.resolve()
     leaves, bundles = [], []
@@ -104,11 +187,16 @@ def collect_targets(app: Path):
                 bundles.append(d / name)
         for name in filenames:
             f = d / name
-            if is_macho(f):
+            kind = _classify_macho(f)
+            if kind == "macho":
                 leaves.append(f)
+            elif kind == "fat_archive" and skipped is not None:
+                skipped.append(f)
     key = lambda p: (-len(p.parts), str(p))  # noqa: E731
     leaves.sort(key=key)
     bundles.sort(key=key)
+    if skipped is not None:
+        skipped.sort(key=str)
     return leaves, bundles
 
 
@@ -137,6 +225,32 @@ def check_self_inward(order, root: Path) -> list:
         problems.append("顺序违规：外层 bundle 必须**最后**签（实际最后是 %s）"
                         % (Path(order[-1]).name if order else "<空>"))
     return problems
+
+
+def classify_xattr_hits(lines, signed_paths) -> tuple[list, list]:
+    """把 `xattr -lr` 的输出行分成 (致命, 良性)。**纯函数，任意平台可测。**
+
+    - **致命**：命中落在**我们自己签过的对象**上（`signed_paths` 里）。
+      那种签名确实**只存在于 xattr**，而 `zip -y` 不保存 xattr → 用户解压出来签名就没了。
+      这正是这条检查当初要防的事，必须继续判死。
+    - **良性**：命中落在签名序列之外。典型案例是上游 Qt wheel 自带的 `*.a` 静态库
+      遗留的旧式 xattr 签名（它不是运行期可加载的代码，丢了不影响包的有效性）。
+      只作提示，不阻断构建。
+
+    ⚠️ 2026-09-20 run #12 的教训：这条检查**原来一行日志都不打**，
+    `ok=False` 时只说「详见报告」——在 CI 里等于「红了但不说什么原因」，
+    定位只能靠读 JSON 排除法。所以两类的命中项都必须完整打出来。
+    """
+    fatal, benign = [], []
+    for line in lines:
+        low = line.lower()
+        if not any(k in low for k in XATTR_SIGN_KEYS):
+            continue
+        # `xattr -l` 的行格式是 `<路径>: <属性名>: <值>`；路径几乎不含冒号，
+        # 故取第一个冒号之前即为路径（值与属性名里都可能还有冒号）。
+        path = line.split(":", 1)[0].strip()
+        (fatal if path in signed_paths else benign).append(line.strip())
+    return fatal, benign
 
 
 def _codesign_prefix(bin_path: str):
@@ -225,12 +339,19 @@ def sign_and_verify(app: Path, identity: str, entitlements, codesign_bin: str,
                          % (codesign_bin, bin_detail))
     log("[sign] codesign = %s" % bin_detail)
 
-    leaves, bundles = collect_targets(root)
+    skipped_archives: list = []
+    leaves, bundles = collect_targets(root, skipped=skipped_archives)
     order = leaves + bundles + [root]
     problems = check_self_inward(order, root)
 
     log("[sign] 待签对象：Mach-O 文件 %d 个 · 嵌套 bundle %d 个 · 外层 1 个 = %d"
         % (len(leaves), len(bundles), len(order)))
+    if skipped_archives:
+        # ⚠️ 必须明示：隐式排除会让人在下次红的时候无从下手（run #12 的教训）
+        log("[sign] 已排除 fat 静态库 %d 个（ar 归档不可内嵌签名，签它只会写成 xattr → zip 丢）:"
+            % len(skipped_archives))
+        for f in skipped_archives[:10]:
+            log("[sign]   - %s" % f.relative_to(root))
     log("[sign] identity=%s%s" % (identity, "（ad-hoc）" if identity in ("", "-") else ""))
     if problems:
         for p in problems:
@@ -261,14 +382,20 @@ def sign_and_verify(app: Path, identity: str, entitlements, codesign_bin: str,
     else:
         log("[sign] 有签名失败，跳过验证（先修签名）")
 
-    # xattr 检查：签名信息若被写进扩展属性，zip 一传就丢 → 包整体失效
-    xattr_hits = []
+    # xattr 检查：签名信息若**只**被写进扩展属性，zip 一传就丢 → 包整体失效。
+    # 关键：只有落在我们签过的对象上的命中才致命；其余只提示（见 classify_xattr_hits）。
+    # 两类的命中项**都要打日志** —— 这道门以前完全静默，run #12 因此只能靠排除法定位。
+    xattr_hits, xattr_benign = [], []
     if sys.platform == "darwin" and not failures:
+        signed_paths = {str(t) for t in order}
         rc, out = run(["xattr", "-lr", str(root)])
-        for line in out.splitlines():
-            low = line.lower()
-            if any(k in low for k in ("com.apple.cs.", "com.apple.codesign")):
-                xattr_hits.append(line.strip())
+        xattr_hits, xattr_benign = classify_xattr_hits(out.splitlines(), signed_paths)
+        log("[sign] xattr 检查：致命 %d 项 · 良性 %d 项（xattr rc=%d）"
+            % (len(xattr_hits), len(xattr_benign), rc))
+        for line in xattr_hits[:10]:
+            log("[sign] ✗ 已签对象上存在 xattr 型签名（zip 会丢）%s" % line)
+        for line in xattr_benign[:10]:
+            log("[sign] · 非签名对象上的 xattr 签名（不影响包有效性）%s" % line)
 
     ok = not failures and not verify_failures and not xattr_hits and not problems
     report = {
@@ -280,19 +407,31 @@ def sign_and_verify(app: Path, identity: str, entitlements, codesign_bin: str,
             "leaves": len(leaves), "bundles": len(bundles), "total": len(order),
             "signed_ok": signed_ok, "sign_failed": len(failures),
             "verify_failed": len(verify_failures), "xattr_hits": len(xattr_hits),
+            "xattr_benign": len(xattr_benign),
+            "skipped_fat_archives": len(skipped_archives),
         },
         "order_ok": not problems,
         "order_problems": problems,
         "sign_order": [str(t.relative_to(root)) if root in t.parents else "." for t in order],
+        "skipped_fat_archives": [str(f.relative_to(root)) for f in skipped_archives],
         "sign_failures": failures,
         "verify_failures": verify_failures,
         "xattr_hits": xattr_hits,
+        "xattr_benign": xattr_benign,
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     log("[sign] 报告：%s" % report_path)
     if not ok:
-        raise SystemExit("[sign] 签名/验证未全部通过（详见报告）—— 中止，不产出发不出去的包")
+        # ⚠️ 失败信息必须**分项**说明是哪道门 —— 原来只说「详见报告」，
+        #    在 CI 里等于「红了但不说什么原因」（run #12 只能靠排除法定位）。
+        raise SystemExit(
+            "[sign] 签名/验证未全部通过 —— 中止，不产出发不出去的包\n"
+            "        分项：sign_failed=%d  verify_failed=%d  xattr_fatal=%d  "
+            "order_problems=%d\n"
+            "        报告：%s"
+            % (len(failures), len(verify_failures), len(xattr_hits),
+               len(problems), report_path))
     log("[sign] ✅ 全部通过：%d 项已签且验证有效（含嵌套 QtWebEngineProcess.app）" % len(order))
     return report
 
@@ -364,6 +503,9 @@ def run_self_test() -> int:
       T4 篡改一个**嵌套**文件后，验证必须失败（否则说明验证是恒真的）
       T5 探针不与替身共谋：同一个**拒绝 --version** 的 codesign，新探针判「可用」
       T5b（负向自检）同一码上老探针（--version）判「不可用」—— 结论必须相反
+      T6/T6b/T6c xattr 命中分类（用 run #12 的真实 4 行为合成数据 + 噪声对照 + 分辨力）
+      T7a..e fat 容器：fat Mach-O 仍签、**fat 静态库必须排除**、旧判据会误判（分辨力）
+      T7f..h 集成：树里带着 fat 静态库时，排除被记录、且整轮 ok=True（不再自伤）
     """
     results = []
 
@@ -428,6 +570,75 @@ def run_self_test() -> int:
             rc, out = run(_codesign_prefix(str(fake)) + ["--verify", "--strict",
                                                          "--verbose=2", str(victim)])
             chk("T4 篡改嵌套可执行后验证必须失败", rc != 0, out[:200])
+
+        # ---- T7 fat 容器：与 fat 静态库共用 magic，只能靠**切片内容**区分 ----
+        def _fat(entry_head: bytes) -> bytes:
+            """造一个 fat 容器：fat_header(8) + 1×fat_arch(20) + 切片数据。"""
+            head = bytes.fromhex("cafebabe") + (1).to_bytes(4, "big")
+            head += (0x0100000C).to_bytes(4, "big") + (0).to_bytes(4, "big")
+            head += (28).to_bytes(4, "big") + (4096).to_bytes(4, "big")
+            head += (12).to_bytes(4, "big")
+            return head + entry_head + b"\x00" * 64
+
+        p_fat_macho = tmp / "fat_macho.bin"
+        p_fat_macho.write_bytes(_fat(b"\xcf\xfa\xed\xfe"))
+        p_fat_ar = tmp / "fat_archive.a"
+        p_fat_ar.write_bytes(_fat(_AR_MAGIC))
+        p_thin_ar = tmp / "thin_archive.a"
+        p_thin_ar.write_bytes(_AR_MAGIC + b"\x00" * 64)
+        p_thin_macho = tmp / "thin_macho.bin"
+        p_thin_macho.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 64)
+
+        chk("T7a thin Mach-O 仍判为可签名", is_macho(p_thin_macho))
+        chk("T7b fat Mach-O 仍判为可签名", is_macho(p_fat_macho))
+        chk("T7c fat 静态库判为**不可**签名（run #12 的根因）", not is_macho(p_fat_ar))
+        chk("T7d thin 静态库判为不可签名", not is_macho(p_thin_ar))
+        chk("T7e 分辨力：旧判据（只看前 4 字节）在同一 fat 归档上会判 True",
+            p_fat_ar.read_bytes()[:4] in MACHO_MAGICS,
+            "前4字节=%r" % p_fat_ar.read_bytes()[:4])
+
+        # T7f/T7g/T7h 集成：把 fat 静态库放进假 .app 里（复现 run #12 的现场）
+        nested_ar = app / "Contents/Resources/libqmlassetdownloaderprivateplugin.a"
+        nested_ar.parent.mkdir(parents=True, exist_ok=True)
+        nested_ar.write_bytes(_fat(_AR_MAGIC))
+        _sk = []
+        _lv, _bd = collect_targets(root, skipped=_sk)
+        chk("T7f 树里的 fat 静态库被排除**且被记录**", nested_ar in _sk,
+            "skipped=%s" % [str(x) for x in _sk])
+        chk("T7g 被排除的对象不在 leaves 里", nested_ar not in _lv,
+            "leaves=%d" % len(_lv))
+        rep2 = tmp / "report2.json"
+        try:
+            r2 = sign_and_verify(app, "-", None, str(fake), rep2, log=lambda *_: None)
+            chk("T7h 树里带着 fat 静态库时，整轮仍然 ok=True（不再自伤）",
+                bool(r2["ok"]) and r2["counts"]["skipped_fat_archives"] == 1,
+                json.dumps(r2["counts"], ensure_ascii=False))
+        except SystemExit as e:
+            chk("T7h 树里带着 fat 静态库时，整轮仍然 ok=True（不再自伤）", False, str(e))
+
+        # ---- T6 xattr 分类：直接用 run #12 命中的那 4 行真实现场当合成数据 ----
+        xa_path = ("/tmp/app/AIStudyCompanion.app/Contents/Resources/PySide6/Qt/qml/"
+                   "Qt/labs/assetdownloader/libqmlassetdownloaderprivateplugin.a")
+        xa_lines = [xa_path + ": com.apple.cs." + n + ": \x00\x01"
+                    for n in ("CodeDirectory", "CodeRequirements",
+                              "CodeRequirements-1", "CodeSignature")]
+        # 噪声对照：不含关键字的 xattr 必须被忽略，否则分类会把整份输出都算进来
+        noise = ["/tmp/app/foo: com.apple.quarantine: 0081",
+                 "/tmp/app/bar: com.apple.provenance: ",
+                 "/tmp/app/baz: user.custom: 1"]
+        f1, b1 = classify_xattr_hits(xa_lines + noise, set())
+        chk("T6 非签名对象上的 xattr 签名 → 良性，不阻断", (not f1) and len(b1) == 4,
+            "fatal=%d benign=%d" % (len(f1), len(b1)))
+        f2, b2 = classify_xattr_hits(xa_lines + noise, {xa_path})
+        chk("T6b 分辨力：同一批行放进「已签」集合 → 全部转致命（结论相反）",
+            len(f2) == 4 and not b2, "fatal=%d benign=%d" % (len(f2), len(b2)))
+        # 噪声对照：不含关键字的 xattr 行**不得**出现在任何一类结果里。
+        # ⚠️ 注意别写成「b1 里的行不含关键字」—— b1 装的就是含关键字的行，那样是恒假。
+        _hay = "\n".join(b1 + f2 + b2)
+        _noise_paths = ("/tmp/app/foo", "/tmp/app/bar", "/tmp/app/baz")
+        chk("T6c 不含关键字的 xattr 被忽略（quarantine / provenance / 自定义都不算）",
+            (not any(p in _hay for p in _noise_paths)) and len(b1) == 4,
+            "混进=%r  b1=%d" % ([p for p in _noise_paths if p in _hay], len(b1)))
 
     print("=" * 74)
     print("macos_sign.py 自测（假 codesign，任意平台可跑）")
