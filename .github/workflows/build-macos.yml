@@ -22,7 +22,9 @@ jobs:
             arch: x86_64
             label: Intel
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # 阶段 1 起本 job 多了两步真机动作：逐个 Mach-O 签名 + 逐项验证（Qt 的嵌套 bundle 很多），
+    # 以及原生外壳冒烟（90s 上限）。60 分钟的余量不足以覆盖「打包慢 + 签名慢」同时发生。
+    timeout-minutes: 90
     # 允许 GITHUB_TOKEN 创建 release（默认只读，否则 softprops/action-gh-release 报 "Resource not accessible by integration"）
     permissions:
       contents: write
@@ -56,6 +58,44 @@ jobs:
           # 若 HuggingFace 直连不稳，可切换国内镜像：
           # HF_ENDPOINT: https://hf-mirror.com
         run: bash backend/scripts/build_macos.sh
+
+      # 2026-09-20 预检新增：原来的 job 在失败时**零 artifact** ——
+      #   build_macos.sh exit 1 → 后续 step 全部跳过；而 sign_report.json /
+      #   smoke_native_shell.json 本来就不在上传列表里。
+      #   于是「唯一一次 macOS 跑批」一旦变红，只剩一份日志可查。
+      # 这两步把三类证据无条件收走：体积、签名报告、外壳冒烟报告 + 应用原始输出。
+      - name: 记录产物体积（WP10 证据）
+        if: always()
+        run: |
+          mkdir -p backend/dist
+          {
+            echo "arch=${{ matrix.arch }}  runner=${{ matrix.os }}"
+            ZIP="backend/dist/ai-study-companion-macos-${{ matrix.arch }}.zip"
+            if [ -f "$ZIP" ]; then
+              echo "zip_bytes=$(stat -f%z "$ZIP")"
+              echo "zip_mb=$(du -m "$ZIP" | cut -f1)"
+            else
+              echo "zip_bytes=NA"
+            fi
+            if [ -d backend/dist/AIStudyCompanion.app ]; then
+              echo "app_mb=$(du -sm backend/dist/AIStudyCompanion.app | cut -f1)"
+            else
+              echo "app_mb=NA"
+            fi
+          } > "backend/dist/size_report_${{ matrix.arch }}.txt" 2>&1 || true
+          cat "backend/dist/size_report_${{ matrix.arch }}.txt" 2>/dev/null || true
+
+      - name: 上传诊断证据（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-${{ matrix.arch }}
+          path: |
+            backend/dist/size_report_${{ matrix.arch }}.txt
+            backend/dist/sign_report.json
+            backend/dist/smoke_native_shell.json
+            backend/dist/smoke_backend_stdout.txt
+          if-no-files-found: ignore
 
       - name: 上传打包产物（artifact）
         uses: actions/upload-artifact@v4

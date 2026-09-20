@@ -87,7 +87,11 @@ echo "=== [5/7] 后端健康冒烟（ASC_BROWSER=1 强制浏览器模式） ==="
 #    真正的外壳判据是下一步 [5b]，见 WP8b。
 SMOKE_PORT="${SMOKE_PORT:-8123}"
 APP_BIN="$APP_BUNDLE/Contents/MacOS/AIStudyCompanion"
-ASC_BROWSER=1 ASC_PORT="$SMOKE_PORT" "$APP_BIN" >/dev/null 2>&1 &
+# ⚠️ 应用输出**不能**丢进 /dev/null：这一步失败时，它是唯一的原始线索。
+#    写到 dist/ 下，由 CI 作为诊断 artifact 收走（2026-09-20 预检发现：
+#    原来丢弃输出 → 失败时只剩「后端未响应」一句，无法区分缺库 / 端口冲突 / 首次解压慢）。
+SMOKE_OUT="$BACKEND_DIR/dist/smoke_backend_stdout.txt"
+ASC_BROWSER=1 ASC_PORT="$SMOKE_PORT" "$APP_BIN" >"$SMOKE_OUT" 2>&1 &
 APP_PID=$!
 ok=0
 for i in $(seq 1 60); do
@@ -101,6 +105,8 @@ kill "$APP_PID" 2>/dev/null || true
 wait "$APP_PID" 2>/dev/null || true
 if [ "$ok" != "1" ]; then
   echo "[ERROR] 后端健康冒烟失败：后端未在 60s 内响应 /api/health（打包产物可能缺原生库）" >&2
+  echo "        --- 应用输出尾部（完整文件：$SMOKE_OUT）---" >&2
+  tail -n 40 "$SMOKE_OUT" >&2 2>/dev/null || true
   exit 1
 fi
 echo "后端健康冒烟通过：/api/health 正常响应"
