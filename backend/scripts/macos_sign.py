@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -175,6 +176,41 @@ def run(cmd, timeout=600):
     return p.returncode, (p.stdout or "").strip()
 
 
+def codesign_available(codesign_bin: str):
+    """判定 codesign 是否可用。返回 (可用?, 说明)。**不调用任何命令行选项。**
+
+    ⚠️⚠️ 绝不要用 `codesign --version` 当探针。
+    macOS 自带的 codesign **没有 `--version` 选项**（只有 -s / -v / -d / -h /
+    --validate-constraint），调它只会打印 usage 并返回**非零** ——
+    于是「探针失败」被读成「这里不是 macOS」，**在真正的 macOS 上也会误判**。
+
+    2026-09-20 的 macOS 跑批就是这样挂的（run #10）：arm64 与 x86_64 **两条 job**
+    都一路走过 [1/6] 模型下载 → [4/6] PyInstaller（产物已生成）→ [5/7] 后端健康冒烟
+    → [5b/7] 原生外壳冒烟（`actual_backend = webview.platforms.qt`，R4 被证伪），
+    唯独 [5c/7] 被这一行判成「本步骤只能在 macOS 上运行」而整步中止。
+
+    它之所以躲过了 `--self-test`：自测用的假 codesign **自己实现了 `--version`**
+    （旧 `_FAKE_CODESIGN` 的 `if "--version" in args: ... sys.exit(0)`）——
+    测试替身把被测代码的错误假设**一起复制了**，所以这个 bug 在自测里结构性地
+    不可能被发现。现在假实现改成**和真身一样拒绝 `--version`**，并由自测 T5/T5b
+    做「同一个二进制、老探针判否 / 新探针判是」的分辨力证明。
+
+    改用「存在且可执行」判定：对真 codesign（/usr/bin/codesign 恒存在）与自测用的
+    .py 假实现都成立，且不依赖任何选项语义。
+    """
+    if Path(codesign_bin).is_absolute() or "/" in codesign_bin or "\\" in codesign_bin:
+        p = Path(codesign_bin)
+        if not p.exists():
+            return False, "路径不存在：%s" % codesign_bin
+        if not os.access(p, os.X_OK):
+            return False, "文件不可执行（缺 +x）：%s" % codesign_bin
+        return True, str(p)
+    found = shutil.which(codesign_bin)
+    if not found:
+        return False, "PATH 里找不到 %s" % codesign_bin
+    return True, found
+
+
 def sign_and_verify(app: Path, identity: str, entitlements, codesign_bin: str,
                     report_path: Path, log=print):
     t0 = time.time()
@@ -182,11 +218,12 @@ def sign_and_verify(app: Path, identity: str, entitlements, codesign_bin: str,
     if not root.is_dir():
         raise SystemExit("[sign] 找不到 .app：%s" % root)
 
-    rc, out = run(_codesign_prefix(codesign_bin) + ["--version"])
-    if rc != 0:
+    ok_bin, bin_detail = codesign_available(codesign_bin)
+    if not ok_bin:
         raise SystemExit("[sign] 调不到 codesign（%s）：%s\n"
-                         "        本步骤只能在 macOS 上运行。" % (codesign_bin, out))
-    log("[sign] %s" % out)
+                         "        本步骤只能在装有 Xcode Command Line Tools 的 macOS 上运行。"
+                         % (codesign_bin, bin_detail))
+    log("[sign] codesign = %s" % bin_detail)
 
     leaves, bundles = collect_targets(root)
     order = leaves + bundles + [root]
@@ -295,8 +332,14 @@ def digest(p):
     return hashlib.sha256("|".join(sorted(parts)).encode()).hexdigest()
 
 args = sys.argv[1:]
+# ⚠️ 与真身保持一致：macOS 的 codesign **拒绝** `--version`（打印 usage、返回非零）。
+#    这里**故意不实现**它 —— 旧版本实现了，结果把「拿 --version 当可用性探针」
+#    这个错误假设一起复制进了测试替身，导致真机上的误判在自测里永远看不见。
+#    改掉之后，谁再把 --version 探针写回去，自测会当场红灯（T3 / T5）。
 if "--version" in args:
-    print("fake codesign 1.0"); sys.exit(0)
+    print("codesign: unrecognized option --version")
+    print("Usage: codesign -s identity [-fv*] [-o flags] [-r reqs] [-i ident] path ...")
+    sys.exit(1)
 verify = "--verify" in args
 target = args[-1]
 if verify:
@@ -319,6 +362,8 @@ def run_self_test() -> int:
       T2 顺序**反了必须被抓到**（把 root 提到最前，check_self_inward 必须报违规）
       T3 正常签完后，逐项验证全部通过
       T4 篡改一个**嵌套**文件后，验证必须失败（否则说明验证是恒真的）
+      T5 探针不与替身共谋：同一个**拒绝 --version** 的 codesign，新探针判「可用」
+      T5b（负向自检）同一码上老探针（--version）判「不可用」—— 结论必须相反
     """
     results = []
 
@@ -363,6 +408,16 @@ def run_self_test() -> int:
                 json.dumps(r["counts"], ensure_ascii=False))
         except SystemExit as e:
             chk("T3 签名 + 逐项验证全部通过", False, str(e))
+
+        # T5 / T5b 分辨力证明：找**同一个**二进制练两种探针，结论必须相反。
+        #   假的 codesign 现在和真身一样拒绝 --version，所以：
+        #     老探针 → 判「不可用」（这正是真机上发生过的误判）；新探针 → 判「可用」。
+        #   两者结论相反 = T3 的通过不是因为替身迁就了探针。
+        rc_v, out_v = run(_codesign_prefix(str(fake)) + ["--version"])
+        avail, avail_detail = codesign_available(str(fake))
+        chk("T5 新探针认可这个 codesign（不依赖 --version）", avail, avail_detail)
+        chk("T5b 负向自检：老探针（--version）在同一码上判「不可用」",
+            rc_v != 0, "rc=%s out=%s" % (rc_v, out_v[:120]))
 
         # T4：篡改一个**嵌套**的 Mach-O，验证必须失败
         victim = app / ("Contents/Frameworks/PySide6/Qt/lib/QtWebEngineCore.framework/"
