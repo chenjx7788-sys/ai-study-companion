@@ -27,6 +27,10 @@ BACKEND_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$BACKEND_DIR/.." && pwd)"
 ARCH="${ARCH:-arm64}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
+# 顶部统一定义（不要在分支内定义）：CI 的 macOS runner 是 bash 3.2 + set -u，
+# 对「分支内才定义、分支外引用」的变量在报错文本/行号上表现不可靠；
+# 全局先定义后，任何分支的引用都无条件安全。
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 
 echo "=== [1/6] 下载 BGE 向量模型（data/ 被 .gitignore，仓库内无此模型） ==="
 mkdir -p "$BACKEND_DIR/data/models/bge-small-zh-v1.5"
@@ -146,18 +150,24 @@ echo "=== [5c/7] 代码签名（WP8 · R5） ==="
 if [ "${SKIP_SIGN:-0}" = "1" ]; then
   echo "[WARN] SKIP_SIGN=1，跳过签名（本次产物**未签名**，不可分发）"
 else
-  SIGN_IDENTITY="${SIGN_IDENTITY:--}"
-  SIGN_ARGS=()
+  # ⚠️ 不用 "${ARR[@]+"${ARR[@]}"}" 数组条件展开传可选参数：
+  # macOS runner 的 /bin/bash 是 3.2 + set -u，空数组展开有一整类 unbound variable 坑，
+  # 且 bash 3.2 的行号计数在含 heredoc/续行的脚本里有偏移，报错不可定位。
+  # 显式分支调用对任何 bash 版本行为一致（零魔法），代价只是两行重复。
   if [ "$SIGN_IDENTITY" != "-" ]; then
     # 真身份才带 entitlements：那些是 hardened runtime 的豁免项，
     # 没有 hardened runtime 时不起作用（详见 macos_entitlements.plist 里的说明）。
-    SIGN_ARGS+=(--entitlements "$BACKEND_DIR/scripts/macos_entitlements.plist")
+    python3 "$BACKEND_DIR/scripts/macos_sign.py" \
+      --app "$APP_BUNDLE" \
+      --identity "$SIGN_IDENTITY" \
+      --entitlements "$BACKEND_DIR/scripts/macos_entitlements.plist" \
+      --report "$BACKEND_DIR/dist/sign_report.json"
+  else
+    python3 "$BACKEND_DIR/scripts/macos_sign.py" \
+      --app "$APP_BUNDLE" \
+      --identity "$SIGN_IDENTITY" \
+      --report "$BACKEND_DIR/dist/sign_report.json"
   fi
-  python3 "$BACKEND_DIR/scripts/macos_sign.py" \
-    --app "$APP_BUNDLE" \
-    --identity "$SIGN_IDENTITY" \
-    "${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"}" \
-    --report "$BACKEND_DIR/dist/sign_report.json"
   echo "签名通过（identity=$SIGN_IDENTITY）；证据：$BACKEND_DIR/dist/sign_report.json"
 fi
 
