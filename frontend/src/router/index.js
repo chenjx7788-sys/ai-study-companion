@@ -15,7 +15,11 @@ const routes = [
   { path: '/settings', name: 'settings', component: () => import('../views/SettingsView.vue'), meta: { title: '管理中心' } },
   { path: '/editor', name: 'editor', component: () => import('../views/EditorView.vue'), meta: { title: '新增文档' } },
   { path: '/editor/:id', name: 'editorEdit', component: () => import('../views/EditorView.vue'), meta: { title: '编辑文档' } },
-  { path: '/help', name: 'help', component: () => import('../views/HelpView.vue'), meta: { title: '使用帮助' } }
+  { path: '/help', name: 'help', component: () => import('../views/HelpView.vue'), meta: { title: '使用帮助' } },
+  // 应用内 AI 浏览器（阶段 2 · WP12）：AI 侧栏。
+  // ⚠️ `bare: true` = 走「裸布局」：不渲染应用自己的左侧导航 / 悬浮问答入口 / 新手引导。
+  //    该页会被嵌进 Qt 的 QWebEngineView 当侧栏用，套一层应用外壳会挤掉可用宽度、并出现第二套导航。
+  { path: '/browser/sidebar', name: 'browserSidebar', component: () => import('../views/BrowserSidebarView.vue'), meta: { title: 'AI 侧栏', bare: true } }
 ]
 
 export default createRouter({

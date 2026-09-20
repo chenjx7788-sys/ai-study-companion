@@ -1,6 +1,6 @@
 <template>
-  <el-container class="app-shell">
-    <aside class="app-aside" :class="{ collapsed: sidebarCollapsed }">
+  <el-container class="app-shell" :class="{ 'app-shell-bare': isBare }">
+    <aside v-if="!isBare" class="app-aside" :class="{ collapsed: sidebarCollapsed }">
       <div class="logo" @click="$router.push('/')">
         <img :src="mascot" class="logo-mark-img" alt="伴学猫头鹰" />
         <span class="logo-text">AI 伴学助手</span>
@@ -27,7 +27,7 @@
       </div>
     </aside>
     <el-main class="app-main">
-      <div v-if="needSetup" class="setup-banner">
+      <div v-if="!isBare && needSetup" class="setup-banner">
         <span class="setup-banner-text">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/><circle cx="12" cy="12" r="4"/></svg>
           还差一步：配置 LLM 模型后，即可开始导入资料、AI 问答与复习
@@ -39,14 +39,14 @@
       </router-view>
     </el-main>
     <!-- E1 全局悬浮问答入口（问答页自身不显示） -->
-    <div v-if="$route.path !== '/chat'" class="float-chat" :class="{ 'float-chat-study': $route.path.startsWith('/study') }"
+    <div v-if="!isBare && $route.path !== '/chat'" class="float-chat" :class="{ 'float-chat-study': $route.path.startsWith('/study') }"
       @click="goChat" title="问伴伴">
       <img :src="mascot" class="float-mascot" alt="伴学猫头鹰" />
       <span class="float-bubble">有学习问题，问伴伴</span>
     </div>
 
     <!-- 首次使用分步引导 -->
-    <el-tour v-model="tourOpen" placement="right" @close="onTourClose">
+    <el-tour v-if="!isBare" v-model="tourOpen" placement="right" @close="onTourClose">
       <!-- 未配置模型：把「配置模型」作为第一步（已配置用户不显示此步） -->
       <el-tour-step v-if="needSetup" target="[data-nav='/settings']" placement="right" title="① 先配置 AI 模型">
         <template #default>
@@ -76,18 +76,23 @@
     </el-tour>
 
     <!-- 引导可随时跳过：遮罩会拦截其余区域点击，若无显式出口，用户会误以为「界面点不动」 -->
-    <div v-if="tourOpen" class="tour-skip" title="关闭引导，直接开始使用" @click="skipTour">跳过引导</div>
+    <div v-if="!isBare && tourOpen" class="tour-skip" title="关闭引导，直接开始使用" @click="skipTour">跳过引导</div>
   </el-container>
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import mascot from './assets/mascot.png'
 import { reviewApi, settingsApi, materialApi } from './api'
 
 const route = useRoute()
 const router = useRouter()
+
+// 「裸布局」（阶段 2 · WP12）：AI 侧栏会被嵌进 Qt 的 QWebEngineView，不能带应用外壳，
+// 否则侧栏里会再套一层 216px 的应用导航栏、可用宽度被挤掉。
+// ⚠️ 只加 v-if 隐藏，不动任何 v-model / @click —— 项目既定的改动安全姿势。
+const isBare = computed(() => !!route.meta.bare)
 
 // 从资料详情页进入问答：把当前资料 id 作为检索范围传递过去
 function goChat() {
@@ -135,7 +140,8 @@ onMounted(() => {
         return
       }
     } catch { /* 静默：取不到就仍按首次处理 */ }
-    setTimeout(() => { tourOpen.value = true }, 600)
+    // 裸布局（AI 侧栏）不弹新手引导：其 target 选择器在裸布局下不存在，弹出来只会是空框
+    if (!isBare.value) setTimeout(() => { tourOpen.value = true }, 600)
   })
   // 点击遮罩空白处 = 跳过引导（否则遮罩会拦下所有点击，造成「界面卡死」的错觉）
   document.addEventListener('click', onMaskClick, true)

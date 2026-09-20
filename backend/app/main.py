@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from app_version import __version__ as APP_VERSION
 from .core.config import settings
 from .database import Base, engine
-from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats, podcasts, ephemeral
+from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats, podcasts, ephemeral, browser
 
 Base.metadata.create_all(bind=engine)
 
@@ -287,6 +287,10 @@ app.include_router(podcasts.router, prefix="/api")
 # 「仅本次阅读」+「最近阅读」内存快照（P0-5）。prefix 自带 /ai/ephemeral，
 # 与 ai.router（/ai）并列而不冲突（FastAPI 按更具体的路径优先匹配）。
 app.include_router(ephemeral.router, prefix="/api")
+# 应用内 AI 浏览器（阶段 2 · WP12）：宿主状态与调试接口。
+# ⚠️ 必须与其它 router 一同注册在**下方 SPA catch-all 之前**：catch-all 对 `api/` 前缀
+#    一律 404，晚注册会被吞掉 —— 症状是 404（极像「路径写错了」），见 routers/browser.py 头部。
+app.include_router(browser.router, prefix="/api")
 
 
 @app.get("/api/health")

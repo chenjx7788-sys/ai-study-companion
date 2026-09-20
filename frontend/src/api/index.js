@@ -41,6 +41,19 @@ export const clipApi = {
   batchPreview: (payload) => http.post('/materials/clip/batch/preview', payload, { timeout: 300000 }),
 }
 
+// 应用内 AI 浏览器（阶段 2 · WP12）：宿主状态 + 侧栏数据面。
+// ⚠️ 后端把 `/api/browser/*` 注册在 SPA catch-all **之前**；若哪天挪到之后，
+//    这里所有请求会变成 404（症状像"路径写错了"），排查请先看 main.py 的注册顺序。
+export const browserApi = {
+  // 宿主只读状态；浏览器模式下 ready 恒为 false，是**正确值**不是故障
+  state: () => http.get('/browser/state'),
+  // 侧栏载荷（无载荷时是确定空态：四个字段都在、值为空串）
+  sidebarPayload: () => http.get('/browser/sidebar/payload'),
+  // 把选中内容投递给侧栏；返回 payload_saved（数据面）与 host_shown（显示面）两个独立字段
+  openSidebar: (payload) => http.post('/browser/sidebar/open', payload),
+  clearSidebar: () => http.post('/browser/sidebar/clear'),
+}
+
 // AI 理解（PRD 模块 B）；生成类接口长文档可能需数分钟，超时放宽到 300s
 export const aiApi = {
   summary: (materialId, instruction) => http.post(`/ai/summary`, { material_id: materialId, instruction }, { timeout: 300000 }),
