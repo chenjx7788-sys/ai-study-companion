@@ -454,6 +454,86 @@ def nav_state():
     return empty
 
 
+# ---------- WP14：多标签 ----------
+# ⚠️ 与 WP13 的 `request_browser_action` 同款纪律：
+#    ① 参数先校验、再查宿主（否则浏览器模式下传错参数会被 host_unavailable 盖掉）；
+#    ② 「数据面」与「显示面」分开返回 —— `ok=False` + `error="tab_limit"` 是**正常约束**，
+#       ≠ 「执行失败」，界面该禁用按钮而不是弹错误。
+
+def _tab_new_on_main(url):
+    from . import browser_panel
+    host = host_view()
+    panel = browser_panel.assemble(host)      # 幂等
+    return browser_panel.tab_new(panel, url=url)
+
+
+def request_tab_new(url=""):
+    """新建标签。返回 `(ok, error, tab_id)`。"""
+    if not is_available():
+        return False, "host_unavailable", None
+    try:
+        ok, err, tid = call_on_main(_tab_new_on_main, url or "")
+        return bool(ok), err, tid
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e), None
+
+
+def _tab_close_on_main(index, tab_id):
+    from . import browser_panel
+    host = host_view()
+    panel = browser_panel.assemble(host)
+    return browser_panel.tab_close(panel, index=index, tab_id=tab_id)
+
+
+def request_tab_close(index=None, tab_id=None):
+    """关闭标签。返回 `(ok, error, remaining)`。
+
+    ⚠️ `last_tab`（只剩一个，不许关）是**正常约束**不是故障 ——
+       故它带 `remaining=1` 回来，界面据此把关闭按钮变灰。
+    """
+    if not is_available():
+        return False, "host_unavailable", 0
+    try:
+        return call_on_main(_tab_close_on_main, index, tab_id)
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e), 0
+
+
+def _tab_switch_on_main(index, tab_id):
+    from . import browser_panel
+    host = host_view()
+    panel = browser_panel.assemble(host)
+    return browser_panel.tab_switch(panel, index=index, tab_id=tab_id)
+
+
+def request_tab_switch(index=None, tab_id=None):
+    """切换活跃标签。返回 `(ok, error, tab_id)`。"""
+    if not is_available():
+        return False, "host_unavailable", None
+    try:
+        return call_on_main(_tab_switch_on_main, index, tab_id)
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e), None
+
+
+def tabs_state():
+    """标签列表（**只读普通值** → 任意线程可调用）。
+
+    ⚠️ 空态是**确定结构**：`{"tabs":[],"active":null,"count":0,"max":N,"assembled":false}`。
+    """
+    empty = {"tabs": [], "active": None, "count": 0, "max": 12, "assembled": False}
+    if not is_available():
+        return empty
+    try:
+        from . import browser_panel
+        if browser_panel.is_assembled():
+            return browser_panel.get_tabs_state()
+    except Exception:
+        pass
+    return empty
+
+
+
 def _selfcheck_on_main():
     from . import browser_panel
     return browser_panel.selfcheck(host_view())

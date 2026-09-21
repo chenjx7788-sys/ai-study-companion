@@ -66,6 +66,12 @@ export const browserApi = {
   action: (action) => http.post('/browser/action', { action }),
   // 导航状态（WP13）：state/url/title/progress/can_back/can_forward/error 七键恒定
   nav: () => http.get('/browser/nav'),
+  // 多标签（WP14）。⚠️ tab_limit / last_tab 是**正常约束**（界面该禁用按钮），
+  // 与「执行失败」是两件事，不要合并成一个布尔。
+  tabs: () => http.get('/browser/tabs'),
+  tabNew: (payload) => http.post('/browser/tab/new', payload || {}),
+  tabClose: (payload) => http.post('/browser/tab/close', payload || {}),
+  tabSwitch: (payload) => http.post('/browser/tab/switch', payload || {}),
 }
 
 // AI 理解（PRD 模块 B）；生成类接口长文档可能需数分钟，超时放宽到 300s

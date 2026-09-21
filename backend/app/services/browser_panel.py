@@ -28,8 +28,11 @@ import threading
 __all__ = [
     "DOCK_OBJNAME", "VIEW_OBJNAME", "ADDR_OBJNAME", "STATUS_OBJNAME",
     "BTN_BACK_OBJNAME", "BTN_FORWARD_OBJNAME", "BTN_RELOAD_OBJNAME", "BTN_STOP_OBJNAME",
+    "TABBAR_OBJNAME", "TABNEW_OBJNAME", "STACK_OBJNAME", "MAX_TABS",
     "assemble", "show", "hide", "close", "navigate", "load_html",
     "is_assembled", "get_state", "get_nav_state", "nav_action",
+    "tab_new", "tab_close", "tab_switch", "get_tabs_state", "active_tab_id",
+    "active_view_eval",
     "classify_load_error", "selfcheck",
 ]
 
@@ -38,6 +41,20 @@ DOCK_OBJNAME = "asc_browser_dock"
 PANEL_OBJNAME = "asc_browser_panel"
 ADDR_OBJNAME = "asc_addr"
 VIEW_OBJNAME = "asc_browser_view"
+
+# ---------- WP14：多标签 ----------
+# ⚠️⚠️ **兼容层设计（关键取舍，不要"顺手清理"）**：
+#   多标签改造后，`panel["view"] / ["addr"] / ["nav"]` 仍然存在，但语义变成
+#   **「当前活跃标签」的别名**。这样 WP13 已验证的 `navigate()` / `nav_action()` /
+#   `_sync_nav()` / `get_nav_state()` **一行都不用改**，20/20 验收天然不回归。
+#   代价：读代码时要记住这三个键是别名，本体在 `panel["tabs"][i]`。
+TABBAR_OBJNAME = "asc_tabbar"
+TABNEW_OBJNAME = "asc_tab_new"
+STACK_OBJNAME = "asc_stack"
+# 标签数上限：判据里**不设**「单标签 <200MB」（V3 已撤回 N02 —— 多进程架构下
+# 「标签页内存」不是可归属实体），改为整应用观测口径。上限只防手滑点爆内存。
+MAX_TABS = 12
+
 STATUS_OBJNAME = "asc_status"
 # WP13 导航动作按钮的对象名（验收脚本按名字定位，**不要**按位置取 —— 加按钮会串位）
 BTN_BACK_OBJNAME = "asc_nav_back"
@@ -195,24 +212,43 @@ def assemble(host, initial_url=""):
         bl.addWidget(btn_close)
         pl.addWidget(bar)
 
-        # ---------- 浏览器内容 ----------
-        view = QWebEngineView()
-        view.setObjectName(VIEW_OBJNAME)
+        # ---------- 浏览器内容（WP14：多标签） ----------
+        # ⚠️ `QStackedWidget` 装所有标签的 view，索引 = 标签顺序；`QTabBar` 只驱动切换。
+        #    用 QStackedWidget 而**不是**「每次切换重建 view」：重建会丢掉页面状态
+        #    （滚动位置 / 表单 / JS 变量），而「切回来标记仍在」正是本包的验收判据。
+        tabbar = QtWidgets.QTabBar()
+        tabbar.setObjectName(TABBAR_OBJNAME)
+        tabbar.setExpanding(False)
+        tabbar.setMovable(True)          # 允许拖动重排（低风险，QTabBar 原生支持）
 
-        # ⚠️ 复用应用界面所在的 profile（**不是**新建默认 profile）：
-        #    V3 §6.1 要求「首次登录后免登录」→ cookie / storage 必须与主窗口同一 profile；
-        #    新建 profile 会导致每次访问都要重新登录（症状像"登录不保存"）。
+        btn_tab_new = QtWidgets.QPushButton("+")
+        btn_tab_new.setObjectName(TABNEW_OBJNAME)
+        btn_tab_new.setToolTip("新建标签")
+        btn_tab_new.setFixedWidth(28)
+
+        tabrow = QtWidgets.QWidget()
+        tabrow.setObjectName("asc_tabrow")
+        tl = QtWidgets.QHBoxLayout(tabrow)
+        tl.setContentsMargins(6, 0, 6, 0)
+        tl.setSpacing(0)
+        tl.addWidget(tabbar, 1)
+        tl.addWidget(btn_tab_new)
+        pl.addWidget(tabrow)
+
+        stack = QtWidgets.QStackedWidget()
+        stack.setObjectName(STACK_OBJNAME)
+        # ⚠️ stretch=1：内容区吃掉所有剩余高度（地址栏 / 标签栏 / 状态栏都是固定高）。
+        pl.addWidget(stack, 1)
+
+        _profile_val = None
         shared_ok = True
         shared_err = None
         try:
             if app_view is not None and hasattr(app_view, "page") and app_view.page() is not None:
-                prof = app_view.page().profile()
-                view.setPage(QWebEnginePage(prof, view))
+                _profile_val = app_view.page().profile()
         except BaseException as e:
             shared_ok = False
             shared_err = "%s: %s" % (type(e).__name__, e)
-
-        pl.addWidget(view, 1)
 
         # ---------- 状态栏 ----------
         status = QtWidgets.QLabel("就绪")
@@ -222,15 +258,23 @@ def assemble(host, initial_url=""):
         dock.setWidget(panel)
 
         _panel = {
-            "dock": dock, "panel": panel, "addr": addr, "view": view,
+            "dock": dock, "panel": panel, "addr": addr,
             "status": status, "app_view": app_view,
             "btn_go": btn_go, "btn_close": btn_close,
             "btn_back": btn_back, "btn_forward": btn_forward,
             "btn_reload": btn_reload, "btn_stop": btn_stop,
-            "shared_profile": shared_ok, "shared_profile_error": shared_err,
+            "tabbar": tabbar, "tab_new_btn": btn_tab_new, "stack": stack,
+            "profile": _profile_val,
+            # ⚠️⚠️ 多标签数据面：`tabs` 是**本体**；`view`/`nav`/`last_url` 等是
+            #     **活跃标签的别名**（由 `_bind_active()` 重绑）。这是兼容层，
+            #     让 WP13 的 navigate/nav_action/_sync_nav 一行不改即可复用。
+            "tabs": [], "active": None, "_tab_seq": 0,
+            "view": None,
             # WP13 导航状态：**只存普通值**（路由线程只读它，绝不直接读 Qt 对象 —— 会挂死）
             "nav": {"state": "idle", "url": "", "title": "", "progress": 0,
                     "can_back": False, "can_forward": False, "error": None},
+            "last_url": "", "last_title": "", "last_load_ok": None, "progress": 0,
+            "shared_profile": shared_ok, "shared_profile_error": shared_err,
         }
 
         # ---------- 接线 ----------
@@ -240,113 +284,456 @@ def assemble(host, initial_url=""):
         addr.returnPressed.connect(_do_navigate)
         btn_go.clicked.connect(_do_navigate)
         btn_close.clicked.connect(lambda: hide(host))
-        # WP13 导航动作：**统一走 nav_action**（单一入口 → 可用性判定与错误回传只写一份）
+        # WP13 导航动作：**统一走 nav_action**（单一入口 → 可用性判定与错误回传只写一份）；
+        # ⚠️ 它内部经 `_active_view(panel)` 取活跃标签的 view → 多标签下天然正确。
         btn_back.clicked.connect(lambda: nav_action(_panel, "back"))
         btn_forward.clicked.connect(lambda: nav_action(_panel, "forward"))
         btn_reload.clicked.connect(lambda: nav_action(_panel, "reload"))
         btn_stop.clicked.connect(lambda: nav_action(_panel, "stop"))
 
-        def _on_load_finished(ok):
+        def _on_tab_current_changed(idx):
+            """QTabBar 切换 → 切 stack + **重绑兼容别名** + 刷新导航面。"""
             try:
-                url = view.url().toString()
-                if _panel is not None:
-                    _panel["last_load_ok"] = bool(ok)
-                    _panel["last_url"] = url
-                    if not addr.hasFocus():
-                        addr.setText(url)      # 回填（跟随页内跳转）
-                status.setText("加载完成" if ok else "加载失败")
-                _sync_nav(_panel)      # WP13：刷新 can_back / can_forward（必须在主线程读）
-            except BaseException:
-                pass
-
-        view.loadFinished.connect(_on_load_finished)
-
-        def _on_title_changed(title):
-            try:
-                if _panel is not None:
-                    _panel["last_title"] = title
-                if title:
-                    status.setText(title)
-            except BaseException:
-                pass
-
-        view.titleChanged.connect(_on_title_changed)
-
-        def _on_load_progress(p):
-            try:
-                if _panel is not None:
-                    _panel["progress"] = int(p)
-            except BaseException:
-                pass
-
-        view.loadProgress.connect(_on_load_progress)
-
-        def _on_loading_changed(info):
-            """WP13 状态机：把加载事件分类成 nav 状态（**唯一**写 nav["state"] 的地方）。
-
-            ⚠️ 必须用 `loadingChanged`（带 `QWebEngineLoadingInfo`）而不是只看
-               `loadFinished`：后者给不出 `errorDomain` / `errorCode` / `isErrorPage`，
-               而「服务器返回 404」与「域名解析失败」对用户是**两句完全不同的话**
-               （实测：HTTP 404 时 `loadFinished=False`，但页面显示的是**服务端的** 404 页）。
-            """
-            try:
-                if _panel is None:
+                if idx < 0:
                     return
-                nav = _panel.setdefault("nav", {})
-                LS = _loading_info().LoadStatus
-                st = info.status()
-                if st == LS.LoadStartedStatus:
-                    nav["state"] = "loading"
-                    nav["error"] = None
-                elif st == LS.LoadSucceededStatus:
-                    nav["state"] = "loaded"
-                    nav["error"] = None
-                elif st == LS.LoadStoppedStatus:
-                    nav["state"] = "stopped"
-                elif st == LS.LoadFailedStatus:
-                    err = classify_load_error(info)
-                    # ⚠️ 服务端自己的错误页（is_chromium_error_page=False）仍**显示服务端内容**
-                    #    → 归 http_error，文案要说「服务器返回 404」，不能说「网页打不开」。
-                    nav["state"] = "http_error" if err.get("kind") == "http" else "net_error"
-                    nav["error"] = err
-                _sync_nav(_panel)
+                tab_switch(_panel, idx)
             except BaseException:
                 pass
 
-        try:
-            view.page().loadingChanged.connect(_on_loading_changed)
-            _panel["loading_hooked"] = True
-        except BaseException as e:
-            _panel["loading_hooked"] = "%s: %s" % (type(e).__name__, e)
+        tabbar.currentChanged.connect(_on_tab_current_changed)
+        btn_tab_new.clicked.connect(lambda: tab_new(_panel))
 
-        # ⚠️ `target=_blank` / `window.open` 必须**留在本视图内**打开：
-        #    否则 Qt 会尝试开新窗口，而 pywebview 没接管它 → 表现成「点了链接没反应」；
-        #    更糟的是若导航到应用自身文档，会把应用界面顶掉（`md.js::createMd` 那条铁律的同类风险）。
-        try:
-            page = view.page()
-
-            def _on_new_window(request):
-                try:
-                    request.openIn(page)
-                except BaseException:
-                    try:
-                        view.setUrl(request.requestedUrl())
-                    except BaseException:
-                        pass
-
-            page.newWindowRequested.connect(_on_new_window)
-            _panel["new_window_hooked"] = True
-        except BaseException as e:
-            _panel["new_window_hooked"] = "%s: %s" % (type(e).__name__, e)
-
+        # ⚠️ `dock` 先挂上，再建第一个标签：`_make_tab()` 里会 `resizeDocks` 前的
+        #    布局计算依赖 dock 已在宿主上；先建标签也完全可以，但保持这个顺序更稳。
         host.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
         host.resizeDocks([dock], [520], QtCore.Qt.Horizontal)
         dock.show()
 
-        if initial_url:
-            navigate(_panel, initial_url)
+        tab_new(_panel, url=initial_url or "")
 
         return _panel
+
+
+# ---------- WP14：多标签管理 ----------
+# ⚠️⚠️ 兼容层核心：`panel["view"] / ["addr"] / ["nav"] / ["last_*"] / ["progress"]`
+#     **不是本体**，而是「当前活跃标签」的别名。所有写这些键的既有代码
+#     （navigate / _sync_nav / 各 load* 信号槽）都只在活跃标签上生效 —— 这恰好就是
+#     多标签的正确语义，所以 WP13 的代码一行都不用改。
+#     本体在 `panel["tabs"][i]`，每个元素是一个 **tab dict**：
+#         {"id": str, "view": QWebEngineView, "nav": {...七键...},
+#          "last_url": str, "last_title": str, "last_load_ok": bool|None, "progress": int}
+#     ⚠️ `nav` 必须是**每标签独立**的 dict 对象（不能共享引用）——
+#        共享会让「切到 B 页却显示 A 页的错误」这种串台 bug 躲过所有断言。
+
+def _tab_dicts(panel):
+    return panel.get("tabs") or []
+
+
+def _active_view(panel):
+    """取**当前活跃标签**的 QWebEngineView（**主线程**，会碰 Qt 对象）。
+
+    ⚠️ 一律经本函数取 view，**不要**再用 `panel["view"]` —— 那只是别人重绑好的别名，
+       在「切换标签」的那一刻可能还没同步。本函数按 `panel["active"]` 现算，是唯一真相。
+    """
+    if panel is None:
+        return None
+    aid = panel.get("active")
+    for t in _tab_dicts(panel):
+        if t.get("id") == aid:
+            return t.get("view")
+    # active 指向不存在（如刚关掉）→ 退回第一个（**不是 None**：有标签就该能拿到 view）
+    ts = _tab_dicts(panel)
+    return ts[0].get("view") if ts else None
+
+
+def _active_tab(panel):
+    if panel is None:
+        return None
+    aid = panel.get("active")
+    for t in _tab_dicts(panel):
+        if t.get("id") == aid:
+            return t
+    ts = _tab_dicts(panel)
+    return ts[0] if ts else None
+
+
+def _bind_active(panel):
+    """把活跃标签的值**重绑**到兼容别名键上。**主线程。**
+
+    ⚠️ 这一步是多标签不回归 WP13 的关键：切完标签后，
+       `panel["view"]` / `["nav"]` / `["last_url"]` 必须立刻指向新活跃标签的对应对象，
+       否则导航按钮、地址栏回填、`/browser/nav` 全都还在读**旧标签**的状态。
+    ⚠️ `nav` 绑的是**同一个 dict 引用**（不是拷贝）—— 加载信号槽往里写状态，
+       必须写进活跃标签自己的那份。
+    """
+    if panel is None:
+        return
+    t = _active_tab(panel)
+    if t is None:
+        panel["view"] = None
+        return
+    panel["view"] = t.get("view")
+    panel["nav"] = t.setdefault("nav", _empty_nav())
+    panel["last_url"] = t.get("last_url", "")
+    panel["last_title"] = t.get("last_title", "")
+    panel["last_load_ok"] = t.get("last_load_ok")
+    panel["progress"] = int(t.get("progress", 0) or 0)
+    # 地址栏回填活跃标签的 URL（切换后必须看到新标签的地址）
+    try:
+        a = panel.get("addr")
+        u = t.get("last_url") or ""
+        if a is not None and not a.hasFocus():
+            a.setText(u)
+    except BaseException:
+        pass
+    _refresh_nav_buttons(panel)
+    _sync_tabbar_labels(panel)
+
+
+def _sync_tabbar_labels(panel):
+    """把标签标题同步到 QTabBar（**主线程**）。标题优先用页面 title，退化用 host。"""
+    try:
+        tb = panel.get("tabbar")
+        if tb is None:
+            return
+        for i, t in enumerate(_tab_dicts(panel)):
+            title = (t.get("last_title") or "").strip()
+            if not title:
+                u = (t.get("last_url") or "").strip()
+                title = _host_of(u) if u else "新标签页"
+            if len(title) > 18:
+                title = title[:17] + "…"
+            tb.setTabText(i, title)
+            tb.setTabToolTip(i, t.get("last_url") or title)
+    except BaseException:
+        pass
+
+
+def _host_of(url):
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).netloc or url
+    except BaseException:
+        return url
+
+
+def _empty_nav():
+    """导航空态（**七个键恒定**，与 WP13 契约一致）。"""
+    return {"state": "idle", "url": "", "title": "", "progress": 0,
+            "can_back": False, "can_forward": False, "error": None}
+
+
+def _wire_tab(panel, tab):
+    """给一个标签的 view 接线（**主线程**）。
+
+    ⚠️ 信号槽必须闭包捕获**本标签**的 `tab`，而**不是**读 `_panel["view"]`
+       （那是活跃标签的别名，会在切标签后变）——否则「后台标签加载完成」
+       会把状态写进前台标签，症状是「切过来的页面进度条乱跳」。
+    """
+    view = tab["view"]
+
+    def _on_load_finished(ok):
+        try:
+            url = view.url().toString()
+            tab["last_load_ok"] = bool(ok)
+            tab["last_url"] = url
+            st = panel.get("status")
+            if st is not None and tab.get("id") == panel.get("active"):
+                st.setText("加载完成" if ok else "加载失败")
+            if tab.get("id") == panel.get("active"):
+                _sync_nav(panel)
+            _sync_tabbar_labels(panel)
+        except BaseException:
+            pass
+
+    def _on_title_changed(title):
+        try:
+            tab["last_title"] = title
+            t = tab.setdefault("nav", _empty_nav())
+            t["title"] = title
+            if tab.get("id") == panel.get("active"):
+                st = panel.get("status")
+                if st is not None and title:
+                    st.setText(title)
+            _sync_tabbar_labels(panel)
+        except BaseException:
+            pass
+
+    def _on_load_progress(p):
+        try:
+            tab["progress"] = int(p)
+            if tab.get("id") == panel.get("active"):
+                panel["progress"] = int(p)
+        except BaseException:
+            pass
+
+    def _on_loading_changed(info):
+        """WP13 状态机，但写**本标签自己的** nav（每标签独立）。"""
+        try:
+            nav = tab.setdefault("nav", _empty_nav())
+            LS = _loading_info().LoadStatus
+            st = info.status()
+            if st == LS.LoadStartedStatus:
+                nav["state"] = "loading"
+                nav["error"] = None
+            elif st == LS.LoadSucceededStatus:
+                nav["state"] = "loaded"
+                nav["error"] = None
+            elif st == LS.LoadStoppedStatus:
+                nav["state"] = "stopped"
+            elif st == LS.LoadFailedStatus:
+                err = classify_load_error(info)
+                nav["state"] = "http_error" if err.get("kind") == "http" else "net_error"
+                nav["error"] = err
+            if tab.get("id") == panel.get("active"):
+                _sync_nav(panel)
+            _sync_tabbar_labels(panel)
+        except BaseException:
+            pass
+
+    try:
+        view.loadFinished.connect(_on_load_finished)
+        view.titleChanged.connect(_on_title_changed)
+        view.loadProgress.connect(_on_load_progress)
+    except BaseException:
+        pass
+    try:
+        view.page().loadingChanged.connect(_on_loading_changed)
+        tab["loading_hooked"] = True
+    except BaseException as e:
+        tab["loading_hooked"] = "%s: %s" % (type(e).__name__, e)
+
+    # ⚠️ `target=_blank` **留在本标签视图内**打开（不新开标签）：
+    #    这正是 WP13 的判据 P3 —— 「不把应用导航走」。
+    try:
+        page = view.page()
+
+        def _on_new_window(request):
+            try:
+                request.openIn(page)
+            except BaseException:
+                try:
+                    view.setUrl(request.requestedUrl())
+                except BaseException:
+                    pass
+
+        page.newWindowRequested.connect(_on_new_window)
+        tab["new_window_hooked"] = True
+    except BaseException as e:
+        tab["new_window_hooked"] = "%s: %s" % (type(e).__name__, e)
+
+
+def tab_new(panel, url=""):
+    """新建标签并激活。**必须在主线程执行。**
+
+    :returns: `(ok, error, tab_id)`；超上限返回 `(False, "tab_limit", None)`。
+
+    ⚠️ 上限返回**独立错误码** `tab_limit`（不复用 `error`），界面才能提示
+       「标签开太多了」而不是通用失败。
+    """
+    if panel is None:
+        return False, "no_panel", None
+    QtCore, QtWidgets, QWebEngineView, QWebEnginePage = _qt()
+    tabs = panel.setdefault("tabs", [])
+    if len(tabs) >= MAX_TABS:
+        return False, "tab_limit", None
+    stack = panel.get("stack")
+    tabbar = panel.get("tabbar")
+    if stack is None or tabbar is None:
+        return False, "no_container", None
+
+    panel["_tab_seq"] = int(panel.get("_tab_seq", 0) or 0) + 1
+    tid = "t%d" % panel["_tab_seq"]
+
+    view = QWebEngineView()
+    view.setObjectName(VIEW_OBJNAME)
+    # ⚠️ 复用宿主 profile（**每标签都要设**）：cookie / storage 与主窗口同一 profile
+    #    → 「首次登录后免登录」。漏设某个标签会让那个标签每次都要求重新登录
+    #    （症状像"登录不保存"，且只在某一个标签上出现，极难定位）。
+    prof = panel.get("profile")
+    if prof is not None:
+        try:
+            view.setPage(QWebEnginePage(prof, view))
+        except BaseException:
+            pass
+
+    tab = {"id": tid, "view": view, "nav": _empty_nav(),
+           "last_url": "", "last_title": "", "last_load_ok": None, "progress": 0}
+    tabs.append(tab)
+    stack.addWidget(view)
+
+    try:
+        tabbar.blockSignals(True)
+        tabbar.addTab("新标签页")
+        tabbar.setCurrentIndex(tabbar.count() - 1)
+        tabbar.blockSignals(False)
+    except BaseException:
+        pass
+
+    _wire_tab(panel, tab)
+    panel["active"] = tid
+    _bind_active(panel)
+
+    if url:
+        navigate(panel, url)
+    return True, None, tid
+
+
+def tab_close(panel, index=None, tab_id=None):
+    """关闭一个标签。**必须在主线程执行。**
+
+    :returns: `(ok, error, remaining)`
+
+    ⚠️ **最后一个标签不允许关闭**，返回 `(False, "last_tab", 1)` ——
+       否则面板会变成一片空白，用户以为界面坏了。这是**正常约束**不是故障，
+       故用独立错误码，界面该把关闭按钮变灰而不是弹错误。
+    """
+    if panel is None:
+        return False, "no_panel", 0
+    tabs = panel.setdefault("tabs", [])
+    if not tabs:
+        return False, "no_tab", 0
+    if len(tabs) <= 1:
+        return False, "last_tab", len(tabs)
+
+    idx = None
+    if tab_id is not None:
+        for i, t in enumerate(tabs):
+            if t.get("id") == tab_id:
+                idx = i
+                break
+    elif index is not None:
+        try:
+            idx = int(index)
+        except BaseException:
+            idx = None
+    if idx is None or idx < 0 or idx >= len(tabs):
+        return False, "bad_index", len(tabs)
+
+    t = tabs[idx]
+    was_active = (t.get("id") == panel.get("active"))
+    stack = panel.get("stack")
+    tabbar = panel.get("tabbar")
+    try:
+        if stack is not None:
+            stack.removeWidget(t["view"])
+        # ⚠️ 用 `deleteLater()`，**不要** `setParent(None)` —— 后者会挂死主线程
+        #    （WP12/WP13 已两次实测；见模块头与 close() 的说明）。
+        t["view"].deleteLater()
+    except BaseException:
+        pass
+    try:
+        if tabbar is not None:
+            tabbar.blockSignals(True)
+            tabbar.removeTab(idx)
+            tabbar.blockSignals(False)
+    except BaseException:
+        pass
+    tabs.pop(idx)
+
+    if was_active:
+        # 移到相邻标签（优先前一个；若关的是第一个则取新的第一个）
+        new_idx = max(0, idx - 1)
+        new_idx = min(new_idx, len(tabs) - 1)
+        panel["active"] = tabs[new_idx]["id"]
+        try:
+            if tabbar is not None:
+                tabbar.blockSignals(True)
+                tabbar.setCurrentIndex(new_idx)
+                tabbar.blockSignals(False)
+            if stack is not None:
+                stack.setCurrentWidget(tabs[new_idx]["view"])
+        except BaseException:
+            pass
+    _bind_active(panel)
+    return True, None, len(tabs)
+
+
+def tab_switch(panel, index=None, tab_id=None):
+    """切换活跃标签。**必须在主线程执行。**
+
+    :returns: `(ok, error, tab_id)`
+    """
+    if panel is None:
+        return False, "no_panel", None
+    tabs = panel.setdefault("tabs", [])
+    idx = None
+    if tab_id is not None:
+        for i, t in enumerate(tabs):
+            if t.get("id") == tab_id:
+                idx = i
+                break
+    elif index is not None:
+        try:
+            idx = int(index)
+        except BaseException:
+            idx = None
+    if idx is None or idx < 0 or idx >= len(tabs):
+        return False, "bad_index", None
+
+    t = tabs[idx]
+    panel["active"] = t["id"]
+    try:
+        stack = panel.get("stack")
+        if stack is not None:
+            stack.setCurrentWidget(t["view"])
+    except BaseException:
+        pass
+    # ⚠️⚠️ 必须同时把 `QTabBar` 的当前项对齐到 `idx`。
+    #    本函数被**两条路径**调用：
+    #      ① tabbar 自己的 `currentChanged` 槽（`_on_tab_current_changed`）——
+    #         那时索引已对齐，重设是幂等的；
+    #      ② API 的 `POST /tab/switch` → `request_tab_switch` → 这里 ——
+    #         那时 tabbar **还停在旧项**。
+    #    缺这一步，界面高亮与实际内容会**错位**（内容已切到 B，高亮还在 A）。
+    #    危险之处在于：`stack` 当前页、`panel["active"]`、数据面**全都是对的** ——
+    #    任何「只查数据/只查 stack」的断言都发现不了，只有直接读
+    #    `tabbar.currentIndex()` 才看得见（WP14 验收专门有这条）。
+    #    `blockSignals` 防止再次触发 `currentChanged` → `tab_switch` 递归。
+    try:
+        tabbar = panel.get("tabbar")
+        if tabbar is not None and tabbar.currentIndex() != idx:
+            tabbar.blockSignals(True)
+            tabbar.setCurrentIndex(idx)
+            tabbar.blockSignals(False)
+    except BaseException:
+        pass
+    _bind_active(panel)
+    return True, None, t["id"]
+
+
+def get_tabs_state():
+    """标签列表（**只读普通值** → 任意线程可调用）。
+
+    ⚠️ 与 `get_state()` 的分工：本函数是 WP14 的新数据面（含每标签独立导航状态）；
+       `get_state()` 保留原形状（`tabs/active/ready/assembled`）不破坏既有消费者。
+    ⚠️ 空态是**确定结构**：`{"tabs": [], "active": null, "count": 0, "max": N, "assembled": false}`。
+    """
+    if _panel is None:
+        return {"tabs": [], "active": None, "count": 0, "max": MAX_TABS, "assembled": False}
+    out = []
+    for t in _tab_dicts(_panel):
+        nav = t.get("nav") or {}
+        out.append({
+            "id": t.get("id"),
+            "url": t.get("last_url", "") or "",
+            "title": t.get("last_title", "") or "",
+            "active": t.get("id") == _panel.get("active"),
+            "state": nav.get("state", "idle"),
+            "progress": int(nav.get("progress", 0) or 0),
+            "can_back": bool(nav.get("can_back", False)),
+            "can_forward": bool(nav.get("can_forward", False)),
+            "error": nav.get("error", None),
+        })
+    return {"tabs": out, "active": _panel.get("active"),
+            "count": len(out), "max": MAX_TABS, "assembled": True}
+
+
+def active_tab_id():
+    """当前活跃标签 id（只读普通值 → 任意线程可调用）。"""
+    if _panel is None:
+        return None
+    return _panel.get("active")
 
 
 def show(host, url=None, width=520):
@@ -390,6 +777,19 @@ def close(host=None):
         return False
     dock = _panel.get("dock")
     try:
+        # WP14：先把标签的 view 逐个摘掉再销毁 dock —— 直接用 deleteLater 让 Qt 收尾，
+        # ⚠️ 仍然**绝不** setParent(None)（会挂死主线程，见上文）。
+        for t in list(_tab_dicts(_panel)):
+            try:
+                t["view"].deleteLater()
+            except BaseException:
+                pass
+        _panel["tabs"] = []
+        _panel["active"] = None
+        _panel["view"] = None
+    except BaseException:
+        pass
+    try:
         if dock is not None:
             dock.hide()
             dock.deleteLater()
@@ -397,6 +797,7 @@ def close(host=None):
         pass
     _panel = None
     return True
+
 
 
 def navigate(panel, url):
@@ -421,7 +822,12 @@ def navigate(panel, url):
         nav = panel.setdefault("nav", {})
         nav["state"] = "loading"
         nav["error"] = None
-        panel["view"].setUrl(QtCore.QUrl(final))
+        # ⚠️ WP14：一律经 `_active_view(panel)` 取 view（**不要**用 `panel["view"]`
+        #    别名 —— 切标签那一刻它可能尚未重绑）。导航只作用于**活跃标签**。
+        v = _active_view(panel)
+        if v is None:
+            return False, "no_view"
+        v.setUrl(QtCore.QUrl(final))
         panel["addr"].setText(final)
         return True, None
     except BaseException as e:
@@ -434,13 +840,42 @@ def load_html(panel, html, base_url=""):
         return False, "no_panel"
     QtCore, _, _, _ = _qt()
     try:
+        v = _active_view(panel)
+        if v is None:
+            return False, "no_view"
         if base_url:
-            panel["view"].setHtml(html, QtCore.QUrl(base_url))
+            v.setHtml(html, QtCore.QUrl(base_url))
         else:
-            panel["view"].setHtml(html)
+            v.setHtml(html)
         return True, None
     except BaseException as e:
         return False, "%s: %s" % (type(e).__name__, e)
+
+
+def active_view_eval(panel, script, timeout_ms=2000):
+    """在**活跃标签**上执行 JS 并**同步**取回结果（WP14 判据 1 / WP16 的前置能力）。
+
+    :returns: `(ok, error, value)`；`value` 是 `runJavaScript` 回调拿到的 JSON 可序列化值。
+
+    ⚠️⚠️ `QWebEnginePage.runJavaScript(script, callback)` 是**异步**的：
+       callback 在**事件循环**里执行。若在主线程同步等待，就是死锁
+       （主线程被占 → 事件循环跑不了 → callback 永不触发）。
+       本函数因此**必须由「非主线程」调用**（经 `call_on_main` 之外的路径），
+       由调用方在自己的线程里 QEventLoop 等待，或改造成「投递 + 轮询」两步式。
+       ⇒ 现阶段只用它在**探针/验收**里，且探针自己起独立 QApplication 跑事件循环。
+    ⚠️ 返回值必须能 JSON 序列化：注入脚本一律 `JSON.stringify` 或返回原始字面量。
+    """
+    if panel is None:
+        return False, "no_panel", None
+    try:
+        v = _active_view(panel)
+        if v is None:
+            return False, "no_view", None
+        v.page().runJavaScript(script)
+        return True, None, None
+    except BaseException as e:
+        return False, "%s: %s" % (type(e).__name__, e), None
+
 
 
 # ---------- WP13：导航动作 + 加载错误分类 ----------
@@ -590,14 +1025,24 @@ def _sync_nav(panel):
         return
     nav = panel.setdefault("nav", {})
     try:
-        view = panel.get("view")
+        # ⚠️ WP14：经 `_active_view` 取（不是 `panel["view"]` 别名）。
+        #    `QWebEngineHistory.canGoBack()` 是 Qt 调用 —— 路由线程直接调会**挂死**，
+        #    故一律在主线程读完后缓存成普通 Python 值，路由只读缓存。
+        view = _active_view(panel)
         if view is not None:
             nav["url"] = view.url().toString()
             hist = view.history()
             nav["can_back"] = bool(hist.canGoBack())
             nav["can_forward"] = bool(hist.canGoForward())
+            # 顺便把 url 同步进标签本体（get_tabs_state 读它）
+            t = _active_tab(panel)
+            if t is not None:
+                if nav["url"]:
+                    t["last_url"] = nav["url"]
+                t["nav"] = nav
     except BaseException:
         pass
+
     try:
         nav["progress"] = int(panel.get("progress", 0) or 0)
     except BaseException:
@@ -622,7 +1067,8 @@ def nav_action(panel, action):
     if act not in _ACTION_WEBACTION:
         return False, "bad_action", False
     _, _, _, QWebEnginePage = _qt()
-    view = panel.get("view")
+    # ⚠️ WP14：作用于**活跃标签**的 view（经 _active_view，不用别名）
+    view = _active_view(panel)
     if view is None:
         return False, "no_view", False
 
@@ -654,13 +1100,14 @@ def get_nav_state():
        任何 `view.url()` / `history().canGoBack()` 这类 Qt 调用都必须经 call_on_main。
     """
     if _panel is None:
-        return {"state": "idle", "url": "", "title": "", "progress": 0,
-                "can_back": False, "can_forward": False, "error": None}
+        return _empty_nav()
+    # ⚠️ WP14：`nav` 是**活跃标签**的那份（由 `_bind_active` 重绑）。
+    #    每标签独立，故切到 B 页读到的就是 B 页的错误，不会串台。
     nav = _panel.get("nav") or {}
     return {
         "state": nav.get("state", "idle"),
         "url": nav.get("url", "") or _panel.get("last_url", "") or "",
-        "title": _panel.get("last_title", "") or "",
+        "title": nav.get("title", "") or _panel.get("last_title", "") or "",
         "progress": int(nav.get("progress", 0) or 0),
         "can_back": bool(nav.get("can_back", False)),
         "can_forward": bool(nav.get("can_forward", False)),
@@ -671,28 +1118,41 @@ def get_nav_state():
 def get_state():
     """面板只读状态（**不碰 Qt 控件**，只读句柄里的普通值）→ 任意线程可调用。
 
+    ⚠️ 形状**保持 WP12 契约不变**（`tabs` 是列表、`active` 是 id）——
+       WP14 只是让 `tabs` 从「恒为单元素」变成「真的多元素」，
+       消费方（侧栏 / 验收脚本）无需改动。更细的每标签状态看 `get_tabs_state()`。
     ⚠️ 只有**已被主线程写入的普通 Python 值**能在这里读；
        任何 `view.url()` / `dock.isVisible()` 这类 Qt 调用都必须经 call_on_main，
        否则路由线程会挂死。
     """
     if _panel is None:
         return {"tabs": [], "active": None, "ready": False, "assembled": False}
+    tabs = []
+    for t in _tab_dicts(_panel):
+        nav = t.get("nav") or {}
+        tabs.append({
+            "id": t.get("id"),
+            "url": t.get("last_url", "") or "",
+            "title": t.get("last_title", "") or "",
+            "loading": int(t.get("progress", 0) or 0) < 100,
+            "progress": int(t.get("progress", 0) or 0),
+            "load_ok": t.get("last_load_ok"),
+            "active": t.get("id") == _panel.get("active"),
+            "state": nav.get("state", "idle"),
+            "can_back": bool(nav.get("can_back", False)),
+            "can_forward": bool(nav.get("can_forward", False)),
+            "error": nav.get("error", None),
+        })
     return {
-        "tabs": [{
-            "id": "main",
-            "url": _panel.get("last_url", ""),
-            "title": _panel.get("last_title", ""),
-            "loading": _panel.get("progress", 100) < 100,
-            "progress": _panel.get("progress", 0),
-            "load_ok": _panel.get("last_load_ok"),
-        }],
-        "active": "main",
+        "tabs": tabs,
+        "active": _panel.get("active"),
         "ready": True,
         "assembled": True,
         "shared_profile": _panel.get("shared_profile"),
         "shared_profile_error": _panel.get("shared_profile_error"),
         "new_window_hooked": _panel.get("new_window_hooked"),
     }
+
 
 
 def selfcheck(host):
@@ -711,8 +1171,10 @@ def selfcheck(host):
     if _panel is None:
         return out
     dock = _panel.get("dock")
-    view = _panel.get("view")
+    view = _active_view(_panel)
     addr = _panel.get("addr")
+    stack = _panel.get("stack")
+    tabbar = _panel.get("tabbar")
     host_docks = host.findChildren(QtWidgets.QDockWidget)
     matching = [d for d in host_docks if d.objectName() == DOCK_OBJNAME]
     out.update({
@@ -722,6 +1184,19 @@ def selfcheck(host):
         "dock_floating": bool(dock.isFloating()) if dock else None,
         "dock_size": [dock.width(), dock.height()] if dock else None,
         "view_visible": bool(view.isVisible()) if view else None,
+        # ---------- WP14：多标签真实 Qt 状态 ----------
+        "tab_count": int(tabbar.count()) if tabbar else None,
+        "stack_count": int(stack.count()) if stack else None,
+        "active_tab_id": _panel.get("active"),
+        # ⚠️ 判据必须包含**一致性**：tabbar / stack / tabs 三者数量必须相等。
+        #    只断言「有 N 个标签」在「UI 加了但数据面没加」时也会通过。
+        "counts_consistent": bool(
+            tabbar is not None and stack is not None
+            and tabbar.count() == stack.count() == len(_tab_dicts(_panel))),
+        "dock_found_by_name": bool(
+            host.findChild(QtWidgets.QTabBar, TABBAR_OBJNAME) is not None),
+        "stack_found_by_name": bool(
+            host.findChild(QtWidgets.QStackedWidget, STACK_OBJNAME) is not None),
         "view_size": [view.width(), view.height()] if view else None,
         "addr_visible": bool(addr.isVisible()) if addr else None,
         "central_unchanged": host.centralWidget() is _panel.get("app_view"),

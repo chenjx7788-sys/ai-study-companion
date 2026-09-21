@@ -198,3 +198,59 @@ def url_normalize(url: str = ""):
     n = browser_host.normalize_url(url)
     return {"input": url, "normalized": n, "valid": bool(n)}
 
+
+# ---------- 多标签（WP14） ----------
+# ⚠️ 与 `/action` 同款契约：三个字段**分开**返回，不许压成一个布尔。
+#    `error="tab_limit"` / `"last_tab"` 是**正常约束**（界面该禁用按钮），
+#    与「执行失败」是两件事；`host_unavailable` 仍然只表示环境不支持。
+
+@router.get("/tabs")
+def list_tabs():
+    """标签列表。空态是**确定结构**，可逐字比对：
+
+    `{"tabs":[],"active":null,"count":0,"max":12,"assembled":false}`
+
+    ⚠️ 与 `/state` 的分工：`/state` 是**面板级**（是否装配、profile 是否共享）；
+       本接口是**标签级**（每标签独立的 url / 标题 / can_back / error）。
+       合成一个会让「面板没装配」与「某标签加载失败」在同一字段里打架。
+    """
+    return browser_host.tabs_state()
+
+
+@router.post("/tab/new")
+def tab_new(payload: dict | None = None):
+    """新建标签（可选 `url`）。返回 `ok` / `error` / `tab_id` / `count`。
+
+    ⚠️ `error="tab_limit"`（超上限）是**正常约束**，不是故障 ——
+       界面该把「新建」变灰，而不是弹错误框。
+    """
+    p = payload or {}
+    ok, err, tid = browser_host.request_tab_new(p.get("url", "") or "")
+    st = browser_host.tabs_state()
+    return {"ok": bool(ok), "error": err, "tab_id": tid,
+            "count": st.get("count", 0), "max": st.get("max")}
+
+
+@router.post("/tab/close")
+def tab_close(payload: dict | None = None):
+    """关闭标签（按 `index` 或 `tab_id`）。返回 `ok` / `error` / `remaining`。
+
+    ⚠️ `error="last_tab"` = 「只剩一个，不许关」→ 界面该禁用关闭按钮。
+       `error="bad_index"` = 「调用方传的位置不存在」→ 才是调用方的问题。
+       两者必须能区分，否则界面无法决定「变灰」还是「报错」。
+    """
+    p = payload or {}
+    idx = p.get("index", None)
+    ok, err, remaining = browser_host.request_tab_close(index=idx, tab_id=p.get("tab_id"))
+    return {"ok": bool(ok), "error": err, "remaining": int(remaining or 0)}
+
+
+@router.post("/tab/switch")
+def tab_switch(payload: dict | None = None):
+    """切换活跃标签（按 `index` 或 `tab_id`）。返回 `ok` / `error` / `tab_id`。"""
+    p = payload or {}
+    idx = p.get("index", None)
+    ok, err, tid = browser_host.request_tab_switch(index=idx, tab_id=p.get("tab_id"))
+    return {"ok": bool(ok), "error": err, "tab_id": tid}
+
+
