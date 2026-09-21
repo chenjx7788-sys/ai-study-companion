@@ -14,6 +14,14 @@
           <span v-if="item.path === '/review' && reviewDue > 0" class="due-badge">{{ reviewDue }}</span>
         </div>
       </nav>
+      <!-- AI 浏览器入口（阶段 2 · WP12）：不是路由，而是请求宿主打开 Qt 侧浏览器面板。
+           ⚠️ 独立于上面的 v-for 循环 —— 该循环的 @click 是路由跳转，而这里要发起动作，
+              故不改循环内任何一行（项目既定的「只加不拆」改动姿势）。 -->
+      <div v-if="!isBare" class="nav-help nav-browser" :class="{ active: browserOpen }"
+        title="在应用内打开网页，选中文字直接问 AI" @click="openBrowser">
+        <span class="nav-icon" v-html="browserIcon"></span>
+        <span class="nav-label">AI 浏览器</span>
+      </div>
       <div class="nav-help" :class="{ active: isActive('/help') }"
         :title="sidebarCollapsed ? '使用帮助' : ''" @click="$router.push('/help')">
         <span class="nav-icon" v-html="helpIcon"></span>
@@ -84,7 +92,8 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import mascot from './assets/mascot.png'
-import { reviewApi, settingsApi, materialApi } from './api'
+import { reviewApi, settingsApi, materialApi, browserApi } from './api'
+import { ElMessage } from 'element-plus'
 
 const route = useRoute()
 const router = useRouter()
@@ -160,6 +169,23 @@ const navItems = [
 ]
 
 const helpIcon = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M6.2 6.2a1.9 1.9 0 1 1 2.7 1.7c-.6.3-.9.8-.9 1.5v.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="11.6" r=".7" fill="currentColor"/></svg>'
+
+// AI 浏览器（阶段 2 · WP12）：入口是**动作**而非路由 —— 它请求宿主在 Qt 侧打开浏览器面板。
+const browserIcon = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.8" y="3" width="12.4" height="10" rx="1.8" stroke="currentColor" stroke-width="1.3"/><path d="M1.8 6.2h12.4" stroke="currentColor" stroke-width="1.3"/><circle cx="4.1" cy="4.6" r=".55" fill="currentColor"/><circle cx="6" cy="4.6" r=".55" fill="currentColor"/></svg>'
+const browserOpen = ref(false)
+async function openBrowser() {
+  // ⚠️ 浏览器模式（无原生窗口）下 opened=false 是**正确值**，不该弹错误吓用户；
+  //    只有真投递失败（host_error 非 host_unavailable）才提示。
+  try {
+    const { data } = await browserApi.open({})
+    browserOpen.value = !!data.opened
+    if (!data.opened && data.host_error && data.host_error !== 'host_unavailable') {
+      ElMessage.warning('浏览器面板打开失败：' + data.host_error)
+    }
+  } catch (e) {
+    ElMessage.warning('浏览器面板打开失败')
+  }
+}
 
 // 首次使用分步引导（localStorage 记忆，仅首次弹出）
 const tourOpen = ref(false)
@@ -265,6 +291,10 @@ watch(() => route.path, (path) => {
   background: var(--asc-primary-soft); color: var(--asc-primary); font-weight: 500;
   box-shadow: inset 2px 0 0 var(--asc-primary);
 }
+/* AI 浏览器入口：与「使用帮助」同一视觉族，但**去掉上边框**——
+   两者相邻时两条分隔线会连成一段，看起来像把菜单切成了三块。
+   ⚠️ 只覆盖 border-top，其余样式全部继承 .nav-help（减少装饰、避免两处漂移）。 */
+.nav-browser { border-top: 0; }
 .aside-footer {
   padding: 14px 18px; font-size: 11px; color: var(--asc-text-3);
   border-top: 1px solid var(--asc-border);

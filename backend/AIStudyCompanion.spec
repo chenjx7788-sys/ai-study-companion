@@ -67,6 +67,16 @@ _QT_HIDDEN = ['PySide6.QtWebEngineWidgets', 'PySide6.QtWebEngineCore', 'PySide6.
               'PySide6.QtWidgets', 'PySide6.QtGui', 'PySide6.QtNetwork', 'PySide6.QtCore',
               'qtpy']
 hiddenimports += _QT_HIDDEN
+
+# ⚠️ 阶段 2（AI 浏览器）：`app.services.browser_panel` 与 `app.services.browser_host`
+#    在源码里是**函数内 import**（`from . import browser_panel`），
+#    这是**有意**的（后端必须能在无 Qt 环境 import 这两个模块，见其 docstring）——
+#    但代价是 **PyInstaller 静态分析看不到它们** → 不显式声明就会漏收 →
+#    打包版表现为「点『AI 浏览器』没反应 / 接口 503」，而源码态一切正常
+#    （与 pywebview 的 qt 后端是同一个坑，见上方注释）。
+#    故此处显式加入。**新增同类「函数内 import」模块时必须同步加到这里。**
+hiddenimports += ['app.services.browser_panel', 'app.services.browser_host']
+
 for pkg in ['qtpy', 'shiboken6']:
     try:
         d, b, h = collect_all(pkg)

@@ -52,6 +52,15 @@ export const browserApi = {
   // 把选中内容投递给侧栏；返回 payload_saved（数据面）与 host_shown（显示面）两个独立字段
   openSidebar: (payload) => http.post('/browser/sidebar/open', payload),
   clearSidebar: () => http.post('/browser/sidebar/clear'),
+  // 打开浏览器面板（可选带 url）。opened=false 表示无原生窗口可放面板（浏览器模式），非故障
+  open: (payload) => http.post('/browser/open', payload || {}),
+  // 导航；error 为 invalid_url 时是用户输入问题（要提示），host_unavailable 则静默
+  navigate: (url) => http.post('/browser/navigate', { url }),
+  close: () => http.post('/browser/close'),
+  // 仅调试/验收：主线程回读面板真实 Qt 状态
+  selfcheck: () => http.get('/browser/panel/selfcheck'),
+  // URL 归一化：前端取「身份」必须与后端同规则（抓取仍用原始输入）
+  normalize: (url) => http.get('/browser/url/normalize', { params: { url } }),
 }
 
 // AI 理解（PRD 模块 B）；生成类接口长文档可能需数分钟，超时放宽到 300s

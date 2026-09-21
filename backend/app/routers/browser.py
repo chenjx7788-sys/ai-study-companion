@@ -90,3 +90,77 @@ def get_sidebar_payload():
 def clear_sidebar_payload():
     """清空侧栏载荷（侧栏「关闭 / 重新开始」用）。"""
     return {"ok": True, "cleared": browser_host.clear_sidebar_payload()}
+
+
+# ---------- 浏览器面板控制（WP12/WP13） ----------
+# ⚠️ 全部经 `browser_host.request_*()` → `call_on_main()` 投递到 Qt 主线程。
+#    在路由线程（FastAPI 工作线程）直接碰 Qt 控件**不会报错，会挂死**
+#    （实测：`setParent` / `takeCentralWidget` 都是静默卡死，连日志都不打）。
+
+@router.post("/open")
+def open_browser(payload: dict | None = None):
+    """打开浏览器面板（可选同时导航到 url）。
+
+    ⚠️ 返回值把「数据面」与「显示面」分开，与 `/sidebar/open` 同款：
+       浏览器模式下 `opened=false` 是**正确值**（没有原生窗口可放面板），不是故障。
+    """
+    p = payload or {}
+    url = p.get("url", "") or ""
+    width = int(p.get("width", 520) or 520)
+    opened, err = browser_host.request_browser_open(url=url, width=width)
+    return {
+        "ok": True,
+        "opened": opened,
+        "host_error": err,
+        "normalized_url": browser_host.normalize_url(url) if url else "",
+    }
+
+
+@router.post("/navigate")
+def navigate(payload: dict | None = None):
+    """让浏览器面板导航到指定 URL。
+
+    ⚠️ `invalid_url` 与 `host_unavailable` 必须能区分：
+       前者是用户输入问题（要提示），后者是环境问题（静默即可）。
+       合成一个 `ok:false` 会让界面无法决定要不要弹错误。
+       ⚠️ 因此 `browser_host.request_browser_navigate` 里**校验先于宿主检查**。
+    """
+    p = payload or {}
+    ok, err = browser_host.request_browser_navigate(p.get("url", "") or "")
+    return {"ok": bool(ok), "error": err}
+
+
+@router.post("/close")
+def close_browser():
+    """隐藏浏览器面板（保留页面状态，不销毁）。"""
+    hidden, err = browser_host.request_browser_close()
+    return {"ok": True, "hidden": hidden, "host_error": err}
+
+
+@router.get("/panel/selfcheck")
+def panel_selfcheck():
+    """仅调试/验收：在主线程回读面板**真实** Qt 状态（WP12 判据 1）。
+
+    ⚠️ 判据里必须有 `dock_found_by_findChildren >= 1` 这一条：
+       只断言「dock 对象存在」在「对象建了但没挂上宿主树」时也会通过 ——
+       而那正是**在 Thread-2 里装配**时的实际症状（Qt 只打一行 setParent 警告）。
+    """
+    data, err = browser_host.request_panel_selfcheck()
+    if err == "host_unavailable":
+        return _host_unavailable(browser_host.HostUnavailable("无宿主窗口（浏览器模式）"))
+    if err:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": "selfcheck_failed", "detail": err})
+    return {"ok": bool(data and data.get("ok")), "detail": data}
+
+
+@router.get("/url/normalize")
+def url_normalize(url: str = ""):
+    """URL 归一化（前端**必须用同一套规则**，否则「预览能成、入库必失败」）。
+
+    ⚠️ 这条接口存在的意义是**让归一化规则可被验收**：
+       前端拿它做「身份」，抓取用原始输入 —— 两侧成对。
+    """
+    n = browser_host.normalize_url(url)
+    return {"input": url, "normalized": n, "valid": bool(n)}
+
