@@ -41,3 +41,7 @@ backend/mascot.iconset/
 
 # 补丁脚本的落地备份（*.bak-<批次>-<时间戳>，见技能 safe-source-patching）
 *.bak-*
+
+# 打包裁剪统计（AIStudyCompanion.spec 每次打包时重写，见技能 ai-study-pack-trim-size）
+# 它是「本次打包到底裁掉了什么」的审计凭据，属构建产物，不进仓库
+backend/build_trim_stats.json

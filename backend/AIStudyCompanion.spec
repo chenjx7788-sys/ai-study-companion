@@ -104,6 +104,55 @@ a = Analysis(
     noarchive=False,
 )
 
+# =============================================================================
+# 第 1 档瘦身：按 asc_pack_trim 的清单过滤 COLLECT 的输入（2026-09-21）
+#
+# ⚠️⚠️ 必须在 COLLECT(...) **之前**替换 a.datas / a.binaries：
+#    COLLECT 捕获的是这两个列表**对象**，构造之后再换一个新列表**不会生效** ——
+#    而且不报错、产物照旧 484 MB，属于「静默失效」。
+# ⚠️ 过滤按 dest 名匹配，dest 形态（反斜杠 vs 斜杠、是否有 `_internal/` 前缀）由清单模块归一化。
+#    清单一条都没命中时**不会报错**，所以下面打印计数，并对「全 0」硬失败。
+# ⚠️ 保留集：qtwebengine_locales 必须留 en-US.pak（Chromium 兜底语言包）；
+#    babel 包**本身**不能删（courlan/filters.py:11 是硬 import），只删 babel/locale-data/。
+# =============================================================================
+import os as _os
+_sys.path.insert(0, SPECPATH)          # SPECPATH 由 PyInstaller 注入 = 本 spec 所在目录
+import asc_pack_trim as _trim
+
+_toc_before = len(a.datas) + len(a.binaries)
+_kept_d, _drop_d, _stats_d = _trim.filter_toc(a.datas, drop_devtools=_trim.DROP_DEVTOOLS)
+_kept_b, _drop_b, _stats_b = _trim.filter_toc(a.binaries, drop_devtools=_trim.DROP_DEVTOOLS)
+a.datas = _kept_d
+a.binaries = _kept_b
+
+_merged = {}
+for _g in _trim.GROUP_ORDER:
+    _merged[_g] = {"files": _stats_d[_g]["files"] + _stats_b[_g]["files"],
+                   "bytes": _stats_d[_g]["bytes"] + _stats_b[_g]["bytes"]}
+_drop_n = len(_drop_d) + len(_drop_b)
+_toc_after = len(a.datas) + len(a.binaries)
+print('[spec] ===== 第 1 档瘦身：COLLECT 输入过滤 =====')
+print('[spec] TOC 条目 %d -> %d（裁掉 %d 项，drop_devtools=%s）'
+      % (_toc_before, _toc_after, _drop_n, _trim.DROP_DEVTOOLS))
+print(_trim.format_stats(_merged))
+if _drop_n == 0:
+    print('[spec] ❌ 裁剪清单一条都没命中 —— dest 名形态与清单不匹配，产物不会变瘦！')
+    raise SystemExit('[spec] 第 1 档瘦身失效：检查 asc_pack_trim.normalize_dest / 分组规则')
+_empty = [_g for _g in _trim.EXPECT_NONZERO if _merged[_g]["files"] == 0]
+if _empty:
+    print('[spec] ⚠️ 以下预期非空的分组命中 0（可能是依赖版本变化，请人工确认）：%s' % _empty)
+
+# 落盘统计：把「spec 自己说裁了多少」变成打包后可复核的证据
+try:
+    import json as _json
+    with open(_os.path.join(SPECPATH, 'build_trim_stats.json'), 'w', encoding='utf-8') as _f:
+        _json.dump({'groups': _merged, 'dropped_files': _drop_n,
+                    'toc_before': _toc_before, 'toc_after': _toc_after,
+                    'drop_devtools': _trim.DROP_DEVTOOLS}, _f,
+                   ensure_ascii=False, indent=2)
+except Exception as _e:
+    print('[spec] ⚠️ 写 build_trim_stats.json 失败：%s: %s' % (type(_e).__name__, _e))
+
 pyz = PYZ(a.pure)
 
 # onedir 模式：二进制与数据文件用 COLLECT 收集到输出目录，避免 onefile 每次启动解压 ~12s
