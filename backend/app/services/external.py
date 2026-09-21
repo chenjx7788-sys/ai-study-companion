@@ -433,6 +433,146 @@ def _looks_like_html(content_type: str, html: str) -> bool:
     return "<html" in head or "<!doctype html" in head or "<body" in head
 
 
+# ---------- WP15：从「页面原始源码」抽取（带登录态的浏览器视图路径） ----------
+#
+# 为什么需要这一节（实测，见 `AI伴学助手_WP15内容抽取入库方案-20260921.md` §2）：
+#   ① 服务端裸抓被反爬拒绝的站点（知乎 403 等），在**用户自己的浏览器视图**里不是问题；
+#   ② `QWebEngineView.toHtml()` 给的是**渲染后 DOM 序列化**，`<script>` 已被剥离
+#      → 公众号/小红书正文都在内联脚本变量里，实测正文 **−90.9%**、配图 0 张
+#      （`_probe_wp15_extract_matrix.py`：1413 字/8 图 → 129 字/0 图）；
+#   ③ Qt 的 `QWebEngineCookieStore` **只写不可读**（无 `cookiesForUrl`）→ 无法把会话
+#      导出给服务端重抓（`_probe_wp15_p1_cookie_fetch.py`）。
+#   ⇒ 唯一可行：在**页面内** `fetch(location.href,{credentials:'include'})`
+#      取回**网络层原始响应体**（含 `<script>` 载荷、自动带 cookie / HttpOnly），
+#      再交给**同一条抽取链**处理（`_probe_wp15_p2_page_fetch.py` 已实证）。
+
+# 单页源码截断上限（字符）。依据：本机样本 2.47 MB / 1.45 MB；回调把字符串搬回 Python
+# 要走 Qt IPC，实测 588K 字符拉取约 62 ms（`_probe_wp15_p3_bigstr.py`）—— 压测无问题，
+# 但数 MB × 多标签会拖垮主线程。取 3,000,000 覆盖绝大多数真实页面（含内联脚本的 SSR 页）。
+# ⚠️ 截断**必须保头**：`window.__INITIAL_STATE__` 等载荷都在文档头部（P3 已验「头在尾丢」）。
+SOURCE_MAX_CHARS = 3_000_000
+
+
+def source_fetch_js(cap: int = SOURCE_MAX_CHARS, token: str = "") -> str:
+    """构造「页内取源」JS。结果写 `window.__asc_src`，状态写 `window.__asc_src_*`。
+
+    ⚠️⚠️ 三个「违反就静默出错」的点，均有实测依据：
+      ① **绝不能**在主线程同步等回调（WP13 血泪）：`runJavaScript` 的回调在事件循环里跑，
+         主线程若被 `Event.wait()` 占住 → 事件循环停摆 → 回调永不触发 → **零结果且不报错**。
+         故本 JS 只「发起 + 写全局」，值由调用方在**自己的线程**里轮询。
+      ② `credentials:'include'` **必须有** —— 少了它请求不带会话，登录站点会返回登录墙。
+         实测负样本：`credentials:'omit'` → 抓到「需要登录才能查看」。
+      ③ 截断在 **JS 侧**做：让 IPC 只搬上限内的字节，同时把**截断前的真实长度**
+         如实回报（`__asc_src_len`），供上层判「是否只拿到半篇」。
+
+    ⚠️ `token` 会**原样嵌入 JS 字面量**。调用方只传本项目自生成的短标识
+       （`browser_panel` 用 `t<seq>`），**绝不传页面内容 / URL** —— 否则引号会提前闭合
+       JS 字符串（症状是「取源莫名失败」）。这里仍做一次清洗兜底。
+    """
+    tok = re.sub(r"[^A-Za-z0-9_\-]", "", str(token or ""))[:64]
+    return (
+        "(function(){var CAP=%d,TOK='%s';"
+        "window.__asc_src=null;window.__asc_src_len=-1;window.__asc_trunc=false;"
+        "window.__asc_tok=TOK;window.__asc_err=null;"
+        "fetch(location.href,{credentials:'include'})"
+        ".then(function(r){return r.text();})"
+        ".then(function(t){window.__asc_trunc=t.length>CAP;"
+        "window.__asc_src=window.__asc_trunc?t.slice(0,CAP):t;"
+        "window.__asc_src_len=t.length;})"
+        ".catch(function(e){window.__asc_err=String(e);window.__asc_src_len=-2;});"
+        "return 'started';})()"
+    ) % (int(cap), tok)
+
+
+def extract_from_source(url: str, html: str) -> dict:
+    """从页面**原始源码**抽取正文 —— 与 `fetch_url` 共用**同一条判定链**。
+
+    ⚠️⚠️ 为什么必须要这个函数，而不是「把源码当 `text` 传给 `fetch_or_passthrough`」：
+       `fetch_or_passthrough(url, text)` 的 `text` 语义是**已抽好的正文**（传了就 passthrough
+       原样落库）。把页面源码当 `text` 传进去 → 落库的是**整篇 HTML**。
+       这正是本项目最忌的「同一资源两个入口给出不同产物」。
+
+    ⚠️ 判定顺序必须与 `fetch_url` **逐字一致**（错误页 → 专用抽取器 → xhs 判死 → SPA →
+       图片消息/图文豁免 → 长度）。`fetch_url` 的网络段之后就是调本函数 →
+       **两处只有一份实现**。守住这条不变量的探针：`_probe_wp15_parity.py`。
+    """
+    raw_input = (url or "").strip()
+    picked = extract_first_url(raw_input)
+    target = _ensure_scheme(picked or raw_input)
+    norm = normalize_url(target)
+    kind = detect_kind(norm)
+    out = {
+        "ok": False, "kind": kind, "url": norm, "input_url": raw_input,
+        "title": "", "text": "", "meta": {}, "reason": "",
+        "chars": 0, "elapsed_ms": 0,
+    }
+
+    def done(reason: str = "") -> dict:
+        if out["ok"] and not out["title"]:
+            try:
+                out["title"] = urllib.parse.urlsplit(norm).hostname or "未命名网页"
+            except ValueError:
+                out["title"] = "未命名网页"
+        out["reason"] = reason
+        out["chars"] = len(out["text"])
+        return out
+
+    # ① 先查错误页（在抽正文之前）：公众号失效链接是 200 + 短噪声，靠抽正文长度判不出来
+    if kind == "wx":
+        hit = next((m for m in WX_ERROR_MARKERS if m in html), "")
+        if hit:
+            out["meta"]["wx_error_marker"] = hit
+            return done("WX_EXPIRED")
+    # 小红书同性质：**裸 note id / token 失效**时页面标题就是「小红书 - 你访问的页面不见了」，
+    # 且同样是 HTTP 200。必须在抽取前判 —— 否则会把一个"页面不见了"壳页当笔记存下来。
+    if kind == "xhs" and _XHS_GONE_MARKER in _xhs_page_title(html):
+        out["meta"]["xhs_gone"] = True
+        return done("XHS_EXPIRED")
+    # 公众号走专用路径：trafilatura 在公众号页上系统性抽不全、拿不到 data-src 图，
+    # 新版页面更是 DOM 里压根没有正文。详见上方「微信公众号专用抽取」一节。
+    if kind == "wx":
+        title, text, meta = _wx_extract(html, norm)
+    elif kind == "xhs":
+        # 小红书同理必须单开：正文与配图都在内联的 __INITIAL_STATE__ 里，DOM 抽取拿不到
+        # （详见上方「小红书专用抽取」一节）
+        title, text, meta = _xhs_extract(html, norm)
+    else:
+        title, text, meta = _extract(html, norm)
+    out["title"] = title
+    out["text"] = text
+    out["meta"].update(meta)
+    if is_wx_temp_link(norm):
+        # 不拦截，只提示 —— 6 小时内仍然可用，用户可能就是想马上读完
+        out["meta"]["wx_temp_link"] = True
+    out["meta"]["template"] = "wx" if kind == "wx" else "article"
+    # 小红书：<title> 正常但笔记对象为空（token 失效 / 笔记被删）→ 单独判死。
+    # ⚠️ 必须放在 SPA 判定之前：否则空正文会被归因成 SPA_EMPTY，给用户的建议动作就错了
+    #    （SPA 是"请粘贴正文"，而这里该做的是"重新复制分享链接"）。
+    if kind == "xhs" and not text:
+        return done("XHS_EXPIRED")
+    # ② SPA 判定（在长度判定**之前**）：SPA 会返回"提示语正文"，先按长度判会被放过
+    haystack = (text or "")[:3000].lower()
+    if not text or any(m.lower() in haystack for m in SPA_MARKERS):
+        return done("SPA_EMPTY")
+    # ⚠️ 图片消息（`item_show_type=8`）例外：正文本来就只有一小段说明 + 若干张图，
+    # 按「字数 < MIN_CHARS 判失败」会把它误判成「不是文章页」—— 用户实测看到的
+    # 「只提取到很短的正文，可能不是文章页」正是这条路径。拿到了内容就算成功。
+    if kind == "wx" and out["meta"].get("wx_image_post") and text:
+        out["ok"] = True
+        return done("")
+    # 小红书图文笔记的文字天然极短（配图才是主体，实测正文 110 字 + 3 图）→ 同样豁免
+    # 字数判失败，否则每篇图文笔记都会被误判成「不是网页正文」。纯文字笔记仍按阈值判。
+    if kind == "xhs" and out["meta"].get("images") and text:
+        out["ok"] = True
+        return done("")
+    if len(text) < MIN_CHARS:
+        low_html = html[:4000].lower()
+        if any(m in low_html for m in GENERIC_ERROR_MARKERS):
+            return done("FETCH_FAILED")
+        return done("TOO_SHORT")
+    out["ok"] = True
+    return done("")
+
 def fetch_url(url: str, timeout: int = 20) -> dict:
     """抓取网页并抽取正文。
     返回：
@@ -550,63 +690,20 @@ def fetch_url(url: str, timeout: int = 20) -> dict:
     if not _looks_like_html(ct, html):
         out["meta"]["content_type"] = ct
         return done("NOT_HTML")
-    # ① 先查错误页（在抽正文之前）：公众号失效链接是 200 + 短噪声，靠抽正文长度判不出来
-    if kind == "wx":
-        hit = next((m for m in WX_ERROR_MARKERS if m in html), "")
-        if hit:
-            out["meta"]["wx_error_marker"] = hit
-            return done("WX_EXPIRED")
-    # 小红书同性质：**裸 note id / token 失效**时页面标题就是「小红书 - 你访问的页面不见了」，
-    # 且同样是 HTTP 200。必须在抽取前判 —— 否则会把一个"页面不见了"壳页当笔记存下来。
-    if kind == "xhs" and _XHS_GONE_MARKER in _xhs_page_title(html):
-        out["meta"]["xhs_gone"] = True
-        return done("XHS_EXPIRED")
-    # 公众号走专用路径：trafilatura 在公众号页上系统性抽不全、拿不到 data-src 图，
-    # 新版页面更是 DOM 里压根没有正文。详见上方「微信公众号专用抽取」一节。
-    if kind == "wx":
-        title, text, meta = _wx_extract(html, norm)
-    elif kind == "xhs":
-        # 小红书同理必须单开：正文与配图都在内联的 __INITIAL_STATE__ 里，DOM 抽取拿不到
-        # （详见上方「小红书专用抽取」一节）
-        title, text, meta = _xhs_extract(html, norm)
-    else:
-        title, text, meta = _extract(html, norm)
-    out["title"] = title
-    out["text"] = text
-    out["meta"].update(meta)
+    # ⚠️ 网络段之后**只剩一次委派** —— 判定链的唯一实现在 `extract_from_source`。
+    #    不要在这里内联任何判定（那会把「浏览器取源」与「服务端抓取」变成两套口径，
+    #    而两者对同一个 href 必须给出同一个分类结果）。
+    src = extract_from_source(target, html)
+    out["title"] = src.get("title") or ""
+    out["text"] = src.get("text") or ""
+    out["meta"].update(src.get("meta") or {})
     if degraded:
         out["meta"]["ssl_degraded"] = True
-    if is_wx_temp_link(norm):
-        # 不拦截，只提示 —— 6 小时内仍然可用，用户可能就是想马上读完
-        out["meta"]["wx_temp_link"] = True
-    out["meta"]["template"] = "wx" if kind == "wx" else "article"
-    # 小红书：<title> 正常但笔记对象为空（token 失效 / 笔记被删）→ 单独判死。
-    # ⚠️ 必须放在 SPA 判定之前：否则空正文会被归因成 SPA_EMPTY，给用户的建议动作就错了
-    #    （SPA 是"请粘贴正文"，而这里该做的是"重新复制分享链接"）。
-    if kind == "xhs" and not text:
-        return done("XHS_EXPIRED")
-    # ② SPA 判定（在长度判定**之前**）：SPA 会返回"提示语正文"，先按长度判会被放过
-    haystack = (text or "")[:3000].lower()
-    if not text or any(m.lower() in haystack for m in SPA_MARKERS):
-        return done("SPA_EMPTY")
-    # ⚠️ 图片消息（`item_show_type=8`）例外：正文本来就只有一小段说明 + 若干张图，
-    # 按「字数 < MIN_CHARS 判失败」会把它误判成「不是文章页」—— 用户实测看到的
-    # 「只提取到很短的正文，可能不是文章页」正是这条路径。拿到了内容就算成功。
-    if kind == "wx" and out["meta"].get("wx_image_post") and text:
-        out["ok"] = True
-        return done("")
-    # 小红书图文笔记的文字天然极短（配图才是主体，实测正文 110 字 + 3 图）→ 同样豁免
-    # 字数判失败，否则每篇图文笔记都会被误判成「不是网页正文」。纯文字笔记仍按阈值判。
-    if kind == "xhs" and out["meta"].get("images") and text:
-        out["ok"] = True
-        return done("")
-    if len(text) < MIN_CHARS:
-        low_html = html[:4000].lower()
-        if any(m in low_html for m in GENERIC_ERROR_MARKERS):
-            return done("FETCH_FAILED")
-        return done("TOO_SHORT")
-    out["ok"] = True
-    return done("")
+    out["ok"] = bool(src.get("ok"))
+    out["reason"] = src.get("reason") or ""
+    out["chars"] = len(out["text"])
+    out["elapsed_ms"] = int((time.time() - t0) * 1000)
+    return out
 
 
 def fetch_or_passthrough(url: str, text: str | None = None,

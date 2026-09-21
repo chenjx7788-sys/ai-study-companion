@@ -47,6 +47,9 @@ __all__ = [
     "request_panel_selfcheck",
     "request_sidebar_show",
     "nav_state",
+    "current_url",
+    "SOURCE_TIMEOUT",
+    "request_page_source",
 ]
 
 # 只允许这两种协议。**显式白名单**：`file:` / `javascript:` / `data:` 一律拒 ——
@@ -551,4 +554,78 @@ def request_panel_selfcheck():
         return call_on_main(_selfcheck_on_main), None
     except Exception as e:
         return None, "%s: %s" % (type(e).__name__, e)
+
+
+# ---------- WP15：带登录态取源 ----------
+# ⚠️ 本段的关键工程点是**时序**：主线程只负责「发起」，等待/轮询放在**调用方线程**。
+#    在主线程同步等 JS 回调 = 事件循环停摆 = 回调永不触发（WP13 已实测）。
+
+SOURCE_TIMEOUT = 20.0
+"""取源总超时（秒）。依据：页面内 fetch 是**再次请求同一 URL**，慢站点 + 大页面
+在实测样本（1.45 MB 本地）是毫秒级；给 20s 覆盖真实站点的首字节延迟 + 传输。
+⚠️ 超时返回 `timeout` 而不是空结果 —— 「没取到」与「取到了但是空的」必须能区分。"""
+
+_SRC_POLL_INTERVAL = 0.08
+
+
+def _page_source_start_on_main():
+    from . import browser_panel
+    panel = browser_panel.assemble(host_view())      # 幂等
+    return browser_panel.page_source_start(panel)
+
+
+def _page_source_poll_on_main():
+    from . import browser_panel
+    browser_panel.page_source_poll()                 # 默认作用于当前面板
+
+
+def current_url():
+    """活跃标签当前 URL（**只读普通值** → 任意线程可调用）。空态是空串。"""
+    return nav_state().get("url", "") or ""
+
+
+def request_page_source(timeout=SOURCE_TIMEOUT):
+    """取当前**活跃标签**页面的**原始源码**（带登录态）。返回 `(ok, box, error)`。
+
+    :returns: `(True, {"length":int,"truncated":bool,"src":str}, None)` 或
+              `(False, 末次box, "host_unavailable"|"timeout"|"superseded"|"no_view"|...)`
+
+    ⚠️⚠️ **两条独立语义必须分开**（与 `/action`、`/tab/*` 同款契约）：
+       `error="host_unavailable"` = 环境不支持（浏览器模式 / 无原生窗口）→ 静默；
+       `error="no_view"` / `"no_panel"` = 面板没装配 → 提示先打开浏览器；
+       `error="timeout"` / `"fetch_failed"` / `"stale"` = 真失败 → 提示重试。
+       压成一个 `ok:false` 之后，界面再也分不清「该静默」与「该提示」。
+    """
+    if not is_available():
+        return False, None, "host_unavailable"
+    try:
+        ok, err, tok = call_on_main(_page_source_start_on_main)
+    except Exception as e:                  # HostUnavailable / MainThreadTimeout / 槽内异常
+        return False, None, "%s: %s" % (type(e).__name__, e)
+    if not ok:
+        return False, None, err
+
+    t0 = time.time()
+    last = None
+    while time.time() - t0 < timeout:
+        try:
+            call_on_main(_page_source_poll_on_main)
+        except Exception:
+            pass                             # 单轮投递失败不致命：下一轮还会再投
+        try:
+            from . import browser_panel
+            last = browser_panel.get_page_source()
+        except Exception:
+            last = None
+        if last:
+            if last.get("token") != tok:
+                # 面板已被别的请求接管（用户又点了一次 / 切了标签）→ 明确报出，不返回错的数据
+                return False, last, "superseded"
+            ph = last.get("phase")
+            if ph == "error":
+                return False, last, last.get("err") or "fetch_failed"
+            if ph == "done":
+                return True, last, None
+        time.sleep(_SRC_POLL_INTERVAL)
+    return False, last, "timeout"
 

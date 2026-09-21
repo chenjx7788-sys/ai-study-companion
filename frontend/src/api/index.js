@@ -72,6 +72,11 @@ export const browserApi = {
   tabNew: (payload) => http.post('/browser/tab/new', payload || {}),
   tabClose: (payload) => http.post('/browser/tab/close', payload || {}),
   tabSwitch: (payload) => http.post('/browser/tab/switch', payload || {}),
+  // 取当前活跃标签的页面**原始源码**并抽取正文（WP15）。带用户自己的登录态 →
+  // 服务端被抓 403 的站点（知乎等）在这里可取。
+  // ⚠️ 它**不回传"已入库"**：入库仍走 clipApi.save（把返回的 source 一起传过去）。
+  // ⚠️ 长页面源码可达数 MB → 超时放宽到 60s。
+  extract: () => http.post('/browser/extract', {}, { timeout: 60000 }),
 }
 
 // AI 理解（PRD 模块 B）；生成类接口长文档可能需数分钟，超时放宽到 300s

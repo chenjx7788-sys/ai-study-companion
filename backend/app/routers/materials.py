@@ -441,6 +441,10 @@ def fulltext_search(q: str, folder_id: int | None = None, db: Session = Depends(
 # 网页正文正常在 5k~30k 字，超过 20 万字基本是异常页面（或抓错了整站索引）。
 MAX_CLIP_CHARS = 200000
 
+# WP15：浏览器视图取回的**页面原始源码**上限（字符）。比 MAX_CLIP_CHARS 大得多是
+# 因为它是**源码**（含内联脚本），抽取之后才会缩到正文字数；这里只防「明显异常的大包」。
+MAX_SOURCE_CHARS = 6_000_000
+
 
 class ClipPreviewReq(BaseModel):
     url: str
@@ -449,6 +453,9 @@ class ClipPreviewReq(BaseModel):
     # 以为粘贴没生效。实测踩过：preview(action=blocked) 而 save 却是好的。
     text: str | None = None
     title: str | None = None
+    # WP15：与 ClipSaveReq 成对（浏览器取源路径）—— 预览与入库必须能走**同一份输入**，
+    # 否则「预览说能存、入库报错」会再次出现（这正是 text 字段当年踩过的坑）。
+    source: str | None = None
 
 
 class ClipSaveReq(BaseModel):
@@ -456,22 +463,38 @@ class ClipSaveReq(BaseModel):
     # 允许前端直接带正文（SPA 降级时由用户粘贴正文）→ 不传 fetch，也不落"抓取失败"的锅
     text: str | None = None
     title: str | None = None
+    # WP15：浏览器视图取回的**页面原始源码**。⚠️ 与 `text` **语义不同**（见 `_clip_fetch`）：
+    # 源码必须**先抽取**，不能直通落库（否则存下去的是整篇 HTML）。
+    source: str | None = None
 
 
 class ClipBatchPreviewReq(BaseModel):
     urls: list[str]
 
 
-def _clip_fetch(req_url: str, text: str | None, title: str | None) -> dict:
-    """剪藏路径的正文来源：优先用前端传来的正文（粘贴降级），否则抓取。
+def _clip_fetch(req_url: str, text: str | None, title: str | None,
+                source: str | None = None) -> dict:
+    """剪藏路径的正文来源：**页面源码（浏览器视图）> 前端正文（粘贴降级）> 抓取**。
 
     实现见 `external_svc.fetch_or_passthrough`（单一来源，临时阅读共用）。
     长度策略留在本层：剪藏语义是**入库**，超长一律拒绝 ——
     静默截断用户要保存的内容，比报错更糟。
+
+    ⚠️⚠️ `source` 与 `text` **语义不同，绝不能混用**（WP15 新增）：
+       `text`   = **已抽好的正文**（粘贴降级）→ `fetch_or_passthrough` 直通落库；
+       `source` = **页面原始源码**（浏览器视图取回）→ 必须 `extract_from_source` **抽取**。
+       把源码当 `text` 传 → 落库的是**整篇 HTML**（本项目最忌的「同一资源两个入口
+       给出不同产物」）。所以这里按**先看 source** 的顺序分派，且源码路径**不**做
+       超长拒绝（源码本来就大；抽完之后的正文长度由 `clip_save` 按原有口径判）。
     """
     body = (text or "").strip()
     if body and len(body) > MAX_CLIP_CHARS:
         raise HTTPException(400, f"正文过长（{len(body)} 字），请拆分后保存")
+    src = (source or "").strip()
+    if src:
+        if len(src) > MAX_SOURCE_CHARS:
+            raise HTTPException(400, f"页面源码过大（{len(src)} 字符），无法处理")
+        return external_svc.extract_from_source(req_url, src)
     return external_svc.fetch_or_passthrough(req_url, text, title)
 
 
@@ -517,8 +540,9 @@ def clip_preview(req: ClipPreviewReq, db: Session = Depends(get_db)):
     url = (req.url or "").strip()
     if not url:
         raise HTTPException(400, "请输入网页链接")
-    # 传了 text → 走粘贴降级（不抓取）；否则抓取。两条路共用 _clip_fetch 保证口径一致。
-    r = _clip_fetch(url, req.text, req.title)
+    # 传了 source → 从源码抽取（浏览器视图路径）；传了 text → 粘贴降级；否则抓取。
+    # 三条路共用 _clip_fetch 保证口径一致。
+    r = _clip_fetch(url, req.text, req.title, req.source)
     payload = external_svc.preview_payload(r)
     # P2-4：预览阶段就把「超长」提示出来，而不是入库时才 400（否则用户白等一次抓取）。
     # 与 clip_save 共用 MAX_CLIP_CHARS 口径，两侧一致。
@@ -559,7 +583,7 @@ def clip_save(req: ClipSaveReq, db: Session = Depends(get_db)):
         d["duplicated"] = True
         return d
 
-    r = _clip_fetch(url, req.text, req.title)
+    r = _clip_fetch(url, req.text, req.title, req.source)
     norm = r.get("url") or ""
     if not r.get("ok"):
         # 抓取失败但没有正文可落库 → 400 + 可读原因（前端已有 hint 可展示）

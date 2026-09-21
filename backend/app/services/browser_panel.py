@@ -23,6 +23,7 @@
 
 ⚠️ 装配是**幂等**的：重复调用返回同一个面板，不叠加（否则每点一次就多一个 dock）。
 """
+import json
 import threading
 
 __all__ = [
@@ -33,6 +34,7 @@ __all__ = [
     "is_assembled", "get_state", "get_nav_state", "nav_action",
     "tab_new", "tab_close", "tab_switch", "get_tabs_state", "active_tab_id",
     "active_view_eval",
+    "page_source_start", "page_source_poll", "get_page_source",
     "classify_load_error", "selfcheck",
 ]
 
@@ -269,6 +271,9 @@ def assemble(host, initial_url=""):
             #     **活跃标签的别名**（由 `_bind_active()` 重绑）。这是兼容层，
             #     让 WP13 的 navigate/nav_action/_sync_nav 一行不改即可复用。
             "tabs": [], "active": None, "_tab_seq": 0,
+            # WP15 取源盒子：**只放普通值**（src 由事件循环里的回调写入，
+            # 路由线程只读它 → 主线程全程不被占住，界面不冻）。
+            "_src": None, "_src_seq": 0,
             "view": None,
             # WP13 导航状态：**只存普通值**（路由线程只读它，绝不直接读 Qt 对象 —— 会挂死）
             "nav": {"state": "idle", "url": "", "title": "", "progress": 0,
@@ -876,6 +881,149 @@ def active_view_eval(panel, script, timeout_ms=2000):
     except BaseException as e:
         return False, "%s: %s" % (type(e).__name__, e), None
 
+
+
+# ---------- WP15：从当前页取「原始源码」（带登录态） ----------
+# ⚠️⚠️ 本节是 WP15 的核心。三个实测结论决定了它的形态：
+#   ① 抽取器**不能**喂 `toHtml()` —— 那是渲染后 DOM 序列化，`<script>` 已剥离：
+#      公众号正文在 `content_noencode`、小红书正文与配图在 `window.__INITIAL_STATE__` 里，
+#      剥掉脚本 = 剥掉整篇正文（实测 1413 字/8 图 → 129 字/0 图，−90.9%）。
+#   ② Qt 的 cookie store **只写不可读**（无 `cookiesForUrl`）→ 没有「导出会话给服务端」这条路。
+#   ③ ⇒ 唯一可行：**页面内** `fetch(location.href,{credentials:'include'})` 取原始响应体。
+#
+# ⚠️⚠️ 取源是**两步式异步**（WP13 血泪：主线程同步等 = 死锁，回调永不触发且**不报错**）：
+#    ① `page_source_start()` 只**发起** fetch（写 window 全局）→ 立刻返回；
+#    ② `page_source_poll()` 由调用方**反复调用**，每次向页面要一份「小快照」，
+#       就绪后再拉**一次**大字符串；
+#    ③ `get_page_source()` 读的是 `panel["_src"]` 这个**普通值盒子**，任意线程可读。
+#    主线程从头到尾只做「发起」，从不 `wait()`。
+
+# 页内「小快照」JS：只回报长度 / 截断 / 错误 / 是否就绪 —— **不搬大字符串**。
+# 轮询每 tick 都跑它，所以它必须是 O(1) 的（P3 实测：每 tick 都搬 MB 会白白拖慢主线程）。
+_SRC_SNAP_JS = ("(function(){var T='%s';"
+                "if(window.__asc_tok!==T){return JSON.stringify({stale:1});}"
+                "return JSON.stringify({"
+                "l:(typeof window.__asc_src_len==='number')?window.__asc_src_len:-1,"
+                "t:!!window.__asc_trunc,e:window.__asc_err||null,"
+                "d:!!window.__asc_src});})()")
+
+
+def page_source_start(panel=None):
+    """发起「取当前**活跃标签**页面源码」。**必须在主线程执行。** 立刻返回，不等结果。
+
+    :returns: `(ok, error, token)`；`token` 是本次请求标识（用于防串场）。
+
+    ⚠️⚠️ 为什么要 token 而不是「直接读结果」：用户可能在 fetch 飞行中**切标签 / 关标签**，
+       没有 token，后到的回调会把**上一个页面**的源码写进盒子 → 张冠李戴，且不报错。
+       本函数每次自增 `_src_seq`，回调只认自己那次的 token（不匹配就丢弃）。
+    """
+    p = panel if panel is not None else _panel
+    if p is None:
+        return False, "no_panel", None
+    try:
+        from . import external as external_svc
+        view = _active_view(p)          # ⚠️ 一律经本函数，**不读** panel["view"] 别名
+        if view is None:
+            return False, "no_view", None
+        p["_src_seq"] = int(p.get("_src_seq", 0) or 0) + 1
+        tok = "t%d" % p["_src_seq"]
+        # 先置成「进行中」——**在发起之前**，否则轮询方可能先读到上一轮的陈旧值
+        p["_src"] = {"token": tok, "phase": "fetching", "err": None,
+                     "length": -1, "truncated": False, "src": "", "pulling": False}
+        cap = int(getattr(external_svc, "SOURCE_MAX_CHARS", 3000000))
+        view.page().runJavaScript(external_svc.source_fetch_js(cap=cap, token=tok))
+        return True, None, tok
+    except BaseException as e:
+        return False, "%s: %s" % (type(e).__name__, e), None
+
+
+def page_source_poll(panel=None):
+    """**主线程**：推进一次取源（要快照 / 拉大字符串）。立刻返回，**不返回结果**。
+
+    ⚠️ 之所以「不返回结果」：`runJavaScript` 的值只能经**回调**拿，而回调在事件循环里跑 ——
+       在主线程同步等它就是死锁（WP13）。故本函数只负责「发起读取」，状态落在 `panel["_src"]`。
+    ⚠️ 每次调用**只做一件事**（快照 或 拉取），由 `phase` 决定 → 幂等、可被安全地反复调用。
+    """
+    p = panel if panel is not None else _panel
+    if p is None:
+        return
+    try:
+        box = p.get("_src")
+        if not box or box.get("phase") in ("done", "error"):
+            return
+        view = _active_view(p)
+        if view is None:
+            box["phase"] = "error"
+            box["err"] = "no_view"
+            return
+        tok = box.get("token") or ""
+        page = view.page()
+
+        if box.get("phase") == "fetching":
+            def _on_snap(raw):
+                # ⚠️ 本回调跑在**事件循环**里 → 只写普通值，绝不碰 Qt 对象、绝不外抛。
+                try:
+                    b = p.get("_src") or {}
+                    if b.get("token") != tok:
+                        return                      # 已被后一次请求取代 → 丢弃（防串场）
+                    data = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                    if not isinstance(data, dict) or data.get("stale"):
+                        b["phase"] = "error"
+                        b["err"] = "stale"
+                        return
+                    b["length"] = int(data.get("l", -1))
+                    b["truncated"] = bool(data.get("t"))
+                    if data.get("e"):
+                        b["phase"] = "error"
+                        b["err"] = str(data.get("e"))[:200]
+                        return
+                    if data.get("d"):
+                        b["phase"] = "ready"
+                except BaseException:
+                    pass
+
+            page.runJavaScript(_SRC_SNAP_JS % tok, _on_snap)
+            return
+
+        if box.get("phase") == "ready" and not box.get("src") and not box.get("pulling"):
+            box["pulling"] = True       # 拉取只做一次，防止反复搬 MB
+
+            def _on_src(val):
+                try:
+                    b = p.get("_src") or {}
+                    if b.get("token") != tok:
+                        return
+                    b["src"] = val if isinstance(val, str) else ""
+                    if b["src"]:
+                        b["phase"] = "done"
+                    else:
+                        b["phase"] = "error"
+                        b["err"] = "empty"
+                except BaseException:
+                    pass
+
+            page.runJavaScript("window.__asc_src", _on_src)
+    except BaseException:
+        pass
+
+
+def get_page_source(panel=None):
+    """读「取源」状态（**只读普通值** → 任意线程可调用）。
+
+    空态是**确定结构**（可逐字比对）：七个键都在。
+    ⚠️ 只有**已被事件循环回调写进普通值**的内容能在这里读；
+       任何 `view.page()` / `runJavaScript` 都必须经主线程。
+    """
+    p = panel if panel is not None else _panel
+    box = (p or {}).get("_src") or {}
+    return {
+        "token": box.get("token"),
+        "phase": box.get("phase", "idle"),
+        "err": box.get("err"),
+        "length": int(box.get("length", -1) or -1),
+        "truncated": bool(box.get("truncated")),
+        "src": box.get("src") or "",
+    }
 
 
 # ---------- WP13：导航动作 + 加载错误分类 ----------

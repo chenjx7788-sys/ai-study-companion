@@ -12,6 +12,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from ..services import browser_host
+from ..services import external as external_svc
 
 router = APIRouter(prefix="/browser", tags=["browser"])
 
@@ -252,5 +253,61 @@ def tab_switch(payload: dict | None = None):
     idx = p.get("index", None)
     ok, err, tid = browser_host.request_tab_switch(index=idx, tab_id=p.get("tab_id"))
     return {"ok": bool(ok), "error": err, "tab_id": tid}
+
+
+# ---------- WP15：带登录态取源（「内容抽取 → 一键入库」的第一步） ----------
+# ⚠️⚠️ 本接口只做「取源 + 抽取」，**不做入库**。入库仍走 `POST /materials/clip/save`
+#    （把 `source` 一起传过去）。理由：
+#      · 抽取链的唯一实现是 `external_svc.extract_from_source`；
+#      · 入库链的唯一实现是 `materials.clip_save`（幂等 / safe_stem / 图片本地化 / 索引）。
+#    在这里顺手也落一次库 = 复制第二套口径，正是本项目反复禁止的形态。
+# ⚠️ 本接口返回的 `preview` 由 `external_svc.preview_payload()` 产出 —— 与
+#    `/materials/clip/preview` **同一个函数**，故两侧字段天然一致（不会「预览能成、入库必失败」）。
+
+@router.post("/extract")
+def browser_extract():
+    """取当前**活跃标签**页面的**原始源码**并抽取正文（WP15 · 带登录态）。
+
+    为什么需要它：服务端裸抓被反爬拒绝的站点（知乎 403 等），在当前浏览器视图里
+    带着**用户自己的登录态**跑，不存在反爬问题。
+
+    ⚠️⚠️ 返回的是**原始源码**（`source`），不是 DOM 序列化 —— 实测 DOM 会丢 −90.9% 正文。
+       前端把 `source` 原样回传给 `/materials/clip/save`（那边的 `source` 字段会**先抽取**）。
+
+    ⚠️ `error` 与 `ok:false` 必须分开（同 `/action`、`/tab/*`）：
+       `host_unavailable` → **503**（环境不支持，静默）；
+       其余（`no_url` / `no_view` / `timeout` / `superseded` / 抽取 `reason`）→ 200 + `ok:false`，
+       界面要提示。压成一个 503 会让界面分不清「该不该弹提示」。
+    """
+    if not browser_host.is_available():
+        return _host_unavailable(browser_host.HostUnavailable("无宿主窗口（浏览器模式）"))
+    url = browser_host.current_url()
+    if not url:
+        return {"ok": False, "error": "no_url", "url": "", "title": "", "source": "",
+                "source_len": -1, "truncated": False, "preview": None}
+    ok, box, err = browser_host.request_page_source()
+    if not ok:
+        return {"ok": False, "error": err or "fetch_failed", "url": url, "title": "",
+                "source": "", "source_len": int((box or {}).get("length", -1) or -1),
+                "truncated": bool((box or {}).get("truncated")), "preview": None}
+    src = (box or {}).get("src") or ""
+    if not src:
+        return {"ok": False, "error": "empty_source", "url": url, "title": "",
+                "source": "", "source_len": 0, "truncated": False, "preview": None}
+    r = external_svc.extract_from_source(url, src)
+    pv = external_svc.preview_payload(r)
+    return {
+        "ok": bool(r.get("ok")),
+        "error": None if r.get("ok") else (r.get("reason") or "extract_failed"),
+        # ⚠️ 回传的 url 用**抽取后的归一化身份**：前端拿它入库，与服务端抓取路径同一身份
+        "url": r.get("url") or url,
+        "input_url": url,
+        "title": r.get("title") or "",
+        # 源码：`source_len` 是**截断前**的真实长度，`len(source)` 是实际搬回来的
+        "source": src,
+        "source_len": int((box or {}).get("length", -1) or -1),
+        "truncated": bool((box or {}).get("truncated")),
+        "preview": pv,
+    }
 
 
