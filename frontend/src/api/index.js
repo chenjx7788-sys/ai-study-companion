@@ -61,6 +61,11 @@ export const browserApi = {
   selfcheck: () => http.get('/browser/panel/selfcheck'),
   // URL 归一化：前端取「身份」必须与后端同规则（抓取仍用原始输入）
   normalize: (url) => http.get('/browser/url/normalize', { params: { url } }),
+  // 导航动作：back/forward/reload/stop。三个字段分开读 —— available=false 是「按钮该灰」，
+  // error 非空才是真失败；合成一个布尔会让界面分不清两者。
+  action: (action) => http.post('/browser/action', { action }),
+  // 导航状态（WP13）：state/url/title/progress/can_back/can_forward/error 七键恒定
+  nav: () => http.get('/browser/nav'),
 }
 
 // AI 理解（PRD 模块 B）；生成类接口长文档可能需数分钟，超时放宽到 300s

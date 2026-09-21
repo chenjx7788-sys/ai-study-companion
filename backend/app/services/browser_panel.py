@@ -27,8 +27,10 @@ import threading
 
 __all__ = [
     "DOCK_OBJNAME", "VIEW_OBJNAME", "ADDR_OBJNAME", "STATUS_OBJNAME",
+    "BTN_BACK_OBJNAME", "BTN_FORWARD_OBJNAME", "BTN_RELOAD_OBJNAME", "BTN_STOP_OBJNAME",
     "assemble", "show", "hide", "close", "navigate", "load_html",
-    "is_assembled", "get_state", "selfcheck",
+    "is_assembled", "get_state", "get_nav_state", "nav_action",
+    "classify_load_error", "selfcheck",
 ]
 
 DOCK_TITLE = "AI 浏览器"
@@ -37,6 +39,11 @@ PANEL_OBJNAME = "asc_browser_panel"
 ADDR_OBJNAME = "asc_addr"
 VIEW_OBJNAME = "asc_browser_view"
 STATUS_OBJNAME = "asc_status"
+# WP13 导航动作按钮的对象名（验收脚本按名字定位，**不要**按位置取 —— 加按钮会串位）
+BTN_BACK_OBJNAME = "asc_nav_back"
+BTN_FORWARD_OBJNAME = "asc_nav_forward"
+BTN_RELOAD_OBJNAME = "asc_nav_reload"
+BTN_STOP_OBJNAME = "asc_nav_stop"
 
 # 面板句柄：**只在主线程访问**（所有公开函数都经 call_on_main 投递，故天然串行）
 _panel = None
@@ -48,6 +55,36 @@ def _qt():
     from qtpy import QtCore, QtWidgets
     from qtpy.QtWebEngineWidgets import QWebEnginePage, QWebEngineView
     return QtCore, QtWidgets, QWebEngineView, QWebEnginePage
+
+
+def _loading_info():
+    """惰性取 `QWebEngineLoadingInfo`（WP13 错误分类用）。
+
+    ⚠️ **不并进 `_qt()` 的返回值** —— 那个 4 元组已有 5 处解包调用，
+       改元数会静默打乱所有调用点的解包（把 QWebEnginePage 当成 LoadingInfo），
+       而且症状是「某个不相关的函数行为诡异」，极难定位。
+    """
+    from qtpy.QtWebEngineCore import QWebEngineLoadingInfo
+    return QWebEngineLoadingInfo
+
+
+def _enum_int(e):
+    """把 Qt 枚举转成 int。
+
+    ⚠️⚠️ Qt6 / PySide6 的枚举是 **Python enum** → `int(SomeEnum.Member)` 抛
+       `TypeError: int() argument must be a string, ... not 'ErrorDomain'`。
+       必须走 `.value`。**本 bug 曾真实发生**（2026-09-21）：`_error_domain_names()`
+       与 `classify_load_error()` 都用了 `int(...)`，异常被 `except BaseException: pass`
+       吞掉 → 域名表建不起来、三类错误全归 "other"，用户永远只看到「加载失败」，
+       看不到「服务器返回 404」。验收 P4b/P4d/P4e 抓到它才算数。
+
+    ⚠️ 只用于**需要 int 比较**的场景；状态机里 `st == LS.LoadFailedStatus` 那种
+       枚举对枚举的比较本来就是对的，不要顺手改。
+    """
+    try:
+        return int(e)
+    except (TypeError, ValueError):
+        return int(e.value)
 
 
 def is_assembled():
@@ -111,6 +148,31 @@ def assemble(host, initial_url=""):
         bl.setContentsMargins(6, 6, 6, 6)
         bl.setSpacing(6)
 
+        # ---------- 导航动作按钮（WP13） ----------
+        # ⚠️ 用**文字符号**而不是图标：不引入资源文件依赖，打包也不会漏图标。
+        # ⚠️ 后退 / 前进初始为**灰**（还没有历史）—— 这是正确状态，不是缺陷。
+        btn_back = QtWidgets.QPushButton("\u2190")
+        btn_back.setObjectName(BTN_BACK_OBJNAME)
+        btn_back.setToolTip("后退")
+        btn_back.setFixedWidth(30)
+        btn_back.setEnabled(False)
+
+        btn_forward = QtWidgets.QPushButton("\u2192")
+        btn_forward.setObjectName(BTN_FORWARD_OBJNAME)
+        btn_forward.setToolTip("前进")
+        btn_forward.setFixedWidth(30)
+        btn_forward.setEnabled(False)
+
+        btn_reload = QtWidgets.QPushButton("\u27f3")
+        btn_reload.setObjectName(BTN_RELOAD_OBJNAME)
+        btn_reload.setToolTip("刷新")
+        btn_reload.setFixedWidth(30)
+
+        btn_stop = QtWidgets.QPushButton("\u2715")
+        btn_stop.setObjectName(BTN_STOP_OBJNAME)
+        btn_stop.setToolTip("停止")
+        btn_stop.setFixedWidth(30)
+
         addr = QtWidgets.QLineEdit()
         addr.setObjectName(ADDR_OBJNAME)
         addr.setPlaceholderText("输入网址，回车打开")
@@ -124,6 +186,10 @@ def assemble(host, initial_url=""):
         btn_close.setObjectName("asc_close")
         btn_close.setFixedWidth(52)
 
+        bl.addWidget(btn_back)
+        bl.addWidget(btn_forward)
+        bl.addWidget(btn_reload)
+        bl.addWidget(btn_stop)
         bl.addWidget(addr, 1)
         bl.addWidget(btn_go)
         bl.addWidget(btn_close)
@@ -159,7 +225,12 @@ def assemble(host, initial_url=""):
             "dock": dock, "panel": panel, "addr": addr, "view": view,
             "status": status, "app_view": app_view,
             "btn_go": btn_go, "btn_close": btn_close,
+            "btn_back": btn_back, "btn_forward": btn_forward,
+            "btn_reload": btn_reload, "btn_stop": btn_stop,
             "shared_profile": shared_ok, "shared_profile_error": shared_err,
+            # WP13 导航状态：**只存普通值**（路由线程只读它，绝不直接读 Qt 对象 —— 会挂死）
+            "nav": {"state": "idle", "url": "", "title": "", "progress": 0,
+                    "can_back": False, "can_forward": False, "error": None},
         }
 
         # ---------- 接线 ----------
@@ -169,6 +240,11 @@ def assemble(host, initial_url=""):
         addr.returnPressed.connect(_do_navigate)
         btn_go.clicked.connect(_do_navigate)
         btn_close.clicked.connect(lambda: hide(host))
+        # WP13 导航动作：**统一走 nav_action**（单一入口 → 可用性判定与错误回传只写一份）
+        btn_back.clicked.connect(lambda: nav_action(_panel, "back"))
+        btn_forward.clicked.connect(lambda: nav_action(_panel, "forward"))
+        btn_reload.clicked.connect(lambda: nav_action(_panel, "reload"))
+        btn_stop.clicked.connect(lambda: nav_action(_panel, "stop"))
 
         def _on_load_finished(ok):
             try:
@@ -179,6 +255,7 @@ def assemble(host, initial_url=""):
                     if not addr.hasFocus():
                         addr.setText(url)      # 回填（跟随页内跳转）
                 status.setText("加载完成" if ok else "加载失败")
+                _sync_nav(_panel)      # WP13：刷新 can_back / can_forward（必须在主线程读）
             except BaseException:
                 pass
 
@@ -203,6 +280,44 @@ def assemble(host, initial_url=""):
                 pass
 
         view.loadProgress.connect(_on_load_progress)
+
+        def _on_loading_changed(info):
+            """WP13 状态机：把加载事件分类成 nav 状态（**唯一**写 nav["state"] 的地方）。
+
+            ⚠️ 必须用 `loadingChanged`（带 `QWebEngineLoadingInfo`）而不是只看
+               `loadFinished`：后者给不出 `errorDomain` / `errorCode` / `isErrorPage`，
+               而「服务器返回 404」与「域名解析失败」对用户是**两句完全不同的话**
+               （实测：HTTP 404 时 `loadFinished=False`，但页面显示的是**服务端的** 404 页）。
+            """
+            try:
+                if _panel is None:
+                    return
+                nav = _panel.setdefault("nav", {})
+                LS = _loading_info().LoadStatus
+                st = info.status()
+                if st == LS.LoadStartedStatus:
+                    nav["state"] = "loading"
+                    nav["error"] = None
+                elif st == LS.LoadSucceededStatus:
+                    nav["state"] = "loaded"
+                    nav["error"] = None
+                elif st == LS.LoadStoppedStatus:
+                    nav["state"] = "stopped"
+                elif st == LS.LoadFailedStatus:
+                    err = classify_load_error(info)
+                    # ⚠️ 服务端自己的错误页（is_chromium_error_page=False）仍**显示服务端内容**
+                    #    → 归 http_error，文案要说「服务器返回 404」，不能说「网页打不开」。
+                    nav["state"] = "http_error" if err.get("kind") == "http" else "net_error"
+                    nav["error"] = err
+                _sync_nav(_panel)
+            except BaseException:
+                pass
+
+        try:
+            view.page().loadingChanged.connect(_on_loading_changed)
+            _panel["loading_hooked"] = True
+        except BaseException as e:
+            _panel["loading_hooked"] = "%s: %s" % (type(e).__name__, e)
 
         # ⚠️ `target=_blank` / `window.open` 必须**留在本视图内**打开：
         #    否则 Qt 会尝试开新窗口，而 pywebview 没接管它 → 表现成「点了链接没反应」；
@@ -302,6 +417,10 @@ def navigate(panel, url):
         return False, "invalid_url"
     try:
         panel["status"].setText("正在打开…")
+        # WP13：每次导航都从 loading 重新开始（并清掉上一次的错误，避免旧错误挂在状态栏）
+        nav = panel.setdefault("nav", {})
+        nav["state"] = "loading"
+        nav["error"] = None
         panel["view"].setUrl(QtCore.QUrl(final))
         panel["addr"].setText(final)
         return True, None
@@ -322,6 +441,231 @@ def load_html(panel, html, base_url=""):
         return True, None
     except BaseException as e:
         return False, "%s: %s" % (type(e).__name__, e)
+
+
+# ---------- WP13：导航动作 + 加载错误分类 ----------
+# ⚠️ 本段所有函数都必须**在主线程执行**（都碰 Qt 对象）；
+#    唯一例外是 `get_nav_state()` —— 它只读普通值，任意线程可调用。
+
+_ACTION_WEBACTION = {"back": "Back", "forward": "Forward", "reload": "Reload", "stop": "Stop"}
+
+# Chromium net error code → 类别。**实测映射**（`_probe_wp13_errsem2.py --no-sandbox`，2026-09-21）
+_CONN_KIND = {
+    -105: "dns",        # ERR_NAME_NOT_RESOLVED
+    -102: "refused",    # ERR_CONNECTION_REFUSED
+    -118: "timeout",    # ERR_CONNECTION_TIMED_OUT
+}
+_KIND_LABEL = {
+    "dns": "找不到这个网站（域名解析失败）",
+    "refused": "无法连接（目标拒绝连接）",
+    "timeout": "连接超时",
+    "tls": "证书不受信任",
+    "other": "加载失败",
+}
+
+_ERROR_DOMAIN_CACHE = None
+
+
+def _error_domain_names():
+    """`int → 域名`，**运行时从 Qt 枚举构建**。
+
+    ⚠️ 不写死数字：`ErrorDomain` 的取值随 Qt 版本漂移，写死会**静默错分类**
+       （症状是「DNS 失败被说成连接超时」—— 用户看不出来，验收脚本也可能照样绿）。
+    """
+    global _ERROR_DOMAIN_CACHE
+    if _ERROR_DOMAIN_CACHE is None:
+        out = {}
+        try:
+            ED = _loading_info().ErrorDomain
+            for n in dir(ED):
+                if n.startswith("_"):
+                    continue
+                try:
+                    out[_enum_int(getattr(ED, n))] = n
+                except BaseException:
+                    pass
+        except BaseException:
+            pass
+        _ERROR_DOMAIN_CACHE = out
+    return _ERROR_DOMAIN_CACHE
+
+
+def classify_load_error(info):
+    """把 `QWebEngineLoadingInfo` 分类成**用户能懂**的错误（纯函数，不碰全局状态）。
+
+    实测映射（`_probe_wp13_errsem2.py --no-sandbox`）：
+
+    | 场景 | domain | code | isErrorPage |
+    |---|---|---|---|
+    | HTTP 404 / 500 | `HttpStatusCodeDomain` | 404 / 500 | **False** |
+    | DNS 失败 | `ConnectionErrorDomain` | -105 | True |
+    | 连接被拒 | `ConnectionErrorDomain` | -102 | True |
+    | 连接超时 | `ConnectionErrorDomain` | -118 | True |
+
+    ⚠️ 返回 dict 的**键必须恒定**（验收脚本要逐字比对）：取不到值也要有键、值为 None。
+    ⚠️ `is_chromium_error_page` 是**关键区分**：
+       True  → 页面显示 Chromium 自带错误页，用户看到「网页打不开」；
+       False → 页面显示的是**服务端自己的**错误页，用户看到 404 页面本身。
+       两者对用户的提示语完全不同，不能合成一句「加载失败」。
+    """
+    domain_name = None
+    code = None
+    is_err_page = None
+    try:
+        d = _enum_int(info.errorDomain())
+        domain_name = _error_domain_names().get(d, "Domain(%d)" % d)
+        code = _enum_int(info.errorCode())
+        is_err_page = bool(info.isErrorPage())
+    except BaseException:
+        pass
+
+    kind = "other"
+    http_status = None
+    if domain_name == "HttpStatusCodeDomain":
+        kind = "http"
+        http_status = code
+    elif domain_name == "CertificateErrorDomain":
+        kind = "tls"
+    elif domain_name == "DnsErrorDomain":
+        kind = "dns"
+    elif domain_name == "ConnectionErrorDomain":
+        kind = _CONN_KIND.get(code, "other")
+
+    if kind == "http" and http_status is not None:
+        label = "服务器返回 %s" % http_status
+    else:
+        label = _KIND_LABEL.get(kind, "加载失败")
+
+    return {
+        "kind": kind,
+        "http_status": http_status,
+        "domain": domain_name,
+        "code": code,
+        "is_chromium_error_page": is_err_page,
+        "label": label,
+    }
+
+
+def _profile_is_shared(panel):
+    """dock 视图与主视图是否**同一个 profile 对象**（WP13 · 用于 R3 结案）。
+
+    ⚠️⚠️ 必须比**对象同一性**（`is`），不能比路径 / URL：
+       两个**不同**的 profile 也可能 `persistentStoragePath` 相同 → 比路径会**假绿**，
+       而 R3 的结论恰恰是「连接挂在哪个对象上」，路径一致推不出对象一致。
+    取不到时返回 `None`（**不是 False**）—— 「没装好」与「装了但不共享」是两件事。
+    """
+    try:
+        v = panel.get("view")
+        a = panel.get("app_view")
+        if v is None or a is None or a.page() is None:
+            return None
+        return bool(v.page().profile() is a.page().profile())
+    except BaseException:
+        return None
+
+
+def _refresh_nav_buttons(panel):
+    """按 nav 状态刷新后退 / 前进按钮的可用性（**主线程**）。"""
+    if panel is None:
+        return
+    nav = panel.get("nav") or {}
+    for key, field in (("can_back", "btn_back"), ("can_forward", "btn_forward")):
+        b = panel.get(field)
+        if b is None:
+            continue
+        try:
+            b.setEnabled(bool(nav.get(key, False)))
+        except BaseException:
+            pass
+
+
+def _sync_nav(panel):
+    """把「只有主线程能读」的 Qt 值同步进普通 dict（供路由线程读）。**主线程**。
+
+    ⚠️ `QWebEngineHistory.canGoBack()` 是 Qt 调用 —— 在路由线程直接调会**挂死**
+       （WP12 已实测同族问题：setParent / takeCentralWidget 都是静默卡死）。
+       故一律在主线程读完后缓存成普通 Python 值，路由只读缓存。
+    """
+    if panel is None:
+        return
+    nav = panel.setdefault("nav", {})
+    try:
+        view = panel.get("view")
+        if view is not None:
+            nav["url"] = view.url().toString()
+            hist = view.history()
+            nav["can_back"] = bool(hist.canGoBack())
+            nav["can_forward"] = bool(hist.canGoForward())
+    except BaseException:
+        pass
+    try:
+        nav["progress"] = int(panel.get("progress", 0) or 0)
+    except BaseException:
+        pass
+    _refresh_nav_buttons(panel)
+
+
+def nav_action(panel, action):
+    """执行导航动作（back / forward / reload / stop）。**必须在主线程执行。**
+
+    :returns: `(ok, error, available)`
+
+    ⚠️ 三元组**不能合成一个布尔**：
+       `available=False` 表示「此刻这个动作不可用」（如没有历史可后退）——
+       那是**正常状态**（按钮该灰），与「执行失败」是两件事。
+    ⚠️ 非法 action 一律 `bad_action`，**不做静默兜底** —— 兜底会把「调用方传错」
+       变成「什么都没发生」，属于最难查的一类 bug。
+    """
+    if panel is None:
+        return False, "no_panel", False
+    act = (action or "").strip().lower()
+    if act not in _ACTION_WEBACTION:
+        return False, "bad_action", False
+    _, _, _, QWebEnginePage = _qt()
+    view = panel.get("view")
+    if view is None:
+        return False, "no_view", False
+
+    available = True
+    try:
+        hist = view.history()
+        if act == "back":
+            available = bool(hist.canGoBack())
+        elif act == "forward":
+            available = bool(hist.canGoForward())
+    except BaseException:
+        available = True
+    if not available:
+        return False, "not_available", False
+
+    try:
+        enum = getattr(QWebEnginePage.WebAction, _ACTION_WEBACTION[act])
+        view.page().triggerAction(enum)
+        return True, None, True
+    except BaseException as e:
+        return False, "%s: %s" % (type(e).__name__, e), available
+
+
+def get_nav_state():
+    """导航状态（**只读普通值** → 任意线程可调用）。
+
+    ⚠️ 空态是**确定结构**（可逐字比对）：七个键都在，值为空串 / 0 / False / None。
+       ⚠️ 只有**已被主线程写入的普通 Python 值**能在这里读；
+       任何 `view.url()` / `history().canGoBack()` 这类 Qt 调用都必须经 call_on_main。
+    """
+    if _panel is None:
+        return {"state": "idle", "url": "", "title": "", "progress": 0,
+                "can_back": False, "can_forward": False, "error": None}
+    nav = _panel.get("nav") or {}
+    return {
+        "state": nav.get("state", "idle"),
+        "url": nav.get("url", "") or _panel.get("last_url", "") or "",
+        "title": _panel.get("last_title", "") or "",
+        "progress": int(nav.get("progress", 0) or 0),
+        "can_back": bool(nav.get("can_back", False)),
+        "can_forward": bool(nav.get("can_forward", False)),
+        "error": nav.get("error", None),
+    }
 
 
 def get_state():
@@ -381,6 +725,9 @@ def selfcheck(host):
         "view_size": [view.width(), view.height()] if view else None,
         "addr_visible": bool(addr.isVisible()) if addr else None,
         "central_unchanged": host.centralWidget() is _panel.get("app_view"),
+        # WP13 · R3 结案判据：连接挂在 **profile 对象**上（qt.py:450）→ 同一对象即必然覆盖
+        "profile_shared_with_app": _profile_is_shared(_panel),
+        "nav": get_nav_state(),
         "central_visible": bool(host.centralWidget().isVisible()) if host.centralWidget() else None,
         "host_visible": bool(host.isVisible()),
     })

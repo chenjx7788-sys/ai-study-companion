@@ -43,8 +43,10 @@ __all__ = [
     "request_browser_open",
     "request_browser_close",
     "request_browser_navigate",
+    "request_browser_action",
     "request_panel_selfcheck",
     "request_sidebar_show",
+    "nav_state",
 ]
 
 # 只允许这两种协议。**显式白名单**：`file:` / `javascript:` / `data:` 一律拒 ——
@@ -393,6 +395,63 @@ def request_browser_close():
     except Exception as e:
         return False, "%s: %s" % (type(e).__name__, e)
     return True, None
+
+
+# ---------- WP13：导航动作 + 导航状态 ----------
+
+def _action_on_main(action):
+    """在 Qt 主线程里执行导航动作（返回 `(ok, error, available)`）。"""
+    from . import browser_panel
+    host = host_view()
+    panel = browser_panel.assemble(host)      # 幂等；未装配时自动装配
+    return browser_panel.nav_action(panel, action)
+
+
+def request_browser_action(action):
+    """执行导航动作（`back` / `forward` / `reload` / `stop`）。
+
+    :returns: `(ok, error, available)`
+
+    ⚠️ 三元组**不能合并**（与 `request_sidebar_show` 把「数据面/显示面」分开是同一个理由）：
+       `available=False` = 「此刻这个动作不可用」（如没有历史可后退）→ **正常状态**，
+       界面该把按钮变灰，而不是弹错误；
+       `error` 非空   = 「执行失败」→ 才是真问题。
+       合成一个布尔后，界面再也分不清「按钮该灰」与「出错了」。
+
+    ⚠️ **动作名先校验、再查宿主**（与 `request_browser_navigate` 把 invalid_url 前置同理）：
+       否则浏览器模式下传一个错动作名，会先返回 `host_unavailable` 而把 `bad_action`
+       盖掉 —— 验收脚本就分不清「调用方传错」与「环境没宿主」。
+    """
+    act = (action or "").strip().lower()
+    if act not in ("back", "forward", "reload", "stop"):
+        return False, "bad_action", False
+    if not is_available():
+        return False, "host_unavailable", False
+    try:
+        ok, err, avail = call_on_main(_action_on_main, act)
+        return bool(ok), err, bool(avail)
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e), False
+
+
+def nav_state():
+    """导航状态（**只读普通值** → 任意线程可调用）。
+
+    ⚠️ 空态是**确定结构**：七个键都在，值为空串 / 0 / False / None。
+       ⚠️ 有宿主但**面板尚未装配**时，也返回同一形状的空态 ——
+       返回 None / 抛异常会让验收脚本无法逐字比对（「不是 500」这种断言天生判不出东西）。
+    """
+    empty = {"state": "idle", "url": "", "title": "", "progress": 0,
+             "can_back": False, "can_forward": False, "error": None}
+    if not is_available():
+        return empty
+    try:
+        from . import browser_panel
+        if browser_panel.is_assembled():
+            return browser_panel.get_nav_state()
+    except Exception:
+        pass
+    return empty
 
 
 def _selfcheck_on_main():

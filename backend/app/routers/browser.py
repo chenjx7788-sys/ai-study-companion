@@ -137,6 +137,40 @@ def close_browser():
     return {"ok": True, "hidden": hidden, "host_error": err}
 
 
+@router.post("/action")
+def browser_action(payload: dict | None = None):
+    """执行导航动作：`back` / `forward` / `reload` / `stop`（WP13）。
+
+    ⚠️ 三个字段必须**分开**返回（`ok` / `error` / `available`）：
+       `available=false` = 「此刻不可用」（没有历史可后退）→ 界面该把按钮变灰；
+       `error` 非空       = 「执行失败」→ 才是真问题。
+       合成一个 `ok:false` 后，前端再也分不清「按钮该灰」与「出错了」——
+       这正是本项目反复出现的「两个独立语义被压成一个布尔」形态。
+    ⚠️ 动作名非法返回 `error="bad_action"`，**不是** 503：
+       那是调用方的问题（要提示），而 503 是环境问题（静默即可）。
+    """
+    p = payload or {}
+    ok, err, avail = browser_host.request_browser_action(p.get("action", "") or "")
+    return {"ok": bool(ok), "error": err, "available": bool(avail)}
+
+
+@router.get("/nav")
+def browser_nav():
+    """导航状态（WP13）。空态是**确定结构**，可逐字比对：
+
+    `{"state":"idle","url":"","title":"","progress":0,
+      "can_back":false,"can_forward":false,"error":null}`
+
+    ⚠️ 与 `/state` 的分工：`/state` 是**面板级**状态（是否装配、profile 是否共享），
+       本接口是**导航级**状态（当前页、能否后退、错误分类）。
+       合成一个接口会让「面板没装配」与「页面加载失败」在同一个字段里打架。
+    ⚠️ 出错时 `error` 的形状（`kind` / `http_status` / `domain` / `code` /
+       `is_chromium_error_page` / `label`）由 `browser_panel.classify_load_error` 产出，
+       六个键**恒定存在**（取不到值时为 null）—— 前端可无条件读 `error.label`。
+    """
+    return browser_host.nav_state()
+
+
 @router.get("/panel/selfcheck")
 def panel_selfcheck():
     """仅调试/验收：在主线程回读面板**真实** Qt 状态（WP12 判据 1）。
