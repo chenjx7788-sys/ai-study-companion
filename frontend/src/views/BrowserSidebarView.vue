@@ -31,7 +31,7 @@
       <div v-if="cand" class="sb-cand" data-role="sb-cand">
         <div class="sb-cand-title" :title="cand.title">{{ cand.title || '未命名网页' }}</div>
         <div class="sb-cand-meta">
-          {{ cand.kindLabel }} · {{ cand.chars }} 字<template v-if="cand.images"> · {{ cand.images }} 张图</template><template v-if="cand.truncated"> · 已截断</template>
+          {{ cand.kindLabel }} · {{ cand.chars }} 字<template v-if="cand.via === 'dom'"> · 正文模式</template><template v-else-if="cand.images"> · {{ cand.images }} 张图</template><template v-if="cand.truncated"> · 已截断</template>
         </div>
         <button class="sb-cand-save" data-role="sb-save"
                 :disabled="busy || !cand.canSave || cand.saved" @click="saveCand">
@@ -335,6 +335,9 @@ async function fetchPage() {
     cand.value = {
       url: data.url,
       source: data.source,
+      // WP19：DOM 兜底（动态页面）时后端给的是 `text`（可见正文），不是 source
+      text: data.text || '',
+      via: data.via || 'source',
       title: data.title || pv.title || '',
       kindLabel: pv.kind_label || '',
       chars: pv.chars || 0,
@@ -343,7 +346,9 @@ async function fetchPage() {
       canSave: pv.action === 'ready',
       saved: !!pv.saved,
     }
-    if (pv.action !== 'ready') {
+    if (data.via === 'dom') {
+      fetchMsg.value = pv.hint || '动态页面：已按页面可见正文读取（不含图片）。'
+    } else if (pv.action !== 'ready') {
       fetchMsg.value = pv.hint || '这个页面暂时不能直接入库，可以改用划选正文。'
       loginHint.value = !!data.login_hint
     } else if (data.truncated) {
@@ -360,8 +365,12 @@ async function saveCand() {
   if (!cand.value) return
   busy.value = true
   try {
-    // ⚠️ 传的是 `source`（页面源码），不是 `text`（已抽正文）—— 后端的语义不同。
-    const { data } = await clipApi.save({ url: cand.value.url, source: cand.value.source })
+    // ⚠️ 两条入库路径：源码路径传 `source`（页面源码，后端先抽取）；
+    //    WP19 DOM 兜底传 `text`（已是可见正文，passthrough 落库）—— 两者语义不同，别混。
+    const payload = cand.value.text
+      ? { url: cand.value.url, text: cand.value.text }
+      : { url: cand.value.url, source: cand.value.source }
+    const { data } = await clipApi.save(payload)
     cand.value.saved = true
     fetchMsg.value = data && data.duplicated ? '这篇已经在知识库里了' : '已加入知识库'
   } catch (e) {

@@ -1008,9 +1008,11 @@ _SRC_SNAP_JS = ("(function(){var T='%s';"
                 "d:!!window.__asc_src});})()")
 
 
-def page_source_start(panel=None):
+def page_source_start(panel=None, mode="source"):
     """发起「取当前**活跃标签**页面源码」。**必须在主线程执行。** 立刻返回，不等结果。
 
+    :param mode: `"source"`（默认，页面内 fetch 原始源码，WP15）或 `"dom"`
+        （读已渲染 DOM 的可见文本，WP19 兜底：SPA 页面重新 fetch 会撞反爬空壳）。
     :returns: `(ok, error, token)`；`token` 是本次请求标识（用于防串场）。
 
     ⚠️⚠️ 为什么要 token 而不是「直接读结果」：用户可能在 fetch 飞行中**切标签 / 关标签**，
@@ -1031,7 +1033,9 @@ def page_source_start(panel=None):
         p["_src"] = {"token": tok, "phase": "fetching", "err": None,
                      "length": -1, "truncated": False, "src": "", "pulling": False}
         cap = int(getattr(external_svc, "SOURCE_MAX_CHARS", 3000000))
-        view.page().runJavaScript(external_svc.source_fetch_js(cap=cap, token=tok))
+        js = (external_svc.dom_text_js(cap=cap, token=tok) if mode == "dom"
+              else external_svc.source_fetch_js(cap=cap, token=tok))
+        view.page().runJavaScript(js)
         return True, None, tok
     except BaseException as e:
         return False, "%s: %s" % (type(e).__name__, e), None
@@ -1775,7 +1779,7 @@ def get_state():
             "id": t.get("id"),
             "url": t.get("last_url", "") or "",
             "title": t.get("last_title", "") or "",
-            "loading": int(t.get("progress", 0) or 0) < 100,
+            "loading": nav.get("state", "idle") == "loading",
             "progress": int(t.get("progress", 0) or 0),
             "load_ok": t.get("last_load_ok"),
             "active": t.get("id") == _panel.get("active"),

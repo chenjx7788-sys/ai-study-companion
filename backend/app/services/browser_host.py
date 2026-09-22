@@ -650,11 +650,11 @@ SOURCE_TIMEOUT = 20.0
 _SRC_POLL_INTERVAL = 0.08
 
 
-def _page_source_start_on_main():
+def _page_source_start_on_main(mode="source"):
     from . import browser_panel
     _install_hook()                                 # 幂等
     panel = browser_panel.assemble(host_view())      # 幂等
-    return browser_panel.page_source_start(panel)
+    return browser_panel.page_source_start(panel, mode=mode)
 
 
 def _page_source_poll_on_main():
@@ -667,8 +667,11 @@ def current_url():
     return nav_state().get("url", "") or ""
 
 
-def request_page_source(timeout=SOURCE_TIMEOUT):
+def request_page_source(timeout=SOURCE_TIMEOUT, mode="source"):
     """取当前**活跃标签**页面的**原始源码**（带登录态）。返回 `(ok, box, error)`。
+
+    :param mode: `"source"`（默认）或 `"dom"`（WP19 兜底：读已渲染 DOM 的可见文本，
+        供 `/extract` 在源码路径失败时重试 —— SPA 页面重新 fetch 会撞反爬空壳）。
 
     :returns: `(True, {"length":int,"truncated":bool,"src":str}, None)` 或
               `(False, 末次box, "host_unavailable"|"timeout"|"superseded"|"no_view"|...)`
@@ -682,7 +685,7 @@ def request_page_source(timeout=SOURCE_TIMEOUT):
     if not is_available():
         return False, None, "host_unavailable"
     try:
-        ok, err, tok = call_on_main(_page_source_start_on_main)
+        ok, err, tok = call_on_main(_page_source_start_on_main, mode)
     except Exception as e:                  # HostUnavailable / MainThreadTimeout / 槽内异常
         return False, None, "%s: %s" % (type(e).__name__, e)
     if not ok:

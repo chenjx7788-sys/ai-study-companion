@@ -379,6 +379,34 @@ def tab_switch(payload: dict | None = None):
 # ⚠️ 本接口返回的 `preview` 由 `external_svc.preview_payload()` 产出 —— 与
 #    `/materials/clip/preview` **同一个函数**，故两侧字段天然一致（不会「预览能成、入库必失败」）。
 
+# ⚠️ WP19：SPA 页面（小红书等）的分享链接**重新 fetch 会撞反爬 / 一次性令牌失效**，
+#    拿回来的是空壳启动页；而已渲染 DOM 的可见文本就是用户正在看的内容。
+#    故源码路径失败时兜底走 DOM（innerText）。代价是丢图片 —— 响应里用 via="dom" 如实标注。
+DOM_MIN_CHARS = 40
+"""DOM 兜底的最短可见文本。低于它视为「这页确实没正文」（登录页/空壳），保留原始错误。"""
+
+
+def _extract_via_dom(url):
+    """源码路径失败后的 DOM 兜底。成功返回与 /extract 成功路径**同形状**的 dict，否则 None。"""
+    ok, box, _ = browser_host.request_page_source(mode="dom")
+    text = ((box or {}).get("src") or "").strip()
+    if not ok or len(text) < DOM_MIN_CHARS:
+        return None
+    title = browser_host.nav_state().get("title") or ""
+    r = {"ok": True, "url": url, "title": title, "text": text, "chars": len(text),
+         "kind": "url", "meta": {}}
+    pv = external_svc.preview_payload(r)
+    pv["hint"] = "动态页面：已按页面可见正文读取（不含图片）。"
+    return {
+        "ok": True, "error": None, "via": "dom",
+        "url": url, "input_url": url, "title": title,
+        "source": "", "text": text,
+        "source_len": int((box or {}).get("length", -1) or -1),
+        "truncated": bool((box or {}).get("truncated")),
+        "preview": pv, "login_hint": False,
+    }
+
+
 @router.post("/extract")
 def browser_extract():
     """取当前**活跃标签**页面的**原始源码**并抽取正文（WP15 · 带登录态）。
@@ -399,6 +427,7 @@ def browser_extract():
     url = browser_host.current_url()
     if not url:
         return {"ok": False, "error": "no_url", "url": "", "title": "", "source": "",
+                "text": "", "via": "",
                 "source_len": -1, "truncated": False, "preview": None,
                 "login_hint": False}
     # WP18 · 取源时序：页面还在加载就取源，拿到的是**上一页 / 半加载页**（实测知乎
@@ -406,23 +435,37 @@ def browser_extract():
     nav = browser_host.nav_state()
     if nav.get("state") == "loading":
         return {"ok": False, "error": "page_loading", "url": url, "title": "",
-                "source": "", "source_len": -1, "truncated": False, "preview": None,
+                "source": "", "text": "", "via": "",
+                "source_len": -1, "truncated": False, "preview": None,
                 "login_hint": browser_host.login_hint_for(url)}
     ok, box, err = browser_host.request_page_source()
     if not ok:
         # 超时但页面其实还在加载 → 同样归 page_loading（「读取超时」在这里也是误导）
         if err == "timeout" and browser_host.nav_state().get("state") == "loading":
             err = "page_loading"
+        if err != "page_loading":
+            dom = _extract_via_dom(url)         # WP19：SPA 空壳的 DOM 兜底
+            if dom is not None:
+                return dom
         return {"ok": False, "error": err or "fetch_failed", "url": url, "title": "",
-                "source": "", "source_len": int((box or {}).get("length", -1) or -1),
+                "source": "", "text": "", "via": "",
+                "source_len": int((box or {}).get("length", -1) or -1),
                 "truncated": bool((box or {}).get("truncated")), "preview": None,
                 "login_hint": browser_host.login_hint_for(url)}
     src = (box or {}).get("src") or ""
     if not src:
+        dom = _extract_via_dom(url)             # WP19
+        if dom is not None:
+            return dom
         return {"ok": False, "error": "empty_source", "url": url, "title": "",
-                "source": "", "source_len": 0, "truncated": False, "preview": None,
+                "source": "", "text": "", "via": "",
+                "source_len": 0, "truncated": False, "preview": None,
                 "login_hint": browser_host.login_hint_for(url)}
     r = external_svc.extract_from_source(url, src)
+    if not r.get("ok"):
+        dom = _extract_via_dom(url)             # WP19：小红书等 SPA 走这里
+        if dom is not None:
+            return dom
     pv = external_svc.preview_payload(r)
     return {
         "ok": bool(r.get("ok")),
@@ -433,6 +476,8 @@ def browser_extract():
         "title": r.get("title") or "",
         # 源码：`source_len` 是**截断前**的真实长度，`len(source)` 是实际搬回来的
         "source": src,
+        "text": "",
+        "via": "source" if r.get("ok") else "",
         "source_len": int((box or {}).get("length", -1) or -1),
         "truncated": bool((box or {}).get("truncated")),
         "preview": pv,

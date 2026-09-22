@@ -484,6 +484,31 @@ def source_fetch_js(cap: int = SOURCE_MAX_CHARS, token: str = "") -> str:
     ) % (int(cap), tok)
 
 
+def dom_text_js(cap: int = SOURCE_MAX_CHARS, token: str = "") -> str:
+    """构造「页内取可见正文」JS（DOM 兜底通道）。结果写 `window.__asc_src` **同一组**全局。
+
+    ⚠️ 与 `source_fetch_js` 共用同一组 window 全局与 token 协议 —— 面板层的
+       轮询 / 防串场机器一份不改，区别只在「取什么」。
+    ⚠️⚠️ 为什么需要这条通道（WP19，实测）：SPA 页面（小红书等）的**分享链接重新 fetch
+       会撞反爬 / 一次性令牌失效**，拿回来的是空壳启动页；而**已渲染 DOM 的可见文本
+       就是用户正在看的内容**。对这类页面，「取源码」反而是错的那条路。
+    ⚠️ 取 `innerText` 而不是 `outerHTML`：天然不含 <script>/<style> 残片，
+       且语义就是「用户可见正文」。代价是丢图片 —— 兜底通道，如实标注即可。
+    """
+    tok = re.sub(r"[^A-Za-z0-9_\-]", "", str(token or ""))[:64]
+    return (
+        "(function(){var CAP=%d,TOK='%s';"
+        "window.__asc_src=null;window.__asc_src_len=-1;window.__asc_trunc=false;"
+        "window.__asc_tok=TOK;window.__asc_err=null;"
+        "try{var t=(document.body?document.body.innerText:'')||'';"
+        "window.__asc_trunc=t.length>CAP;"
+        "window.__asc_src=window.__asc_trunc?t.slice(0,CAP):t;"
+        "window.__asc_src_len=t.length;}"
+        "catch(e){window.__asc_err=String(e);window.__asc_src_len=-2;}"
+        "return 'started';})()"
+    ) % (int(cap), tok)
+
+
 def extract_from_source(url: str, html: str) -> dict:
     """从页面**原始源码**抽取正文 —— 与 `fetch_url` 共用**同一条判定链**。
 
