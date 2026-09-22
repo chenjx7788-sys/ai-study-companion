@@ -334,6 +334,18 @@
         </el-upload>
       </div>
       <p class="storage-tip">数据目录：{{ storage.data_dir }}（恢复前会自动备份当前数据，可随时回滚）</p>
+      <!-- WP18 · N04：AI 浏览器的浏览数据（登录态 Cookie / 缓存 / 页内历史）一键清除 -->
+      <el-divider />
+      <div class="storage-row">
+        <el-button type="warning" plain data-role="clear-browsing-data"
+                   :loading="clearingBrowsing" @click="clearBrowsingData">
+          清除浏览数据（AI 浏览器）
+        </el-button>
+      </div>
+      <p class="storage-tip" data-role="browsing-privacy-note">
+        {{ browsingPrivacyNote || '浏览历史不落库；页面内容不上传第三方；登录态与 Cookie 仅存本机数据目录，可一键清除。' }}
+        清除后，知乎等站点需要重新登录；你的材料、笔记与设置不受影响。
+      </p>
     </el-card>
       </el-tab-pane>
 
@@ -383,7 +395,7 @@ import { reactive, ref, computed, onMounted } from 'vue'
 import { Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { useRouter, useRoute } from 'vue-router'
-import { settingsApi } from '../api'
+import { settingsApi, browserApi } from '../api'
 import http from '../api/http'
 import { useAsr } from '../composables/useAsr'
 import PageHead from '../components/PageHead.vue'
@@ -686,6 +698,46 @@ function fillDefault(key) {
 const storage = reactive({ files_mb: 0, db_mb: 0, chroma_mb: 0, data_dir: '' })
 const backingUp = ref(false)
 
+// WP18 · N04：清除浏览数据（AI 浏览器的登录态 Cookie / 缓存 / 页内历史）。
+// ⚠️ 文案 `browsingPrivacyNote` 优先取后端 /browser/privacy 的 cookie_note ——
+//    口径单一来源在后端，前端不自己另写一份（本项目反复强调的形态）。
+const clearingBrowsing = ref(false)
+const browsingPrivacyNote = ref('')
+
+async function loadBrowsingPrivacy() {
+  try {
+    const { data } = await browserApi.privacy()
+    if (data && data.cookie_note) browsingPrivacyNote.value = data.cookie_note
+  } catch { /* 静默：文案有兜底，接口失败不影响设置页其余功能 */ }
+}
+
+async function clearBrowsingData() {
+  try {
+    await ElMessageBox.confirm(
+      '将清除 AI 浏览器的登录态（Cookie）、缓存与页面历史。清除后知乎等站点需要重新登录；材料、笔记与设置不受影响。',
+      '清除浏览数据', { type: 'warning', confirmButtonText: '清除', cancelButtonText: '取消' })
+  } catch { return }   // 用户取消
+  clearingBrowsing.value = true
+  try {
+    const { data } = await browserApi.clearData()
+    if (data && data.ok) {
+      const c = data.cleared || {}
+      const parts = []
+      if (c.cookies) parts.push('登录态')
+      if (c.http_cache) parts.push('缓存')
+      if (c.histories) parts.push(`${c.histories} 份页面历史`)
+      ElMessage.success('已清除浏览数据' + (parts.length ? `（${parts.join('、')}）` : ''))
+    } else {
+      ElMessage.error('清除失败：' + ((data && data.error) || '未知原因'))
+    }
+  } catch (e) {
+    // 浏览器模式（无原生窗口）时后端回 503 → 如实告知，不假报成功
+    ElMessage.warning('当前环境没有浏览器面板可清理（浏览器模式下无需此操作）')
+  } finally {
+    clearingBrowsing.value = false
+  }
+}
+
 async function loadStorage() {
   const { data } = await http.get('/settings/storage')
   Object.assign(storage, data)
@@ -776,6 +828,7 @@ onMounted(async () => {
   loadStorage()
   loadUsage()
   loadAsr()
+  loadBrowsingPrivacy()
   // 从问答页「前往配置模型」跳入（/settings?add=1）：直接打开添加模型弹窗
   if (route.query.add) openModelEditor(null)
 })

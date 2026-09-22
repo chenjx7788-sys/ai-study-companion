@@ -77,6 +77,12 @@ export const browserApi = {
   // ⚠️ 它**不回传"已入库"**：入库仍走 clipApi.save（把返回的 source 一起传过去）。
   // ⚠️ 长页面源码可达数 MB → 超时放宽到 60s。
   extract: () => http.post('/browser/extract', {}, { timeout: 60000 }),
+  // WP18 清除浏览数据（cookie/缓存/访问记录/页内历史）。`cleared` 键恒定，逐键可读。
+  // ⚠️ 只清浏览数据，不动材料/笔记/设置；浏览器模式下 503（环境不支持，静默）。
+  clearData: () => http.post('/browser/data/clear', {}),
+  // WP18 N04 隐私口径的可验证形式（纯数据面）：history_tables 应为空、
+  // storage_under_data_dir 应为真 —— 设置页直接展示 `cookie_note`，口径单一来源。
+  privacy: () => http.get('/browser/privacy'),
   // WP16 选区三动作。⚠️ 与本文件的 `sidebarPayload` 分工不同，**不要合并**：
   //    这里读的是「页面上**选了什么**」（含 seq / path / err —— 用来区分"没选"与"选了但桥不通"）；
   //    `sidebarPayload` 读的是「侧栏**要显示什么**」（含动作与其结果）。

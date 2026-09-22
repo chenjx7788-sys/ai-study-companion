@@ -399,16 +399,29 @@ def browser_extract():
     url = browser_host.current_url()
     if not url:
         return {"ok": False, "error": "no_url", "url": "", "title": "", "source": "",
-                "source_len": -1, "truncated": False, "preview": None}
+                "source_len": -1, "truncated": False, "preview": None,
+                "login_hint": False}
+    # WP18 · 取源时序：页面还在加载就取源，拿到的是**上一页 / 半加载页**（实测知乎
+    # 问题页 ~35s 才稳定），且旧提示「可能不是文章页」是误导 → 单独原因码先拦住。
+    nav = browser_host.nav_state()
+    if nav.get("state") == "loading":
+        return {"ok": False, "error": "page_loading", "url": url, "title": "",
+                "source": "", "source_len": -1, "truncated": False, "preview": None,
+                "login_hint": browser_host.login_hint_for(url)}
     ok, box, err = browser_host.request_page_source()
     if not ok:
+        # 超时但页面其实还在加载 → 同样归 page_loading（「读取超时」在这里也是误导）
+        if err == "timeout" and browser_host.nav_state().get("state") == "loading":
+            err = "page_loading"
         return {"ok": False, "error": err or "fetch_failed", "url": url, "title": "",
                 "source": "", "source_len": int((box or {}).get("length", -1) or -1),
-                "truncated": bool((box or {}).get("truncated")), "preview": None}
+                "truncated": bool((box or {}).get("truncated")), "preview": None,
+                "login_hint": browser_host.login_hint_for(url)}
     src = (box or {}).get("src") or ""
     if not src:
         return {"ok": False, "error": "empty_source", "url": url, "title": "",
-                "source": "", "source_len": 0, "truncated": False, "preview": None}
+                "source": "", "source_len": 0, "truncated": False, "preview": None,
+                "login_hint": browser_host.login_hint_for(url)}
     r = external_svc.extract_from_source(url, src)
     pv = external_svc.preview_payload(r)
     return {
@@ -423,6 +436,11 @@ def browser_extract():
         "source_len": int((box or {}).get("length", -1) or -1),
         "truncated": bool((box or {}).get("truncated")),
         "preview": pv,
+        # WP18 登录墙引导：抽取失败 / 抽到登录页时，前端多给一句「请在浏览器里登录后重试」。
+        # ⚠️ 只做提示、不做拦截（V3 §6.1：未登录表现与 Chrome 一致，不额外拦截、不伪造）。
+        "login_hint": browser_host.login_hint_for(r.get("url") or url,
+                                                  r.get("title") or "")
+        if not r.get("ok") else False,
     }
 
 
@@ -557,3 +575,34 @@ def sidebar_toggle(payload: dict | None = None):
     ok, visible, err = browser_host.request_side_toggle(None if vis is None else bool(vis))
     return {"ok": bool(ok), "visible": bool(visible), "error": err,
             "pane": browser_host.side_state()}
+
+
+# ---------- WP18：清除浏览数据 + 隐私口径（N04） ----------
+# ⚠️ `/data/clear` 要碰 Qt（profile / 各标签历史）→ 经主线程投递，浏览器模式下 503。
+#    `/privacy` 是**纯数据面**（查 DB 表名 + 存储路径）→ 浏览器模式下也能验收。
+
+@router.post("/data/clear")
+def clear_browsing_data():
+    """清除浏览数据：cookie（登录态）/ HTTP 缓存 / 访问记录 / 各标签页内历史。
+
+    ⚠️ 只清**浏览**数据：用户的材料 / 笔记 / 设置不在这里（它们不在 webview profile 里），
+       验收判据 ④ 就是「清完后材料数不变」。
+    ⚠️ `cleared` 键恒定（cookies / http_cache / visited_links / histories），
+       前端与验收都可逐键比对 —— 「哪部分没清成」必须看得见，不能只剩一个 ok:false。
+    """
+    ok, err, cleared = browser_host.request_clear_browsing_data()
+    if err == "host_unavailable":
+        return _host_unavailable(browser_host.HostUnavailable("无宿主窗口（浏览器模式）"))
+    return {"ok": bool(ok), "error": err,
+            "cleared": cleared or {"cookies": False, "http_cache": False,
+                                   "visited_links": False, "histories": 0}}
+
+
+@router.get("/privacy")
+def browser_privacy():
+    """N04 隐私口径的可验证形式（纯数据面）。
+
+    `history_tables` 为空 = 「浏览历史不落库」成立；`storage_under_data_dir` 为真 =
+    「登录态与 Cookie 仅存本机数据目录」成立。两者都是**查出来的**，不是「我们保证」。
+    """
+    return {"ok": True, **browser_host.privacy_state()}

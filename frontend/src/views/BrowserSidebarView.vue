@@ -24,6 +24,10 @@
         {{ busy ? '正在读取…' : '读取当前网页' }}
       </button>
       <p v-if="fetchMsg" class="sb-fetch-msg" data-role="sb-fetch-msg">{{ fetchMsg }}</p>
+      <!-- WP18 登录墙引导：只在后端判定「像登录墙」时出现；文案固定，供验收逐字断言 -->
+      <p v-if="loginHint" class="sb-login-hint" data-role="sb-login-hint">
+        这个站点可能需要登录：请在左侧浏览器里完成登录后，再点「读取当前网页」。
+      </p>
       <div v-if="cand" class="sb-cand" data-role="sb-cand">
         <div class="sb-cand-title" :title="cand.title">{{ cand.title || '未命名网页' }}</div>
         <div class="sb-cand-meta">
@@ -123,6 +127,9 @@ const payload = ref({ url: '', title: '', selection: '', ts: 0,
 const busy = ref(false)
 const fetchMsg = ref('')
 const cand = ref(null)
+// WP18 登录墙引导：后端判定失败现场像「需要登录」时置真，前端多给一句指引。
+// ⚠️ 只引导、不拦截（V3 §6.1：未登录表现与 Chrome 一致，产品不额外拦截、不伪造）。
+const loginHint = ref(false)
 
 // ⚠️ 判「有没有内容」只看 selection：侧栏的核心是「有没有一段可交给 AI 的文本」。
 //    若改判 url，会出现「只投了链接、没有正文」也被当成有内容 → 空态判据失真。
@@ -298,6 +305,9 @@ function extractErrText(err) {
     no_panel: '请先打开 AI 浏览器面板',
     no_view: '请先打开 AI 浏览器面板',
     no_url: '当前标签还没有打开网页',
+    // WP18 取源时序：跳转后立即取源会拿到上一页/半加载页（实测知乎 ~35s 才稳定），
+    // 必须单独一句 —— 笼统的「读取失败」会让用户去重试一个必然失败的时机。
+    page_loading: '页面还在加载中，请等加载完成后重试',
     timeout: '读取超时，请确认页面已加载完成后重试',
     superseded: '页面已切换，请重试',
     fetch_failed: '页面读取失败，请确认页面能正常打开后重试',
@@ -313,10 +323,12 @@ async function fetchPage() {
   busy.value = true
   fetchMsg.value = ''
   cand.value = null
+  loginHint.value = false
   try {
     const { data } = await browserApi.extract()
     if (!data.ok) {
       fetchMsg.value = extractErrText(data.error)
+      loginHint.value = !!data.login_hint
       return
     }
     const pv = data.preview || {}
@@ -333,6 +345,7 @@ async function fetchPage() {
     }
     if (pv.action !== 'ready') {
       fetchMsg.value = pv.hint || '这个页面暂时不能直接入库，可以改用划选正文。'
+      loginHint.value = !!data.login_hint
     } else if (data.truncated) {
       fetchMsg.value = '页面较长，已按上限截断后读取，可能不含完整正文。'
     }
@@ -437,6 +450,7 @@ onUnmounted(() => {
 }
 .sb-fetch-btn:disabled { opacity: .55; cursor: default; }
 .sb-fetch-msg { margin: 8px 0 0; font-size: 12px; line-height: 1.6; color: var(--asc-text-3); }
+.sb-login-hint { margin: 6px 0 0; font-size: 12px; line-height: 1.6; color: #b26a00; }
 .sb-cand { margin-top: 10px; padding: 10px 12px; background: var(--asc-surface-2); border-radius: 8px; }
 .sb-cand-title {
   font-size: 13px; font-weight: 500; color: var(--asc-text); margin-bottom: 4px;
@@ -553,6 +567,8 @@ onUnmounted(() => {
   }
   /* ⚠️ `.sb-error` 的红色是硬编码的：深色底上对比度不足，必须单独覆盖 */
   .sb-error { color: #ff8a7a; }
+  /* WP18 登录墙引导的琥珀色同理（浅色 #b26a00 在深色底上偏暗） */
+  .sb-login-hint { color: #f0b35c; }
   /* 主按钮的白字在浅紫底上仍可读，但深色下把紫色提亮后要保证仍是白字 */
   .sb-act.on, .sb-tab.on, .sb-ask-send, .sb-cand-save { color: #16161a; }
 }

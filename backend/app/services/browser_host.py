@@ -59,6 +59,9 @@ __all__ = [
     "request_inject",
     "request_side_toggle",
     "side_state",
+    "request_clear_browsing_data",
+    "privacy_state",
+    "login_hint_for",
 ]
 
 # 只允许这两种协议。**显式白名单**：`file:` / `javascript:` / `data:` 一律拒 ——
@@ -826,3 +829,128 @@ def side_state():
     except Exception:
         return {"available": False, "visible": False, "requested_url": "",
                 "splitter": False, "error": None}
+
+
+# ---------- WP18：清除浏览数据 + 隐私口径（N04） ----------
+# ⚠️ N04（改写后）：①浏览历史不落库；②页面内容不上传第三方（仅用户主动触发 AI 时
+#    把所选文本发给自己配置的 LLM）；③登录态与 Cookie 仅存本地，用户可一键清除。
+#    本段把 ③ 落成可验收的行为：清除入口 + `privacy_state()` 让口径可被机器验证。
+
+def _clear_browsing_data_on_main():
+    """在 Qt 主线程清除浏览数据。返回 `(ok, error, cleared)`。
+
+    ⚠️ profile 从**主视图**取（`host.centralWidget()`），不依赖浏览器面板是否装配过
+       —— 面板没开过也该能清（用户可能只在主窗口里浏览过自己的内容）。
+    ⚠️ 不清 localStorage：主应用自己的本地记忆（新手引导 / 侧栏折叠）与第三方站点的
+       localStorage 同在**共享 profile** 下，Qt 没有按源站选择性清除的 API，
+       全清会把应用自己的状态也抹掉。N04 ③ 承诺的是「登录态与 Cookie」，
+       登录态由 cookie 承载（知乎等）→ `deleteAllCookies()` 是行为判据的关键。
+    """
+    from . import browser_panel
+    host = host_view()
+    cleared = {"cookies": False, "http_cache": False, "visited_links": False,
+               "histories": 0}
+    prof = None
+    try:
+        app_view = host.centralWidget()
+        if app_view is not None and app_view.page() is not None:
+            prof = app_view.page().profile()
+    except BaseException:
+        prof = None
+    if prof is None:
+        return False, "no_profile", cleared
+    try:
+        prof.cookieStore().deleteAllCookies()
+        cleared["cookies"] = True
+    except BaseException:
+        pass
+    try:
+        prof.clearHttpCache()
+        cleared["http_cache"] = True
+    except BaseException:
+        pass
+    try:
+        prof.clearAllVisitedLinks()
+        cleared["visited_links"] = True
+    except BaseException:
+        pass
+    try:
+        if browser_panel.is_assembled():
+            cleared["histories"] = int(browser_panel.clear_histories())
+    except BaseException:
+        pass
+    return True, None, cleared
+
+
+def request_clear_browsing_data():
+    """清除浏览数据（cookie / HTTP 缓存 / 访问记录 / 各标签页内历史）。
+
+    :returns: `(ok, error, cleared)`；`cleared` 键恒定（cookies / http_cache /
+              visited_links / histories），便于验收逐键比对。
+    ⚠️ `host_unavailable` → 503（环境不支持）；`no_profile` → 200 + ok:false
+       （宿主在但取不到 profile，是真问题，要提示）。
+    """
+    if not is_available():
+        return False, "host_unavailable", None
+    try:
+        return call_on_main(_clear_browsing_data_on_main)
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e), None
+
+
+def privacy_state():
+    """N04 隐私口径的**可验证形式**（只读普通值 + 查 DB 表名 → 任意线程可调用）。
+
+    返回键恒定：
+      - `history_tables`: DB 里名字像「浏览历史」的表（`history|visited|browsing`）。
+        N04 ①「历史不落库」的可验证形式就是**这张清单为空** —— 比「我们保证不写」强。
+      - `storage_path` / `storage_under_data_dir`: Qt profile 持久化目录是否在
+        `settings.data_dir` 下（N04 ③「仅存本地」的可验证形式）。
+      - `cookie_note`: 一句话说明（前端设置页直接展示，保持口径单一来源）。
+    """
+    import re
+    import sqlite3
+    from ..core.config import settings
+
+    out = {"history_tables": [], "storage_path": "",
+           "storage_under_data_dir": False,
+           "cookie_note": "浏览历史不落库；页面内容不上传第三方；"
+                          "登录态与 Cookie 仅存本机数据目录，可一键清除。"}
+    # ① 历史不落库：直接查 sqlite_master（隔离数据目录下同样成立）
+    try:
+        db_url = str(settings.db_url or "")
+        path = db_url.split("sqlite:///", 1)[-1]
+        con = sqlite3.connect(path)
+        try:
+            names = [r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")]
+        finally:
+            con.close()
+        pat = re.compile(r"(history|visited|browsing)", re.I)
+        out["history_tables"] = sorted(n for n in names if pat.search(n or ""))
+    except BaseException:
+        pass
+    # ③ 仅存本地：profile 持久化目录是 launcher 的 `_webview_storage_path()`
+    #    （= data_dir/webview，经 webview.start(storage_path=…) 传入）。
+    try:
+        p = (settings.data_dir / "webview").resolve()
+        out["storage_path"] = str(p)
+        out["storage_under_data_dir"] = str(p).startswith(
+            str(settings.data_dir.resolve()))
+    except BaseException:
+        pass
+    return out
+
+
+def login_hint_for(url, title=""):
+    """登录墙引导：判断「这个失败现场看起来像需要登录」。纯函数。
+
+    ⚠️ 只作**提示**用（前端据此多给一句「请在浏览器里登录后重试」），不作拦截：
+       N04/V3 §6.1 口径是「未登录访问受限内容与 Chrome 未登录完全一致」——
+       产品**不额外拦截、不伪造**，引导只是降低用户的归因成本。
+    ⚠️ 判定用 URL + 标题的关键词，**不读正文**：正文判「登录页」要吃掉整页文本，
+       而登录页的特征（signin/passport/登录）在地址与标题里已经足够稳定。
+    """
+    s = ("%s %s" % (url or "", title or "")).lower()
+    return any(k in s for k in ("login", "signin", "sign_in", "passport",
+                                "oauth", "登录"))

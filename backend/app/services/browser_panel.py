@@ -41,7 +41,7 @@ __all__ = [
     "selection_snapshot_start", "selection_probe_start",
     "inject_now", "inject_probe",
     "side_toggle", "side_set_visible", "side_state", "side_ensure_loaded",
-    "classify_load_error", "selfcheck",
+    "classify_load_error", "selfcheck", "clear_histories",
 ]
 
 DOCK_TITLE = "AI 浏览器"
@@ -1473,6 +1473,50 @@ def side_state(panel=None):
     out["splitter"] = p.get("split") is not None
     out["error"] = p.get("side_err")
     return out
+
+
+# ---------- WP18：清除浏览数据（页内历史部分） ----------
+
+def clear_histories(panel=None):
+    """清空所有标签页与侧栏的**会话历史**（back/forward 列表）。**必须在主线程执行。**
+
+    :returns: 清掉的份数（每个标签一份 + 侧栏一份）。
+
+    ⚠️ 这只清「页内历史」；cookie / HTTP 缓存 / 访问记录在 profile 上，
+       由 `browser_host._clear_browsing_data_on_main()` 统一清（那里能拿到
+       主视图的共享 profile，不依赖面板是否装配过）。
+    ⚠️ 每个标签的 `nav` 里的 `can_back / can_forward` 要**立刻失效**：
+       它们是给路由线程读的普通值缓存，不重置的话「清除之后按钮还是亮的」，
+       用户点后退会发现没反应 —— 症状像 bug，实际是缓存没失效。
+    """
+    p = panel if panel is not None else _panel
+    if p is None:
+        return 0
+    n = 0
+    for t in _tab_dicts(p):
+        try:
+            v = t.get("view")
+            if v is not None:
+                v.history().clear()
+                n += 1
+        except BaseException:
+            pass
+        try:
+            nav = t.get("nav")
+            if isinstance(nav, dict):
+                nav["can_back"] = False
+                nav["can_forward"] = False
+        except BaseException:
+            pass
+    try:
+        side = p.get("side")
+        if side is not None:
+            side.history().clear()
+            n += 1
+    except BaseException:
+        pass
+    _refresh_nav_buttons(p)
+    return n
 
 
 # ---------- WP13：导航动作 + 加载错误分类 ----------
