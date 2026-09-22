@@ -25,16 +25,22 @@
 """
 import json
 import threading
+import time
 
 __all__ = [
     "DOCK_OBJNAME", "VIEW_OBJNAME", "ADDR_OBJNAME", "STATUS_OBJNAME",
     "BTN_BACK_OBJNAME", "BTN_FORWARD_OBJNAME", "BTN_RELOAD_OBJNAME", "BTN_STOP_OBJNAME",
     "TABBAR_OBJNAME", "TABNEW_OBJNAME", "STACK_OBJNAME", "MAX_TABS",
+    "SPLIT_OBJNAME", "SIDE_OBJNAME", "BTN_SIDE_OBJNAME",
     "assemble", "show", "hide", "close", "navigate", "load_html",
     "is_assembled", "get_state", "get_nav_state", "nav_action",
     "tab_new", "tab_close", "tab_switch", "get_tabs_state", "active_tab_id",
     "active_view_eval",
     "page_source_start", "page_source_poll", "get_page_source",
+    "selection_state", "js_pull_start", "js_pull_state",
+    "selection_snapshot_start", "selection_probe_start",
+    "inject_now", "inject_probe",
+    "side_toggle", "side_set_visible", "side_state", "side_ensure_loaded",
     "classify_load_error", "selfcheck",
 ]
 
@@ -43,6 +49,12 @@ DOCK_OBJNAME = "asc_browser_dock"
 PANEL_OBJNAME = "asc_browser_panel"
 ADDR_OBJNAME = "asc_addr"
 VIEW_OBJNAME = "asc_browser_view"
+
+# ---------- WP16：AI 侧栏宿主 ----------
+# ⚠️ 三个名字都是**验收探针按名查找**的目标（`selfcheck` 用 findChild），改名即打红。
+SPLIT_OBJNAME = "asc_split"          # 内容区 | 侧栏 的分隔器
+SIDE_OBJNAME = "asc_side"            # 侧栏的 QWebEngineView
+BTN_SIDE_OBJNAME = "asc_side_toggle"  # 工具栏上的「侧栏」开关
 
 # ---------- WP14：多标签 ----------
 # ⚠️⚠️ **兼容层设计（关键取舍，不要"顺手清理"）**：
@@ -67,6 +79,20 @@ BTN_STOP_OBJNAME = "asc_nav_stop"
 # 面板句柄：**只在主线程访问**（所有公开函数都经 call_on_main 投递，故天然串行）
 _panel = None
 _panel_lock = threading.Lock()
+
+# WP16 选区事件钩子（**模块级默认**；由 `browser_host` 经 `set_selection_hook()` 注入）。
+# ⚠️ 为什么不把它做成 `assemble()` 的必填参数：`show()` / `navigate()` / 取源入口
+#    内部都会调 `assemble()` —— 加必填参数要改 4 处调用点，而且**探针单独 assemble**
+#    （WP12/13/14 的验收脚本都是这条路径）会拿不到钩子。做成注册式，改动面最小。
+# ⚠️ 钩子在**主线程 / 事件循环**里被调用 → 实现方只许做 O(1) 的写普通值（见 browser_actions）。
+_sel_hook = None
+
+
+def set_selection_hook(fn):
+    """注册 WP16 选区事件钩子（可选）。`fn(tab_id, ev)`；传 `None` 可注销。"""
+    global _sel_hook
+    _sel_hook = fn
+    return True
 
 
 def _qt():
@@ -123,7 +149,7 @@ def _find_dock(host, QtWidgets):
     return None
 
 
-def assemble(host, initial_url=""):
+def assemble(host, initial_url="", on_selection=None):
     """在宿主窗口里装配浏览器面板（幂等）。**必须在主线程执行。**
 
     :returns: 面板句柄 dict（供同模块其他函数使用）
@@ -205,12 +231,24 @@ def assemble(host, initial_url=""):
         btn_close.setObjectName("asc_close")
         btn_close.setFixedWidth(52)
 
+        # ---------- 侧栏开关（WP16 · U01「可收起」） ----------
+        # ⚠️ 用**文字**不用图标：同导航按钮的理由 —— 不引资源文件依赖，打包也不会漏图标。
+        # ⚠️ `setCheckable` + 初始按下，只保证"首帧别显示成错的"；真实可见性以
+        #    `side_set_visible()` 的结果为准（它是唯一真相）。
+        btn_side = QtWidgets.QPushButton("侧栏")
+        btn_side.setObjectName(BTN_SIDE_OBJNAME)
+        btn_side.setToolTip("显示 / 收起 AI 侧栏")
+        btn_side.setCheckable(True)
+        btn_side.setChecked(True)
+        btn_side.setFixedWidth(46)
+
         bl.addWidget(btn_back)
         bl.addWidget(btn_forward)
         bl.addWidget(btn_reload)
         bl.addWidget(btn_stop)
         bl.addWidget(addr, 1)
         bl.addWidget(btn_go)
+        bl.addWidget(btn_side)
         bl.addWidget(btn_close)
         pl.addWidget(bar)
 
@@ -239,8 +277,17 @@ def assemble(host, initial_url=""):
 
         stack = QtWidgets.QStackedWidget()
         stack.setObjectName(STACK_OBJNAME)
+
+        # ---------- 内容区 | AI 侧栏（WP16） ----------
+        # ⚠️⚠️ splitter 装在 **dock 里的 panel 内部** —— **绝不碰 centralWidget**。
+        #    WP12 实测（见模块 docstring）：`cw.setParent(None)` / `takeCentralWidget()`
+        #    会**静默挂死**主线程；放在 dock 内则中央区零改动（判据 `central_unchanged`）。
+        # ⚠️ 此处**先只加 stack**：侧栏视图要用共享 profile，而 profile 在下面才解得出来。
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split.setObjectName(SPLIT_OBJNAME)
+        split.addWidget(stack)
         # ⚠️ stretch=1：内容区吃掉所有剩余高度（地址栏 / 标签栏 / 状态栏都是固定高）。
-        pl.addWidget(stack, 1)
+        pl.addWidget(split, 1)
 
         _profile_val = None
         shared_ok = True
@@ -280,7 +327,49 @@ def assemble(host, initial_url=""):
                     "can_back": False, "can_forward": False, "error": None},
             "last_url": "", "last_title": "", "last_load_ok": None, "progress": 0,
             "shared_profile": shared_ok, "shared_profile_error": shared_err,
+            # WP16 选区盒子：**只放普通值**（桥回调在事件循环里写、路由线程只读）。
+            # ⚠️ 与 WP15 的 `_src` 同款纪律 —— 主线程绝不在这里做 IO。
+            "_sel": None, "_sel_seq": 0, "_js": {}, "_js_seq": 0,
+            # WP16 选区事件转发钩子：由 `browser_host` 注入（面板**不反向依赖** host，
+            # 否则会形成 import 环，且探针单独 assemble 时无法使用面板）。
+            "_on_sel": on_selection if on_selection is not None else _sel_hook,
+            # WP16 侧栏：splitter / 视图 / 开关。`side_visible` 是**普通值**，
+            # 供路由线程读（Qt 的 `isVisible()` 只能主线程调）。
+            "split": split, "side": None, "side_url": "", "side_visible": True,
+            "side_err": None, "btn_side": btn_side,
         }
+
+        # ---------- WP16：AI 侧栏视图 ----------
+        # ⚠️ 用**共享 profile**（同每个标签的理由）：侧栏里的 localStorage / 令牌必须与主窗口
+        #    同一份，否则会出现"主窗口登了、侧栏还是游客"，且只在侧栏里表现出来。
+        # ⚠️ 建视图时**不加载页面**：此刻 `app_view.url()` 很可能还是 `about:blank`
+        #    （宿主尚未导航）→ 加载交给 `side_ensure_loaded()`（幂等；show() 与开关处都会调）。
+        # ⚠️ 整段包 try：侧栏是**附加**能力，建不起来只该降级（开关点了没反应 + side_err 有值），
+        #    不该让整个面板装配失败。
+        try:
+            side = QWebEngineView()
+            side.setObjectName(SIDE_OBJNAME)
+            if _profile_val is not None:
+                side.setPage(QWebEnginePage(_profile_val, side))
+            split.addWidget(side)
+            split.setStretchFactor(0, 3)
+            split.setStretchFactor(1, 2)
+            try:
+                # 初始比例：内容区 `[520, 360]`。窗口更宽时多出的宽度按 3:2 分摊。
+                split.setSizes([520, 360])
+            except BaseException:
+                pass
+            _panel["side"] = side
+        except BaseException as e:
+            _panel["side_err"] = "%s: %s" % (type(e).__name__, e)
+
+        def _side_clicked(checked):
+            try:
+                side_set_visible(_panel, bool(checked))
+            except BaseException:
+                pass
+
+        btn_side.clicked.connect(_side_clicked)
 
         # ---------- 接线 ----------
         def _do_navigate():
@@ -442,6 +531,9 @@ def _wire_tab(panel, tab):
             url = view.url().toString()
             tab["last_load_ok"] = bool(ok)
             tab["last_url"] = url
+            # WP16：整页导航 = **新的 JS 执行上下文** → 上次注入的工具栏与桥都没了。
+            #     重注是**必需**而非优化；放这里（而不是 urlChanged）是为了等页面就绪。
+            _reinject(panel, tab, url)
             st = panel.get("status")
             if st is not None and tab.get("id") == panel.get("active"):
                 st.setText("加载完成" if ok else "加载失败")
@@ -563,7 +655,11 @@ def tab_new(panel, url=""):
             pass
 
     tab = {"id": tid, "view": view, "nav": _empty_nav(),
-           "last_url": "", "last_title": "", "last_load_ok": None, "progress": 0}
+           "last_url": "", "last_title": "", "last_load_ok": None, "progress": 0,
+           # WP16：桥对象 / QWebChannel / 注入回读。
+           # ⚠️⚠️ `bridge` **必须被 tab 持有引用**：否则 QObject 被 GC →
+           #    页面里的 `ascBridge` 悬空 → 点击静默无反应（症状最像「注入没生效」）。
+           "bridge": None, "channel": None, "inject": None, "inject_err": None}
     tabs.append(tab)
     stack.addWidget(view)
 
@@ -576,6 +672,7 @@ def tab_new(panel, url=""):
         pass
 
     _wire_tab(panel, tab)
+    _attach_inject(panel, tab)      # WP16：装桥 + 首帧注入（幂等；失败只降级不阻断）
     panel["active"] = tid
     _bind_active(panel)
 
@@ -748,6 +845,9 @@ def show(host, url=None, width=520):
     dock = panel["dock"]
     dock.show()
     dock.raise_()
+    # WP16：装配时宿主可能还是 about:blank（推不出侧栏地址）→ 面板露出来了再补一次加载。
+    # ⚠️ 幂等：同一 URL 不会重复 load（否则每次 show 都把侧栏刷白一次）。
+    side_ensure_loaded(panel)
     try:
         host.resizeDocks([dock], [width], _qt()[0].Qt.Horizontal)
     except BaseException:
@@ -1024,6 +1124,355 @@ def get_page_source(panel=None):
         "truncated": bool(box.get("truncated")),
         "src": box.get("src") or "",
     }
+
+
+# ---------- WP16：选区注入 + QWebChannel 桥（页面 → Python） ----------
+# ⚠️⚠️ 与 WP15 取源是**同款时序纪律**，但方向相反：
+#    WP15 是「纯拉取」（主线程发起 → 调用方线程轮询）；
+#    WP16 主路是**推送**（用户点按钮 → 页面经桥回调进事件循环 → 写普通值盒子），
+#    兜底路才回到拉取（页面没桥时把载荷落在 `window.__asc_sel`）。
+#    两条路**必须同时存在**：只留拉取则「点击后要等一个轮询周期」；
+#    只留推送则「桥没建起来就彻底点不动」—— 而这两种病的现象都是「点了没反应」。
+#
+# ⚠️ 注入只在 `http(s)` 上做：`about:blank` 与 Chromium 内建错误页注入没有意义，
+#    还会在错误页上留一个点了没反应的工具栏（用户会当成 bug）。
+#    这一条**是产品判断，不是技术限制** —— 探针实测错误页上注入本身是成功的。
+
+def _injectable(url):
+    u = (url or "").strip().lower()
+    return u.startswith("http://") or u.startswith("https://")
+
+
+def _tab_by_id(panel, tid):
+    for t in _tab_dicts(panel):
+        if t.get("id") == tid:
+            return t
+    return None
+
+
+def _attach_inject(panel, tab):
+    """给标签装桥（**主线程**）。返回 `(ok, error)`。
+
+    ⚠️ `setWebChannel` 必须在**页面加载之前**调用：`qt.webChannelTransport` 是引擎在
+       文档创建时送进主世界的，页面已经跑起来再设，本页就永远没有 transport
+       （症状：`__asc_bstate == 'no_transport'`，工具栏还在但每次点击都走轮询）。
+       本函数在 `tab_new()` 里、`navigate()` 之前被调 → 时序正确。
+    ⚠️ 桥造不出来**不算失败**：原因记进 `tab["inject_err"]`，页面侧自动落到轮询兜底。
+       「采集失败」与「采集成功但桥不通」是两种病，不能压成一个 bool。
+    """
+    if panel is None or tab is None:
+        return False, "no_tab"
+    from . import browser_inject as bi
+    try:
+        WC = bi.webchannel_cls()
+        if WC is None:
+            tab["inject_err"] = "no_qwebchannel_cls"
+            return False, tab["inject_err"]
+        tid = tab.get("id")
+        bridge, err = bi.make_bridge(lambda raw: _on_live_payload(panel, tid, raw))
+        if bridge is None:
+            tab["inject_err"] = err or "bridge_failed"
+            return False, tab["inject_err"]
+        ch = WC()
+        ch.registerObject(bi.BRIDGE_NAME, bridge)
+        view = tab.get("view")
+        if view is None:
+            tab["inject_err"] = "no_view"
+            return False, "no_view"
+        view.page().setWebChannel(ch)
+        tab["bridge"] = bridge          # ⚠️ 必须持有引用（见 tab dict 注释）
+        tab["channel"] = ch
+        tab["inject_err"] = None
+        return True, None
+    except BaseException as e:
+        tab["inject_err"] = "%s: %s" % (type(e).__name__, e)
+        return False, tab["inject_err"]
+
+
+def _reinject(panel, tab, url):
+    """在页面里注入「qwebchannel.js + 桥初始化 + 工具栏」（**主线程**）。幂等，可反复调。"""
+    if panel is None or tab is None:
+        return False, "no_tab"
+    if not _injectable(url):
+        kind = "about" if (url or "").strip().lower().startswith("about:") else "non_http"
+        tab["inject"] = {"ok": False, "skipped": kind, "url": url or ""}
+        return False, "skip_%s" % kind
+    try:
+        from . import browser_inject as bi
+        view = tab.get("view")
+        if view is None:
+            return False, "no_view"
+        view.page().runJavaScript(bi.inject_js())
+        tab["inject"] = {"ok": True, "ver": bi.INJECT_VER, "url": url or "",
+                         "ts": time.time()}
+        return True, None
+    except BaseException as e:
+        tab["inject"] = {"ok": False, "err": "%s: %s" % (type(e).__name__, e),
+                         "url": url or "", "ts": time.time()}
+        return False, tab["inject"]["err"]
+
+
+def inject_now(panel=None):
+    """手动重注**活跃标签**（**主线程**）。返回 `(ok, error)`。
+
+    存在的理由：① 验收要能主动重注后立刻回读；② 侧栏打开时补一次「确保已武装」。
+    幂等 ⇒ 反复调用无副作用。
+    """
+    p = panel if panel is not None else _panel
+    if p is None:
+        return False, "no_panel"
+    tab = _active_tab(p)
+    if tab is None:
+        return False, "no_tab"
+    url = ""
+    try:
+        url = tab["view"].url().toString()
+    except BaseException:
+        pass
+    return _reinject(p, tab, url)
+
+
+def inject_probe(panel=None):
+    """读「注入/桥」的**本地**状态（只读普通值 → 任意线程）。键恒定。
+
+    ⚠️ 与 `selection_probe_state()` 分工不同：本函数读的是 **Python 侧**记录
+       （桥建没建起来、注入有没有发起）；页面侧的真实情况要靠
+       `selection_probe_start()` 回读 —— 「我发起了注入」与「页面上真有节点」
+       是两件事，后者才是判据。
+    """
+    p = panel if panel is not None else _panel
+    tab = _active_tab(p) if p is not None else None
+    out = {"tab": None, "attached": False, "bridge": False,
+           "inject": None, "err": None}
+    if tab is None:
+        return out
+    out["tab"] = tab.get("id")
+    out["attached"] = tab.get("channel") is not None
+    out["bridge"] = tab.get("bridge") is not None
+    out["inject"] = tab.get("inject")
+    out["err"] = tab.get("inject_err")
+    return out
+
+
+def _on_live_payload(panel, tid, raw):
+    """桥回调（**事件循环 / 主线程**）。只写普通值 + 转发钩子，**绝不做 IO**。
+
+    ⚠️⚠️ 这里**不许**调 LLM / 写库 / 起阻塞 IO：本函数跑在 Qt 事件循环里，
+       一旦耗时，界面立刻冻住，而症状是「选中文字后整个应用卡几秒」——
+       用户会以为是浏览器慢，完全不会指向这里。耗时的活由钩子自己起线程。
+    ⚠️ 载荷来自**第三方页面**（什么都可能）→ 解析失败只记为 `bad_payload`，
+       绝不让异常冒回 Qt（那会打出无从定位的堆栈，且下次点击行为不定）。
+    """
+    try:
+        from . import browser_inject as bi
+        panel["_sel_seq"] = int(panel.get("_sel_seq", 0) or 0) + 1
+        box = {"seq": panel["_sel_seq"], "kind": "", "act": None, "sel": "",
+               "url": "", "title": "", "ts": 0, "path": "bridge", "err": None,
+               "raw_len": len(raw or "")}
+        d, why = bi.parse_payload(raw)
+        parsed = d is not None
+        if parsed:
+            for k in ("kind", "act", "sel", "url", "title", "ts"):
+                box[k] = d.get(k)
+        else:
+            box["err"] = why
+        box["seq"] = panel["_sel_seq"]
+        panel["_sel"] = box
+        tab = _tab_by_id(panel, tid)
+        if tab is not None:
+            tab["sel"] = box
+        hook = panel.get("_on_sel")
+        if callable(hook) and parsed:
+            try:
+                hook(tid, dict(box))
+            except BaseException:
+                pass
+    except BaseException:
+        pass
+
+
+def selection_state(panel=None):
+    """读选区盒子（**只读普通值** → 任意线程）。空态**键恒定**、可逐字比对。"""
+    p = panel if panel is not None else _panel
+    from . import browser_inject as bi
+    out = bi.empty_selection()
+    box = (p or {}).get("_sel")
+    if isinstance(box, dict):
+        for k in list(out.keys()):
+            if k in box:
+                out[k] = box[k]
+    return out
+
+
+# ---- 页面侧回读 / 兜底拉取：与 WP15 取源共用「发起 + 轮询」两步式 ----
+
+def js_pull_start(panel, key, script):
+    """发起一次「取回页面里的一个 JS 值」（**主线程**）。返回 `(ok, error, token)`。
+
+    ⚠️ 立即返回、**不返回结果**：`runJavaScript` 的值只能经**回调**拿，而回调在事件循环里
+       跑 —— 主线程同步等它就是死锁（WP13 实测：回调永不触发且**不报错**）。
+       结果落在 `panel["_js"][key]`，由调用方在**自己的线程**里轮询。
+    ⚠️ token 防串场（同 WP15）：用户可能在飞行中切标签，后到的回调会把**别的页面**的值
+       写进盒子 → 张冠李戴且不报错。回调只认自己那次的 token。
+    """
+    p = panel if panel is not None else _panel
+    if p is None:
+        return False, "no_panel", None
+    try:
+        tab = _active_tab(p)
+        if tab is None:
+            return False, "no_tab", None
+        seq = int(p.get("_js_seq", 0) or 0) + 1
+        p["_js_seq"] = seq
+        tok = "j%d" % seq
+        boxes = p.setdefault("_js", {})
+        boxes[key] = {"token": tok, "phase": "pending", "raw": None}
+
+        def _cb(v):
+            try:
+                b = (p.get("_js") or {}).get(key) or {}
+                if b.get("token") != tok:
+                    return                    # 已被后一次请求取代 → 丢弃
+                b["raw"] = v
+                b["phase"] = "done"
+            except BaseException:
+                pass
+
+        tab["view"].page().runJavaScript(script, _cb)
+        return True, None, tok
+    except BaseException as e:
+        return False, "%s: %s" % (type(e).__name__, e), None
+
+
+def js_pull_state(panel, key):
+    """读上面那次的取回状态（**只读普通值**）。空态键恒定。"""
+    p = panel if panel is not None else _panel
+    b = ((p or {}).get("_js") or {}).get(key) or {}
+    return {"token": b.get("token"), "phase": b.get("phase", "idle"), "raw": b.get("raw")}
+
+
+def selection_snapshot_start(panel=None):
+    """兜底路：发起「读 `window.__asc_sel`」。"""
+    from . import browser_inject as bi
+    return js_pull_start(panel, "sel", bi.snapshot_js())
+
+
+def selection_probe_start(panel=None):
+    """回读路：发起「读页面上的注入状态」（**双向断言的「回读」半边**）。"""
+    from . import browser_inject as bi
+    return js_pull_start(panel, "probe", bi.probe_js())
+
+
+# ---------- WP16：AI 侧栏宿主（QSplitter + 第二个 QWebEngineView） ----------
+# 侧栏是一个**独立的文档**，加载同源的 `/browser/sidebar`（SPA 路由，`meta.bare`）。
+# 内容由「HTTP 数据面 + 轮询」送达（WP12 定的口径）—— 不用 `evaluate_js` 直塞 JS 变量：
+# 那条路只在 Qt 宿主下可用，会让整条链在浏览器模式下无法验证。
+
+def _side_origin(panel):
+    """从**宿主视图**的 URL 推出侧栏地址（同源 + `/browser/sidebar`）。推不出返回 `""`。
+
+    ⚠️ **不写死端口**：源码版前端是 vite 的 5173、打包版是后端的 8000 ——
+       硬编码任何一种，另一种形态就是白屏，而且只在发行包里出现。
+    ⚠️ 推不出（`about:blank` / 非 http）**不抛异常**，只返回空串：装配期宿主还没导航
+       是**正常情况**，抛出去会让整个面板装配失败。
+    """
+    try:
+        av = panel.get("app_view")
+        u = av.url() if av is not None else None
+        if u is None or not u.isValid():
+            return ""
+        scheme = u.scheme()
+        if scheme not in ("http", "https"):
+            return ""
+        h = u.host()
+        if not h:
+            return ""
+        base = "%s://%s" % (scheme, h)
+        port = u.port()
+        # ⚠️⚠️ Qt6 的 `QUrl.port()` 在「URL 里没写端口」时返回 **-1**（Qt5 是 0）——
+        #    只判 `if port` 会拼出 `http://host:-1/browser/sidebar`：**非法地址**，
+        #    `side.load()` 静默失败（Qt 不抛异常，`side_err` 也是空）→ 侧栏白屏。
+        #    实测：verify_wp16_side.py 的 S5e / S5f。
+        #    `> 0` 同时覆盖 -1 与 0 这两种「没有端口」的表示。
+        if port and port > 0 and port not in (80, 443):
+            base += ":%d" % port
+        return base + "/browser/sidebar"
+    except BaseException:
+        return ""
+
+
+def side_ensure_loaded(panel=None):
+    """确保侧栏视图已加载（**主线程**，幂等）。返回实际生效的 URL，未加载返回 `""`。
+
+    ⚠️ 幂等靠 `panel["side_url"]` 比对：不比对的话每次 `show()` 都会重新 load，
+       用户看到的是「面板一开侧栏就被刷白一下」。
+    """
+    p = panel if panel is not None else _panel
+    if p is None:
+        return ""
+    side = p.get("side")
+    if side is None:
+        return ""
+    url = _side_origin(p)
+    if not url or p.get("side_url") == url:
+        return p.get("side_url") or ""
+    try:
+        from qtpy.QtCore import QUrl
+        side.load(QUrl(url))
+        p["side_url"] = url
+        return url
+    except BaseException as e:
+        p["side_err"] = "%s: %s" % (type(e).__name__, e)
+        return ""
+
+
+def side_set_visible(panel=None, visible=True):
+    """显示 / 收起侧栏（**主线程**）。返回 `(ok, visible, error)`。
+
+    ⚠️ 收起用 `setVisible(False)`（**保留页面状态**），不是销毁 —— 重新展开时
+       用户的会话/滚动位置都还在。销毁会让「收起来再打开」变成一次白屏重载。
+    """
+    p = panel if panel is not None else _panel
+    if p is None:
+        return False, False, "no_panel"
+    side = p.get("side")
+    if side is None:
+        return False, False, p.get("side_err") or "no_side_view"
+    try:
+        if visible:
+            side_ensure_loaded(p)
+        side.setVisible(bool(visible))
+        p["side_visible"] = bool(visible)
+        return True, bool(visible), None
+    except BaseException as e:
+        return False, False, "%s: %s" % (type(e).__name__, e)
+
+
+def side_toggle(panel=None):
+    """切换侧栏显隐（**主线程**）。返回 `(ok, visible, error)`。"""
+    p = panel if panel is not None else _panel
+    cur = bool((p or {}).get("side_visible", True))
+    return side_set_visible(p, not cur)
+
+
+def side_state(panel=None):
+    """侧栏状态（**只读普通值** → 任意线程）。空态**键恒定**。
+
+    ⚠️ 这里**故意不读** `side.url()` —— 那是 Qt 调用，从路由线程调会挂死/崩。
+       要页面真实地址就用 `selfcheck()`（它在主线程回读，且会连 `side_err` 一起给）。
+       「我请求加载的地址」与「页面此刻的真实地址」是两个量，不要在本函数里混起来。
+    """
+    p = panel if panel is not None else _panel
+    out = {"available": False, "visible": False, "requested_url": "",
+           "splitter": False, "error": None}
+    if p is None:
+        return out
+    out["available"] = p.get("side") is not None
+    out["visible"] = bool(out["available"] and p.get("side_visible", True))
+    out["requested_url"] = p.get("side_url") or ""
+    out["splitter"] = p.get("split") is not None
+    out["error"] = p.get("side_err")
+    return out
 
 
 # ---------- WP13：导航动作 + 加载错误分类 ----------
@@ -1310,7 +1759,7 @@ def selfcheck(host):
        dock 真的挂在宿主树上 —— 只断言 `dock is not None` 在"对象建了但没挂上"时
        也会通过（这正是 Thread-2 里装配时的实际症状）。
     """
-    QtCore, QtWidgets, _, _ = _qt()
+    QtCore, QtWidgets, QWebEngineView, _ = _qt()
     app = QtCore.QCoreApplication.instance()
     out = {
         "on_main_thread": bool(QtCore.QThread.currentThread() == app.thread()) if app else None,
@@ -1323,6 +1772,8 @@ def selfcheck(host):
     addr = _panel.get("addr")
     stack = _panel.get("stack")
     tabbar = _panel.get("tabbar")
+    side = _panel.get("side")
+    split = _panel.get("split")
     host_docks = host.findChildren(QtWidgets.QDockWidget)
     matching = [d for d in host_docks if d.objectName() == DOCK_OBJNAME]
     out.update({
@@ -1353,6 +1804,16 @@ def selfcheck(host):
         "nav": get_nav_state(),
         "central_visible": bool(host.centralWidget().isVisible()) if host.centralWidget() else None,
         "host_visible": bool(host.isVisible()),
+        # ---------- WP16：侧栏真实 Qt 状态（**主线程回读**） ----------
+        # ⚠️ 判据用 `findChild` 而不是"面板 dict 里有没有这个键"：后者在「对象建了但没装进树」
+        #    时也会通过 —— 与 `dock_found_by_findChildren` 同一个理由。
+        "side_found_by_name": bool(host.findChild(QWebEngineView, SIDE_OBJNAME) is not None),
+        "split_found_by_name": bool(host.findChild(QtWidgets.QSplitter, SPLIT_OBJNAME) is not None),
+        "split_count": int(split.count()) if split else None,
+        "side_visible": bool(side.isVisible()) if side else None,
+        "side_url": side.url().toString() if side else None,
+        "side_sizes": list(split.sizes()) if split else None,
+        "side_err": _panel.get("side_err"),
     })
     out["ok"] = bool(
         out["on_main_thread"]

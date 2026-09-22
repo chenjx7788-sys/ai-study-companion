@@ -361,6 +361,28 @@ DEFAULT_PROMPTS = {
    共 {seg_count} 句，每句平均约 {avg_chars} 字。写超和写少都视为不合格。
 5. 每句 20-120 字，适合朗读；不要出现 Markdown 符号、括号注释、表情符号
 6. 不编造素材中没有的事实和数据""",
+    "prompt_browser_explain": """你是一名伴学助手。用户在用内置浏览器读网页时选中了一段文字，想让你解释。请：
+1. 先用一两句话说明这段文字在讲什么；
+2. 再解释其中的关键概念、术语或隐含前提；
+3. 必要时举一个具体例子帮助理解；
+4. 直接输出正文，不要复述原文，不要写「好的」「以下是」这类开场话。
+如果这段文字像是从句子中间截断的，就按现有内容尽力解释，不要因此拒答。""",
+    "prompt_browser_summarize": """你是一名伴学助手。用户在用内置浏览器读网页时选中了一段文字，想要一个摘要。请：
+1. 用 2-4 句话概括这段文字的核心意思；
+2. 若原文有分点结构，用 Markdown 无序列表列出要点；
+3. 只概括已给出的内容，不补充网页里没有的信息；
+4. 直接输出，不要复述原文，不要写开场话。""",
+    "prompt_browser_quiz": """你是一名测评出题助手。用户在用内置浏览器读网页时选中了一段文字，想据此自测。请：
+1. 依据这段文字出 3 道单选题，考察理解而不是死记；
+2. 每题 4 个选项，只有 1 个正确，干扰项要似是而非（常见误区 / 易混淆概念）；
+3. 用 Markdown 输出，每题固定写成：
+   **1. 题干**
+   - A. ……
+   - B. ……
+   - C. ……
+   - D. ……
+   答案：X —— 一句话解析
+4. 不出这段文字里无法判断的题。""",
 }
 
 
@@ -478,6 +500,50 @@ def explain_messages(selected_text: str, context: str, history: list[dict], ques
 
 def explain(selected_text: str, context: str, history: list[dict], question: str | None = None) -> str:
     return chat(explain_messages(selected_text, context, history, question), kind="explain")
+
+
+# ---------- WP16：浏览器选区三动作（解释 / 总结 / 出题） ----------
+# ⚠️ 与上面的「划线解读」是**同一族**（短输入、强交互、要秒回），故复用问答模型 `chat()`，
+#    不新造第二套「哪个动作走哪个模型」的规则 —— 那种规则一定会跟主流程分叉。
+
+BROWSER_ACTION_PROMPTS = {
+    "explain": "prompt_browser_explain",
+    "summarize": "prompt_browser_summarize",
+    "quiz": "prompt_browser_quiz",
+}
+
+
+def browser_selection_messages(action: str, selection: str, title: str = "", url: str = "") -> list[dict]:
+    """浏览器选区三动作 → messages。
+
+    ⚠️ `action` 不合法时**直接 KeyError**，不静默回退到 explain：
+       静默回退会让「点了总结却得到解释」这种病**不报错、只错内容**。
+       调用方 `browser_actions.start_action()` 已经先闸过一次，这里是第二道闸。
+    ⚠️ 标题与地址只作**定位线索**（帮助模型判断语境），不要求它在回答里复述。
+    """
+    key = BROWSER_ACTION_PROMPTS[action]
+    head = []
+    if title:
+        head.append("【页面标题】%s" % title)
+    if url:
+        head.append("【页面地址】%s" % url)
+    ctx = ("\n".join(head) + "\n\n") if head else ""
+    return [
+        {"role": "system", "content": get_prompt(key)},
+        {"role": "user", "content": "%s【选中的文字】\n%s" % (ctx, selection)},
+    ]
+
+
+def browser_selection_action(action: str, selection: str, title: str = "", url: str = "") -> str:
+    """执行一次浏览器选区动作，返回模型输出（Markdown）。
+
+    ⚠️ `kind` **逐动作区分**（`browser_explain` / `browser_summarize` / `browser_quiz`）：
+       记账表按 kind 聚合，合成一个之后再也回答不了「三个动作各花了多少 token、
+       各自多慢」—— 而这三个动作的输入长度与期望输出长度差异很大，必须分开看。
+    """
+    return chat(
+        browser_selection_messages(action, selection, title=title, url=url),
+        kind="browser_%s" % action)
 
 
 # ---------- 文本加工（改写/扩写/续写/总结；笔记与材料文本共用） ----------

@@ -11,6 +11,7 @@
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from ..services import browser_actions
 from ..services import browser_host
 from ..services import external as external_svc
 
@@ -311,3 +312,103 @@ def browser_extract():
     }
 
 
+
+
+# ---------- WP16：选区三动作（解释 / 总结 / 出题） ----------
+# ⚠️ 与 `/extract` 同款契约：`host_unavailable` → **503**（环境不支持，静默）；
+#    其余（`bad_action` / `empty_selection`）→ 200 + `ok:false`（调用方问题，要提示）。
+# ⚠️ 本段的「选区 → 动作 → 结果」三段全部走**内存盒子 + 普通线程**，不碰 Qt ——
+#    所以整条链在**无宿主环境**（浏览器模式）下也能被完整验收，不必等真机。
+#    必须在宿主里执行的只有「重新注入 + 回读页面」那一个接口。
+
+@router.get("/selection")
+def get_selection():
+    """当前选区盒子（页面推送的最新一次）。
+
+    空态**键恒定**（`seq=0` / `kind=""` / `act=None` / 字符串字段为空串），
+    由 `browser_inject.empty_selection()` 保证 —— 不是 404、也不是 null。
+
+    ⚠️ 与 `/sidebar/payload` 的分工：本接口是「**页面上选了什么**」（含 `seq` / `path` /
+       `err`，用来区分「没选」与「选了但桥不通」）；`/sidebar/payload` 是
+       「**侧栏要显示什么**」（含动作与其结果）。合成一个会让这两类语义在同一字段里打架。
+    """
+    return {"ok": True, "selection": browser_host.selection_state(),
+            "actions": list(browser_actions.ACTION_ORDER),
+            "labels": dict(browser_actions.ACTION_LABELS)}
+
+
+@router.post("/selection/action")
+def selection_action(payload: dict | None = None):
+    """对选区执行一个动作：`explain` / `summarize` / `quiz`。
+
+    ⚠️ **两种调用方式都要支持**（缺一不可）：
+       ① 页面桥推送触发（用户点浮动工具栏）→ 不带 `selection`，取当前选区；
+       ② 带 `selection` 直接调用（前端 / 验收脚本）→ 显式指定选区。
+       只支持 ① 的话整条链只能靠真机验证；只支持 ② 的话用户点按钮没反应。
+
+    ⚠️ **异步**：立刻返回 `status="running"`，结果去 `/sidebar/payload` 读（靠 `gen` 配对）。
+       同步等 LLM 会让 HTTP 线程挂住几十秒，前端也无法显示「正在生成…」。
+    """
+    p = payload or {}
+    sel = p.get("selection", None)
+    if sel is None:
+        sel = browser_host.selection_state().get("sel") or ""
+    return browser_actions.start_action(
+        p.get("action", "") or "", sel,
+        url=p.get("url", "") or "", title=p.get("title", "") or "")
+
+
+@router.post("/inject")
+def browser_inject_now():
+    """让**活跃标签**重新注入工具栏与桥，并回读页面侧真实状态（真机验收用）。
+
+    ⚠️ 「我发起了注入」（`ok`）与「页面上真有节点」（`probe.has_el`）是**两件事**。
+       只回 `ok` 的接口在「注入没生效」时会给出全绿 —— 这正是探针最常犯的错。
+       故本接口一次返回两者：`ok` 是发起结果，`probe` 是**回读**结果。
+
+    ⚠️ `probe_error` 与 `probe.has_el == false` 必须分开看：前者是「回读本身失败」
+       （超时 / 无标签），后者是「回读成功、页面确实没有」——
+       压成一个假值之后就再也分不清「没注上」与「没读到」。
+    """
+    if not browser_host.is_available():
+        return _host_unavailable(browser_host.HostUnavailable("无宿主窗口（浏览器模式）"))
+    ok, err = browser_host.request_inject()
+    pok, probe, perr = browser_host.request_selection_probe()
+    return {"ok": bool(ok), "error": err,
+            "probe_ok": bool(pok), "probe": probe, "probe_error": perr}
+
+
+# ---------- WP16：侧栏宿主（显隐开关） ----------
+# ⚠️ 本段**必须在宿主里执行**（碰 Qt 控件），故与 `/selection/*` 不同：浏览器模式下
+#    一律 `host_unavailable` → **503**（环境不支持，静默）。这与 C5 的契约一致。
+
+@router.get("/sidebar/pane")
+def sidebar_pane():
+    """侧栏宿主状态（**只读普通值**）。空态**键恒定**：
+
+    `{"available":false,"visible":false,"requested_url":"","splitter":false,"error":null}`
+
+    ⚠️ 与 `/sidebar/payload` 的分工：本接口说「侧栏这个**视图**怎么样」
+       （建没建起来 / 收起来了没 / 请求加载的是哪个地址）；
+       `/sidebar/payload` 说「侧栏要**显示什么内容**」。
+       合成一个会让"侧栏被收起"与"侧栏没内容"在同一字段里打架。
+
+    ⚠️ 这里**不回页面真实地址**（那要碰 Qt，会挂死路由线程）——
+       要真实地址用 `/panel/selfcheck` 的 `side_url`。
+    """
+    return {"ok": True, "pane": browser_host.side_state()}
+
+
+@router.post("/sidebar/toggle")
+def sidebar_toggle(payload: dict | None = None):
+    """显示 / 收起 / 切换侧栏：`{"visible": true|false}` 或省略表示**切换**。
+
+    ⚠️ 返回值三键分开（`ok` / `visible` / `error`）：
+       `visible` 是**操作之后的真实状态**，界面据此对齐开关按钮 ——
+       只回 `ok` 的话，切换语义下按钮状态只能靠前端自己猜，猜错就是"按钮与侧栏相反"。
+    """
+    p = payload or {}
+    vis = p.get("visible", None)
+    ok, visible, err = browser_host.request_side_toggle(None if vis is None else bool(vis))
+    return {"ok": bool(ok), "visible": bool(visible), "error": err,
+            "pane": browser_host.side_state()}

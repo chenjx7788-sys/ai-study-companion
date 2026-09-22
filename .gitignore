@@ -45,3 +45,9 @@ backend/mascot.iconset/
 # 打包裁剪统计（AIStudyCompanion.spec 每次打包时重写，见技能 ai-study-pack-trim-size）
 # 它是「本次打包到底裁掉了什么」的审计凭据，属构建产物，不进仓库
 backend/build_trim_stats.json
+
+# 补丁工具的本地备份：_patchlib.py 在同目录生成 `*.patchbak`；
+# 抢救/抢救前副本形如 `*.NUL.bak` / `*.preWP16.bak`。
+# ⚠️ 它们是**回滚保险**，不是构建产物 —— 只忽略、不删除。
+*.patchbak
+*.bak

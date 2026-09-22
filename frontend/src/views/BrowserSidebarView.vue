@@ -41,6 +41,19 @@
       </div>
       <div class="sb-label">选中内容</div>
       <div class="sb-selection" data-role="sidebar-selection">{{ payload.selection }}</div>
+
+      <!-- WP16：三个动作。⚠️ 结果不由这里持有 —— 一律读轮询回来的 `payload.status/result`。
+           前端再留一份本地副本，就等于把后端那道 gen 闸又拆了（会出现"显示上一次的答案"）。 -->
+      <div class="sb-acts" data-role="sb-acts">
+        <button v-for="a in actions" :key="a.key" class="sb-act"
+                :class="{ on: payload.action === a.key }"
+                :data-role="'sb-act-' + a.key"
+                :disabled="acting || !canAct" @click="runAction(a.key)">{{ a.label }}</button>
+      </div>
+      <p v-if="actMsg" class="sb-act-msg" data-role="sb-act-msg">{{ actMsg }}</p>
+      <div v-if="payload.status === 'running'" class="sb-running" data-role="sb-running">正在生成…</div>
+      <div v-else-if="payload.status === 'error'" class="sb-error" data-role="sb-error">生成失败：{{ payload.error || '未知原因' }}</div>
+      <div v-else-if="payload.result" class="sb-result" data-role="sb-result" v-html="resultHtml"></div>
     </section>
   </div>
 </template>
@@ -49,9 +62,26 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import mascot from '../assets/mascot.png'
 import { browserApi, clipApi } from '../api'
+import { createMd } from '../utils/md'
+
+// 选项与 StudyView 一致（渲染 AI 生成正文：保留单换行、自动链接化）。
+// ⚠️ 外链 `target=_blank` 由 `createMd` 统一加 —— **不要**在这里另起一个 `new MarkdownIt(...)`，
+//    项目已经因为"9 处各写一遍"漂移过一次（只有两个视图开了 linkify）。
+const md = createMd({ linkify: true, breaks: true })
+
+// 三个动作。⚠️ `key` 必须与后端 `browser_actions.ACTION_LABELS` 逐字一致 ——
+//    后端按 key 分发，写错的症状是"点了没反应"且不报错。
+const actions = [
+  { key: 'explain', label: '解释' },
+  { key: 'summarize', label: '总结' },
+  { key: 'quiz', label: '出题' },
+]
 
 const hostReady = ref(false)
-const payload = ref({ url: '', title: '', selection: '', ts: 0 })
+// 键与后端 `browser_host._sidebar` 逐字对齐（含动作那几个）——
+// 少写一个键不会报错，只会让界面永远显示空值（这类 bug 最难查）。
+const payload = ref({ url: '', title: '', selection: '', ts: 0,
+                      action: '', status: 'idle', result: '', error: '', gen: 0 })
 // WP15：取源 / 入库的界面状态。source 留在内存（不回填、不落库），只在点「加入知识库」时回传。
 const busy = ref(false)
 const fetchMsg = ref('')
@@ -60,6 +90,40 @@ const cand = ref(null)
 // ⚠️ 判「有没有内容」只看 selection：侧栏的核心是「有没有一段可交给 AI 的文本」。
 //    若改判 url，会出现「只投了链接、没有正文」也被当成有内容 → 空态判据失真。
 const hasContent = computed(() => !!(payload.value.selection || '').trim())
+
+// 只用来**立刻禁用按钮**（防连点）。结果态不在这里 —— 一律读 `payload.status`（后端是唯一真相）。
+const acting = ref(false)
+const actMsg = ref('')
+const canAct = computed(() => hasContent.value)
+const resultHtml = computed(() => (payload.value.result ? md.render(payload.value.result) : ''))
+
+async function runAction(key) {
+  if (!canAct.value || acting.value) return
+  acting.value = true
+  actMsg.value = ''
+  try {
+    // ⚠️ 有意**不传** selection：让后端取"当前选区"。
+    //    这与网页里点浮动工具栏走的是同一条路（那边也不带 payload）——
+    //    传了本地副本就等于多出一份可能过期的选区（用户可能在两次轮询之间又划了别的）。
+    const { data } = await browserApi.selectionAction({ action: key })
+    if (data && data.ok === false) actMsg.value = actionErrText(data.error)
+  } catch {
+    actMsg.value = '请求失败，请重试'
+  } finally {
+    acting.value = false
+    pullPayload()
+  }
+}
+
+// ⚠️ 与 `extractErrText` 同款分工：`bad_action` / `empty_selection` 是**调用方问题**（要提示），
+//    「生成失败」是模型/配置侧的问题（走 `payload.status === 'error'`）。两者不要合成一句。
+function actionErrText(err) {
+  const map = {
+    bad_action: '不支持的动作',
+    empty_selection: '请先在网页里选中一段文字',
+  }
+  return map[err] || ('发起失败：' + (err || '未知原因'))
+}
 
 async function pullPayload() {
   try {
@@ -215,4 +279,47 @@ onUnmounted(() => timer && clearInterval(timer))
   border: none; border-radius: 7px;
 }
 .sb-cand-save:disabled { opacity: .55; cursor: default; }
+/* ---------- WP16：三动作与结果 ---------- */
+.sb-acts { display: flex; gap: 6px; margin-top: 14px; }
+.sb-act {
+  flex: 1; padding: 7px 4px; font-size: 12.5px; cursor: pointer;
+  color: var(--asc-text); background: var(--asc-surface-2);
+  border: 1px solid var(--asc-border); border-radius: 7px;
+}
+.sb-act.on { color: #fff; background: var(--asc-primary, #3a6df0); border-color: transparent; }
+.sb-act:disabled { opacity: .55; cursor: default; }
+.sb-act-msg { margin: 8px 0 0; font-size: 12px; color: var(--asc-text-3); }
+.sb-running { margin-top: 12px; font-size: 12.5px; color: var(--asc-text-3); }
+.sb-error {
+  margin-top: 12px; padding: 10px 12px; font-size: 12.5px; line-height: 1.7;
+  color: #c0392b; background: var(--asc-surface-2); border-radius: 8px; word-break: break-word;
+}
+.sb-result {
+  margin-top: 12px; padding: 10px 12px; font-size: 13px; line-height: 1.8;
+  color: var(--asc-text-2); background: var(--asc-surface-2); border-radius: 8px;
+  word-break: break-word; overflow-wrap: anywhere;
+}
+/* ⚠️ `v-html` 注入的节点在**当前作用域之外**，必须 `:deep()` 才能命中
+   （scoped 样式默认加不上子节点 —— 症状是"内容出来了但完全没有排版"）。 */
+.sb-result :deep(p) { margin: 0 0 8px; }
+.sb-result :deep(p:last-child) { margin-bottom: 0; }
+.sb-result :deep(ul), .sb-result :deep(ol) { margin: 6px 0 8px; padding-left: 20px; }
+.sb-result :deep(li) { margin: 3px 0; }
+.sb-result :deep(h1), .sb-result :deep(h2), .sb-result :deep(h3), .sb-result :deep(h4) {
+  margin: 12px 0 6px; font-size: 13.5px; color: var(--asc-text);
+}
+.sb-result :deep(code) { padding: 1px 4px; font-size: 12px; border-radius: 4px; background: var(--asc-bg); }
+.sb-result :deep(pre) {
+  margin: 8px 0; padding: 8px 10px; border-radius: 6px; background: var(--asc-bg); overflow-x: auto;
+}
+.sb-result :deep(pre code) { padding: 0; background: none; }
+.sb-result :deep(blockquote) {
+  margin: 8px 0; padding: 2px 0 2px 10px; color: var(--asc-text-3);
+  border-left: 3px solid var(--asc-border);
+}
+/* ⚠️ 正文图片必须限宽：模型输出的外链大图会撑破 360px 的侧栏、产生横向滚动。 */
+.sb-result :deep(img) { max-width: 100%; height: auto; border-radius: 6px; }
+.sb-result :deep(a) { color: var(--asc-primary, #3a6df0); }
+.sb-result :deep(table) { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.sb-result :deep(th), .sb-result :deep(td) { padding: 4px 6px; border: 1px solid var(--asc-border); }
 </style>

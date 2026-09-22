@@ -77,6 +77,19 @@ export const browserApi = {
   // ⚠️ 它**不回传"已入库"**：入库仍走 clipApi.save（把返回的 source 一起传过去）。
   // ⚠️ 长页面源码可达数 MB → 超时放宽到 60s。
   extract: () => http.post('/browser/extract', {}, { timeout: 60000 }),
+  // WP16 选区三动作。⚠️ 与本文件的 `sidebarPayload` 分工不同，**不要合并**：
+  //    这里读的是「页面上**选了什么**」（含 seq / path / err —— 用来区分"没选"与"选了但桥不通"）；
+  //    `sidebarPayload` 读的是「侧栏**要显示什么**」（含动作与其结果）。
+  selection: () => http.get('/browser/selection'),
+  // 执行动作：explain / summarize / quiz。**异步** —— 立刻回来的只是 status="running"，
+  // 结果要回 `sidebarPayload` 读（后端用 gen 配对，防"旧答案盖新选区"）。
+  // ⚠️ 不传 selection 时后端取「当前选区」—— 这正是「点网页浮动工具栏」与「点侧栏按钮」
+  //    走同一条链的原因：两个入口都只发一个 action，不允许各自维护一套参数。
+  selectionAction: (payload) => http.post('/browser/selection/action', payload || {}),
+  // 仅真机 / 验收：让活跃标签重新注入工具栏与桥，并**回读**页面侧真实状态。
+  // ⚠️ `ok` 是"我发起了注入"，`probe.has_el` 才是"页面上真有节点" —— 必须分开读，
+  //    否则"注入没生效"会给出全绿。
+  inject: () => http.post('/browser/inject'),
 }
 
 // AI 理解（PRD 模块 B）；生成类接口长文档可能需数分钟，超时放宽到 300s

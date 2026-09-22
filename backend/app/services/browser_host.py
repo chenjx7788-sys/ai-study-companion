@@ -22,6 +22,7 @@
 ⚠️ 模块顶层**禁止** import `webview` / `qtpy`：
    后端必须能在浏览器模式、单元测试、验收脚本里正常 import（见 `_load_qt()` 惰性加载）。
 """
+import json
 import threading
 import time
 from urllib.parse import urlsplit
@@ -50,6 +51,14 @@ __all__ = [
     "current_url",
     "SOURCE_TIMEOUT",
     "request_page_source",
+    "begin_sidebar_action",
+    "set_sidebar_result",
+    "selection_state",
+    "request_selection_pull",
+    "request_selection_probe",
+    "request_inject",
+    "request_side_toggle",
+    "side_state",
 ]
 
 # 只允许这两种协议。**显式白名单**：`file:` / `javascript:` / `data:` 一律拒 ——
@@ -275,13 +284,21 @@ def selftest_timeout(block_s=2.0, timeout=0.4):
 #    在**浏览器模式下也能完整验证** —— 否则这条链只能等真机才测得到。
 # ⚠️ 进程内存、不落库：与 V3 §6.3 的 N04 口径一致（页面内容不上传、浏览历史不落库）。
 
-_sidebar = {"url": "", "title": "", "selection": "", "ts": 0.0}
+# ⚠️ WP16 起，本盒子装**两组语义**（刻意不合并成一组）：
+#     ① `url / title / selection`  = 「选中了什么」
+#     ② `action / status / result / error / gen` = 「对它做了什么」
+#    合成一组就再也分不清「这条结果是**这一次**选区的」还是「上一段文字的」——
+#    而那种错**不报错、只错内容**，是本项目最贵的一类 bug。
+#    ⚠️ 旧判据（A6a「四字段齐、值为空」）只断言那四个键的**值**，故新增键不破坏它。
+_sidebar = {"url": "", "title": "", "selection": "", "ts": 0.0,
+            "action": "", "status": "idle", "result": "", "error": "", "gen": 0}
 _sidebar_lock = threading.Lock()
 
 
-def set_sidebar_payload(url="", title="", selection=""):
-    """写入侧栏载荷，返回是否写入成功。
+def set_sidebar_payload(url="", title="", selection="", action=""):
+    """写入「选中了什么」，并**把上一次的动作结果作废**（`status` 回 idle、`gen` **递增**）。
 
+    ⚠️ 必须连带清结果：否则「换一段文字」之后侧栏会拿**上一段的答案**配新文字。
     ⚠️ 一律 `str()` 强转：调用方可能传进来非字符串（Qt 侧 JS 值回来常是各种形态），
        不转会让下游的 `.strip()` / 前端渲染在不该出错的地方出错。
     """
@@ -291,22 +308,74 @@ def set_sidebar_payload(url="", title="", selection=""):
             "title": str(title or ""),
             "selection": str(selection or ""),
             "ts": time.time(),
+            "action": str(action or ""),
+            "status": "idle",
+            "result": "",
+            "error": "",
+            # ⚠️⚠️ `gen` **只增不归零**。归零会让「上一次动作」与「下一次动作」拿到同一个
+            #     代号（都是 1）→ 先发后到的旧回调**通过**代号校验 → 新选区上出现旧答案。
+            #     递增等于「作废一切在飞的回调」，且不需要任何额外的取消机制。
+            "gen": int(_sidebar.get("gen", 0) or 0) + 1,
         })
     return True
 
 
 def sidebar_payload():
-    """读侧栏载荷（**确定空态**：四个字段都在，值为空串 / 0.0，不是 404 也不是 null）。"""
+    """读侧栏载荷（**确定空态**：键恒定；空值时 `url/title/selection/result/error` 为空串、
+    `ts` 为 0.0、`status` 为 `"idle"`、`gen` 为 0 —— 不是 404 也不是 null）。"""
     with _sidebar_lock:
         return dict(_sidebar)
 
 
 def clear_sidebar_payload():
-    """清空侧栏载荷，返回「清空前是否有内容」。"""
+    """清空侧栏载荷，返回「清空前是否有内容」。
+
+    ⚠️ `had` 也看 `result`：只清结果、还没选区的那种中间态（动作失败后用户又点清空）
+       也必须报「此前有内容」，否则界面会以为本来就是空的、跳过重建流程。
+    """
     with _sidebar_lock:
-        had = bool(_sidebar["url"] or _sidebar["selection"])
-        _sidebar.update({"url": "", "title": "", "selection": "", "ts": 0.0})
+        had = bool(_sidebar["url"] or _sidebar["selection"] or _sidebar["result"])
+        _sidebar.update({"url": "", "title": "", "selection": "", "ts": 0.0,
+                         "action": "", "status": "idle", "result": "", "error": "",
+                         # ⚠️ 同上：清零会让「清空之前的在飞回调」与「清空之后的新动作」撞代号。
+                         "gen": int(_sidebar.get("gen", 0) or 0) + 1})
     return had
+
+
+def begin_sidebar_action(action):
+    """开始一次动作：自增 `gen`、置 `status="running"`，返回本次 `gen`。
+
+    ⚠️ `gen` 是**防串场**的唯一手段（与 WP15 取源的 token 同款）：用户连点两次动作时，
+       先发的那次回调会带着旧 `gen` 回来，`set_sidebar_result()` 会把它丢掉。
+       没有它就会出现「侧栏显示的是上一次动作的结果」。
+    """
+    with _sidebar_lock:
+        g = int(_sidebar.get("gen", 0) or 0) + 1
+        _sidebar.update({"gen": g, "action": str(action or ""), "status": "running",
+                         "result": "", "error": ""})
+    return g
+
+
+def set_sidebar_result(gen, status, result="", error=""):
+    """写入一次动作的结果。**`gen` 不匹配则丢弃并发回 False**（不是异常）。"""
+    with _sidebar_lock:
+        if int(gen or 0) != int(_sidebar.get("gen", 0) or 0):
+            return False
+        _sidebar.update({"status": str(status or ""), "result": str(result or ""),
+                         "error": str(error or "")})
+    return True
+
+
+def _install_hook():
+    """确保面板装配时带着 WP16 选区钩子（幂等）。
+
+    ⚠️ 必须在 **`assemble()` 之前**调：钩子是在装配那一刻被写进面板 dict 的
+       （`panel["_on_sel"]`），装完之后再注册对已存在的面板无效 —— 症状是
+       「面板能用、但点了动作侧栏永远不动」，且没有任何报错。
+    """
+    from . import browser_panel, browser_actions
+    if getattr(browser_panel, "_sel_hook", None) is not browser_actions.on_selection_event:
+        browser_panel.set_selection_hook(browser_actions.on_selection_event)
 
 
 def _show_sidebar_on_main():
@@ -318,8 +387,16 @@ def _show_sidebar_on_main():
        合成一件事会让「没宿主」这种**正常情况**看起来像失败。
     """
     from . import browser_panel
+    _install_hook()
     host = host_view()
-    browser_panel.show(host)
+    panel = browser_panel.show(host)
+    # WP16：`/sidebar/open` 的语义是"**侧栏要出来**" —— 只是把面板显示出来还不够，
+    # 必须把侧栏那一栏也展开（否则用户点了"查看选中内容"，面板开了但侧栏是收起的，
+    # 现象就是"点了没反应"）。
+    try:
+        browser_panel.side_set_visible(panel, True)
+    except BaseException:
+        pass
     return True
 
 
@@ -341,6 +418,7 @@ def request_sidebar_show():
 
 def _open_on_main(url, width):
     from . import browser_panel
+    _install_hook()
     host = host_view()
     browser_panel.show(host, url=url, width=width)
     return True
@@ -359,6 +437,7 @@ def request_browser_open(url="", width=520):
 
 def _navigate_on_main(url):
     from . import browser_panel
+    _install_hook()
     host = host_view()
     panel = browser_panel.assemble(host)      # 幂等；未装配时自动装配
     return browser_panel.navigate(panel, url)
@@ -570,6 +649,7 @@ _SRC_POLL_INTERVAL = 0.08
 
 def _page_source_start_on_main():
     from . import browser_panel
+    _install_hook()                                 # 幂等
     panel = browser_panel.assemble(host_view())      # 幂等
     return browser_panel.page_source_start(panel)
 
@@ -629,3 +709,120 @@ def request_page_source(timeout=SOURCE_TIMEOUT):
         time.sleep(_SRC_POLL_INTERVAL)
     return False, last, "timeout"
 
+
+
+# ---------- WP16：选区（回读 / 兜底拉取 / 重新注入） ----------
+# ⚠️⚠️ 与 `request_page_source` 同一套时序纪律：**主线程只发起**，轮询放在**本线程**。
+#    区别：选区的主路是「页面推」（桥回调进事件循环自动落盒子），
+#    这里两个接口都是**兜底/验收**用的主动取回 —— 它们的存在让
+#    「注入没生效」与「注入了但桥不通」可以被分开判定。
+
+_JS_POLL_INTERVAL = 0.08
+
+
+def selection_state():
+    """当前选区盒子（**只读普通值** → 任意线程）。空态**键恒定**、可逐字比对。"""
+    from . import browser_panel
+    return browser_panel.selection_state()
+
+
+def _js_pull(key, starter, timeout):
+    """通用「发起 + 轮询」取回一个页面 JS 值。返回 `(ok, value, error)`。
+
+    ⚠️ 轮询循环里**只读普通值**（`js_pull_state`），**不再投递主线程**：
+       应用跑着时 Qt 事件循环本来就在转，`runJavaScript` 的回调会自己执行。
+       每次轮询再投一次主线程只会白白增加主线程负载（WP15 已实测过这个取舍）。
+    """
+    from . import browser_panel
+    if not is_available():
+        return False, None, "host_unavailable"
+    try:
+        ok, err, tok = call_on_main(starter)
+    except Exception as e:
+        return False, None, "%s: %s" % (type(e).__name__, e)
+    if not ok:
+        return False, None, err
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        st = browser_panel.js_pull_state(None, key)
+        if st.get("phase") == "done":
+            return True, st.get("raw"), None
+        time.sleep(_JS_POLL_INTERVAL)
+    return False, None, "timeout"
+
+
+def request_selection_pull(timeout=1.5):
+    """**兜底路**：把页面里的 `window.__asc_sel` 拉回来。返回 `(ok, raw_or_None, error)`。
+
+    用途：桥没建起来时（`__asc_bstate != 'ok'`）唯一能拿到选区的通路；
+    也用于区分「页面确实没采集到」与「采集到了但桥不通」。
+    """
+    from . import browser_panel
+    return _js_pull("sel", lambda: browser_panel.selection_snapshot_start(), timeout)
+
+
+def request_selection_probe(timeout=2.0):
+    """**回读路**：读页面侧的注入状态（双向断言的「回读」那一半）。
+    返回 `(ok, dict_or_None, error)`。
+    """
+    from . import browser_panel
+    ok, raw, err = _js_pull("probe", lambda: browser_panel.selection_probe_start(), timeout)
+    if not ok:
+        return False, None, err
+    if isinstance(raw, str) and raw:
+        try:
+            return True, json.loads(raw), None
+        except Exception:
+            return False, None, "bad_probe_json"
+    return False, None, "no_probe_value"
+
+
+def request_inject(timeout=3.0):
+    """让活跃标签**重新注入**工具栏与桥（主线程）。返回 `(ok, error)`。幂等。"""
+    from . import browser_panel
+    if not is_available():
+        return False, "host_unavailable"
+    try:
+        _install_hook()
+        ok, err = call_on_main(browser_panel.inject_now, timeout=timeout)
+        return bool(ok), err
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
+# ---------- WP16：侧栏宿主开关（回读走 selfcheck，见 routers） ----------
+
+def _side_toggle_on_main(visible):
+    from . import browser_panel
+    _install_hook()                                 # 幂等
+    panel = browser_panel.assemble(host_view())      # 幂等
+    if visible is None:
+        return browser_panel.side_toggle(panel)
+    return browser_panel.side_set_visible(panel, bool(visible))
+
+
+def request_side_toggle(visible=None):
+    """显示 / 收起 / 切换侧栏（`visible=None` 表示切换）。返回 `(ok, visible, error)`。
+
+    ⚠️ 三种语义必须由**同一个** `visible` 参数表达，而不是两个接口：
+       界面上的开关按钮要的是"切换"，而"打开侧栏"的调用点要的是"确保展开" ——
+       分成两个接口就会出现「用切换去实现确保展开，第二次点反而收起」。
+    ⚠️ `error="no_side_view"` = 侧栏视图没建起来（见 `selfcheck().side_err` 拿真因）；
+       `host_unavailable` = 环境不支持（浏览器模式）。两者不要压成一个假值。
+    """
+    if not is_available():
+        return False, False, "host_unavailable"
+    try:
+        return call_on_main(_side_toggle_on_main, visible)
+    except Exception as e:
+        return False, False, "%s: %s" % (type(e).__name__, e)
+
+
+def side_state():
+    """侧栏状态（**只读普通值** → 任意线程）。"""
+    try:
+        from . import browser_panel
+        return browser_panel.side_state()
+    except Exception:
+        return {"available": False, "visible": False, "requested_url": "",
+                "splitter": False, "error": None}
