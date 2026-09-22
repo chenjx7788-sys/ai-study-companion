@@ -383,6 +383,12 @@ DEFAULT_PROMPTS = {
    - D. ……
    答案：X —— 一句话解析
 4. 不出这段文字里无法判断的题。""",
+    "prompt_browser_ask": """你是一名伴学助手。用户在用内置浏览器读网页时选中了一段文字，并围绕它在追问。请：
+1. 直接回答用户这一次的问题，不要重述之前已经答过的内容；
+2. 只依据【选中的文字】与你们的往来作答；文字里判断不了的，就明确说「这段文字里没有提到」，不要脑补；
+3. 答案要短、可读：需要分点时用 Markdown 列表，能一句话说清就一句话；
+4. 直接输出正文，不要写「好的」「根据你选中的文字」这类开场话。
+如果这个问题与选中的文字无关，就按你的理解回答，并说明这是文字之外的补充。""",
 }
 
 
@@ -544,6 +550,68 @@ def browser_selection_action(action: str, selection: str, title: str = "", url: 
     return chat(
         browser_selection_messages(action, selection, title=title, url=url),
         kind="browser_%s" % action)
+
+
+def browser_selection_stream(action: str, selection: str, title: str = "", url: str = ""):
+    """流式版三个动作：逐 token yield **文本**（不是 `(kind, text)` 元组）。
+
+    ⚠️ 与 `browser_selection_action` 共用同一个 `kind`（`browser_<action>`）：
+       两个入口若各算一个 kind，记账表会把同一个动作拆成两行，
+       以后再也回答不了「解释这个动作一共花了多少 token、多慢」。
+    ⚠️ 只 yield `kind == "content"`：三个动作是短输入强交互，推理 token 会让侧栏
+       先刷一大段用户看不见的思考再出答案（侧栏只渲染答案）。
+    """
+    for kind, text in chat_stream(
+            browser_selection_messages(action, selection, title=title, url=url),
+            kind="browser_%s" % action):
+        if kind == "content":
+            yield text
+
+
+def browser_ask_messages(selection: str, history, question: str,
+                         title: str = "", url: str = "") -> list[dict]:
+    """侧栏追问 → messages。
+
+    ⚠️ `history` 由**前端携带**（服务端无状态、不落库）—— 与 `ephemeral.explain` 同口径。
+       侧栏刷新后不「记得」上一轮是**有意**的（N04：浏览内容不落库）。
+    ⚠️ 选区**每次重发**，不从 history 里找：选区是「被问的东西」，
+       混进 history 会让用户换了选区之后仍被引用旧文字，且**不报错**。
+    ⚠️ 角色白名单在**本模块**做，是这条链上**唯一**的清洗点 ——
+       调用方（`browser_actions`）不要再清洗一遍（两处清洗迟早分叉）。
+    """
+    head = []
+    if title:
+        head.append("【页面标题】%s" % title)
+    if url:
+        head.append("【页面地址】%s" % url)
+    ctx = ("\n".join(head) + "\n\n") if head else ""
+    msgs = [
+        {"role": "system", "content": get_prompt("prompt_browser_ask")},
+        {"role": "user", "content": "%s【选中的文字】\n%s" % (ctx, selection)},
+    ]
+    for m in (history or []):
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            msgs.append({"role": role, "content": content})
+    msgs.append({"role": "user", "content": question})
+    return msgs
+
+
+def browser_ask_stream(selection: str, history, question: str,
+                       title: str = "", url: str = ""):
+    """流式追问：逐 token yield **文本**。
+
+    ⚠️ `kind="browser_ask"` **独立于三个动作**：追问的输入长度随轮数增长，
+       与一次性动作的 token 曲线完全不同，合成一个 kind 就再也分不清两者。
+    """
+    for kind, text in chat_stream(
+            browser_ask_messages(selection, history, question, title=title, url=url),
+            kind="browser_ask"):
+        if kind == "content":
+            yield text
 
 
 # ---------- 文本加工（改写/扩写/续写/总结；笔记与材料文本共用） ----------

@@ -8,6 +8,15 @@
       <span class="sb-host">{{ hostReady ? '浏览器视图已就绪' : '当前无浏览器视图' }}</span>
     </header>
 
+    <!-- WP17：侧栏标签栏。⚠️ 侧栏与浏览器面板是**两个独立文档**，看不到 Qt 的 QTabBar
+         → 必须自己列一遍（数据来自 /browser/tabs，浏览器模式下为空数组，是正常空态）。 -->
+    <nav v-if="tabs.length" class="sb-tabs" data-role="sb-tabs">
+      <button v-for="t in tabs" :key="t.id" class="sb-tab"
+              :class="{ on: t.active }" data-role="sb-tab"
+              :title="t.title || t.url || '新标签'"
+              @click="switchTab(t)">{{ tabLabel(t) }}</button>
+    </nav>
+
     <!-- WP15：把**当前网页**抽成正文并入库。带用户自己的登录态 → 服务端被抓 403 的站点也能取。 -->
     <!-- ⚠️ 这一块与"划选内容"是**两件事**：不依赖 selection，故不受上面的空态分支影响。 -->
     <section class="sb-fetch">
@@ -53,16 +62,44 @@
       <p v-if="actMsg" class="sb-act-msg" data-role="sb-act-msg">{{ actMsg }}</p>
       <div v-if="payload.status === 'running'" class="sb-running" data-role="sb-running">正在生成…</div>
       <div v-else-if="payload.status === 'error'" class="sb-error" data-role="sb-error">生成失败：{{ payload.error || '未知原因' }}</div>
-      <div v-else-if="payload.result" class="sb-result" data-role="sb-result" v-html="resultHtml"></div>
+      <div v-else-if="payload.result" class="sb-md sb-result" data-role="sb-result" v-html="resultHtml"></div>
+
+      <!-- WP17 流式：边生成边渲染（渲染的仍是**盒子**里的文本，不是前端自己拼的 token）。
+           ⚠️ 这是一个**独立节点**、有意不并入上面的三态链 —— 并进去等于宣告
+              「running / error / result 三态互斥」这条既有判据失效（WP12 E 组在断言它）。 -->
+      <div v-if="streaming" class="sb-md sb-stream" data-role="sb-stream" v-html="resultHtml"></div>
+      <div v-if="streaming" class="sb-res-bar">
+        <span class="sb-res-msg">正在输出…</span>
+      </div>
+
+      <!-- WP17 一键复制（A05）。放在正文**之外**的一行：正文里有链接与代码，
+           把按钮浮在正文上会挡内容。 -->
+      <div v-if="payload.result && payload.status !== 'running'" class="sb-res-bar">
+        <span class="sb-res-msg" data-role="sb-res-msg">{{ resMsg }}</span>
+        <button class="sb-mini" data-role="sb-copy" @click="copyResult">复制</button>
+      </div>
+
+      <!-- WP17 追问（A06）。只在「已有答案」时出现：没有答案时该用上面那三个动作。
+           ⚠️ 历史由**前端**携带、不落库；选区一换就整体作废（旧答案对新文字是错上下文）。 -->
+      <form v-if="payload.result && payload.status !== 'running'"
+            class="sb-ask" data-role="sb-ask" @submit.prevent="sendAsk">
+        <input v-model="askText" class="sb-ask-input" data-role="sb-ask-input" type="text"
+               placeholder="就这段文字继续追问…" :disabled="asking" />
+        <button class="sb-ask-send" data-role="sb-ask-send" type="submit"
+                :disabled="asking || !askText.trim()">{{ asking ? '发送中' : '追问' }}</button>
+      </form>
     </section>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import mascot from '../assets/mascot.png'
 import { browserApi, clipApi } from '../api'
 import { createMd } from '../utils/md'
+// WP17：复制与流式各只有一份实现，不许在本视图里再写一遍（见 utils 内的注释）。
+import { copyText } from '../utils/clipboard'
+import { streamSSE } from '../utils/sse'
 
 // 选项与 StudyView 一致（渲染 AI 生成正文：保留单换行、自动链接化）。
 // ⚠️ 外链 `target=_blank` 由 `createMd` 统一加 —— **不要**在这里另起一个 `new MarkdownIt(...)`，
@@ -123,6 +160,127 @@ function actionErrText(err) {
     empty_selection: '请先在网页里选中一段文字',
   }
   return map[err] || ('发起失败：' + (err || '未知原因'))
+}
+
+// ---------- WP17：流式 / 复制 / 追问 / 标签栏 ----------
+
+// 流式区 = 「正在生成**且**盒子里已有文本」。
+// ⚠️⚠️ 前端**绝不**自己把 token 拼成答案：那会多出第二份真相，一旦与后端盒子不一致，
+//    症状是「看着流出来的」与「最后停住的」不是同一段文字，且无从复现。
+//    所以这里读的仍是 `payload.result` —— 订阅只负责**尽快去取**（见 schedulePull）。
+const streaming = computed(() => payload.value.status === 'running' && !!payload.value.result)
+
+const resMsg = ref('')
+const askText = ref('')
+const asking = ref(false)
+const tabs = ref([])
+
+// 追问历史（A06）：由**前端**携带、服务端无状态 → 刷新即丢。这是**有意**的
+// （N04：浏览内容不落库），不是缺陷。上限与后端 MAX_HISTORY_MSGS 对齐。
+const MAX_HISTORY = 12
+const history = ref([])
+
+// 选区一换，历史整体作废：旧答案对新文字是**错上下文** ——
+// 而这类错的症状是「答得挺顺但答偏了」，比报错难查得多。
+const selKey = computed(() => payload.value.url + '\n' + payload.value.selection)
+watch(selKey, () => {
+  history.value = []
+  askText.value = ''
+  resMsg.value = ''
+})
+
+// 一次动作跑完（running → 其它）就把答案喂进历史，这样「解释完接着追问」才连贯。
+// ⚠️ 判据用 status 的**跃迁**而不是「有 result」：流式期间 result 一直在变，
+//    按「有 result」会在输出过程中反复 push 同一段答案。
+watch(() => payload.value.status, (now, before) => {
+  if (before === 'running' && now !== 'running' && payload.value.result) {
+    history.value.push({ role: 'assistant', content: payload.value.result })
+    if (history.value.length > MAX_HISTORY) history.value = history.value.slice(-MAX_HISTORY)
+  }
+})
+
+async function copyResult() {
+  const ok = await copyText(payload.value.result || '')
+  // ⚠️ 失败必须如实说：一律弹「已复制」会让用户粘贴时才发现是空的。
+  resMsg.value = ok ? '已复制' : '复制失败，请手动选择文本'
+  setTimeout(() => { resMsg.value = '' }, 1800)
+}
+
+async function sendAsk() {
+  const q = askText.value.trim()
+  if (!q || asking.value || !canAct.value) return
+  asking.value = true
+  actMsg.value = ''
+  try {
+    // ⚠️ 与三个动作同款：**不传** selection —— 让后端取「当前选区」。
+    //    传本地副本就等于多出一份可能过期的选区（用户可能又划了别的文字）。
+    const { data } = await browserApi.selectionAsk({ question: q, history: history.value })
+    if (data && data.ok === false) { actMsg.value = actionErrText(data.error); return }
+    history.value.push({ role: 'user', content: q })
+    askText.value = ''
+  } catch {
+    actMsg.value = '请求失败，请重试'
+  } finally {
+    asking.value = false
+    pullPayload()
+  }
+}
+
+// ---------- 侧栏标签栏（WP17） ----------
+// ⚠️ 走的是与真机同一个数据面 /browser/tabs；浏览器模式下返回空数组（正常空态），
+//    所以这里**不弹错、不显示占位**，只是标签栏不出现。
+async function pullTabs() {
+  try {
+    const { data } = await browserApi.tabs()
+    tabs.value = Array.isArray(data && data.tabs) ? data.tabs : []
+  } catch { /* 静默 */ }
+}
+
+function tabLabel(t) {
+  const s = String((t && t.title) || '').trim()
+  if (s) return s.length > 14 ? s.slice(0, 14) + '…' : s
+  const u = String((t && t.url) || '').trim()
+  if (!u) return '新标签'
+  try { return new URL(u).hostname.replace(/^www\./, '') } catch { return u.slice(0, 14) }
+}
+
+async function switchTab(t) {
+  if (!t || t.active) return
+  try { await browserApi.tabSwitch({ tab_id: t.id }) } catch { /* 无宿主时是正常约束 */ }
+  pullTabs()
+}
+
+// ---------- WP17 流式订阅（SSE） ----------
+// ⚠️ 订阅是**加速通道**，不是取代轮询：断开 / 后端没重启 / 端点 404 时轮询照旧在跑。
+//    因此这里的任何失败都**不弹错、不停轮询**，只按退避重连。
+let subAc = null
+let stopped = false
+let backoff = 1000
+let pullScheduled = false
+
+function schedulePull() {
+  // 把一串 token 合并成 ≤10 次/秒的取数：token 频率远高于人眼需要的刷新率，
+  // 且每次取的都是**整个**盒子（不是增量），不做合并会白刷几十倍请求。
+  if (pullScheduled) return
+  pullScheduled = true
+  setTimeout(() => { pullScheduled = false; pullPayload() }, 100)
+}
+
+async function subscribeLoop() {
+  while (!stopped) {
+    subAc = new AbortController()
+    try {
+      await streamSSE('/browser/sidebar/stream', {},
+        () => schedulePull(),      // token：尽快取一次盒子
+        () => pullPayload(),       // done：立刻取最终态
+        () => pullPayload(),       // error：错误文案的真相在盒子里 → 立刻拉，不另造一套
+        () => { backoff = 1000 },  // meta：连上了 → 重置退避
+        null, subAc.signal)
+    } catch { /* AbortError / 连不上：都走下面的退避重连 */ }
+    if (stopped) break
+    await new Promise(r => setTimeout(r, backoff))
+    backoff = Math.min(backoff * 2, 15000)
+  }
 }
 
 async function pullPayload() {
@@ -208,15 +366,27 @@ async function pullHost() {
 }
 
 let timer = null
+let tabsTimer = null
 onMounted(() => {
   pullHost()
   pullPayload()
-  // ⚠️ 用轮询而不是推送：投递方（WP16 的注入脚本经后端）与侧栏是**两个独立的文档**，
-  //    目前没有从 Python 主动推 JS 的通道（那要 evaluate_js，只在 Qt 宿主下可用）。
+  pullTabs()
+  // ⚠️ 轮询**保留**（不是被流式取代）：投递方（WP16 的注入脚本经后端）与侧栏是
+  //    两个**独立文档**，没有从 Python 主动推 JS 的通道（那只在 Qt 宿主下可用）。
   //    1.5s 让用户主观上感觉"即时"，且这条链在浏览器模式下也能完整验证。
   timer = setInterval(pullPayload, 1500)
+  // 标签是宿主侧的（浏览器模式下恒为空），变化不快，3s 足够。
+  tabsTimer = setInterval(pullTabs, 3000)
+  subscribeLoop()
 })
-onUnmounted(() => timer && clearInterval(timer))
+onUnmounted(() => {
+  timer && clearInterval(timer)
+  tabsTimer && clearInterval(tabsTimer)
+  // ⚠️⚠️ 必须**同时**置 stopped 与 abort：只置标志会在断网时把这条连接留在后端，
+  //     只 abort 则 while 会立刻重连 —— 两者缺一都会泄漏订阅者。
+  stopped = true
+  if (subAc) { try { subAc.abort() } catch { /* 已自行结束 */ } }
+})
 </script>
 
 <style scoped>
@@ -294,32 +464,96 @@ onUnmounted(() => timer && clearInterval(timer))
   margin-top: 12px; padding: 10px 12px; font-size: 12.5px; line-height: 1.7;
   color: #c0392b; background: var(--asc-surface-2); border-radius: 8px; word-break: break-word;
 }
-.sb-result {
+/* ---------- WP17：正文容器抽成公共类 `.sb-md` ----------
+   ⚠️ 流式区与结果区**必须共用同一套排版**：两处各写一遍必然漂移，
+      症状是「生成中」到「生成完」跳一次版（字号/行高突变）。 */
+.sb-md {
   margin-top: 12px; padding: 10px 12px; font-size: 13px; line-height: 1.8;
   color: var(--asc-text-2); background: var(--asc-surface-2); border-radius: 8px;
   word-break: break-word; overflow-wrap: anywhere;
 }
+/* 生成中：虚线边框做视觉区分，且**不改变布局尺寸**（否则完成瞬间会跳动） */
+.sb-stream { border: 1px dashed var(--asc-border); }
 /* ⚠️ `v-html` 注入的节点在**当前作用域之外**，必须 `:deep()` 才能命中
    （scoped 样式默认加不上子节点 —— 症状是"内容出来了但完全没有排版"）。 */
-.sb-result :deep(p) { margin: 0 0 8px; }
-.sb-result :deep(p:last-child) { margin-bottom: 0; }
-.sb-result :deep(ul), .sb-result :deep(ol) { margin: 6px 0 8px; padding-left: 20px; }
-.sb-result :deep(li) { margin: 3px 0; }
-.sb-result :deep(h1), .sb-result :deep(h2), .sb-result :deep(h3), .sb-result :deep(h4) {
+.sb-md :deep(p) { margin: 0 0 8px; }
+.sb-md :deep(p:last-child) { margin-bottom: 0; }
+.sb-md :deep(ul), .sb-md :deep(ol) { margin: 6px 0 8px; padding-left: 20px; }
+.sb-md :deep(li) { margin: 3px 0; }
+.sb-md :deep(h1), .sb-md :deep(h2), .sb-md :deep(h3), .sb-md :deep(h4) {
   margin: 12px 0 6px; font-size: 13.5px; color: var(--asc-text);
 }
-.sb-result :deep(code) { padding: 1px 4px; font-size: 12px; border-radius: 4px; background: var(--asc-bg); }
-.sb-result :deep(pre) {
+.sb-md :deep(code) { padding: 1px 4px; font-size: 12px; border-radius: 4px; background: var(--asc-bg); }
+.sb-md :deep(pre) {
   margin: 8px 0; padding: 8px 10px; border-radius: 6px; background: var(--asc-bg); overflow-x: auto;
 }
-.sb-result :deep(pre code) { padding: 0; background: none; }
-.sb-result :deep(blockquote) {
+.sb-md :deep(pre code) { padding: 0; background: none; }
+.sb-md :deep(blockquote) {
   margin: 8px 0; padding: 2px 0 2px 10px; color: var(--asc-text-3);
   border-left: 3px solid var(--asc-border);
 }
 /* ⚠️ 正文图片必须限宽：模型输出的外链大图会撑破 360px 的侧栏、产生横向滚动。 */
-.sb-result :deep(img) { max-width: 100%; height: auto; border-radius: 6px; }
-.sb-result :deep(a) { color: var(--asc-primary, #3a6df0); }
-.sb-result :deep(table) { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-.sb-result :deep(th), .sb-result :deep(td) { padding: 4px 6px; border: 1px solid var(--asc-border); }
+.sb-md :deep(img) { max-width: 100%; height: auto; border-radius: 6px; }
+.sb-md :deep(a) { color: var(--asc-primary, #3a6df0); }
+.sb-md :deep(table) { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.sb-md :deep(th), .sb-md :deep(td) { padding: 4px 6px; border: 1px solid var(--asc-border); }
+
+/* ---------- WP17：复制 / 追问 / 标签栏 ---------- */
+.sb-res-bar {
+  display: flex; align-items: center; gap: 8px; margin-top: 6px;
+  min-height: 22px;   /* 恒定高度：不然「正在输出…」消失的瞬间按钮会跳一行 */
+}
+.sb-res-msg { margin-right: auto; font-size: 11.5px; color: var(--asc-text-3); }
+.sb-mini {
+  padding: 3px 10px; font-size: 11.5px; cursor: pointer;
+  color: var(--asc-text-2); background: var(--asc-bg);
+  border: 1px solid var(--asc-border); border-radius: 6px;
+}
+.sb-mini:hover { color: var(--asc-text); }
+.sb-ask { display: flex; gap: 6px; margin-top: 10px; }
+.sb-ask-input {
+  flex: 1; min-width: 0; padding: 7px 10px; font-size: 12.5px;
+  color: var(--asc-text); background: var(--asc-bg);
+  border: 1px solid var(--asc-border); border-radius: 8px;
+}
+.sb-ask-input:disabled { opacity: .6; }
+.sb-ask-send {
+  flex-shrink: 0; padding: 7px 12px; font-size: 12.5px; cursor: pointer;
+  color: #fff; background: var(--asc-primary, #3a6df0);
+  border: none; border-radius: 8px;
+}
+.sb-ask-send:disabled { opacity: .55; cursor: default; }
+.sb-tabs {
+  display: flex; gap: 4px; padding: 8px 12px; flex-shrink: 0;
+  overflow-x: auto; border-bottom: 1px solid var(--asc-divider);
+}
+.sb-tab {
+  flex-shrink: 0; max-width: 132px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+  color: var(--asc-text-2); background: var(--asc-surface-2);
+  border: 1px solid var(--asc-border); border-radius: 999px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sb-tab.on { color: #fff; background: var(--asc-primary, #3a6df0); border-color: transparent; }
+
+/* ---------- WP17：深色（**只作用于侧栏作用域**） ----------
+   ⚠️ 为什么不在 global.css 的 `:root` 上做：那会改造**全应用**十几个视图，
+      而它们大量硬编码浅色（#fff / 颜色字面量）→ 工作量与风险都远超本包。
+      侧栏是**独立文档**，在这里覆盖同名令牌（`--asc-*`）即可自动跟随系统。 */
+@media (prefers-color-scheme: dark) {
+  .browser-sidebar {
+    --asc-bg: #1e1e20;
+    --asc-card: #26262a;
+    --asc-surface-2: #2a2a2e;
+    --asc-border: #3a3a40;
+    --asc-divider: #323236;
+    --asc-text: #e9e9ec;
+    --asc-text-2: #b4b4bb;
+    --asc-text-3: #8a8a92;   /* 深色底上次要文字下限：约 5.0:1 */
+    --asc-primary: #8f7bff;
+  }
+  /* ⚠️ `.sb-error` 的红色是硬编码的：深色底上对比度不足，必须单独覆盖 */
+  .sb-error { color: #ff8a7a; }
+  /* 主按钮的白字在浅紫底上仍可读，但深色下把紫色提亮后要保证仍是白字 */
+  .sb-act.on, .sb-tab.on, .sb-ask-send, .sb-cand-save { color: #16161a; }
+}
 </style>

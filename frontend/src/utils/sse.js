@@ -6,7 +6,9 @@
 const SSE_BASE = import.meta.env.VITE_SSE_BASE || ''
 
 // onProgress：分批任务（如长文档摘要的两段式）的进度回调，payload = {done, total}
-export async function streamSSE(url, body, onToken, onDone, onError, onMeta, onProgress) {
+// signal：可选的 AbortSignal（WP17 侧栏订阅要在卸载时断开长连接）。
+//   ⚠️ 长连接（SSE）**必须**能断开：否则每次订阅都在后端留一条不死连接 + 一个订阅者队列。
+export async function streamSSE(url, body, onToken, onDone, onError, onMeta, onProgress, signal) {
   const headers = { 'Content-Type': 'application/json' }
   let resp
   try {
@@ -14,8 +16,11 @@ export async function streamSSE(url, body, onToken, onDone, onError, onMeta, onP
       method: 'POST',
       headers,
       body: JSON.stringify(body),
+      signal,
     })
   } catch (e) {
+    // ⚠️ 主动中断**不是**故障：原样抛 AbortError，调用方据此区分「我关的」与「连不上」
+    if (e && e.name === 'AbortError') throw e
     // 网络层失败（后端没起来 / 被拦截）→ 给出可读提示，不要让它看起来像"卡死"
     throw new Error('无法连接服务，请确认后端已启动后重试')
   }

@@ -86,6 +86,13 @@ export const browserApi = {
   // ⚠️ 不传 selection 时后端取「当前选区」—— 这正是「点网页浮动工具栏」与「点侧栏按钮」
   //    走同一条链的原因：两个入口都只发一个 action，不允许各自维护一套参数。
   selectionAction: (payload) => http.post('/browser/selection/action', payload || {}),
+  // WP17 追问：围绕**当前选区**继续提问。`history` 由前端携带（服务端无状态、不落库）——
+  // 与 ephemeral/explain 同口径：侧栏刷新后不「记得」上一轮是**有意**的（N04）。
+  // ⚠️ 同为**异步**：立刻回来的只是 status="running"，正文仍回 `sidebarPayload` 读。
+  // ⚠️ 追问**不是第四个动作**：它不进后端 ACTION_ORDER（那会打红 WP16 的「工具栏三个按钮」判据）。
+  selectionAsk: (payload) => http.post('/browser/selection/ask', payload || {}),
+  // WP17 流式订阅走 `POST /browser/sidebar/stream`（SSE）—— 用 `utils/sse.js::streamSSE` 发起，
+  // 本对象**不包**它：那条链是「长连接 + 逐事件回调」，与本文件「一发一收」的形状不同。
   // 仅真机 / 验收：让活跃标签重新注入工具栏与桥，并**回读**页面侧真实状态。
   // ⚠️ `ok` 是"我发起了注入"，`probe.has_el` 才是"页面上真有节点" —— 必须分开读，
   //    否则"注入没生效"会给出全绿。

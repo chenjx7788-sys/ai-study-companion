@@ -8,12 +8,18 @@
    原因：数据面在浏览器模式下也能完整验证；UI 动作要碰 Qt 控件，必须经
    `browser_host.call_on_main()` 投递到主线程，那部分（WP13/WP14）单独落。
 """
-from fastapi import APIRouter
-from fastapi.responses import JSONResponse
+import asyncio
+import json
+import queue
+import time
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..services import browser_actions
 from ..services import browser_host
 from ..services import external as external_svc
+from ..services import sidebar_stream
 
 router = APIRouter(prefix="/browser", tags=["browser"])
 
@@ -78,6 +84,8 @@ def open_sidebar(payload: dict | None = None):
     p = payload or {}
     saved = browser_host.set_sidebar_payload(
         url=p.get("url", ""), title=p.get("title", ""), selection=p.get("selection", ""))
+    # WP17：投递新选区 = 一次**权威变更**（结果已被作废）→ 订阅者立刻拉一次
+    sidebar_stream.publish_round(status="idle", reason="open")
     shown, err = browser_host.request_sidebar_show()
     return {"ok": True, "payload_saved": saved, "host_shown": shown, "host_error": err}
 
@@ -91,7 +99,113 @@ def get_sidebar_payload():
 @router.post("/sidebar/clear")
 def clear_sidebar_payload():
     """清空侧栏载荷（侧栏「关闭 / 重新开始」用）。"""
-    return {"ok": True, "cleared": browser_host.clear_sidebar_payload()}
+    cleared = browser_host.clear_sidebar_payload()
+    # WP17：清空同样是**权威变更** —— 不广播的话，订阅者会继续显示已经清掉的内容，
+    # 直到下一轮 1.5s 轮询才纠正（用户看到的是「点了清空，内容闪一下才消失」）。
+    sidebar_stream.publish_round(status="idle", reason="clear")
+    return {"ok": True, "cleared": cleared}
+
+
+# ---------- WP17：侧栏流式订阅（SSE · 只读扇出） ----------
+# ⚠️ 与 `/selection/*` 同款：本段**只在内存里发事件**、不碰 Qt → 浏览器模式下可完整验收。
+# ⚠️⚠️ 本接口是**加速通道**，不是唯一通道。客户端拿不到流时（断开 / 后端未重启 / 404）
+#    必须退回 1.5s 轮询 —— 所以这里**不缓存历史事件、不做 Last-Event-ID 重放**：
+#    漏掉的事件由「拉一次盒子」补，比在后端存一份会漂移的事件日志便宜得多、也不会错。
+# ⚠️ 事件词表只有四个：`token` / `done` / `error` / `meta`（见 `services/sidebar_stream.py`）；
+#    词表外的名字在**发布侧**就被收敛成 `done`，这里不做二次纠正。
+
+SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+def _sse(event: str, payload: dict) -> str:
+    # ⚠️ 与 routers/ai.py / stats.py / podcasts.py 同规格（本项目每个 router 自带一份两行实现；
+    #    不抽公共模块，是为了不让「改一个形状」牵动四条互不相关的链）。
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _sidebar_stream_gen(request: Request):
+    """SSE 生成器：订阅 → 取事件转帧；**`finally` 一定注销**。
+
+    ⚠️⚠️ 必须是 **async 生成器**，不能写成同步生成器 —— 这条是实测出来的，不是风格偏好：
+       starlette 1.6 只在 `spec_version >= 2.4` 时「发送失败即抛 OSError」，而 uvicorn 0.52
+       对外报的是 **2.3** → 走的是**旧路**：`listen_for_disconnect` 与 `stream_response`
+       并发跑，断开时用 **cancel scope 取消整个任务组**。
+       · 同步生成器会被 starlette 包进 `iterate_in_threadpool`：取消发生在**包装层**，
+         命中不了生成器自己的挂起点 → `finally` 要等 **GC** 才跑。实测：断开后 5 秒
+         `subs` 仍是 1，**手动 `gc.collect()` 的瞬间才变 0**。
+         于是「关掉侧栏就释放订阅」实际不成立：泄漏攒到 `MAX_SUBS` 之后新订阅一律 503，
+         流式静默退化成 1.5s 轮询（没有报错、没有日志，极难归因）。
+       · async 生成器把 `await` 放在**自己的帧里** → 取消直接命中该挂起点 → `finally` 立即执行。
+    ⚠️ 另加一道**自己**的断开检测（`request.is_disconnected()`）：它对未来换成 2.4 路径也成立
+       （那时 starlette 不再帮我们取消，只能靠自己或靠发送失败）。
+       两条路任一生效都会注销，不会互相抵消：
+       我们去 `receive()` 抢到 `http.disconnect` → 我们 `break`；
+       starlette 的监听器抢到 → 取消任务组 → 我们的 `finally` 跑。
+    ⚠️ 心跳靠「空闲超时」而不是阻塞 `queue.get(timeout=…)`：阻塞会把线程池线程钉住，
+       而 `await asyncio.sleep()` 的挂起点同时**就是**取消能命中的那个点（一箭双雕）。
+    """
+    try:
+        q = sidebar_stream.subscribe_sidebar_stream()
+    except RuntimeError as e:                    # 订阅名额满（并发重叠 / 泄漏）
+        yield _sse("error", {"message": str(e)})
+        return
+    try:
+        last_hb = time.monotonic()
+        last_probe = time.monotonic()
+        while True:
+            busy = False
+            while True:
+                try:
+                    evt = q.get_nowait()
+                except queue.Empty:
+                    break
+                busy = True
+                yield _sse(evt.pop("event", "done"), evt)
+            now = time.monotonic()
+            if now - last_hb >= sidebar_stream.STREAM_HEARTBEAT_S:
+                last_hb = now
+                # 注释行：`utils/sse.js` 只认 `event:` + `data:`，两者都没有就整条跳过 → 安全
+                yield ": hb\n\n"
+            if now - last_probe >= 1.0:
+                last_probe = now
+                if await request.is_disconnected():
+                    break
+            if not busy:
+                await asyncio.sleep(0.05)
+    finally:
+        sidebar_stream.unsubscribe_sidebar_stream(q)
+
+
+@router.get("/sidebar/stream")
+@router.post("/sidebar/stream")
+async def sidebar_stream_sse(request: Request):
+    """订阅「侧栏盒子在变」（SSE）。**GET 与 POST 都收**。
+
+    ⚠️ 同时收两种方法不是随手加的：GET 是 SSE 惯例（curl / 验收探针直接用），
+       而本项目前端**唯一**的流式入口 `utils/sse.js::streamSSE()` 是 **POST**
+       （20 个调用点全是 POST、带 body）。只支持一种就得改其中一边，
+       而那个 helper 的形状一旦被改，四条互不相关的 AI 链会一起受影响。
+    ⚠️ 订阅名额满是 **503**（资源问题，客户端退避重连即可），**不是** 500（代码故障）。
+    ⚠️ 这里**不写 `ok` 字段**：它是 SSE，响应体不是 JSON —— 塞一个 `ok` 只会让人误以为
+       可以像其它接口那样 `resp.json()`。
+    """
+    if sidebar_stream.subscriber_count() >= sidebar_stream.MAX_SUBS:
+        return JSONResponse(status_code=503,
+                            content={"ok": False, "error": "too_many_streams",
+                                     "detail": "同时订阅数已达上限 %d" % sidebar_stream.MAX_SUBS})
+    return StreamingResponse(_sidebar_stream_gen(request), media_type="text/event-stream",
+                             headers=SSE_HEADERS)
+
+
+@router.get("/sidebar/stream/stats")
+def sidebar_stream_stats():
+    """仅调试/验收：订阅面只读状态（**键恒定**，可逐字比对）。
+
+    ⚠️ 存在的理由：订阅者泄漏的症状是「用一阵子之后开始变慢」，没有这个接口就只能靠
+       进程内存曲线猜。`subs` 必须在侧栏关闭后**回到 0**（`/sidebar/stream` 用的是
+       同步生成器，每个订阅占一个线程池线程）。
+    """
+    return {"ok": True, "stats": sidebar_stream.stream_stats()}
 
 
 # ---------- 浏览器面板控制（WP12/WP13） ----------
@@ -355,6 +469,37 @@ def selection_action(payload: dict | None = None):
         sel = browser_host.selection_state().get("sel") or ""
     return browser_actions.start_action(
         p.get("action", "") or "", sel,
+        url=p.get("url", "") or "", title=p.get("title", "") or "")
+
+
+# ---------- WP17：选区追问（围绕**当前选区**继续问） ----------
+# ⚠️⚠️ 追问**不是第四个动作**：它不进 `ACTION_ORDER` / `ACTION_LABELS`。
+#    那不是「少写一行」的问题 —— 页面侧浮动工具栏是**按 ACTION_ORDER 渲染按钮**的，
+#    多一个 key 就会在**网页里**多出一个「追问」按钮（网页上看不到答案，追问毫无意义），
+#    同时直接打红 WP16「工具栏三按钮 / acts=3」那条判据。
+# ⚠️ 与 `/selection/action` 同款契约：`empty_selection` / `empty_question` → **200 + `ok:false`**
+#    （调用方问题，界面要提示）；异步跑，正文仍去 `/sidebar/payload` 读（按 `gen` 配对）。
+# ⚠️⚠️ 选区来源与动作**有意不同**：动作取「页面上选了什么」（`selection_state()`），
+#    追问取「**侧栏正在显示的那段选区**」（`start_ask` 读盒子）——
+#    追问必须接在「已经给出的那个答案」的同一段文字上，而不是页面上后来新划的一段。
+#    （反过来做的症状是：答案在讲 A，追问却拿 B 去问，答得挺顺但答的不是一件事。）
+
+@router.post("/selection/ask")
+def selection_ask(payload: dict | None = None):
+    """就**当前选区**追问一次；`history` 由前端携带（服务端无状态、不落库）。
+
+    ⚠️ 返回值里**没有 `result`**：此刻只有 `status="running"`。
+       放个空串进去前端会当成「跑完了但没内容」。
+    ⚠️⚠️ 与 `/selection/action` **同款双入口**（缺一不可）：
+       ① 不带 `selection` → 取侧栏盒子里**正在显示**的那段选区（侧栏那个输入框走这条）；
+       ② 带 `selection` → 显式指定（验收脚本 / 别的调用方走这条）。
+       ⚠️ 少了 ② 的症状很隐蔽：`selection` 传了却被**静默忽略**，
+       于是「空选区拦截」这条判据在 HTTP 面上**永远打不出来**（WP17 探针首跑就是这样漏掉的）。
+    """
+    p = payload or {}
+    return browser_actions.start_ask(
+        p.get("question", "") or "", history=p.get("history") or [],
+        selection=p.get("selection", None),
         url=p.get("url", "") or "", title=p.get("title", "") or "")
 
 
