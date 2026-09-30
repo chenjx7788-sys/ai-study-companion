@@ -12,7 +12,47 @@ import webbrowser
 
 from app_version import __version__ as APP_VERSION
 
+# ⚠️⚠️ 控制台编码兜底 —— 必须早于本文件**任何**一句中文 print（也早于 import app.main）。
+#
+# 打包版是窗口模式（AIStudyCompanion.spec 的 console=False）。当 stdout/stderr 被重定向、
+# 而目标编码不是 UTF-8 时（英文 Windows 的 ANSI 代码页是 cp1252），第一句中文 print
+# 就抛 UnicodeEncodeError。2026-09-30 CI 实测（Build Windows #6，注解原文）：
+#
+#   File "launcher.py", line 79, in _ensure_models
+#   UnicodeEncodeError: 'charmap' codec can't encode characters in position 11-13
+#   During handling of the above exception, another exception occurred:
+#   File "launcher.py", line 81, in _ensure_models    ← except 分支里**还有一句**中文 print
+#
+# 于是：第一句崩 → 被 except 接住 → except 里那句又崩 → 异常逃出 main()，
+# 应用**永远起不来**，外部只看到「90s 没响应」。中文 Windows（cp936）编得出中文、
+# macOS 是 UTF-8，所以本机与 mac 一直是绿的 —— 这是只在英文环境下才现形的缺陷。
+#
+# 这里是**单点修复**：一次 reconfigure 覆盖本进程后续所有输出，包括
+# `from app.main import app` 之后 app/ 里那些中文 print（如 main.py 的 chroma 重建日志、
+# webview_js.py 的 emoji）。只改**输出编码**，不动任何业务行为；
+# errors="replace" 保证即便目标仍不支持 UTF-8，也只会显示成问号而不是把应用打死。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 PORT = int(os.environ.get("ASC_PORT", "8000"))
+
+
+def _safe_print(msg: str) -> None:
+    """打印**绝不允许**打死应用。
+
+    兜底一：窗口模式且没有重定向时 sys.stdout 可能是 None（print 本就是 no-op）。
+    兜底二：万一上面的 reconfigure 没生效（stdout 不是可 reconfig 的 TextIOWrapper），
+            print 仍可能抛 UnicodeEncodeError —— 而这里处在启动关键路径上，
+            抛出去就等于「应用起不来」。见 _ensure_models 里 2026-09-30 的那次事故。
+    """
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
+
 
 # 启动 loading 页：内联 HTML，不依赖后端。窗口先显示它，前端轮询 /api/health 就绪后自动跳转主页。
 LOADING_HTML = """<!DOCTYPE html>
@@ -76,9 +116,12 @@ def _ensure_models():
         if src.exists() and not (dst / "model.onnx").exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(src, dst)
-            print("[launcher] 已预置 BGE 向量模型")
+            _safe_print("[launcher] 已预置 BGE 向量模型")
     except Exception as e:
-        print(f"[launcher] 预置模型失败（将走自动下载）：{e}")
+        # ⚠️ 这里**必须**用 _safe_print：本分支原本是 print，而当年触发它的那次异常
+        #    正是「上一句 print 编不出中文」—— 于是 except 里的 print 二次崩溃，
+        #    异常逃出 main()，应用永远起不来（Build Windows #6）。
+        _safe_print("[launcher] 预置模型失败（将走自动下载）：%s" % e)
 
 
 def _open_browser():
