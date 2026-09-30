@@ -88,6 +88,7 @@ jobs:
           path: |
             backend/dist/size_report_win.txt
             backend/dist/smoke_backend_stdout.txt
+            backend/dist/smoke_data/**
             backend/dist/build_log.txt
             backend/dist/failure.txt
             backend/dist/step_logs/*.log
@@ -96,7 +97,12 @@ jobs:
       # 没有仓库 admin 权限时拉不到 job 日志（GET /actions/runs/{id}/logs → 403），
       # 所以把失败报告**回显到日志里**，并用 ::error:: 写一条 check-run 注解
       # （公开仓库的 annotations 无需鉴权即可读）——两条通道总有一条能拿到。
-      - name: 失败时回显 failure.txt
+      #
+      # ⚠️⚠️ smoke_backend_stdout.txt 是**唯一的根因通道**：打包版 console=False
+      #   （窗口模式），启动期崩溃时 PyInstaller 弹模态框把进程挂住、不退出也不监听，
+      #   而窗口模式下 sys.stdout/stderr 只能在被重定向时落进这个文件。
+      #   实测：Build #5 崩在这一步，但当时没回显它，报告里只剩「90s 没响应」。
+      - name: 失败时回显 failure.txt 与冒烟输出
         if: failure()
         shell: bash
         run: |
@@ -105,6 +111,18 @@ jobs:
             cat backend/dist/failure.txt
           else
             echo "（未生成 failure.txt —— 失败发生在脚本启动之前）"
+          fi
+          echo ""
+          if [ -f backend/dist/smoke_backend_stdout.txt ]; then
+            echo "========== backend/dist/smoke_backend_stdout.txt =========="
+            cat backend/dist/smoke_backend_stdout.txt
+          else
+            echo "（未生成 smoke_backend_stdout.txt —— 没走到冒烟这一步）"
+          fi
+          echo ""
+          if [ -f backend/dist/smoke_data/launcher_backend.log ]; then
+            echo "========== backend/dist/smoke_data/launcher_backend.log =========="
+            tail -60 backend/dist/smoke_data/launcher_backend.log
           fi
 
       - name: 上传打包产物（artifact）

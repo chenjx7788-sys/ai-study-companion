@@ -46,9 +46,9 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
-import tempfile
 import time
 import traceback
 import urllib.request
@@ -63,6 +63,19 @@ BUILD_DIR = BACKEND_DIR / "build"
 STEP_LOG_DIR = DIST_DIR / "step_logs"
 BUILD_LOG = DIST_DIR / "build_log.txt"
 FAILURE_REPORT = DIST_DIR / "failure.txt"
+# 冒烟用的隔离数据目录 + 应用原始输出。
+# ⚠️⚠️ 必须放在 DIST_DIR 下（**不能**用 tempfile.mkdtemp）：打包版是窗口模式
+#   （AIStudyCompanion.spec 里 console=False，第 181 行），启动期崩溃时 PyInstaller
+#   会弹一个「Unhandled exception in script」模态框**把进程挂住** —— 进程不退出、
+#   也不监听端口，冒烟只能耗尽超时；而 temp 目录会随进程/清理一起消失，等于零证据。
+#   2026-09-30 本机实测：故意让 ASC_PORT 非数字 → 模态框挂 20s+ 不休、端口始终未监听、
+#   但 traceback 确实写进了被重定向的 stdout（144 B）。所以这份输出是唯一的根因通道。
+SMOKE_DATA_DIR = DIST_DIR / "smoke_data"
+SMOKE_STDOUT = DIST_DIR / "smoke_backend_stdout.txt"
+# 冒烟等 /api/health 的上限。本机（Defender 有缓存）实测 6.3s；runner 是冷环境。
+SMOKE_TIMEOUT = 90
+# 冒烟期间打印「阶段探针」的间隔（进程/端口/落盘进度）
+SMOKE_PROBE_EVERY = 15
 MODEL_REL = Path("data") / "models" / "bge-small-zh-v1.5"
 MODEL_DIR = BACKEND_DIR / MODEL_REL
 APP_NAME = "AIStudyCompanion"
@@ -135,6 +148,35 @@ def step(title: str) -> None:
     log("=" * 72)
     log(title)
     log("=" * 72)
+
+
+def _evidence_lines(path: Path) -> list:
+    """读一个证据文件，返回「头 HEAD_LINES 行 + 省略标记 + 尾 TAIL_LINES 行」。
+
+    ⚠️ 只取尾部是不够的：窗口模式（console=False）下 PyInstaller 的崩溃 traceback
+       只有 3 行（Traceback / File / ValueError），而启动期的进度输出可能很长 ——
+       只留尾部就会把 traceback 挤掉。
+    """
+    all_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if len(all_lines) <= HEAD_LINES + TAIL_LINES:
+        return all_lines
+    return (all_lines[:HEAD_LINES]
+            + ["  …（中间省略 %d 行）…" % (len(all_lines) - HEAD_LINES - TAIL_LINES)]
+            + all_lines[-TAIL_LINES:])
+
+
+def _dump_evidence(label: str, path: Path) -> None:
+    """把证据文件的头尾打进日志（文件不存在也明确说一声，免得误以为「没输出」）。"""
+    try:
+        if not path.exists():
+            log("%s：%s（不存在）" % (label, path.name))
+            return
+        shown = _evidence_lines(path)
+        log("%s：%s（共 %d 字节）" % (label, path.name, path.stat().st_size))
+        for line in shown:
+            log("  | " + line)
+    except Exception as exc:  # noqa: BLE001
+        log("%s：%s 读取失败（%s）" % (label, path.name, exc))
 
 
 # ── 失败证据 ────────────────────────────────────────────────────────────────
@@ -263,6 +305,25 @@ def report_failure(exc: BaseException) -> None:
             lines.extend("".join(tb).splitlines())
             brief.append("—— 回溯 · 尾部 ——")
             brief.extend("".join(tb).splitlines()[-TAIL_LINES:])
+
+        # ── 应用侧证据：**与异常类型无关，永远带上** ────────────────────────
+        # ⚠️⚠️ 打包版是窗口模式（console=False）。启动期崩溃时 PyInstaller 弹
+        #   「Unhandled exception in script」模态框、**进程不退出也不监听端口**，
+        #   traceback 只落进 SMOKE_STDOUT。此前 SystemExit 分支只发回溯，于是
+        #   失败报告里只剩「90s 没响应」这种没有信息量的结论（实测 Build #5 踩过）。
+        for _label, _p in (("应用 stdout/stderr", SMOKE_STDOUT),
+                           ("launcher 落盘日志", SMOKE_DATA_DIR / "launcher_backend.log")):
+            if not _p.exists():
+                continue
+            try:
+                _ev = _evidence_lines(_p)
+            except Exception:  # noqa: BLE001
+                continue
+            lines.append("")
+            lines.append("—— %s（%s，共 %d 字节）——" % (_label, _p.name, _p.stat().st_size))
+            lines.extend(_ev)
+            brief.append("—— %s · 尾部 ——" % _label)
+            brief.extend(_ev[-TAIL_LINES:])
 
         body = "\n".join(lines)
         try:
@@ -407,6 +468,15 @@ def http_health_ok(port: int, timeout: float = 3.0) -> bool:
         return False
 
 
+def port_listening(port: int, timeout: float = 1.0) -> bool:
+    """TCP 层能不能连上。用来区分「后端还没起来」与「根本没在听」。"""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
 # =============================================================================
 def main() -> int:
     version = read_version()
@@ -474,10 +544,16 @@ def main() -> int:
         log("  [WARN] SKIP_SMOKE=1 —— 本次**没有**验证包能不能起来")
     else:
         smoke_port = int(os.environ.get("SMOKE_PORT", "8127"))
-        smoke_out = DIST_DIR / "smoke_backend_stdout.txt"
+        smoke_out = SMOKE_STDOUT
         # 四个 ASC_* 一起隔离（照 backend/scripts/smoke_native_shell.py 的做法）：
         # 只设 ASC_DATA_DIR 的话，材料文件仍会落进 runner 的用户目录。
-        data_dir = Path(tempfile.mkdtemp(prefix="asc_ci_smoke_"))
+        # ⚠️⚠️ 用固定目录而非 tempfile.mkdtemp：进程崩溃时（窗口模式会**挂着不退**）
+        #    这份数据目录是唯一还能看出「卡在哪一步」的东西，必须留在 DIST_DIR 里
+        #    被 diag artifact 收走。SMOKE_DATA_DIR 不在 APP_DIR 内，不会进 zip。
+        DIST_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(SMOKE_DATA_DIR, ignore_errors=True)
+        SMOKE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        data_dir = SMOKE_DATA_DIR
         # ⚠️ 必须走 child_env()：应用本身是中文的，在没有 PYTHONIOENCODING 的
         #    cp1252 环境下，它自己 print 中文就会崩在启动阶段（表现成「冒烟失败」），
         #    而且输出文件会被写成 cp1252 字节 —— 我们按 utf-8 读就成了乱码证据。
@@ -496,8 +572,20 @@ def main() -> int:
                                     stdout=fh, stderr=subprocess.STDOUT)
         log("  已启动：pid=%d port=%d（输出 → %s）" % (proc.pid, smoke_port, smoke_out))
 
+        def smoke_probe() -> str:
+            """父进程侧能看到的三件事：进程活着吗 / 端口在听吗 / 应用读到第几步了。"""
+            rc = proc.poll()
+            return "进程=%s；端口=%s；app.db=%s；chroma=%s" % (
+                ("已退出 rc=%s" % rc) if rc is not None else "存活",
+                "监听中" if port_listening(smoke_port) else "未监听",
+                "有" if (data_dir / "app.db").exists() else "无",
+                "有" if (data_dir / "chroma").exists() else "无")
+
         ok = False
-        deadline = time.time() + 90
+        crashed = False
+        t0 = time.time()
+        deadline = t0 + SMOKE_TIMEOUT
+        nxt_probe = t0 + SMOKE_PROBE_EVERY
         while time.time() < deadline:
             if http_health_ok(smoke_port):
                 ok = True
@@ -505,23 +593,36 @@ def main() -> int:
             if proc.poll() is not None:
                 log("  [!!] 进程已退出（退出码 %s）" % proc.returncode)
                 break
+            # ⚠️⚠️ 窗口模式（console=False）崩溃时 PyInstaller 弹模态框**把进程挂住**：
+            #    进程既不退出、也不监听端口 → 光看 poll() 永远判不出来，只能等满超时。
+            #    所以这里主动读一眼应用输出：出现 Traceback 就是启动期崩了，立刻收手。
+            try:
+                if smoke_out.exists() and b"Traceback (most recent call last)" in smoke_out.read_bytes():
+                    crashed = True
+                    log("  [!!] 应用启动期崩溃：输出里出现 Traceback（模态框把进程挂住了）")
+                    break
+            except Exception:  # noqa: BLE001 — 读不到不该把冒烟本身弄挂
+                pass
+            if time.time() >= nxt_probe:
+                log("  t=%3.0fs %s" % (time.time() - t0, smoke_probe()))
+                nxt_probe += SMOKE_PROBE_EVERY
             time.sleep(1)
 
         # 只结束本次启动的进程树（/T 连带 uvicorn 子进程）；不碰 runner 上别的进程
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                        capture_output=True)
-        log("  冒烟用时与结果：%s" % ("通过" if ok else "失败"))
+        log("  冒烟用时 %.1fs，结果：%s（%s）"
+            % (time.time() - t0, "通过" if ok else "失败", smoke_probe()))
 
         if not ok:
-            log("  --- 应用输出尾部（完整文件：%s）---" % smoke_out)
-            try:
-                tail = smoke_out.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]
-                for line in tail:
-                    log("  | " + line)
-            except Exception as exc:  # noqa: BLE001
-                log("  （读取输出失败：%s）" % exc)
-            raise SystemExit("[ERROR] 冒烟失败：后端未在 90s 内响应 /api/health"
-                             "（打包产物可能缺原生库）")
+            _dump_evidence("  应用输出", smoke_out)
+            _dump_evidence("  launcher 落盘日志", data_dir / "launcher_backend.log")
+            log("  data_dir 内容：%s" % sorted(
+                str(p.relative_to(data_dir)) for p in data_dir.rglob("*")))
+            raise SystemExit(
+                "[ERROR] 冒烟失败：%s（%s；崩溃=%s；完整输出见 %s）"
+                % ("应用启动期崩溃" if crashed else "后端未在 %ds 内响应 /api/health" % SMOKE_TIMEOUT,
+                   smoke_probe(), crashed, smoke_out.name))
         log("  冒烟通过：/api/health 正常响应")
 
     # ── [5/5] zip + 守卫 ─────────────────────────────────────────────────
