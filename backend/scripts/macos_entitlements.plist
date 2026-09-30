@@ -10,17 +10,32 @@
     - 下面这些授权全是**针对 hardened runtime 的豁免**，没有 hardened runtime 时
       它们不起作用，传了只会引入一个「CI 上从没验证过」的签名形态。
 
-  【为什么必须存在这份文件】
-  hardened runtime 默认禁止 JIT 与可写可执行内存。QtWebEngine 的渲染进程是 Chromium，
-  V8 必须 JIT —— 不开豁免的话，用户那边表现为**窗口打开、内容白屏**（渲染进程被内核拒了），
-  而签名与公证**都会通过**，CI 全绿。这是那种「验证全过、产品是坏的」的失败形态，
-  所以必须在启用真身份的同时把这份文件一起带上。
+  【⚠️ 2026-09-22：产品侧已不内嵌 Chromium，这份文件为何仍**原样保留**】
+  当初引入这份文件的直接动因是 QtWebEngine：它的渲染进程就是 Chromium，V8 必须 JIT，
+  hardened runtime 不豁免就表现为「窗口打开、内容白屏」（渲染进程被内核拒掉），
+  而**签名与公证都会通过、CI 全绿** —— 那种「验证全过、产品是坏的」形态。
 
-  各项理由：
-    allow-jit                          V8 需要可执行内存页（Chromium 渲染进程的硬需求）
-    allow-unsigned-executable-memory   部分 JIT 路径仍走 unsigned 内存
-    allow-dyld-environment-variables   Qt 插件/框架在包内按相对路径加载
-    disable-library-validation         PyInstaller 把 Qt 框架放在 .app 内非标准位置，
+  AI 浏览器下线后，macOS 外壳回到 cocoa(WKWebView)：渲染发生在**系统** WebKit 的
+  独立进程里，应用自身不需要 JIT ⇒ 理论上前两条（allow-jit /
+  allow-unsigned-executable-memory）已可去掉。
+
+  但仍然**原样保留**，理由是「便宜且无法验证」：
+    · entitlements 是**权限**（放行），不是约束 —— 授予一条用不到的权限没有副作用，
+      也不构成公证被拒的理由；
+    · 删它们只能等真机 macOS + 真 Developer ID 跑一次「签名 + 公证 + 起窗口」才算
+      验证过，而本仓库没有 macOS 机器（`macosx_13_0` 那条路至今未实测）。
+      ⇒ 在没有证据的情况下改一个**发得出去/发不出去**的签名形态，风险大于收益。
+    · 后两条仍有现实理由：PyInstaller 把大量 `.dylib` / `.so` 放在 .app 内的非标准
+      位置，由 Python 用 dlopen 加载（onnxruntime / ctranslate2 / cv2 / chromadb …）。
+
+  ⇒ 决策：**先不动**。等真机上验证过「去掉前两条后仍能起窗口」，再删 —— 那是一次
+     有证据的改动，而不是一次猜测。
+
+  各项理由（保留现状时的说明）：
+    allow-jit                          V8 需要可执行内存页（**已无内嵌 Chromium**，暂留）
+    allow-unsigned-executable-memory   部分 JIT 路径走 unsigned 内存（同上，暂留）
+    allow-dyld-environment-variables   包内 .dylib/.so 按相对路径加载
+    disable-library-validation         PyInstaller 把二进制放在 .app 内非标准位置，
                                        库校验会拒绝加载（不豁免 → 启动即崩）
 -->
 <plist version="1.0">

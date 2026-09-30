@@ -269,12 +269,15 @@ def ask_stream(req: AskReq, db: Session = Depends(get_db)):
     # 用户显式指定了资料/笔记 = 强意图：不做任何分数过滤（向量分可为负，阈值滤会误杀），
     # 指定内容必被引用；未指定时才用阈值过滤，避免无关内容注入
     _threshold = float(settings_store.load().get("kb_hit_threshold", settings.kb_hit_threshold))
-    # 阈值过滤：全文精确命中（关键词命中即相关）或向量分达标者保留；
-    # 指定条目仍不过滤（强意图必引用）
+    # 阈值过滤：全文精确命中（关键词命中即相关）或实体命中（命中了实体名）或
+    # 向量分达标者保留；指定条目仍不过滤（强意图必引用）。
+    # 实体命中即相关：question 直接匹配到实体名，等价于「精确关联」，不该被向量阈值误杀。
     if specified:
         filtered = hits
     else:
-        filtered = [h for h in hits if h.get("from_fts") or (h.get("vec_score") or 0.0) >= _threshold]
+        filtered = [h for h in hits
+                    if h.get("from_fts") or h.get("from_entity")
+                    or (h.get("vec_score") or 0.0) >= _threshold]
     if summary_hit:
         filtered = [summary_hit] + filtered
     kb_hit = bool(filtered)
@@ -334,7 +337,9 @@ def ask_stream(req: AskReq, db: Session = Depends(get_db)):
                     full += text
                     yield f"event: token\ndata: {json.dumps({'t': text}, ensure_ascii=False)}\n\n"
         except Exception as e:
-            yield f"event: error\ndata: {json.dumps({'message': str(e)[:200]}, ensure_ascii=False)}\n\n"
+            # 取 detail（HTTPException 时为纯文案），避免 `str(e)` 带出 "400: "/"502: " 状态码前缀
+            msg = str(getattr(e, "detail", None) or e)
+            yield f"event: error\ndata: {json.dumps({'message': msg[:200]}, ensure_ascii=False)}\n\n"
             return
         # 回答完成 → 生成 3 个相关问题（问答内容驱动，失败不阻塞）
         suggestions = llm.generate_suggestions(question, full)

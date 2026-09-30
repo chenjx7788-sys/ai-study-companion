@@ -5,6 +5,31 @@
 // 即静默打错目标。如需覆盖可用 VITE_SSE_BASE。
 const SSE_BASE = import.meta.env.VITE_SSE_BASE || ''
 
+// 「未配置模型」信号（与 api/http.js 的 NEED_SETUP 一致）：命中时弹「中文原因 + 前往配置」引导
+const NEED_SETUP = '[NEED_SETUP]'
+function guideSetup(message) {
+  if (!message || typeof message !== 'string' || !message.includes(NEED_SETUP)) return false
+  const reason = message.replace(NEED_SETUP, '').replace(/^\d{3}:\s*/, '').trim() || '尚未配置可用的 AI 模型'
+  import('element-plus').then(({ ElMessage }) => {
+    ElMessage({
+      type: 'warning',
+      duration: 8000,
+      message: (() => {
+        const span = document.createElement('span')
+        span.innerHTML = reason + '，'
+        const a = document.createElement('a')
+        a.textContent = '前往配置'
+          a.href = '/settings'
+          a.style.cssText = 'color:#409eff;cursor:pointer;text-decoration:underline;font-weight:600'
+          a.onclick = (ev) => { ev.preventDefault(); window.location.href = '/settings' }
+        span.appendChild(a)
+        return span
+      })(),
+    })
+  })
+  return true
+}
+
 // onProgress：分批任务（如长文档摘要的两段式）的进度回调，payload = {done, total}
 // signal：可选的 AbortSignal（WP17 侧栏订阅要在卸载时断开长连接）。
 //   ⚠️ 长连接（SSE）**必须**能断开：否则每次订阅都在后端留一条不死连接 + 一个订阅者队列。
@@ -26,7 +51,10 @@ export async function streamSSE(url, body, onToken, onDone, onError, onMeta, onP
   }
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}))
-    throw new Error(err.detail || `请求失败 ${resp.status}`)
+    const detail = err.detail || `请求失败 ${resp.status}`
+    const e = new Error(detail)
+    e.needSetup = guideSetup(detail)   // HTTP 层未配置：命中则已弹引导，调用方据此跳过自身 error 提示
+    throw e
   }
   const reader = resp.body.getReader()
   const decoder = new TextDecoder()
@@ -45,7 +73,16 @@ export async function streamSSE(url, body, onToken, onDone, onError, onMeta, onP
       const payload = JSON.parse(dataLine)
       if (ev === 'token') onToken?.(payload.t)
       else if (ev === 'done') onDone?.(payload)
-      else if (ev === 'error') onError?.(payload.message)
+      else if (ev === 'error') {
+        // 未配置模型：额外弹「前往配置」引导；仍回调 onError（剥掉信号前缀）以保证调用方复位 loading
+        const msg = payload.message || ''
+        if (msg.includes(NEED_SETUP)) {
+          guideSetup(msg)
+          onError?.(msg.replace(NEED_SETUP, ''))
+        } else {
+          onError?.(msg)
+        }
+      }
       else if (ev === 'meta') onMeta?.(payload)
       else if (ev === 'progress') onProgress?.(payload)
     }

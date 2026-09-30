@@ -22,8 +22,10 @@ jobs:
             arch: x86_64
             label: Intel
     runs-on: ${{ matrix.os }}
-    # 阶段 1 起本 job 多了两步真机动作：逐个 Mach-O 签名 + 逐项验证（Qt 的嵌套 bundle 很多），
-    # 以及原生外壳冒烟（90s 上限）。60 分钟的余量不足以覆盖「打包慢 + 签名慢」同时发生。
+    # 阶段 1 起本 job 多了两步真机动作：逐个 Mach-O 签名 + 逐项验证，以及原生外壳冒烟（90s 上限）。
+    # 60 分钟的余量不足以覆盖「打包慢 + 签名慢」同时发生。
+    # ⚠️ 2026-09-22（AI 浏览器下线）：包内不再有 PySide6（324.5 MB、数百个嵌套 bundle），
+    #    打包与签名都会快很多；90 分钟先原样保留当余量，等下一轮拿到真实耗时可下调。
     timeout-minutes: 90
     # 允许 GITHUB_TOKEN 创建 release（默认只读，否则 softprops/action-gh-release 报 "Resource not accessible by integration"）
     permissions:

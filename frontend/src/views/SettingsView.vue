@@ -137,6 +137,14 @@
             修改后对「新上传 / 重试解析」的材料生效；仅调分块参数时点上方「一键重建全部索引」即可生效，无需重新解析
           </div>
         </el-form-item>
+        <el-form-item label="知识图谱">
+          <el-checkbox v-model="autoExtractEntities">导入材料后自动生成知识图谱</el-checkbox>
+          <div class="kg-hint">
+            <div class="field-hint">开启后每份材料会调用大模型抽取实体与关系（消耗 token）。</div>
+            <div class="field-hint">关闭时仍可在「知识库 → 按材料」对单份材料点「生成图谱」按需生成；</div>
+            <div class="field-hint">材料重试解析时若内容未变化，会自动跳过抽取、不重复消耗 token</div>
+          </div>
+        </el-form-item>
         <el-form-item style="margin-top: 12px">
           <el-button type="primary" :loading="saving" @click="save()">保存</el-button>
         </el-form-item>
@@ -334,18 +342,6 @@
         </el-upload>
       </div>
       <p class="storage-tip">数据目录：{{ storage.data_dir }}（恢复前会自动备份当前数据，可随时回滚）</p>
-      <!-- WP18 · N04：AI 浏览器的浏览数据（登录态 Cookie / 缓存 / 页内历史）一键清除 -->
-      <el-divider />
-      <div class="storage-row">
-        <el-button type="warning" plain data-role="clear-browsing-data"
-                   :loading="clearingBrowsing" @click="clearBrowsingData">
-          清除浏览数据（AI 浏览器）
-        </el-button>
-      </div>
-      <p class="storage-tip" data-role="browsing-privacy-note">
-        {{ browsingPrivacyNote || '浏览历史不落库；页面内容不上传第三方；登录态与 Cookie 仅存本机数据目录，可一键清除。' }}
-        清除后，知乎等站点需要重新登录；你的材料、笔记与设置不受影响。
-      </p>
     </el-card>
       </el-tab-pane>
 
@@ -386,6 +382,56 @@
       <el-empty v-else description="暂无调用记录（配置 Key 后使用 AI 功能即开始统计）" :image-size="60" />
     </el-card>
       </el-tab-pane>
+
+      <el-tab-pane label="浏览器扩展" name="ext">
+      <el-card class="set-card" shadow="never">
+      <template #header>
+        <div class="card-head">
+          <span>浏览器扩展</span>
+          <span class="card-head-tip">网页划词，随时调用本机 AI</span>
+        </div>
+      </template>
+
+      <div class="ext-steps">
+        <div class="ext-step">
+          <span class="ext-step-no">1</span>
+          <div class="ext-step-main">
+            <div class="ext-step-title">下载并安装扩展</div>
+            <div class="ext-step-desc">下载 zip 并解压 → 浏览器打开 <code>chrome://extensions</code>
+              （Edge 用 <code>edge://extensions</code>）→ 打开「开发者模式」→「加载已解压的扩展程序」
+              → 选中解压出的 ZhiYing-Extension 文件夹</div>
+            <div class="ext-step-action">
+              <el-button type="primary" @click="downloadExt">下载扩展</el-button>
+            </div>
+          </div>
+        </div>
+
+        <div class="ext-step">
+          <span class="ext-step-no">2</span>
+          <div class="ext-step-main">
+            <div class="ext-step-title">复制配对令牌</div>
+            <div class="ext-token-row">
+              <el-input v-model="extToken" readonly class="ext-token-input" placeholder="令牌加载中…" />
+              <el-button @click="copyExtToken">复制</el-button>
+              <el-button text @click="regenExtToken">重新生成</el-button>
+            </div>
+          </div>
+        </div>
+
+        <div class="ext-step">
+          <span class="ext-step-no">3</span>
+          <div class="ext-step-main">
+            <div class="ext-step-title">在扩展里完成配对</div>
+            <div class="ext-step-desc">右键浏览器工具栏里的扩展图标 →「选项」→ 粘贴令牌；
+              「主应用地址」保持 <code>http://127.0.0.1:8000</code>（改过启动端口才需同步改）
+              → 保存 → 点「测试连接」</div>
+          </div>
+        </div>
+      </div>
+
+      <p class="ext-note">主应用需保持运行；扩展不联网，只和本机主应用通信。</p>
+    </el-card>
+      </el-tab-pane>
     </el-tabs>
   </div>
 </template>
@@ -395,7 +441,7 @@ import { reactive, ref, computed, onMounted } from 'vue'
 import { Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { useRouter, useRoute } from 'vue-router'
-import { settingsApi, browserApi } from '../api'
+import { settingsApi } from '../api'
 import http from '../api/http'
 import { useAsr } from '../composables/useAsr'
 import PageHead from '../components/PageHead.vue'
@@ -430,7 +476,7 @@ function maybeGuideAfterSetup() {
   localStorage.setItem(SETUP_DONE_KEY, '1')
   ElNotification({
     title: '模型已就绪 🎉',
-    message: '现在去导入第一份材料，开始你的 AI 伴学 · 点此前往材料库',
+    message: '现在去导入第一份材料，开始你的知萤之旅 · 点此前往材料库',
     type: 'success',
     duration: 9000,
     onClick: () => router.push('/'),
@@ -595,6 +641,9 @@ const threshold = ref(0.15)
 const chunkSize = ref(700)
 const chunkOverlap = ref(100)
 const cleanSwitches = reactive({ header_footer: true, watermark: true, garbled: true, dedup: true })
+// 知识图谱：导入材料后自动抽取实体（默认关——每次抽取调 LLM 耗 token，成本主动权交给用户；
+// 关闭时仍可在知识库页对单份材料手动点「生成图谱」）
+const autoExtractEntities = ref(false)
 const asrModelSize = ref('')   // 语音模型默认转写版本：''=自动，'small'/'base'=强制
 const calibrating = ref(false)
 const calibResult = ref('')
@@ -625,6 +674,7 @@ const promptFields = [
   { key: 'prompt_review', label: '复习出题', desc: '从笔记生成自测卡片（保留 JSON 输出格式说明）', category: 'study' },
   { key: 'prompt_suggest', label: '相关问题推荐', desc: '问答回答后生成 3 个追问建议（保留 JSON 数组格式）', category: 'study' },
   { key: 'prompt_quiz', label: '测一测出题', desc: '基于资料核心内容生成测试题（保留 JSON 数组格式）', category: 'study' },
+  { key: 'prompt_learn_note', label: '简单学 · 学习讲义', desc: '把材料转译成结构化学习笔记（必记要点 / 逐章转译 / 三点小结 / 重点加权）。出题复用「测一测出题」模板', category: 'study' },
   { key: 'prompt_note_rewrite', label: '文本改写', desc: '改写选中文字或整条内容（笔记 / 材料文本共用，更通顺/专业/简洁）', category: 'note' },
   { key: 'prompt_note_expand', label: '文本扩写', desc: '补充背景/例子/细节，展开要点（笔记 / 材料文本共用）', category: 'note' },
   { key: 'prompt_note_summarize', label: '文本总结', desc: '提炼压缩为精炼要点（笔记 / 材料文本共用）', category: 'note' },
@@ -638,7 +688,7 @@ const promptFields = [
 ]
 const prompts = reactive({
   prompt_summary: '', prompt_keywords: '', prompt_explain: '',
-  prompt_kb_qa: '', prompt_general: '', prompt_review: '', prompt_suggest: '', prompt_quiz: '',
+  prompt_kb_qa: '', prompt_general: '', prompt_review: '', prompt_suggest: '', prompt_quiz: '', prompt_learn_note: '',
   prompt_note_rewrite: '', prompt_note_expand: '', prompt_note_summarize: '', prompt_note_continue: '',
 })
 const promptDefaults = reactive({})
@@ -698,45 +748,6 @@ function fillDefault(key) {
 const storage = reactive({ files_mb: 0, db_mb: 0, chroma_mb: 0, data_dir: '' })
 const backingUp = ref(false)
 
-// WP18 · N04：清除浏览数据（AI 浏览器的登录态 Cookie / 缓存 / 页内历史）。
-// ⚠️ 文案 `browsingPrivacyNote` 优先取后端 /browser/privacy 的 cookie_note ——
-//    口径单一来源在后端，前端不自己另写一份（本项目反复强调的形态）。
-const clearingBrowsing = ref(false)
-const browsingPrivacyNote = ref('')
-
-async function loadBrowsingPrivacy() {
-  try {
-    const { data } = await browserApi.privacy()
-    if (data && data.cookie_note) browsingPrivacyNote.value = data.cookie_note
-  } catch { /* 静默：文案有兜底，接口失败不影响设置页其余功能 */ }
-}
-
-async function clearBrowsingData() {
-  try {
-    await ElMessageBox.confirm(
-      '将清除 AI 浏览器的登录态（Cookie）、缓存与页面历史。清除后知乎等站点需要重新登录；材料、笔记与设置不受影响。',
-      '清除浏览数据', { type: 'warning', confirmButtonText: '清除', cancelButtonText: '取消' })
-  } catch { return }   // 用户取消
-  clearingBrowsing.value = true
-  try {
-    const { data } = await browserApi.clearData()
-    if (data && data.ok) {
-      const c = data.cleared || {}
-      const parts = []
-      if (c.cookies) parts.push('登录态')
-      if (c.http_cache) parts.push('缓存')
-      if (c.histories) parts.push(`${c.histories} 份页面历史`)
-      ElMessage.success('已清除浏览数据' + (parts.length ? `（${parts.join('、')}）` : ''))
-    } else {
-      ElMessage.error('清除失败：' + ((data && data.error) || '未知原因'))
-    }
-  } catch (e) {
-    // 浏览器模式（无原生窗口）时后端回 503 → 如实告知，不假报成功
-    ElMessage.warning('当前环境没有浏览器面板可清理（浏览器模式下无需此操作）')
-  } finally {
-    clearingBrowsing.value = false
-  }
-}
 
 async function loadStorage() {
   const { data } = await http.get('/settings/storage')
@@ -763,8 +774,8 @@ const usage = reactive({ today: { _total: { calls: 0, tokens: 0 } }, all: { _tot
 
 // Token 统计业务展示顺序（按业务流），未收录的新 kind 自动排在最后
 const KIND_ORDER = ['summary', 'section_summary', 'keywords', 'explain', 'ask', 'transform',
-                    'chat', 'suggest', 'review', 'quiz', 'stats_report',
-                    'podcast_brief', 'podcast_script']
+                    'chat', 'suggest', 'review', 'quiz', 'learn_note', 'stats_report',
+                    'podcast_brief', 'podcast_script', 'knowledge_graph']
 const usageKinds = computed(() => {
   const { _total, ...rest } = usage.all
   const ordered = {}
@@ -780,7 +791,9 @@ const kindLabel = (k) => ({
   summary: '摘要', section_summary: '分章总结', keywords: '知识点',
   explain: '解读/追问', ask: '材料提问', transform: '文本加工',
   chat: '问答', suggest: '追问建议', review: '复习出题', quiz: '测一测',
+  learn_note: '简单学',
   stats_report: '学习报告', podcast_brief: '播客简报', podcast_script: '播客脚本',
+  knowledge_graph: '知识图谱',
 }[k] || k)
 const fmtTokens = (n) => n >= 10000 ? (n / 10000).toFixed(1) + 'w' : (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n))
 
@@ -808,6 +821,68 @@ async function onRestore({ file }) {
   }
 }
 
+// 浏览器扩展配对令牌（GET /api/ext/token 免 token，仅本页展示用；跨站网页被 Sec-Fetch-Site 防护拦）
+const extToken = ref('')
+async function loadExtToken() {
+  try {
+    const { data } = await http.get('/ext/token')
+    extToken.value = data.token || ''
+  } catch (e) {
+    extToken.value = ''
+  }
+}
+async function downloadExt() {
+  // blob 下载：window.open 在桌面壳（WebView2）里不一定触发保存；这条路径两处都稳
+  try {
+    const resp = await http.get('/ext/download', { responseType: 'blob' })
+    const url = URL.createObjectURL(resp.data)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'ZhiYing-Extension.zip'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    ElMessage.success('扩展 zip 已开始下载，解压后按第 1 步说明安装')
+  } catch (e) {
+    const status = e && e.response && e.response.status
+    if (status === 404) {
+      ElMessage.error('主应用版本过旧（没有下载接口），请重启主应用后再试')
+    } else {
+      ElMessage.error('下载失败：' + ((e && e.message) || '请稍后重试'))
+    }
+  }
+}
+async function copyExtToken() {
+  if (!extToken.value) { ElMessage.warning('令牌还没加载出来，请稍后重试'); return }
+  try {
+    await navigator.clipboard.writeText(extToken.value)
+    ElMessage.success('已复制，去扩展设置页粘贴')
+  } catch (e) {
+    ElMessageBox.alert(extToken.value, '手动复制令牌', { confirmButtonText: '知道了' })
+  }
+}
+
+// 重新生成配对令牌（POST /api/ext/token/rotate）：旧令牌立即失效，已配对的扩展须重贴
+async function regenExtToken() {
+  try {
+    await ElMessageBox.confirm(
+      '重新生成后旧令牌立即失效，已配对的浏览器扩展需要到「选项」页重新粘贴新令牌。',
+      '重新生成配对令牌？',
+      { confirmButtonText: '重新生成', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch (e) {
+    return   // 用户取消
+  }
+  try {
+    const { data } = await http.post('/ext/token/rotate')
+    extToken.value = data.token || ''
+    ElMessage.success('已生成新令牌，请复制后到扩展里重新粘贴')
+  } catch (e) {
+    ElMessage.error('生成失败：' + ((e && e.message) || '请稍后重试'))
+  }
+}
+
 onMounted(async () => {
   const { data } = await settingsApi.get()
   Object.assign(form, data)
@@ -822,13 +897,14 @@ onMounted(async () => {
   cleanSwitches.watermark = data.clean_watermark ?? true
   cleanSwitches.garbled = data.clean_garbled ?? true
   cleanSwitches.dedup = data.clean_dedup ?? true
+  autoExtractEntities.value = data.auto_extract_entities ?? false
   asrModelSize.value = data.asr_model_size || ''
   for (const p of promptFields) prompts[p.key] = data[p.key] || ''
   Object.assign(promptDefaults, data.prompt_defaults || {})
   loadStorage()
   loadUsage()
   loadAsr()
-  loadBrowsingPrivacy()
+  loadExtToken()
   // 从问答页「前往配置模型」跳入（/settings?add=1）：直接打开添加模型弹窗
   if (route.query.add) openModelEditor(null)
 })
@@ -854,6 +930,7 @@ async function save(successMsg = '保存成功', skipGuide = false) {
       clean_watermark: cleanSwitches.watermark,
       clean_garbled: cleanSwitches.garbled,
       clean_dedup: cleanSwitches.dedup,
+      auto_extract_entities: autoExtractEntities.value,
     })
     Object.assign(form, data)
     models.value = data.llm_models || []
@@ -904,6 +981,10 @@ async function rebuildAll() {
 .card-head { display: flex; justify-content: space-between; align-items: center; font-weight: 600; }
 .test-result { margin-left: 12px; font-size: 13px; color: var(--asc-text-2); }
 .field-hint { margin-left: 10px; font-size: 12.5px; color: var(--asc-text-3); white-space: nowrap; }
+/* 知识图谱提示：三条独立成行 + 允许换行（覆盖 .field-hint 的 nowrap，防溢出画面） */
+/* flex-basis:100% —— el-form-item 内容区是 flex 横排，强制提示区换到 checkbox 下一行 */
+.kg-hint { margin-top: 2px; flex-basis: 100%; max-width: 100%; }
+.kg-hint .field-hint { margin-left: 0; white-space: normal; line-height: 1.7; word-break: break-word; }
 .clean-switches { display: flex; flex-wrap: wrap; gap: 2px 20px; }
 /* 模型管理列表 */
 .model-section { margin-bottom: 8px; }
@@ -1078,4 +1159,30 @@ async function rebuildAll() {
   .prompt-card-actions { position: static; margin-bottom: 10px; }
 }
 
+
+/* 浏览器扩展 tab：编号步骤条（2026-09-24） */
+.ext-steps { display: flex; flex-direction: column; }
+.ext-step { display: flex; align-items: flex-start; gap: 14px; padding: 16px 4px; }
+.ext-step:first-child { padding-top: 4px; }
+.ext-step + .ext-step { border-top: 1px dashed var(--asc-border); }
+.ext-step-no {
+  flex: none; width: 26px; height: 26px; border-radius: 50%; margin-top: 1px;
+  background: var(--asc-primary); color: #fff;
+  font-size: 13px; font-weight: 600;
+  display: flex; align-items: center; justify-content: center;
+}
+.ext-step-main { flex: 1; min-width: 0; }
+.ext-step-title { font-size: 14px; font-weight: 600; color: var(--asc-text); margin-bottom: 4px; }
+.ext-step-desc { font-size: 12.5px; color: var(--asc-text-2); line-height: 1.7; }
+.ext-step-desc code, .ext-note code {
+  background: var(--asc-bg); padding: 1px 6px; border-radius: 4px; font-size: 12px;
+}
+.ext-step-action { margin-top: 10px; }
+.ext-token-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+.ext-token-input { max-width: 380px; }
+.ext-token-input .el-input__inner { font-family: Consolas, 'Courier New', monospace; font-size: 12.5px; }
+.ext-note {
+  margin: 4px 0 0; padding-top: 12px; border-top: 1px solid var(--asc-border);
+  font-size: 12px; color: var(--asc-text-3);
+}
 </style>

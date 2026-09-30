@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "知萤划词助手",
+  "version": "0.1.0",
+  "description": "网页划词，调用本地知萤主应用进行解释 / 总结 / 保存到知识库。所有处理都在本机完成，不发送任何数据到外部服务器。",
+  "permissions": ["storage", "contextMenus", "activeTab", "scripting"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["lib/Readability.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "brainmate-explain": {
+      "suggested_key": { "default": "Alt+B" },
+      "description": "知萤 解释选中文本"
+    }
+  },
+  "options_page": "options.html",
+  "action": {
+    "default_title": "知萤划词助手",
+    "default_icon": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+  },
+  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+}

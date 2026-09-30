@@ -55,12 +55,31 @@
       </div>
     </div>
 
-    <!-- 工具条：tabs 行右侧放搜索框，一行搞定 -->
+    <!-- 工具条：tabs 行（吸顶，滚动时切 tab 不下沉）。
+         搜索框已下移到各 tab 内容区顶部：它只服务「按材料 / 按笔记」，
+         留在 tab 栏右侧会让「知识图谱」也挂着一个用不上的输入框。 -->
     <div class="kb-tabs-wrap">
       <el-tabs v-model="tab" class="kb-tabs">
       <!-- 按材料 -->
       <el-tab-pane label="按材料" name="materials">
-        <div class="kb-table-card"><el-table :data="data.materials" v-loading="loading">
+        <!-- 顶部行：左文件类型筛选 chips + 右搜索框（与「按笔记」同一结构，见 .kb-pane-head）。
+             搜索框独立于数据状态（表空时也要能搜），chips 则只在有材料时出现 -->
+        <div class="kb-pane-head">
+          <div v-if="data.materials.length" class="kb-type-chips" role="group" aria-label="按文件类型筛选">
+            <button type="button" class="kb-type-chip" :class="{ active: fmtFilter === 'all' }"
+              :aria-pressed="fmtFilter === 'all'" @click="fmtFilter = 'all'">
+              全部<b>{{ data.materials.length }}</b>
+            </button>
+            <button v-for="g in visibleFmtFilters" :key="g" type="button"
+              class="kb-type-chip" :class="{ active: fmtFilter === g }"
+              :aria-pressed="fmtFilter === g" @click="fmtFilter = g">
+              {{ fmtGroupLabel(g) }}<b>{{ fmtCount(g) }}</b>
+            </button>
+          </div>
+          <el-input v-model="search" class="kb-search" placeholder="搜索材料" clearable
+            :prefix-icon="Search" @input="load" />
+        </div>
+        <div class="kb-table-card"><el-table :data="filteredMaterials" v-loading="loading">
           <el-table-column label="材料" min-width="240">
             <template #default="{ row }">
               <div class="kb-m-cell">
@@ -74,7 +93,16 @@
           </el-table-column>
           <el-table-column label="入库状态" width="150">
             <template #default="{ row }">
-              <span class="kb-status" :class="statusOf(row).cls">
+              <button v-if="row.indexed" type="button" class="kb-status kb-status-btn" :class="statusOf(row).cls"
+                :aria-label="`查看 ${row.title} 的 ${row.chunk_count} 个切块内容`"
+                @click="openChunks(row)">
+                <i class="kb-dot" aria-hidden="true"></i>{{ statusOf(row).text }}
+                <svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor"
+                  stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M9 6l6 6-6 6" />
+                </svg>
+              </button>
+              <span v-else class="kb-status" :class="statusOf(row).cls">
                 <i class="kb-dot" aria-hidden="true"></i>{{ statusOf(row).text }}
               </span>
             </template>
@@ -87,10 +115,17 @@
           <el-table-column label="导入时间" width="110">
             <template #default="{ row }"><span class="kb-date">{{ shortDate(row.created_at) }}</span></template>
           </el-table-column>
-          <el-table-column label="" width="110" align="right">
+          <el-table-column label="" width="200" align="right">
             <template #default="{ row }">
               <el-button size="small" text type="primary" :disabled="row.parsed_status !== 'success'"
                 :loading="rebuilding === row.material_id" @click="rebuild(row)">重建索引</el-button>
+              <el-button size="small" text :type="row.entity_count ? 'success' : 'primary'"
+                :disabled="row.parsed_status !== 'success'"
+                :loading="extracting === row.material_id"
+                :title="row.entity_count ? '查看该材料的知识图谱' : '为该材料生成知识图谱（调用大模型，消耗少量 token）'"
+                @click="row.entity_count ? viewGraph(row) : extractGraph(row)">
+                {{ row.entity_count ? `图谱 · ${row.entity_count}` : '生成图谱' }}
+              </el-button>
             </template>
           </el-table-column>
         </el-table></div>
@@ -98,20 +133,30 @@
           description="知识库为空，先去材料库上传学习内容">
           <el-button type="primary" @click="$router.push('/')">去材料库上传</el-button>
         </el-empty>
+        <!-- 筛选后为空（材料本身有，只是该类型没有）→ 与「按笔记」同一套提示 -->
+        <div v-else-if="!loading && !filteredMaterials.length" class="kb-filter-empty">
+          <span>该类型下暂无材料</span>
+          <el-button text type="primary" size="small" @click="fmtFilter = 'all'">查看全部 {{ data.materials.length }} 条</el-button>
+        </div>
       </el-tab-pane>
 
       <!-- 按笔记 -->
       <el-tab-pane label="按笔记" name="notes">
-        <div v-if="data.notes.length" class="kb-type-chips" role="group" aria-label="按笔记类型筛选">
-          <button type="button" class="kb-type-chip" :class="{ active: typeFilter === 'all' }"
-            :aria-pressed="typeFilter === 'all'" @click="typeFilter = 'all'">
-            全部<b>{{ data.notes.length }}</b>
-          </button>
-          <button v-for="t in visibleTypeFilters" :key="t.key" type="button"
-            class="kb-type-chip" :class="{ active: typeFilter === t.key }"
-            :aria-pressed="typeFilter === t.key" @click="typeFilter = t.key">
-            {{ t.label }}<b>{{ typeCount(t.key) }}</b>
-          </button>
+        <div class="kb-pane-head">
+          <div v-if="data.notes.length" class="kb-type-chips" role="group" aria-label="按笔记类型筛选">
+            <button type="button" class="kb-type-chip" :class="{ active: typeFilter === 'all' }"
+              :aria-pressed="typeFilter === 'all'" @click="typeFilter = 'all'">
+              全部<b>{{ data.notes.length }}</b>
+            </button>
+            <button v-for="t in visibleTypeFilters" :key="t.key" type="button"
+              class="kb-type-chip" :class="{ active: typeFilter === t.key }"
+              :aria-pressed="typeFilter === t.key" @click="typeFilter = t.key">
+              {{ t.label }}<b>{{ typeCount(t.key) }}</b>
+            </button>
+          </div>
+          <!-- 搜索框与筛选 chips 同行靠右；chips 为空（暂无笔记）时它仍要在 -->
+          <el-input v-model="search" class="kb-search" placeholder="搜索笔记" clearable
+            :prefix-icon="Search" @input="load" />
         </div>
         <div class="note-grid">
           <div v-for="(n, i) in filteredNotes" :key="n.id" class="kb-note-card card-in"
@@ -139,127 +184,50 @@
           <el-button text type="primary" size="small" @click="typeFilter = 'all'">查看全部 {{ data.notes.length }} 条</el-button>
         </div>
       </el-tab-pane>
+      <!-- 知识图谱：实体 + 关系可视化（只读，数据来自后台异步抽取） -->
+      <el-tab-pane label="知识图谱" name="graph">
+        <KnowledgeGraph :focus-material="graphFocusMaterial" />
+      </el-tab-pane>
       </el-tabs>
-      <el-input v-model="search" class="kb-search" placeholder="搜索材料或笔记" clearable
-        :prefix-icon="Search" @input="load" />
     </div>
 
-    <!-- 孤儿笔记弹窗（材料已删除，无学习页可跳）：与资料详情页笔记弹窗一致 -->
-    <el-dialog v-model="noteDialog.show" width="560px" class="note-dialog" :close-on-click-modal="false">
-      <template #header>
-        <div class="nd-header">
-          <div class="nd-title-row">
-            <span class="nd-title">编辑笔记</span>
-            <span class="nd-src-tag" :class="noteTagClass(noteDialog.sourceType)">
-              {{ noteTagLabel(noteDialog.sourceType) }}
-            </span>
+    <!-- 切块抽屉：点「已入库 · N 块」查看该材料的解析切块（只读）。
+         复用学习页文本视图同一接口 GET /materials/{id}/chunks，按页码顺序列出。 -->
+    <el-drawer v-model="chunksDrawer.show" class="kb-chunks-drawer" direction="rtl" :size="440"
+      :with-header="false" destroy-on-close>
+      <div class="kb-chunks">
+        <div class="kb-chunks-head">
+          <div class="kb-chunks-title" :title="chunksDrawer.title">{{ chunksDrawer.title }}</div>
+          <button type="button" class="kb-chunks-close" aria-label="关闭" @click="chunksDrawer.show = false">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round" aria-hidden="true">
+              <path d="M6 6l12 12M18 6L6 18" />
+            </svg>
+          </button>
+        </div>
+        <div class="kb-chunks-meta">
+          <span v-if="chunksLoading">正在加载切块…</span>
+          <span v-else>共 {{ chunksDrawer.list.length }} 块 · 按页码顺序</span>
+        </div>
+        <div v-loading="chunksLoading" class="kb-chunks-body">
+          <div v-if="!chunksLoading && !chunksDrawer.list.length" class="kb-chunks-empty">
+            该材料暂无解析文本，可到材料库「重建索引」后重试。
           </div>
-          <div class="nd-sub">{{ noteDialog.materialTitle }}</div>
-        </div>
-      </template>
-
-      <div class="nd-body">
-        <div class="nd-field">
-          <label class="nd-label" for="kb-nd-title">标题</label>
-          <el-input id="kb-nd-title" v-model="noteDialog.title" placeholder="给这条笔记起个标题" maxlength="80" />
-        </div>
-
-        <div class="nd-field">
-          <div class="nd-field-head">
-            <label class="nd-label">内容</label>
-            <div class="nd-seg" role="tablist" aria-label="笔记内容编辑方式">
-              <button type="button" class="nd-seg-btn" :class="{ active: noteDialog.mode === 'edit' }"
-                role="tab" :aria-selected="noteDialog.mode === 'edit'" @click="noteDialog.mode = 'edit'">编辑</button>
-              <button type="button" class="nd-seg-btn" :class="{ active: noteDialog.mode === 'preview' }"
-                role="tab" :aria-selected="noteDialog.mode === 'preview'" @click="noteDialog.mode = 'preview'">预览</button>
+          <div v-for="c in chunksDrawer.list" :key="c.id" class="kb-chunk-item">
+            <div class="kb-chunk-head">
+              <span class="kb-chunk-page">第 {{ c.page_no }} 页</span>
+              <span v-if="c.section_path" class="kb-chunk-section">{{ c.section_path }}</span>
             </div>
-          </div>
-          <textarea v-if="noteDialog.mode === 'edit'" v-model="noteDialog.content" :rows="10" class="nd-textarea"
-            placeholder="支持 Markdown，可直接粘贴"
-            @mouseup.stop="onNoteSelect" @keyup="onNoteSelect" @blur="hideNoteSel"></textarea>
-          <div v-else class="md-preview nd-preview" v-html="renderMd(noteDialog.content)"></div>
-          <div v-if="noteSel.show" class="nd-sel-bar">
-            <span class="nd-sel-count">已选中 {{ noteSel.text.length }} 字</span>
-            <span class="nd-sel-sep" aria-hidden="true"></span>
-            <el-button text type="primary" size="small" @mousedown.prevent @click="noteTransform('rewrite', noteSel)">改写</el-button>
-            <el-button text type="primary" size="small" @mousedown.prevent @click="noteTransform('expand', noteSel)">扩写</el-button>
-            <el-button text type="primary" size="small" @mousedown.prevent @click="noteTransform('continue', noteSel)">续写</el-button>
-            <el-button text type="primary" size="small" @mousedown.prevent @click="noteTransform('summarize', noteSel)">总结</el-button>
-            <el-button text size="small" @mousedown.prevent @click="hideNoteSel">取消</el-button>
-          </div>
-          <div class="nd-count">{{ noteDialog.content.length }} 字</div>
-        </div>
-      </div>
-
-      <div v-if="noteDialog.content.trim()" class="nd-ai">
-        <span class="nd-ai-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor">
-            <path d="M12 2l1.7 5.3L19 9l-5.3 1.7L12 16l-1.7-5.3L5 9l5.3-1.7L12 2z"/>
-            <path d="M19 14l.9 2.6 2.6.9-2.6.9L19 21l-.9-2.6-2.6-.9 2.6-.9L19 14z"/>
-          </svg>
-        </span>
-        <span class="nd-ai-label">AI 加工</span>
-        <span class="nd-ai-sep" aria-hidden="true"></span>
-        <el-tooltip content="换个说法，保持原意与事实" placement="top" :show-after="250">
-          <el-button text type="primary" size="small" @click="noteTransform('rewrite')">改写</el-button>
-        </el-tooltip>
-        <el-tooltip content="补充细节、例子与解释，让笔记更充实" placement="top" :show-after="250">
-          <el-button text type="primary" size="small" @click="noteTransform('expand')">扩写</el-button>
-        </el-tooltip>
-        <el-tooltip content="接着已有内容往下续写，补全或延伸思路" placement="top" :show-after="250">
-          <el-button text type="primary" size="small" @click="noteTransform('continue')">续写</el-button>
-        </el-tooltip>
-        <el-tooltip content="压缩成精炼要点，突出核心结论" placement="top" :show-after="250">
-          <el-button text type="primary" size="small" @click="noteTransform('summarize')">总结</el-button>
-        </el-tooltip>
-      </div>
-
-      <div class="nd-shortcuts">
-        <el-button v-if="noteDialog.materialId && noteDialog.materialTitle !== '（材料已删除）' && noteDialog.anchor?.page_no"
-          text size="small" @click="jumpToOriginal">跳转原文 P{{ noteDialog.anchor.page_no }}</el-button>
-        <el-tooltip content="把这条笔记出成选择题，进复习队列定期重考（再认）" placement="top" :show-after="250">
-          <el-button text type="warning" size="small" :loading="addingReview" @click="addToReview">加入复习</el-button>
-        </el-tooltip>
-        <el-tooltip content="出成引导题，先自己讲一遍再对照答案，练主动回忆（费曼）" placement="top" :show-after="250">
-          <el-button text type="primary" size="small" :loading="addingRecall" @click="addToRecall">生成复述卡</el-button>
-        </el-tooltip>
-        <el-button v-if="noteDialog.content.length > 200" text type="warning" size="small"
-          :loading="splittingReview" @click="splitToReview">拆成多卡</el-button>
-        <span class="nd-sep"></span>
-        <el-popconfirm title="删除这条笔记？不可恢复"
-          confirm-button-text="删除" confirm-button-type="danger" cancel-button-text="取消"
-          @confirm="deleteNote">
-          <template #reference>
-            <el-button type="danger" text size="small">删除</el-button>
-          </template>
-        </el-popconfirm>
-      </div>
-
-      <template #footer>
-        <div class="nd-footer">
-          <div class="nd-actions">
-            <el-button @click="noteDialog.show = false">取消</el-button>
-            <el-button type="primary" :loading="noteDialog.saving" @click="saveNote">保存</el-button>
+            <div class="kb-chunk-content">{{ c.content }}</div>
           </div>
         </div>
-      </template>
-    </el-dialog>
+      </div>
+    </el-drawer>
 
-    <!-- 笔记加工结果弹窗（原文 vs 结果，采用/放弃） -->
-    <el-dialog v-model="transformDialog.show" :title="noteTransformTitle" width="560px" class="note-dialog">
-      <div class="polish-block">
-        <div class="polish-label">原文</div>
-        <div class="polish-text">{{ transformDialog.original }}</div>
-      </div>
-      <div class="polish-block polish-block-new">
-        <div class="polish-label">{{ transformDialog.mode === 'continue' ? '续写内容' : (TRANSFORM_LABELS[transformDialog.mode] + '后') }}</div>
-        <div class="polish-text">{{ transformDialog.result }}<span v-if="transformDialog.streaming" class="stream-cursor">▍</span></div>
-      </div>
-      <template #footer>
-        <el-button @click="transformDialog.show = false">放弃</el-button>
-        <el-button type="primary" :disabled="transformDialog.streaming" @click="adoptTransform">{{ transformDialog.mode === 'continue' ? '插入' : '采用' }}</el-button>
-      </template>
-    </el-dialog>
+    <!-- 笔记弹窗（全屏 Vditor，共用组件：与学习页/统计/播客页同一内核；
+         孤儿笔记材料已删除也无妨——「跳转原文」按钮仅在 materialId 存在时出现） -->
+    <NoteEditorDialog v-model="noteDialog.show" :note-id="noteDialog.id"
+      :material-title="noteDialog.materialTitle" @changed="load" />
   </div>
 </template>
 
@@ -268,208 +236,55 @@ import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Search, Document, Picture, Headset, VideoPlay, Reading } from '@element-plus/icons-vue'
-import MarkdownIt from 'markdown-it'
 import mascot from '../assets/mascot.png'
-import { kbApi, noteApi, reviewApi, settingsApi } from '../api'
-import http, { errMsg } from '../api/http'
-// ⚠️ SSE 统一走共享 util：内联副本曾硬编码 127.0.0.1:8000（手机访问时打到手机自己）
-// 且不带令牌头（远程模式必 401）—— 方案 §8.2 缺陷 #1 的同类实现。
-import { streamSSE } from '../utils/sse'
+import { kbApi, settingsApi, materialApi } from '../api'
+import { errMsg } from '../api/http'
+import NoteEditorDialog from '../components/NoteEditorDialog.vue'
+import KnowledgeGraph from '../components/KnowledgeGraph.vue'
 
 const router = useRouter()
 const route = useRoute()
-const md = new MarkdownIt({ breaks: true })
-const renderMd = (t) => md.render(t || '')
-const noteDialog = reactive({
-  show: false, id: null, title: '', content: '', materialTitle: '',
-  materialId: null, sourceType: 'manual', anchor: null, saving: false, mode: 'edit',
-})
+const noteDialog = reactive({ show: false, id: null, materialTitle: '' })
+// 切块抽屉：点「已入库 · N 块」查看该材料的解析切块（只读）
+const chunksDrawer = reactive({ show: false, title: '', list: [] })
+const chunksLoading = ref(false)
 
-// 笔记加工（改写/扩写/续写/总结）
-const TRANSFORM_LABELS = { rewrite: '改写', expand: '扩写', continue: '续写', summarize: '总结' }
-const transformDialog = reactive({ show: false, mode: 'rewrite', original: '', result: '', streaming: false, sel: null })
-// 笔记内容选区：选中指定文字后浮出加工工具（sel 为 null=整条笔记）
-const noteSel = reactive({ show: false, text: '', start: 0, end: 0 })
-const noteTransformTitle = computed(() => {
-  const act = TRANSFORM_LABELS[transformDialog.mode] || '加工'
-  return transformDialog.sel ? `${act}选中文字` : `${act}笔记`
-})
-
-// SSE 流式读取（与资料详情页 streamSSE 一致）
-
-async function openNote(n) {
-  noteDialog.id = n.id
-  noteDialog.title = n.title
-  noteDialog.content = n.content
-  noteDialog.materialTitle = n.material_title
-  noteDialog.materialId = n.material_id
-  noteDialog.sourceType = n.source_type || 'manual'
-  noteDialog.mode = 'edit'
-  noteDialog.show = true
-  // 列表 content 截断过，弹窗拉全文（含 anchor / material_id）
+async function openChunks(row) {
+  chunksDrawer.title = row.title
+  chunksDrawer.list = []
+  chunksDrawer.show = true
+  chunksLoading.value = true
   try {
-    const { data } = await http.get(`/notes/${n.id}`)
-    noteDialog.content = data.content
-    noteDialog.anchor = data.anchor || null
-  } catch { /* 拉全文失败则用列表截断内容 */ }
+    const { data } = await materialApi.chunks(row.material_id)
+    chunksDrawer.list = data || []
+  } catch (e) {
+    ElMessage.error(errMsg(e, '切块加载失败'))
+  } finally {
+    chunksLoading.value = false
+  }
+}
+
+function openNote(n) {
+  noteDialog.id = n.id
+  noteDialog.materialTitle = n.material_title
+  noteDialog.show = true
 }
 
 // 从别处跳转过来直接打开某条笔记（统计页 / 播客页的「已转笔记 · 查看」）。
 // 这些笔记是材料无关的，列表里能查到来源标签；查不到（如刚转存、列表未刷新）则留空。
-async function openNoteById(id) {
-  // ⚠️ 这里的响应变量绝不能叫 data —— 外层 `const data = reactive({...})` 是笔记列表，
-  // 用 const { data } 解构会把它整个遮蔽掉。
+// 正文由 NoteEditorDialog 按 id 自行拉全文，这里只负责定位来源标签。
+function openNoteById(id) {
   const item = (data.notes || []).find(n => n.id === Number(id))
-  try {
-    const res = await http.get(`/notes/${id}`)
-    const d = res.data
-    noteDialog.id = d.id
-    noteDialog.title = d.title
-    noteDialog.content = d.content
-    noteDialog.sourceType = d.source_type || 'manual'
-    noteDialog.materialId = d.material_id
-    noteDialog.materialTitle = item?.material_title || ''
-    noteDialog.anchor = d.anchor || null
-    noteDialog.mode = 'edit'
-    noteDialog.show = true
-  } catch {
-    ElMessage.error('笔记打开失败，可能已被删除')
-  }
-}
-
-function jumpToOriginal() {
-  const anchor = noteDialog.anchor
-  if (!noteDialog.materialId || !anchor?.page_no) return
-  const q = { page: anchor.page_no }
-  if (anchor.selected_text) q.hl = anchor.selected_text
-  router.push({ path: `/study/${noteDialog.materialId}`, query: q })
-}
-
-async function saveNote() {
-  noteDialog.saving = true
-  try {
-    const { data } = await noteApi.update(noteDialog.id, { title: noteDialog.title, content: noteDialog.content })
-    noteDialog.show = false
-    await load()
-    if (data.reindex_warning) ElMessage.warning(data.reindex_warning)
-    else ElMessage.success('已保存')
-  } catch (e) {
-    ElMessage.error(errMsg(e, '保存失败'))
-  } finally {
-    noteDialog.saving = false
-  }
-}
-
-async function deleteNote() {
-  await noteApi.remove(noteDialog.id)
-  noteDialog.show = false
-  await load()
-  ElMessage.success('已删除')
-}
-
-const addingReview = ref(false)
-async function addToReview() {
-  addingReview.value = true
-  try {
-    const { data } = await reviewApi.createCard(noteDialog.id)
-    ElMessage.success(data.created ? `已加入复习：「${data.question.slice(0, 24)}…」` : '该笔记已在复习队列中')
-  } catch (e) {
-    ElMessage.error(errMsg(e, '加入复习失败'))
-  } finally {
-    addingReview.value = false
-  }
-}
-
-const addingRecall = ref(false)
-async function addToRecall() {
-  addingRecall.value = true
-  try {
-    const { data } = await reviewApi.createRecallCard(noteDialog.id)
-    ElMessage.success(data.created ? `已生成复述卡：「${data.question.slice(0, 24)}…」` : '该笔记已有复述卡')
-  } catch (e) {
-    ElMessage.error(errMsg(e, '生成复述卡失败'))
-  } finally {
-    addingRecall.value = false
-  }
-}
-
-const splittingReview = ref(false)
-async function splitToReview() {
-  splittingReview.value = true
-  try {
-    const { data } = await reviewApi.split(noteDialog.id)
-    ElMessage.success(`已拆成 ${data.created} 张复习卡`)
-  } catch (e) {
-    ElMessage.error(errMsg(e, '拆卡失败'))
-  } finally {
-    splittingReview.value = false
-  }
-}
-
-// ---------- 笔记加工：改写/扩写/续写/总结 ----------
-// 笔记内容选区：选中文字后浮出加工工具
-function onNoteSelect(e) {
-  const el = e.target
-  if (!el || typeof el.selectionStart !== 'number') return
-  const start = el.selectionStart, end = el.selectionEnd
-  const text = el.value.substring(start, end)
-  if (!text.trim()) { noteSel.show = false; noteSel.text = ''; return }
-  noteSel.text = text
-  noteSel.start = start
-  noteSel.end = end
-  noteSel.show = true
-}
-function hideNoteSel() { noteSel.show = false; noteSel.text = '' }
-
-async function noteTransform(mode, sel) {
-  const content = sel ? sel.text : noteDialog.content?.trim()
-  if (!content) { ElMessage.warning(sel ? '请先选中文字' : '笔记还没有内容'); return }
-  transformDialog.mode = mode
-  transformDialog.original = content
-  transformDialog.result = ''
-  transformDialog.sel = sel ? { start: sel.start, end: sel.end } : null
-  transformDialog.streaming = true
-  transformDialog.show = true
-  noteSel.show = false
-  try {
-    await streamSSE('/api/ai/note/transform/stream',
-      { content, mode, title: noteDialog.title },
-      (t) => { transformDialog.result += t },
-      () => {},
-      (msg) => { throw new Error(msg) },
-    )
-  } catch (e) {
-    ElMessage.error(e.message || '加工失败')
-    transformDialog.show = false
-  } finally {
-    transformDialog.streaming = false
-  }
-}
-
-function adoptTransform() {
-  if (!transformDialog.result.trim()) { ElMessage.warning('结果为空，无法采用'); return }
-  if (transformDialog.sel) {
-    const { start, end } = transformDialog.sel
-    if (transformDialog.mode === 'continue') {
-      // 续写：保留原选段，续写内容追加在选区之后
-      noteDialog.content = noteDialog.content.substring(0, end) + '\n\n' + transformDialog.result + noteDialog.content.substring(end)
-    } else {
-      noteDialog.content = noteDialog.content.substring(0, start) + transformDialog.result + noteDialog.content.substring(end)
-    }
-  } else if (transformDialog.mode === 'continue') {
-    // 整条续写：原文保留，续写内容追加到末尾
-    noteDialog.content = noteDialog.content.trimEnd() + '\n\n' + transformDialog.result
-  } else {
-    noteDialog.content = transformDialog.result
-  }
-  transformDialog.show = false
-  ElMessage.success(transformDialog.mode === 'continue' ? '已续写，记得保存' : '已采用，记得保存')
+  noteDialog.id = Number(id)
+  noteDialog.materialTitle = item?.material_title || ''
+  noteDialog.show = true
 }
 
 const tab = ref('materials')
 const search = ref('')
 const loading = ref(false)
 const rebuilding = ref(null)
+const extracting = ref(null)   // 生成知识图谱中的材料 id
 const data = reactive({ materials: [], notes: [] })
 
 const shortDate = (iso) => iso ? iso.slice(0, 10) : ''
@@ -531,17 +346,6 @@ const srcPillClass = (t) => ({
   report: t === 'weekly_report', podcast: t === 'podcast_script',
   brief: t === 'podcast_brief',
 })
-const NOTE_TAG = {
-  chat: '问答笔记', ai_asset: 'AI 生成',
-  weekly_report: 'AI 周报', podcast_script: 'AI 播客脚本',
-  podcast_brief: 'AI 播客简报',
-}
-const noteTagLabel = (t) => NOTE_TAG[t] || '手动'
-const noteTagClass = (t) => ({
-  'is-ai': t === 'ai_asset', 'is-chat': t === 'chat',
-  'is-report': t === 'weekly_report', 'is-podcast': t === 'podcast_script',
-  'is-brief': t === 'podcast_brief',
-})
 const filteredNotes = computed(() =>
   typeFilter.value === 'all'
     ? data.notes
@@ -561,6 +365,20 @@ const fmtGroup = (f) => {
   return 'pdf'
 }
 const fmtIcon = (f) => ({ img: Picture, audio: Headset, video: VideoPlay, epub: Reading }[fmtGroup(f)] || Document)
+
+// ---------- 材料文件类型筛选（客户端即时过滤，与搜索联动；分组口径复用 fmtGroup） ----------
+// chips 排列顺序：文档类在前（最常见），媒体类在后；计数为 0 的不占位
+const FMT_ORDER = ['pdf', 'ppt', 'doc', 'md', 'epub', 'img', 'audio', 'video']
+const FMT_GROUP_LABEL = { pdf: 'PDF', ppt: 'PPT', doc: 'WORD', md: 'MD', epub: 'EPUB', img: '图片', audio: '音频', video: '视频' }
+const fmtGroupLabel = (g) => FMT_GROUP_LABEL[g] || String(g || '').toUpperCase()
+const fmtFilter = ref('all')
+const fmtCount = (g) => data.materials.filter(m => fmtGroup(m.format) === g).length
+// 同「按笔记」：没有的类型不出现 —— 用户不会看到一排「图片 0」
+const visibleFmtFilters = computed(() => FMT_ORDER.filter(g => fmtCount(g) > 0))
+const filteredMaterials = computed(() =>
+  fmtFilter.value === 'all'
+    ? data.materials
+    : data.materials.filter(m => fmtGroup(m.format) === fmtFilter.value))
 
 // ---------- 入库状态（dot pill，弱化标签噪音） ----------
 function statusOf(row) {
@@ -592,6 +410,29 @@ async function rebuild(row) {
   } finally {
     rebuilding.value = null
   }
+}
+
+// 生成知识图谱：后台异步抽取实体（约需几分钟，取决于材料块数）；
+// 内容未变时服务端会跳过 LLM 调用直接复用（指纹去重），点击后稍等刷新列表即可看到实体数。
+async function extractGraph(row) {
+  extracting.value = row.material_id
+  try {
+    await kbApi.extractEntities(row.material_id)
+    ElMessage.success(`已开始为「${row.title}」生成知识图谱，完成后实体数会显示在按钮上`)
+    // 后台抽取需要时间，延迟刷新一次列表（短材料约 1-2 分钟）
+    setTimeout(() => load(), 30000)
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '生成失败')
+  } finally {
+    extracting.value = null
+  }
+}
+
+// 已生成图谱的材料：点击跳到「知识图谱」tab，并自动选中该材料的子图
+const graphFocusMaterial = ref(null)
+function viewGraph(row) {
+  graphFocusMaterial.value = row.material_id
+  tab.value = 'graph'
 }
 
 onMounted(async () => {
@@ -653,11 +494,32 @@ onMounted(async () => {
 .kb-stat.pending b { color: var(--asc-primary); }
 .kb-stat.pending:hover { transform: translateY(-2px); border-color: rgba(124, 92, 252, .45); box-shadow: var(--asc-shadow-hover); }
 
-/* ===== 工具条：tabs + 右侧搜索 ===== */
+/* ===== 工具条：tabs（吸顶） ===== */
 .kb-tabs-wrap { position: relative; }
-.kb-search { position: absolute; right: 0; top: 1px; width: 220px; z-index: 2; }
+/* 搜索框：已从 tab 栏右侧下移到各 tab 内容区顶部（见 .kb-pane-head），
+   因此不再 sticky —— 它只服务「按材料 / 按笔记」，切到知识图谱就不该出现。 */
+.kb-search { width: 240px; flex-shrink: 0; }
+/* 「按材料 / 按笔记」内容区顶部：左筛选 chips + 右搜索框，两端对齐；
+   chips 为空（暂无数据）时搜索框仍靠右（margin-left:auto 兜底）；
+   窄屏时搜索框自动折到下一行。—— 两个 tab 共用同一结构，改一处两边同步。 */
+.kb-pane-head {
+  display: flex; flex-wrap: wrap; align-items: flex-start; gap: 12px;
+  justify-content: space-between; margin-bottom: 14px;
+}
+.kb-pane-head .kb-type-chips { flex: 1; min-width: 0; margin-bottom: 0; }
+.kb-pane-head .kb-search { margin-left: auto; }
+.kb-tabs :deep(.el-tabs__header) {
+  position: sticky; top: 0; z-index: 6;
+  margin: 0; padding: 1px 0 0 0;
+  background: var(--asc-bg);
+  /* 吸顶时用投影替代下边距，既分隔滚动上来的内容又不留透明缝 */
+  box-shadow: 0 1px 0 var(--asc-border);
+}
 .kb-tabs :deep(.el-tabs__item) { font-size: 14px; padding: 0 18px; }
 .kb-tabs :deep(.el-tabs__content) { padding-top: 16px; }
+/* ⚠️ el-tabs 默认 content overflow:hidden 会建立滚动上下文，打断内部（知识图谱头）的
+   position:sticky → 改为 visible（活动 pane 用 v-show 隐藏，无需靠 overflow 裁剪）。 */
+.kb-tabs :deep(.el-tabs__content) { overflow: visible; }
 
 /* ===== 按材料：卡片化表格 ===== */
 .kb-table-card {
@@ -690,13 +552,22 @@ onMounted(async () => {
 .kb-date { font-size: 12px; color: var(--asc-text-2); font-variant-numeric: tabular-nums; }
 .kb-status {
   display: inline-flex; align-items: center; gap: 6px;
-  font-size: 12px; font-weight: 500; line-height: 1;
+  font-size: 8px; font-weight: 500; line-height: 1;
   padding: 5px 10px; border-radius: 999px;
+  white-space: nowrap; flex-shrink: 0;
 }
 .kb-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
 .kb-status.ok { color: #0f6e56; background: rgba(15, 110, 86, .08); }
 .kb-status.warn { color: #ba7517; background: rgba(186, 117, 23, .09); }
 .kb-status.muted { color: var(--asc-text-3); background: var(--asc-surface-2); }
+/* 可点击的「已入库」pill：按钮化，加 hover 反馈与右侧箭头 */
+.kb-status-btn {
+  font: inherit; border: none; cursor: pointer;
+  transition: box-shadow .16s ease, transform .16s ease, filter .16s ease;
+}
+.kb-status-btn:hover { filter: brightness(.93); box-shadow: var(--asc-shadow-hover); }
+.kb-status-btn:active { transform: translateY(1px); }
+.kb-status-btn svg { margin-left: 1px; opacity: .8; }
 
 /* ===== 按笔记：类型筛选 chips ===== */
 .kb-type-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
@@ -761,6 +632,46 @@ onMounted(async () => {
 .kb-note-idx i { width: 5px; height: 5px; border-radius: 50%; background: #d9a13b; }
 .kb-note-idx.ok i { background: #0f6e56; }
 
+/* ===== 切块抽屉 ===== */
+.kb-chunks-drawer :deep(.el-drawer__body) { padding: 0; display: flex; flex-direction: column; }
+.kb-chunks { display: flex; flex-direction: column; height: 100%; }
+.kb-chunks-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 16px 18px 12px; border-bottom: 1px solid var(--asc-divider);
+}
+.kb-chunks-title { flex: 1; min-width: 0; font-size: 15px; font-weight: 600; }
+/* 标题过长仍显示两行，保留可读性 */
+.kb-chunks-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kb-chunks-close {
+  flex-shrink: 0; width: 30px; height: 30px; border-radius: 8px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: none; background: transparent; color: var(--asc-text-2); cursor: pointer;
+  transition: background .16s ease, color .16s ease;
+}
+.kb-chunks-close:hover { background: var(--asc-surface-2); color: var(--asc-text); }
+.kb-chunks-meta { padding: 8px 18px 0; font-size: 12px; color: var(--asc-text-3); }
+.kb-chunks-body { flex: 1; overflow-y: auto; padding: 12px 18px 20px; min-height: 120px; }
+.kb-chunks-empty { padding: 40px 0; text-align: center; font-size: 13px; color: var(--asc-text-3); }
+.kb-chunk-item {
+  background: var(--asc-surface-2); border: 1px solid var(--asc-border);
+  border-radius: 12px; padding: 12px 14px; margin-bottom: 12px;
+}
+.kb-chunk-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.kb-chunk-page {
+  flex-shrink: 0; white-space: nowrap;
+  font-size: 11px; font-weight: 600; color: var(--asc-primary); line-height: 1;
+  padding: 4px 9px; border-radius: 6px; background: var(--asc-primary-soft);
+}
+.kb-chunk-section {
+  flex: 1 1 auto; min-width: 0;
+  font-size: 11px; color: var(--asc-text-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.kb-chunk-content {
+  font-size: 13px; color: var(--asc-text-2); line-height: 1.75;
+  white-space: pre-wrap; word-break: break-word;
+}
+
 /* 空状态图标圆角 */
 :deep(.el-empty__image) { border-radius: 16px; }
 
@@ -771,112 +682,4 @@ onMounted(async () => {
   .card-in { animation: none; }
   .kb-note-card, .kb-stat.pending, .kb-note-card::before { transition: none; }
 }
-
-/* ===== 笔记弹窗（与资料详情页 note-dialog 一致） ===== */
-.note-dialog :deep(.el-dialog__header) { padding: 20px 24px 14px; margin: 0; }
-.note-dialog :deep(.el-dialog__body) { padding: 6px 24px 4px; }
-.note-dialog :deep(.el-dialog__footer) { padding: 14px 24px 20px; border-top: 1px solid var(--asc-divider); }
-
-.nd-header { display: flex; flex-direction: column; gap: 6px; }
-.nd-title-row { display: flex; align-items: center; gap: 10px; }
-.nd-title { font-size: 17px; font-weight: 600; color: var(--asc-text); }
-.nd-src-tag {
-  font-size: 11px; font-weight: 500; line-height: 1; padding: 4px 8px; border-radius: 6px;
-  background: var(--asc-surface-2); color: var(--asc-text-2); letter-spacing: .5px;
-}
-.nd-src-tag.is-ai { background: var(--asc-primary-soft); color: var(--asc-primary); }
-.nd-src-tag.is-chat { background: rgba(28, 145, 138, .12); color: #12837c; }
-.nd-src-tag.is-report { background: rgba(217, 119, 6, .12); color: #b45309; }
-.nd-src-tag.is-podcast { background: rgba(74, 114, 212, .12); color: #3f63c4; }
-.nd-src-tag.is-brief { background: rgba(162, 28, 175, .12); color: #a21caf; }
-.nd-sub { font-size: 12px; color: var(--asc-text-3); }
-
-.nd-body { display: flex; flex-direction: column; gap: 16px; }
-.nd-field { display: flex; flex-direction: column; gap: 8px; }
-.nd-label { font-size: 13px; font-weight: 500; color: var(--asc-text-2); }
-.nd-field-head { display: flex; align-items: center; justify-content: space-between; }
-
-.nd-seg {
-  display: inline-flex; padding: 3px; gap: 2px;
-  background: var(--asc-surface-2); border-radius: 8px;
-}
-.nd-seg-btn {
-  border: none; background: transparent; cursor: pointer;
-  font-size: 12px; font-weight: 500; color: var(--asc-text-2);
-  padding: 5px 14px; border-radius: 6px; line-height: 1.4;
-  transition: all .16s ease;
-}
-.nd-seg-btn:hover { color: var(--asc-text); }
-.nd-seg-btn.active {
-  background: var(--asc-card); color: var(--asc-primary);
-  box-shadow: 0 1px 4px rgba(0, 0, 0, .08);
-}
-
-.nd-preview {
-  background: var(--asc-surface-2); border-radius: 8px;
-  padding: 14px 16px; min-height: 220px; max-height: 360px; overflow-y: auto;
-  font-size: 14px;
-}
-.nd-count {
-  align-self: flex-end; font-size: 11px; color: var(--asc-text-3);
-  margin-top: 2px; font-variant-numeric: tabular-nums;
-}
-
-/* AI 加工面板：浅紫卡片，图标 + 标签 + 三动作 */
-.nd-ai {
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-  margin-top: 8px;
-  padding: 9px 12px;
-  background: var(--asc-primary-soft);
-  border: 1px solid rgba(124, 92, 252, .14);
-  border-radius: 10px;
-}
-.nd-ai-icon { display: inline-flex; color: var(--asc-primary); line-height: 0; }
-.nd-ai-label { font-size: 12px; font-weight: 500; color: var(--asc-primary); }
-.nd-ai-sep { width: 1px; height: 12px; background: rgba(124, 92, 252, .22); margin: 0 2px; }
-
-/* 原生 textarea 复刻 el-textarea 视觉（选区捕获需原生元素） */
-.nd-textarea {
-  width: 100%; border: none; outline: none; resize: vertical;
-  background: var(--asc-card); box-shadow: 0 0 0 1px var(--asc-border) inset;
-  border-radius: 6px; padding: 8px 12px;
-  font-family: inherit; font-size: 14px; line-height: 1.6; color: var(--asc-text);
-  transition: box-shadow .18s ease;
-}
-.nd-textarea:focus { box-shadow: 0 0 0 1.5px var(--asc-primary) inset; }
-
-/* 选区加工工具条：选中文字后浮出 */
-.nd-sel-bar {
-  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
-  padding: 7px 10px;
-  background: var(--asc-surface-2); border-radius: 8px;
-}
-.nd-sel-count { font-size: 12px; color: var(--asc-text-2); }
-.nd-sel-sep { width: 1px; height: 12px; background: var(--asc-border); margin: 0 2px; }
-
-.nd-shortcuts {
-  display: flex; align-items: center; gap: 2px; flex-wrap: wrap;
-  margin-top: 12px; padding: 12px 0 0; border-top: 1px dashed var(--asc-divider);
-}
-.nd-sep { width: 1px; height: 14px; background: var(--asc-divider); margin: 0 6px; flex-shrink: 0; }
-
-/* 加工结果对比弹窗（与资料详情页一致） */
-.polish-block { margin-bottom: 14px; }
-.polish-label {
-  font-size: 11px; font-weight: 600; letter-spacing: 1.5px;
-  color: var(--asc-text-3); margin-bottom: 6px;
-}
-.polish-block-new .polish-label { color: #0f6e56; }
-.polish-text {
-  font-size: 14px; line-height: 1.75; color: var(--asc-text);
-  background: var(--asc-surface-2); border-radius: 8px;
-  padding: 12px 14px; white-space: pre-wrap;
-  max-height: 240px; overflow-y: auto;
-}
-.polish-block-new .polish-text { background: rgba(15, 110, 86, .07); }
-.stream-cursor { color: var(--asc-primary); animation: cursor-blink 1s step-end infinite; }
-@keyframes cursor-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
-
-.nd-footer { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
-.nd-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 </style>

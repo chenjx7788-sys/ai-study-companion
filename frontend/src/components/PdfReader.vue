@@ -49,7 +49,11 @@ const innerRefs = shallowRef({})
 
 let doc = null
 let observer = null
+let resizeObserver = null
+let resizeTimer = null
+let refitting = false
 const renderedPages = new Set()
+const pageTasks = {}   // 每页渲染任务串行化：避免懒渲染与重排渲染在同一 canvas 上并发
 let scale = 1
 
 const fp = (pageNum) => props.footprints?.[pageNum] || null
@@ -71,6 +75,8 @@ async function renderPage(pageNum) {
   canvas.style.height = Math.floor(cssViewport.height) + 'px'
   await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise
 
+  // 重排重渲染时先清掉旧文字层，否则 span 会叠加
+  textLayerDiv.innerHTML = ''
   const textContent = await page.getTextContent()
   textLayerDiv.style.setProperty('--scale-factor', String(scale))
   const tl = new TextLayer({
@@ -82,6 +88,14 @@ async function renderPage(pageNum) {
   applyPdfHighlights(pageNum)
   rendered.value++
   if (rendered.value === total.value) loading.value = false
+}
+
+// 同一页的渲染请求串行执行（pdf.js 不允许同一 canvas 并发 render）
+function queueRender(pageNum) {
+  pageTasks[pageNum] = (pageTasks[pageNum] || Promise.resolve())
+    .then(() => renderPage(pageNum))
+    .catch(() => {})
+  return pageTasks[pageNum]
 }
 
 // 恢复该页划线高亮：给与高亮文本匹配的 textLayer span 加背景类
@@ -109,8 +123,52 @@ function handleIntersect(entries) {
     const pageNum = Number(entry.target.dataset.page)
     if (renderedPages.has(pageNum)) continue
     renderedPages.add(pageNum)
-    renderPage(pageNum).catch(() => {})
+    queueRender(pageNum)
   }
+}
+
+// 容器宽度自适应：加载时只算一次 scale，拖拽分栏/改窗口后必须重排，
+// 否则 canvas 保持旧尺寸 → 内容被裁切，要切换视图才能恢复（历史 bug）
+function computeScale(baseWidth) {
+  return Math.min((wrapRef.value.clientWidth - 64) / baseWidth, 2)
+}
+
+// 当前可视区最上方的页码：重排后滚回这里，不打断阅读位置
+function currentTopPage() {
+  const wrapTop = wrapRef.value?.getBoundingClientRect().top ?? 0
+  for (const el of wrapRef.value?.querySelectorAll('.pdf-page') || []) {
+    const r = el.getBoundingClientRect()
+    if (r.bottom > wrapTop + 40) return Number(el.dataset.page)
+  }
+  return 0
+}
+
+async function refit() {
+  if (!doc || !wrapRef.value || refitting) return
+  refitting = true
+  try {
+    const first = await doc.getPage(1)
+    const base = first.getViewport({ scale: 1 })
+    const newScale = computeScale(base.width)
+    if (Math.abs(newScale - scale) < 0.01) return
+    const topPage = currentTopPage()
+    scale = newScale
+    // 已渲染页按新 scale 重渲染；未渲染页懒加载时自然采用新 scale
+    for (const p of [...renderedPages].sort((a, b) => a - b)) {
+      await queueRender(p)
+    }
+    if (topPage) {
+      const el = wrapRef.value.querySelector(`.pdf-page[data-page="${topPage}"]`)
+      el?.scrollIntoView({ behavior: 'auto', block: 'start' })
+    }
+  } finally {
+    refitting = false
+  }
+}
+
+function onWrapResize() {
+  clearTimeout(resizeTimer)
+  resizeTimer = setTimeout(refit, 200)   // 拖拽期间连续触发，防抖到停顿后一次重排
 }
 
 async function load() {
@@ -121,7 +179,7 @@ async function load() {
     // 按容器宽度自适应缩放
     const first = await doc.getPage(1)
     const base = first.getViewport({ scale: 1 })
-    scale = Math.min((wrapRef.value.clientWidth - 64) / base.width, 2)
+    scale = computeScale(base.width)
     // 首屏先渲染第 1 页，隐藏 loading（其余页懒加载）
     await renderPage(1)
     renderedPages.add(1)
@@ -132,6 +190,9 @@ async function load() {
       const el = wrapRef.value?.querySelector(`.pdf-page[data-page="${i}"]`)
       if (el) observer.observe(el)
     }
+    // 容器尺寸变化（拖分栏 / 改窗口 / 进出全屏）→ 防抖重排
+    resizeObserver = new ResizeObserver(onWrapResize)
+    resizeObserver.observe(wrapRef.value)
   } catch (e) {
     error.value = '原文渲染失败：' + (e.message || '未知错误')
     loading.value = false
@@ -140,6 +201,8 @@ async function load() {
 
 onMounted(load)
 onUnmounted(() => {
+  clearTimeout(resizeTimer)
+  resizeObserver?.disconnect()
   observer?.disconnect()
   doc?.destroy()
 })

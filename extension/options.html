@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>知萤划词助手 · 设置</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: #f7f6f3; color: #2c2c2a; padding: 32px 20px; }
+  .wrap { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+  .sub { font-size: 13px; color: #6e6e6e; margin-bottom: 24px; line-height: 1.6; }
+  .card { background: #fff; border: 1px solid #e4e2dc; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  label { display: block; font-size: 13px; font-weight: 500; color: #444441; margin-bottom: 6px; }
+  input { width: 100%; padding: 9px 12px; font-size: 13px; border: 1px solid #d3d1c7;
+    border-radius: 8px; outline: none; }
+  input:focus { border-color: #534AB7; }
+  .field { margin-bottom: 16px; }
+  .tip { font-size: 12px; color: #888780; margin-top: 5px; line-height: 1.6; }
+  .tip code { background: #f1efe8; padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+  .row { display: flex; gap: 10px; align-items: center; }
+  button { border: 1px solid #d3d1c7; background: #fff; color: #444441; font-size: 13px;
+    padding: 8px 18px; border-radius: 8px; cursor: pointer; }
+  button.primary { background: #534AB7; border-color: #534AB7; color: #fff; }
+  button.primary:hover { background: #3C3489; }
+  #status { font-size: 13px; margin-left: 4px; }
+  #status.ok { color: #0F6E56; }
+  #status.err { color: #A32D2D; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>知萤划词助手</h1>
+  <p class="sub">扩展是本地知萤主应用的「遥控器」：所有 AI 处理都在本机完成，扩展不向任何外部服务器发送数据。</p>
+
+  <div class="card">
+    <div class="field">
+      <label for="baseUrl">主应用地址</label>
+      <input id="baseUrl" type="text" placeholder="http://127.0.0.1:8000">
+      <p class="tip">默认 <code>http://127.0.0.1:8000</code>；改过启动端口的话在这里同步改。</p>
+    </div>
+    <div class="field">
+      <label for="token">配对令牌</label>
+      <input id="token" type="text" placeholder="64 位令牌，从主应用设置页复制">
+      <p class="tip">在主应用里打开 <code>设置 → 浏览器扩展</code>，点「复制令牌」后粘贴到这里。</p>
+    </div>
+    <div class="row">
+      <button id="save" class="primary">保存</button>
+      <button id="test">测试连接</button>
+      <span id="status"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>使用方式</label>
+    <p class="tip">① 网页里选中文字 → 点浮动工具栏的「解释 / 总结 / 存知识库」<br>
+      ② 选中后按 <code>Alt+B</code> 直接解释（可在 chrome://extensions/shortcuts 改）<br>
+      ③ 右键选中文字 → 知萤菜单；页面空白处右键 →「保存本页到知萤」</p>
+  </div>
+</div>
+<script src="options.js"></script>
+</body>
+</html>

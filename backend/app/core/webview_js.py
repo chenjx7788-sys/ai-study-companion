@@ -1,13 +1,15 @@
 """页面脚本取值的统一封装（阶段 1 · R2）：把 `evaluate_js` 的返回值解析成 Python 对象。
 
-⚠️ 为什么必须有这一层 —— Qt 后端的 `Window.evaluate_js()` **返回 str、不做 JSON 解析**
-   （阶段 0 实测 A14：`type(result) == str`）。若在调用处直接写 `result["x"]`，
-   在 Qt 下就变成「对字符串取下标」→ 要么抛异常、要么静默取到一个字符。
+⚠️ 为什么必须有这一层 —— pywebview 的 `Window.evaluate_js(script, parse_json=False)`
+   **默认不解析 JSON，直接返回 str**（阶段 0 实测 A14：`type(result) == str`）。若在调用处
+   直接写 `result["x"]`，就变成「对字符串取下标」→ 要么抛异常、要么静默取到一个字符。
    后者是典型的**静默出错**：页面明明是对的，代码却拿到错的东西。
+   （历史注记：这条最初在 Qt 外壳下实测；2026-09-22 外壳换回系统 WebView2 / WKWebView 后
+     结论**依然成立** —— `parse_json` 的默认值没变，winforms 也在 `parse_json=True` 时才解析。）
 
 ⚠️ R1 硬约束：本模块的函数**必须在主线程调用**。
    pywebview 的 `after_start` 回调跑在工作线程（实测 Thread-2），在那里直接调
-   `evaluate_js` / 碰 Qt 控件会**挂死**（不是报错，是没有任何输出地卡住）。
+   `evaluate_js` / 碰原生控件会**挂死**（不是报错，是没有任何输出地卡住）。
    需要从工作线程取值时，走 `Window.evaluate_js()` 这类**已做线程投递**的入口，
    或自建 `QObject + Signal` 桥把取值动作投到主线程。
 
@@ -48,7 +50,7 @@ def eval_js_json(window, script, *, default=_UNSET):
     """
     raw = window.evaluate_js(script)
     if not isinstance(raw, str):
-        return raw                      # 后端已解析（非 Qt 形态）→ 原样返回，不再解析
+        return raw                      # 后端已解析（parse_json=True 的形态）→ 原样返回
     s = raw.strip()
     if s == "":
         return _fallback(default, "脚本返回空串（JS 的 undefined / 空返回）", script)

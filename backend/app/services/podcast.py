@@ -37,6 +37,8 @@ LENGTH_PRESETS = {
     3:  {"script_chars": 850,  "brief_chars": 420,  "segments": 16, "label": "3 分钟精华"},
     5:  {"script_chars": 1450, "brief_chars": 650,  "segments": 26, "label": "5 分钟轻听"},
     10: {"script_chars": 2850, "brief_chars": 1200, "segments": 50, "label": "10 分钟深度"},
+    # 20 分钟档：按 3/5/10 的线性关系外推（≈285 字/分钟、≈5 句/分钟），供深度解读内容使用
+    20: {"script_chars": 5700, "brief_chars": 2400, "segments": 100, "label": "20 分钟深读"},
 }
 
 # 字数容忍度：超出此范围自动重生成一次（LLM 对字数约束遵守度有限）
@@ -56,6 +58,16 @@ SOLO_SEGMENT_RATIO = 0.5
 # 单次送入 LLM 的素材上限（超过则等间隔抽样，保证覆盖全文而非只取开头）
 MAX_SOURCE_CHARS = 14000
 
+# 原文朗读（verbatim）：素材**不抽样、不截断**，但设总上限 —— 这里没有 LLM 上下文
+# 限制，真正的约束是 TTS 成本与音频时长（6 万字 ≈ 4 小时音频）。超限明确报错，
+# 绝不静默抽样丢内容（抽样是为 LLM 上下文设计的妥协，朗读场景不可接受）。
+VERBATIM_MAX_CHARS = 60000
+# 逐句分句：目标 200 字/句（兼顾逐句高亮粒度与 TTS 调用数）；
+# 硬上限必须小于路由层 MAX_SEG_CHARS(400) —— 那里对超长句是**直接砍尾**，
+# 「原文一字不丢」的前提是句长在这里就控制住。
+VERBATIM_SEG_TARGET = 200
+VERBATIM_SEG_MAX = 380
+
 # 三色划线语义（已在方案中确认）
 HIGHLIGHT_SEMANTICS = {
     "green":  {"label": "已懂",  "hint": "用户已掌握、标记为懂的内容"},
@@ -68,6 +80,7 @@ SOURCE_TYPES = {
     "notes":      "笔记",
     "highlights": "三色划线",
     "review":     "错题卡片",
+    "text":       "粘贴文本",
 }
 
 
@@ -230,34 +243,73 @@ def _sample_text(chunks: list[str], max_chars: int) -> str:
     return "\n\n".join(t[:per] for t in picked)
 
 
-def _material_text(db, material_id: int) -> tuple[str, str]:
-    """单篇文档的素材。返回 (标题, 文本)"""
+def _material_text(db, material_id: int, full: bool = False) -> tuple[str, str]:
+    """单篇文档的素材。返回 (标题, 文本)
+
+    full=True（原文朗读）时取全文、不抽样：抽样是为 LLM 上下文设计的妥协，
+    朗读场景用它等于「只读一部分」，与「不改写、不丢字」的诉求直接冲突。
+    """
     m = db.get(Material, material_id)
     if not m:
         return "", ""
     chunks = (db.query(MaterialChunk)
               .filter(MaterialChunk.material_id == material_id)
               .order_by(MaterialChunk.id).all())
+    if full:
+        return m.title, "\n\n".join(c.content for c in chunks if (c.content or "").strip())
     text = _sample_text([c.content for c in chunks], MAX_SOURCE_CHARS)
     return m.title, text
 
 
 def collect_source(db, source_type: str, ref_ids: list[int] | None = None,
                    highlight_colors: list[str] | None = None,
-                   limit: int = 30) -> tuple[str, str, list[dict]]:
+                   limit: int = 30, pasted_text: str = "",
+                   verbatim: bool = False) -> tuple[str, str, list[dict]]:
     """抽取素材。返回 (标题, 素材文本, 来源快照列表)
 
     来源快照存进 podcasts.source_refs，供列表页展示「这条播客来自哪里」。
+
+    verbatim=True（原文朗读）：素材取全文、不抽样；总量超 VERBATIM_MAX_CHARS
+    时明确报错（不静默丢内容）。
     """
     ref_ids = ref_ids or []
     refs: list[dict] = []
 
+    def _finish(texts: list[str]) -> str:
+        """素材收尾：verbatim 取全文（含上限校验），否则按 LLM 口径抽样"""
+        if verbatim:
+            joined = "\n\n".join(t for t in texts if (t or "").strip())
+            if len(joined) > VERBATIM_MAX_CHARS:
+                raise ValueError(
+                    f"内容共 {len(joined)} 字，超过原文朗读上限 "
+                    f"{VERBATIM_MAX_CHARS} 字，请先拆分再生成")
+            return joined
+        return _sample_text(texts, MAX_SOURCE_CHARS)
+
+    if source_type == "text":
+        # 粘贴文本：内容不在库里，快照必须带全文 —— 否则「重新生成」拿不到原文
+        content = (pasted_text or "").strip()
+        if not content:
+            raise ValueError("请先粘贴要朗读的内容")
+        if verbatim and len(content) > VERBATIM_MAX_CHARS:
+            raise ValueError(
+                f"内容共 {len(content)} 字，超过原文朗读上限 "
+                f"{VERBATIM_MAX_CHARS} 字，请拆分后再生成")
+        first = next((ln.strip() for ln in content.splitlines() if ln.strip()), "")
+        title = (first[:24] + "…") if len(first) > 24 else (first or "粘贴文本")
+        refs.append({"type": "text", "chars": len(content), "content": content})
+        return title, _finish([content]), refs
+
     if source_type == "article":
         if not ref_ids:
             raise ValueError("请选择一篇文档")
-        title, text = _material_text(db, ref_ids[0])
+        title, text = _material_text(db, ref_ids[0], full=verbatim)
         if not text.strip():
             raise ValueError("该文档没有可用的正文（可能尚未解析完成）")
+        if verbatim and len(text) > VERBATIM_MAX_CHARS:
+            raise ValueError(
+                f"文档全文共 {len(text)} 字，超过原文朗读上限 "
+                f"{VERBATIM_MAX_CHARS} 字，请换较短的文档或拆分后再生成")
         refs.append({"type": "material", "id": ref_ids[0], "title": title})
         return title, text, refs
 
@@ -271,7 +323,7 @@ def collect_source(db, source_type: str, ref_ids: list[int] | None = None,
             blocks.append(f"### {n.title}\n{(n.content or '').strip()}")
             refs.append({"type": "note", "id": n.id, "title": n.title})
         title = notes[0].title if len(notes) == 1 else f"{notes[0].title} 等 {len(notes)} 条笔记"
-        return title, _sample_text(blocks, MAX_SOURCE_CHARS), refs
+        return title, _finish(blocks), refs
 
     if source_type == "highlights":
         if not ref_ids:
@@ -306,7 +358,7 @@ def collect_source(db, source_type: str, ref_ids: list[int] | None = None,
         title = f"{m.title} · 划线精读"
         refs.append({"type": "material", "id": m.id, "title": m.title,
                      "colors": [c for c in colors if any(h.color == c for h in rows)]})
-        return title, _sample_text(blocks, MAX_SOURCE_CHARS), refs
+        return title, _finish(blocks), refs
 
     if source_type == "review":
         now = datetime.utcnow()
@@ -325,12 +377,62 @@ def collect_source(db, source_type: str, ref_ids: list[int] | None = None,
         refs.append({"type": "review", "count": len(cards),
                      "titles": sorted(mats)[:5]})
         head = f"以下是今日到期需要复习的 {len(cards)} 张卡片，每张包含问题与答案：\n\n"
-        return title, _sample_text([head + "\n".join(blocks)], MAX_SOURCE_CHARS), refs
+        return title, _finish([head + "\n".join(blocks)]), refs
 
     raise ValueError(f"暂不支持的来源类型：{source_type}")
 
 
 # ---------- 生成 ----------
+
+# 句末标点（切句依据，标点保留在句尾）
+_SENT_END = "。！？；!?;…"
+
+
+def split_verbatim(text: str, on_stage=None) -> list[dict]:
+    """原文 → 逐句脚本（不改写、不丢字）：按行 → 按句末标点切，贪婪打包到目标句长。
+
+    - 单句超 VERBATIM_SEG_MAX 时硬切（极端长句，如通篇无标点的粘贴文本）；
+    - 说话人统一 host（单音色朗读），合成 / 逐句缓存 / 音频指纹管线零改动；
+    - Markdown 标题的 # 号在切句时剥掉：朗读出来是「井号井号」，属于呈现层噪音，
+      剥它不是改写内容。
+    """
+    _stage(on_stage, "split")
+    segs: list[str] = []
+
+    def _emit(s: str) -> None:
+        s = s.strip()
+        if s:
+            segs.append(s)
+
+    for para in (text or "").split("\n"):
+        para = para.strip()
+        if not para:
+            continue
+        para = para.lstrip("#").lstrip()      # Markdown 标题标记不朗读
+        if not para:
+            continue
+        sents, cur = [], ""
+        for ch in para:
+            cur += ch
+            if ch in _SENT_END:
+                sents.append(cur)
+                cur = ""
+        if cur:
+            sents.append(cur)
+        buf = ""
+        for s in sents:
+            while len(s) > VERBATIM_SEG_MAX:
+                _emit(buf)
+                buf = ""
+                _emit(s[:VERBATIM_SEG_MAX])
+                s = s[VERBATIM_SEG_MAX:]
+            if buf and len(buf) + len(s) > VERBATIM_SEG_TARGET:
+                _emit(buf)
+                buf = ""
+            buf += s
+        _emit(buf)
+    return [{"speaker": "host", "text": t} for t in segs]
+
 
 def plan_for(target_minutes: int, style: str = "dialogue") -> dict:
     """时长档位 → 字数 / 句数（句数随风格调整，见 SOLO_SEGMENT_RATIO）"""

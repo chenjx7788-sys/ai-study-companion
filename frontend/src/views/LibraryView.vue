@@ -33,7 +33,7 @@
         <el-popover ref="importPop" placement="bottom-end" :width="232" trigger="click" popper-class="import-popper">
           <template #reference>
             <el-button plain>
-              导入本地<el-icon class="el-icon--right"><ArrowDown /></el-icon>
+              导入内容<el-icon class="el-icon--right"><ArrowDown /></el-icon>
             </el-button>
           </template>
           <div class="import-menu">
@@ -210,11 +210,12 @@
               </el-select>
             </el-popover>
           </div>
-          <div v-if="m.parsed_status === 'parsing' && m.parse_progress > 1" class="parse-progress">
+          <div v-if="m.parsed_status === 'parsing' && m.parse_progress >= 1" class="parse-progress">
             <div class="progress-track">
-              <div class="progress-fill" :style="{ width: m.parse_progress + '%' }"></div>
+              <div class="progress-fill" :class="{ 'progress-indeterminate': isImageFmt(m.format) }"
+                :style="isImageFmt(m.format) ? {} : { width: m.parse_progress + '%' }"></div>
             </div>
-            <span class="progress-text">{{ m.parse_progress }}%</span>
+            <span class="progress-text">{{ isImageFmt(m.format) ? 'OCR 识别中' : m.parse_progress + '%' }}</span>
           </div>
           <div v-if="m.page_count && m.last_read_page" class="progress-row">
             <div class="progress-track">
@@ -625,14 +626,19 @@ async function saveTags(m, tags) {
 
 const isMediaFmt = (f) => ['mp3', 'wav', 'm4a', 'mp4'].includes(f)
 const isImageFmt = (f) => ['jpg', 'jpeg', 'png', 'webp', 'bmp'].includes(f)
-const isSlowFmt = (f) => isMediaFmt(f) || isImageFmt(f) || f === 'pdf'
-const slowLabel = (f) => isMediaFmt(f) ? '转写中' : '识别中'
+const isSlowFmt = (f) => isMediaFmt(f) || isImageFmt(f) || f === 'pdf' || f === 'epub'
+// 慢格式状态文案：图片 OCR 是单块调用拿不到真实进度，只显示阶段不给假百分比
+const slowLabel = (f, pct) => {
+  if (isMediaFmt(f)) return `转写中 ${pct}%`
+  if (isImageFmt(f)) return '识别中…'
+  return `解析中 ${pct}%`
+}
 
 // 材料状态标签：解析中（转写/识别带百分比）/ 解析失败 / 扫描件 / 已总结，无状态返回 null
 function statusTag(m) {
   if (m.parsed_status === 'parsing') {
     const pct = m.parse_progress || 0
-    return { type: 'primary', loading: true, text: isSlowFmt(m.format) ? `${slowLabel(m.format)} ${pct}%` : '解析中', title: '' }
+    return { type: 'primary', loading: true, text: isSlowFmt(m.format) ? slowLabel(m.format, pct) : '解析中', title: '' }
   }
   if (m.parsed_status === 'failed') return { type: 'danger', text: '解析失败', title: m.parse_error || '' }
   if (m.parsed_status === 'scanned') return { type: 'warning', text: '扫描件', title: m.parse_error || '' }
@@ -931,7 +937,7 @@ onUnmounted(() => pollTimer && clearInterval(pollTimer))
 }
 .search-group :deep(.el-input__wrapper) { border-radius: 8px !important; }
 
-/* ===== 导入本地弹出菜单 ===== */
+/* ===== 导入内容弹出菜单 ===== */
 .import-menu { display: flex; flex-direction: column; }
 .import-item {
   display: flex; align-items: center; gap: 8px;
@@ -1134,6 +1140,12 @@ onUnmounted(() => pollTimer && clearInterval(pollTimer))
 .progress-row, .parse-progress { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .progress-track { flex: 1; height: 4px; background: var(--asc-surface-2); border-radius: 2px; overflow: hidden; }
 .progress-fill { height: 100%; background: linear-gradient(90deg, var(--asc-primary), #a38dfd); border-radius: 2px; transition: width .3s; }
+/* 图片 OCR：单块调用拿不到真实进度 → 不确定动画，不编假百分比 */
+.progress-fill.progress-indeterminate { width: 40%; transition: none; animation: parse-slide 1.2s ease-in-out infinite; }
+@keyframes parse-slide {
+  0% { margin-left: -40%; }
+  100% { margin-left: 100%; }
+}
 .progress-text { font-size: 11px; color: var(--asc-text-3); flex-shrink: 0; font-variant-numeric: tabular-nums; }
 
 .card-footer {
@@ -1202,6 +1214,6 @@ onUnmounted(() => pollTimer && clearInterval(pollTimer))
 </style>
 
 <style>
-/* 导入本地弹层：收紧内边距（非 scoped，作用于 popper） */
+/* 导入内容弹层：收紧内边距（非 scoped，作用于 popper） */
 .import-popper.el-popover { padding: 8px !important; border-radius: 12px !important; }
 </style>

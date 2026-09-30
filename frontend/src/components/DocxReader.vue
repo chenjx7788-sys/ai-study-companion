@@ -38,6 +38,21 @@ const host = ref(null)
 const loading = ref(true)
 const error = ref('')
 let cancelled = false
+let resizeObserver = null
+
+// 容器变窄时等比缩小版面：docx-preview 渲染的是固定宽度纸张（A4），
+// 容器窄于纸宽会横向裁切（历史 bug：要切视图再切回才恢复）。
+// 用 zoom 而非 transform scale —— zoom 会同步缩放布局高度，不留空白占位。
+function fitWidth() {
+  const wrap = host.value?.querySelector('.docx-wrapper')
+  const section = host.value?.querySelector('section.docx')
+  const container = host.value?.parentElement
+  if (!wrap || !section || !container) return
+  const pageWidth = section.offsetWidth
+  const avail = container.clientWidth - 32
+  if (!pageWidth || !avail) return
+  wrap.style.zoom = pageWidth > avail ? String(Math.max(avail / pageWidth, 0.3)) : ''
+}
 
 async function render() {
   if (!host.value) return
@@ -58,6 +73,7 @@ async function render() {
       renderFooters: true,
       renderFootnotes: true,
     })
+    fitWidth()
   } catch (e) {
     if (!cancelled) error.value = String(e?.message || e)
   } finally {
@@ -65,8 +81,16 @@ async function render() {
   }
 }
 
-onMounted(render)
-onBeforeUnmount(() => { cancelled = true })
+onMounted(() => {
+  render()
+  // 拖分栏 / 改窗口 / 进出全屏 → 重新计算缩放
+  resizeObserver = new ResizeObserver(() => fitWidth())
+  if (host.value?.parentElement) resizeObserver.observe(host.value.parentElement)
+})
+onBeforeUnmount(() => {
+  cancelled = true
+  resizeObserver?.disconnect()
+})
 </script>
 
 <style scoped>

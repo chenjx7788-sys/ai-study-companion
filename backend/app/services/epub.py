@@ -482,3 +482,30 @@ class EpubBook:
         except KeyError:
             return []
         return blocks_from_html(data)
+
+    def images(self, href: str) -> list[str]:
+        """章节正文里的图片 zip 内路径列表（按出现顺序、去重）。
+
+        供 parse_epub 做内嵌图 OCR：正文 `<img src="...">` 的 src（可含相对路径/百分号编码/
+        fragment）用 _norm_zip_path 归一为 zip 内路径，再经 self.read 取回字节。
+        无图片返回 []。
+        """
+        try:
+            data = self.read(href)
+        except KeyError:
+            return []
+        root = _load_html(data)
+        if root is None:
+            return []
+        base = posixpath.dirname(href)
+        out: list[str] = []
+        for el in root.iter():
+            if _local(el.tag) != "img":
+                continue
+            src = el.get("src")
+            if not src:
+                continue
+            p = _norm_zip_path(base, src)
+            if p and p not in out and self._has(p):
+                out.append(p)
+        return out

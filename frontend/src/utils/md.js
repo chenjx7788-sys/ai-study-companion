@@ -11,6 +11,18 @@
 //      webview/platforms/edgechromium.py:on_new_window_request）→ 系统浏览器打开；
 //      若同标签打开，整个桌面应用会被导航到外站且**没有返回入口**。
 //
+//
+// ---------- 图片走本站只读代理（2026-09-23） ----------
+// ⚠️ 与上面「外链新窗口」不同，这条**是**为所有调用方统一加的兜底，理由如下（实测）：
+//   微信 `mmbiz.qpic.cn` 对带**非微信域 Referer** 的请求返回一张 140x140 占位图
+//   （HTTP 200，图上印着「此图片来自微信公众平台未经允许不可引用」）；
+//   而浏览器从本地应用加载外链图，必然带 `Referer: http://127.0.0.1:<port>/`；
+//   用 `referrerpolicy="no-referrer"` 去掉 Referer 后会换成 **HTTP 400**
+//   （浏览器特征头 `Sec-Fetch-*` + 无 Referer）—— 三组浏览器矩阵实测结论一致。
+//   ⇒ 浏览器侧无解，只能让**后端**去取（后端不带 `Sec-Fetch-*`，被当普通抓取放行）。
+//   见 `backend/app/routers/imgproxy.py`。
+// ⚠️ 代理取不到时会 302 回原 URL —— 所以这条改写**不会让原本能显示的图变不能显示**。
+// ⚠️ 只改 http(s) 外链；站内地址（`/api/assets/…`，已本地化的配图）原样保留。
 // ⚠️ 工厂**不设隐式默认值**：调用方传什么就是什么，避免迁移某个页面时行为被悄悄改掉。
 import MarkdownIt from 'markdown-it'
 
@@ -23,5 +35,24 @@ export function createMd(opts = {}) {
     tokens[idx].attrSet('rel', 'noopener noreferrer')
     return base(tokens, idx, options, env, self)
   }
+  // 图片：外链改走只读代理（见文件头「图片走本站只读代理」）。
+  // ⚠️ markdown-it 的 `rules.image` 默认实现负责把 alt 从 children 渲染成文本，
+  //    所以必须**先改 src 再调它**（自己重写一份等于把 alt/title 行为也接管了）。
+  const baseImg = md.renderer.rules.image || ((t, i, o, e, self) => self.renderToken(t, i, o))
+  md.renderer.rules.image = (tokens, idx, options, env, self) => {
+    const at = tokens[idx].attrIndex('src')
+    if (at >= 0) {
+      const proxied = proxiedImageSrc(tokens[idx].attrs[at][1])
+      if (proxied !== tokens[idx].attrs[at][1]) tokens[idx].attrs[at][1] = proxied
+    }
+    return baseImg(tokens, idx, options, env, self)
+  }
   return md
+}
+
+// 只读图片代理：把外链图交给后端取回（原因见文件头注释）。
+const IMG_PROXY = '/api/imgproxy?url='
+
+function proxiedImageSrc(src) {
+  return /^https?:\/\//i.test(src) ? IMG_PROXY + encodeURIComponent(src) : src
 }

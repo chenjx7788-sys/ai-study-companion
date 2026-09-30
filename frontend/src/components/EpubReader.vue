@@ -49,7 +49,7 @@ const props = defineProps({
   index: { type: Number, default: 1 },
   base: { type: String, required: true },
 })
-const emit = defineEmits(['change'])
+const emit = defineEmits(['change', 'select', 'hidesel', 'loaded'])
 
 const frame = ref(null)
 const loading = ref(true)
@@ -82,11 +82,105 @@ function onLoad() {
     const doc = frame.value?.contentDocument
     if (doc && !doc.body?.textContent?.trim() && !doc.querySelector('img, svg, image')) {
       error.value = '该章节没有可显示的内容'
+    } else if (doc?.body) {
+      setupFrame(doc)
     }
   } catch {
     /* 跨源受限时忽略：不影响阅读 */
   }
+  // 无论成功与否都通知父组件（applyHighlights 对无 body 场景有容错）
+  emit('loaded', cur.value)
 }
+
+// ---------- 选区捕获与划线渲染（划线 / AI 解读 / 转笔记 / 复制的入口） ----------
+//
+// iframe 内的 mouseup 不会冒泡到父文档，必须挂进章节文档；
+// 工具条是父页面的 position:fixed 元素 → 选区矩形要换算到顶层视口坐标。
+// 划线恢复与 PDF/Markdown 同口径：selected_text 文本匹配包裹（同章多处出现会都标上）。
+
+const HL_STYLE_ID = 'asc-epub-hl-style'
+function injectHlStyle(doc) {
+  if (doc.getElementById(HL_STYLE_ID)) return
+  const st = doc.createElement('style')
+  st.id = HL_STYLE_ID
+  st.textContent = `
+    .hl-user.hl-yellow { background: rgba(252, 211, 77, .5); }
+    .hl-user.hl-green { background: rgba(134, 239, 172, .55); }
+    .hl-user.hl-blue { background: rgba(147, 197, 253, .55); }`
+  doc.head?.appendChild(st)
+}
+
+// 文本匹配包裹（同 StudyView.wrapTextOccurrences 口径，但节点由 iframe 文档创建）
+function wrapText(doc, root, text, className) {
+  if (!text || !root) return
+  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+  const nodes = []
+  let n
+  while ((n = walker.nextNode())) nodes.push(n)
+  for (const node of nodes) {
+    const val = node.nodeValue || ''
+    if (!val.includes(text)) continue
+    if (node.parentElement?.closest('.hl-user')) continue
+    const parts = val.split(text)
+    if (parts.length === 1) continue
+    const frag = doc.createDocumentFragment()
+    parts.forEach((part, i) => {
+      if (part) frag.appendChild(doc.createTextNode(part))
+      if (i < parts.length - 1) {
+        const span = doc.createElement('span')
+        span.className = className
+        span.textContent = text
+        frag.appendChild(span)
+      }
+    })
+    node.parentNode.replaceChild(frag, node)
+  }
+}
+
+function clearHlMarks(doc) {
+  doc.querySelectorAll('.hl-user').forEach(el => {
+    el.parentNode.replaceChild(doc.createTextNode(el.textContent), el)
+  })
+  doc.body?.normalize()
+}
+
+// 父组件调用：把「当前章」的划线列表重刷进 iframe（先清再按文本匹配包裹）
+function applyHighlights(list) {
+  const doc = frame.value?.contentDocument
+  if (!doc?.body) return
+  injectHlStyle(doc)
+  clearHlMarks(doc)
+  for (const h of list || []) {
+    if (h.selected_text) wrapText(doc, doc.body, h.selected_text, `hl-user hl-${h.color}`)
+  }
+}
+
+function clearSelection() {
+  frame.value?.contentWindow?.getSelection()?.removeAllRanges()
+}
+
+function onFrameMouseUp() {
+  const win = frame.value?.contentWindow
+  const sel = win?.getSelection()
+  const text = sel?.toString().trim() || ''
+  if (!text || !sel.rangeCount) { emit('hidesel'); return }
+  const rect = sel.getRangeAt(0).getBoundingClientRect()
+  const fr = frame.value.getBoundingClientRect()
+  emit('select', {
+    text,
+    page: cur.value,
+    x: Math.min(fr.left + rect.left, window.innerWidth - 320),
+    y: fr.top + rect.bottom + 8,
+  })
+}
+
+function setupFrame(doc) {
+  injectHlStyle(doc)
+  doc.addEventListener('mouseup', onFrameMouseUp)
+  doc.addEventListener('mousedown', () => emit('hidesel'))
+}
+
+defineExpose({ applyHighlights, clearSelection })
 
 function go(v) {
   const n = clamp(v)

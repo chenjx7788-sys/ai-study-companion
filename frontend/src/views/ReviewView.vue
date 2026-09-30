@@ -164,7 +164,7 @@
       <div class="review-col review-right">
         <!-- 今日完成（队列清空 or 全部评完） -->
         <div v-if="!current" class="all-done">
-      <img :src="mascot" class="done-mascot" alt="伴学猫头鹰" />
+      <img :src="mascot" class="done-mascot" alt="知萤猫头鹰" />
       <p class="done-title">今日复习完成，伴伴为你点赞</p>
       <p class="done-sub">知识又巩固了一层，明天见</p>
       <p v-if="stats.reviewed_today" class="done-stats">今日复习 {{ stats.reviewed_today }} 次 · 今日记得率 {{ todayRate }}%</p>

@@ -132,6 +132,14 @@
               </div>
             </div>
 
+            <div class="field" v-else-if="form.source_type === 'text'">
+              <label>粘贴文本<span class="hint-inline" v-if="form.pasted_text">{{ form.pasted_text.length }}
+                字 · 预计约 {{ Math.max(1, Math.round(form.pasted_text.length / 250)) }} 分钟</span></label>
+              <el-input v-model="form.pasted_text" type="textarea" :rows="6" size="small"
+                maxlength="60000" show-word-limit
+                placeholder="把整理好的内容粘贴到这里。配合「原文朗读」使用：不改写、逐句照读" />
+            </div>
+
             <div class="field" v-else>
               <label>今日到期卡片</label>
               <div class="due-box" :class="{ empty: !options.review_due }">
@@ -146,6 +154,17 @@
             <div class="section-label">输出设置</div>
 
             <div class="field">
+              <label>方式</label>
+              <div class="seg-ctl">
+                <span class="seg-item" :class="{ on: genMode === 'rewrite' }"
+                  @click="genMode = 'rewrite'">AI 改写</span>
+                <span class="seg-item" :class="{ on: genMode === 'verbatim' }"
+                  @click="genMode = 'verbatim'">原文朗读</span>
+              </div>
+              <p class="hint" v-if="isVerbatim">不改写原文，按内容逐句朗读；时长由内容长度决定（上限 6 万字）</p>
+            </div>
+
+            <div class="field" v-if="!isVerbatim">
               <label>风格</label>
               <div class="seg-ctl">
                 <span v-for="s in options.styles" :key="s.id" class="seg-item"
@@ -154,7 +173,7 @@
               <p class="hint">{{ styleDesc }}</p>
             </div>
 
-            <div class="field">
+            <div class="field" v-if="!isVerbatim">
               <label>时长</label>
               <div class="seg-ctl">
                 <span v-for="l in options.lengths" :key="l.minutes" class="seg-item"
@@ -166,7 +185,7 @@
             <div class="field">
               <label>音色<span class="hint-inline">点 ▶ 可试听每个音色</span></label>
               <div class="voice-row">
-                <span class="voice-role">主持人</span>
+                <span class="voice-role">{{ isVerbatim ? '朗读' : '主持人' }}</span>
                 <el-select v-model="form.voice_map.host" size="small" style="flex:1">
                   <el-option v-for="v in options.voices" :key="v.id"
                     :label="v.name" :value="v.id">
@@ -188,7 +207,7 @@
                 </button>
               </div>
               <!-- 单人精讲只有一个说话人 → 不显示专家音色（选了也不会被用上） -->
-              <div class="voice-row" v-if="form.style !== 'solo'">
+              <div class="voice-row" v-if="form.style !== 'solo' && !isVerbatim">
                 <span class="voice-role">专家</span>
                 <el-select v-model="form.voice_map.expert" size="small" style="flex:1">
                   <el-option v-for="v in options.voices" :key="v.id"
@@ -211,7 +230,7 @@
                 </button>
               </div>
               <!-- 双人对话里两个角色同音色 → 听不出谁在说谁（像自言自语） -->
-              <p class="hint warn" v-if="sameVoice">
+              <p class="hint warn" v-if="sameVoice && !isVerbatim">
                 主持人与专家选了同一个音色，对话会分不清谁在说谁。换一个音色区分开。
               </p>
             </div>
@@ -273,7 +292,10 @@
               @ended="stopPreview" @error="onPreviewError"></audio>
           </div>
 
-          <div class="form-section">
+          <!-- 附加要求仅 AI 改写适用；生成按钮/进度条已移入下方 .gen-dock 吸附块。
+               ⚠️ 吸附块必须独立于本 section：verbatim 下本段整体隐藏，按钮若还在
+               里面会被一起藏掉（实测踩中过一次）。 -->
+          <div class="form-section" v-if="!isVerbatim">
             <div class="field">
               <label>附加要求<span class="hint-inline">可选</span></label>
               <div class="inst-presets">
@@ -283,14 +305,21 @@
               <el-input v-model="form.instruction" type="textarea" :rows="2" size="small"
                 placeholder="例如：多举工作中的例子 / 侧重方法论" />
             </div>
+          </div>
 
-            <div class="field mode-row">
+          <!-- 底部吸附：快速模式 + 生成按钮 + 进度条固定在可视区底部，不随表单滚动 -->
+          <div class="gen-dock">
+            <div class="field mode-row" v-if="!isVerbatim">
               <el-checkbox v-model="fastMode" size="small">快速模式</el-checkbox>
               <span class="hint-inline">跳过知识简报，直接出脚本（更快，信息密度略降）</span>
             </div>
 
             <el-button type="primary" class="generate-btn" :loading="generating" @click="generate">
-              {{ generating ? '正在生成脚本...' : (current ? '重新生成脚本' : '生成脚本') }}
+              {{ generating
+                ? (isVerbatim ? '正在整理文稿...' : '正在生成脚本...')
+                : (isVerbatim
+                  ? (current ? '重新整理文稿' : '整理文稿')
+                  : (current ? '重新生成脚本' : '生成脚本')) }}
             </el-button>
 
             <!-- 生成要过 1~2 次 LLM（每次 20-60s）：只写「正在生成脚本…」用户无法判断
@@ -312,7 +341,7 @@
       <!-- ============ 右栏：作品内容 ============ -->
       <div class="podcast-col col-right">
         <div class="empty-guide" v-if="!current">
-          <img :src="mascot" class="eg-img" alt="伴学猫头鹰" />
+          <img :src="mascot" class="eg-img" alt="知萤猫头鹰" />
           <h3 class="eg-title">还没有选中的作品</h3>
           <p class="eg-sub">三步做出一段可以听的复习音频</p>
           <div class="eg-steps">
@@ -336,7 +365,6 @@
               <div class="ac-info">
                 <div class="ac-title">
                   <span class="ac-title-text">{{ current.title }}</span>
-                  <span class="ac-badge" v-if="audioMismatch">上一版</span>
                 </div>
                 <div class="ac-meta">{{ current.segment_count }} 句 · {{ fmtDur(current.duration_sec) }}
                   · {{ (current.audio_bytes / 1024 / 1024).toFixed(1) }} MB
@@ -397,7 +425,7 @@
             <div class="ws-head">
               <div class="tabs">
                 <span class="tab" :class="{ on: tab === 'script' }" @click="tab = 'script'">
-                  对话脚本<span class="tab-num">{{ script.length }}</span>
+                  {{ isVerbatimWork ? '朗读文稿' : '对话脚本' }}<span class="tab-num">{{ script.length }}</span>
                 </span>
                 <span class="tab" :class="{ on: tab === 'brief' }" @click="tab = 'brief'"
                   v-if="current.brief">知识简报</span>
@@ -454,8 +482,9 @@
             </div>
 
             <p class="ws-tip" v-if="!current.has_audio">
-              脚本可逐句修改：点角色名切换主持人/专家，点文字直接编辑。
-              确认满意后再点「合成音频」——不点就不会消耗合成时间。
+              {{ isVerbatimWork
+                ? '文稿可逐句修改：点文字直接编辑。确认后点「合成音频」——不点就不会消耗合成时间。'
+                : '脚本可逐句修改：点角色名切换主持人/专家，点文字直接编辑。确认满意后再点「合成音频」——不点就不会消耗合成时间。' }}
             </p>
             <p class="ws-tip error" v-if="current.status === 'failed' && current.error">
               {{ current.error }}
@@ -546,7 +575,8 @@ const options = ref({
   ],
   lengths: [{ minutes: 3, label: '3 分钟精华' },
             { minutes: 5, label: '5 分钟轻听' },
-            { minutes: 10, label: '10 分钟深度' }],
+            { minutes: 10, label: '10 分钟深度' },
+            { minutes: 20, label: '20 分钟深读' }],
   highlight_semantics: {}, review_due: 0,
   default_style: 'dialogue',
   // 单句字数上限由后端下发（不再手抄一份，避免两处常量漂移）
@@ -568,12 +598,20 @@ const form = reactive({
   target_minutes: 3,
   voice_map: { host: '', expert: '' },
   instruction: '',
+  // 「粘贴文本」来源的内容（不进库的裸文本；快照随作品 source_refs 保存，可回填）
+  pasted_text: '',
   // 背景音乐：bgm_id 为空表示不加。改它会立刻写进作品，从而让后端指纹
   // 把已合成的音频判为「上一版」（不需要等下一次合成）。
   bgm_id: '',
   bgm_volume: -20,
 })
 const fastMode = ref(false)
+// 生成方式：rewrite AI 改写（两步式 / 快速）/ verbatim 原文朗读（不走 LLM，原文逐句照读）
+const genMode = ref('rewrite')
+const isVerbatim = computed(() => genMode.value === 'verbatim')
+// 当前选中作品是否为原文朗读产物（决定右栏「朗读文稿」口径与提示文案；
+// 旧作品没有 gen_mode 字段 → 空串 → 按 AI 改写口径展示，行为不变）
+const isVerbatimWork = computed(() => (current.value?.gen_mode || '') === 'verbatim')
 
 // ---------- 附加要求预设 ----------
 const instructionPresets = [
@@ -634,6 +672,7 @@ const sourceTypes = [
   { id: 'notes', label: '笔记' },
   { id: 'highlights', label: '三色划线' },
   { id: 'review', label: '错题卡片' },
+  { id: 'text', label: '粘贴文本' },
 ]
 
 const voiceStatus = ref({ ok: true, label: '语音服务', text: '点击检测语音服务' })
@@ -939,6 +978,8 @@ function loadCurrent(p) {
   dirty.value = false
   playerTime.value = 0
   playing.value = false
+  // 该作品可能正在后台合成（用户离开过页面）：是则恢复进度显示（fire-and-forget）
+  resumeSynthIfRunning(p.id)
 }
 
 // 打开作品：列表接口只回卡片字段（script / brief 体积大，不随列表下发），
@@ -976,6 +1017,8 @@ function syncFormFromWork(p) {
       if (Array.isArray(colors) && colors.length) form.highlight_colors = [...colors]
     }
   }
+  genMode.value = (p.gen_mode || '') === 'verbatim' ? 'verbatim' : 'rewrite'
+  form.pasted_text = type === 'text' ? (refs[0]?.content || '') : ''
   const styleIds = (options.value.styles || []).map((s) => s.id)
   form.style = styleIds.includes(p.style) ? p.style : (options.value.default_style || 'dialogue')
   if (p.target_minutes) form.target_minutes = p.target_minutes
@@ -1009,7 +1052,9 @@ function resetForm() {
   form.instruction = ''
   form.bgm_id = ''
   form.bgm_volume = bgmVolumeRange.value.default ?? -20
+  form.pasted_text = ''
   fastMode.value = false
+  genMode.value = 'rewrite'
 }
 
 function onSourceType(t) {
@@ -1046,8 +1091,10 @@ function payload() {
     style: form.style,
     target_minutes: form.target_minutes,
     voice_map: { ...form.voice_map },
-    mode: fastMode.value ? 'fast' : 'two_step',
+    mode: isVerbatim.value ? 'verbatim' : (fastMode.value ? 'fast' : 'two_step'),
     instruction: form.instruction,
+    // 「粘贴文本」来源的内容随请求上送；verbatim 模式后端原样分句、不经 LLM
+    text: form.source_type === 'text' ? form.pasted_text : '',
     bgm_id: form.bgm_id || '',
     bgm_volume: form.bgm_volume,
   }
@@ -1063,6 +1110,11 @@ async function generate() {
     // 生成的内容与用户看到的勾选状态不一致
     if (form.ref_id == null) return ElMessage.warning('请选择一篇有划线的文档')
     if (!form.highlight_colors.length) return ElMessage.warning('请至少选择一种划线颜色')
+  } else if (form.source_type === 'text') {
+    if (!form.pasted_text.trim()) return ElMessage.warning('请先粘贴要朗读的内容')
+    if (isVerbatim.value && form.pasted_text.length > 60000) {
+      return ElMessage.warning('内容超过 6 万字上限，请拆分后再生成')
+    }
   } else if (form.ref_id == null) {
     return ElMessage.warning('请先选择文档')
   }
@@ -1372,6 +1424,55 @@ async function refreshCurrent() {
   } catch { /* 忽略刷新失败 */ }
 }
 
+// 启动或附着合成任务。合成是**服务端任务**（后端 _SynthJob）：SSE 只是进度
+// 订阅者，离开页面任务照跑、落盘照写；重复调用只会附着到正在跑的任务上。
+async function streamSynth(pid) {
+  let ok = false
+  await streamSSE(
+    podcastApi.synthesizeStreamUrl(pid),
+    {
+      voice_map: { ...form.voice_map }, gap_ms: options.value.defaults?.gap_ms,
+      bgm_id: form.bgm_id || '', bgm_volume: form.bgm_volume,
+    },
+    undefined,
+    ({ podcast }) => {
+      ok = true
+      if (podcast) loadCurrent(podcast)
+      else refreshCurrent()
+    },
+    (msg) => { ElMessage.error(msg || '合成失败'); refreshCurrent() },
+    // precheck 事件走 meta 通道（utils/sse.js 已有的元信息回调）
+    (pre) => applyPrecheck(pre),
+    ({ done, total }) => { synthProgress.value = { done, total } },
+  )
+  return ok
+}
+
+// 回到页面 / 切换作品时：若该作品有正在跑的合成任务，恢复进度显示并重新附着。
+// 不问这一句的话，后台明明在合成，界面却呈现「没人在跑」的假状态。
+async function resumeSynthIfRunning(pid) {
+  if (synthesizing.value) return
+  let st
+  try {
+    const { data } = await podcastApi.synthStatus(pid)
+    st = data
+  } catch { return }                    // 状态查询失败就当没有在跑
+  if (st?.status !== 'running') return
+  if (!current.value || current.value.id !== pid) return
+  synthesizing.value = true
+  synthProgress.value = { done: st.done || 0, total: st.total || 0 }
+  try {
+    const ok = await streamSynth(pid)
+    await loadList()
+    if (ok && current.value && current.value.id === pid) {
+      ElMessage.success(`音频已生成：${fmtDur(current.value.duration_sec)}，可在下方播放`)
+    }
+  } finally {
+    synthesizing.value = false
+    synthProgress.value = { done: 0, total: 0 }
+  }
+}
+
 async function synthesize() {
   if (!current.value) return
   const clean = script.value.filter((s) => (s.text || '').trim())
@@ -1390,23 +1491,7 @@ async function synthesize() {
       current.value = saved.data
     }
     // 走 SSE：逐句合成要 30-60s，进度按「已完成句数」回传（见后端 /synthesize/stream）
-    await streamSSE(
-      podcastApi.synthesizeStreamUrl(current.value.id),
-      {
-        voice_map: { ...form.voice_map }, gap_ms: options.value.defaults?.gap_ms,
-        bgm_id: form.bgm_id || '', bgm_volume: form.bgm_volume,
-      },
-      undefined,
-      ({ podcast }) => {
-        ok = true
-        if (podcast) loadCurrent(podcast)
-        else refreshCurrent()
-      },
-      (msg) => { ElMessage.error(msg || '合成失败'); refreshCurrent() },
-      // precheck 事件走 meta 通道（utils/sse.js 已有的元信息回调）
-      (pre) => applyPrecheck(pre),
-      ({ done, total }) => { synthProgress.value = { done, total } },
-    )
+    ok = await streamSynth(current.value.id)
     await loadList()
     if (ok && current.value) {
       ElMessage.success(`音频已生成：${fmtDur(current.value.duration_sec)}，可在下方播放`)
@@ -1577,12 +1662,19 @@ async function removeWork(p) {
   }
   try {
     await podcastApi.remove(p.id)
-    if (current.value?.id === p.id) resetForm()
-    await loadList()
-    ElMessage.success('已删除')
   } catch (e) {
     ElMessage.error(errMsg(e, '删除失败'))
+    return
   }
+  // 乐观移除：条目先消失，再拉列表对账。旧写法是「删完等 loadList 成功才更新」——
+  // 紧随其后的 GET 一旦失败（如后端恰好重启的窗口期），就出现「实际已删、列表还在」，
+  // 且 catch 还会把它误报成「删除失败」（用户实测踩中）。
+  list.value = list.value.filter((w) => w.id !== p.id)
+  if (current.value?.id === p.id) resetForm()
+  ElMessage.success('已删除')
+  try {
+    await loadList()            // 后台对账；失败无碍 —— 条目已移除，下次进页自然刷新
+  } catch { /* 对账失败不掩盖「已删除」的事实 */ }
 }
 
 async function checkVoice() {
@@ -1736,6 +1828,15 @@ onMounted(async () => {
 /* ---------- 表单分节 ---------- */
 .form-section { padding-top: 18px; }
 .form-section + .form-section { border-top: 1px solid var(--asc-divider); margin-top: 18px; }
+/* 生成台底部吸附块：粘在滚动容器（.col-center）可视区底部。
+   背景必须不透明（滚过的内容会从它下方穿过）；上边框划出停靠区分界。
+   它是 panel-left 的最后一个子元素，DOM 序最后 → 天然压在滚过的内容上。 */
+.gen-dock {
+  position: sticky; bottom: 0; z-index: 5;
+  margin-top: 18px; padding-top: 12px;
+  background: var(--asc-card);
+  border-top: 1px solid var(--asc-divider);
+}
 .form-section:first-of-type { padding-top: 0; }
 .section-label {
   font-size: 12px; font-weight: 600; color: var(--asc-text);
@@ -2007,11 +2108,6 @@ onMounted(async () => {
 .ac-stale-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .ac-stale b { font-size: 12.5px; font-weight: 600; color: #8a5a00; }
 .ac-stale span { font-size: 12px; color: #96660f; }
-.ac-badge {
-  display: inline-block; vertical-align: middle; margin-left: 8px;
-  font-size: 11px; font-weight: 500; color: #8a5a00; background: #fdf8ec;
-  border-radius: 4px; padding: 2px 7px;
-}
 .ac-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
 .ac-info { min-width: 0; flex: 1; }
 .ac-title {
@@ -2022,7 +2118,6 @@ onMounted(async () => {
   flex: 1; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.ac-title .ac-badge { flex: none; }
 .ac-meta {
   font-size: 12px; color: var(--asc-text-2); margin-top: 6px; font-variant-numeric: tabular-nums;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

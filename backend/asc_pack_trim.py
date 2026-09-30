@@ -12,52 +12,49 @@
 COLLECT 之前过滤 ⇒ 文件**根本不会被复制**到 dist。事后删文件既慢、又要二次判断，
 而且会撞上本机的批量删除护栏（阈值 50/回合，超了抛 SystemExit）。
 
-⚠️ 三条「静默失效」的坑（都踩过或差点踩）
+⚠️ 两条「静默失效」的坑（都踩过或差点踩）
 1. **dest 名形态不固定**：Windows 上可能带 `\\`、也可能带 `_internal/` 前缀。
    本模块统一 normalize 后再匹配；匹配不上就**不会**裁掉任何东西 ——
    而「没裁掉」在体积报告里看起来只像「收益比预期小」，不会报错。
    ⇒ 故 spec 里必须打印各组命中计数，且**预期非零的组命中 0 时大声失败**。
-2. **保留集必须显式**：`qtwebengine_locales` 里 `en-US.pak` 是 Chromium 的兜底语言包，
-   `zh-CN.pak` 是本产品的界面语言。不能「只留 zh-CN」。
-3. **`babel` 包本身不能删**：`courlan/filters.py:11` 是 `from babel import Locale`
+2. **`babel` 包本身不能删**：`courlan/filters.py:11` 是 `from babel import Locale`
    → 硬 import。只可删 `babel/locale-data/`（数据子目录）。
    实测（`_fetch_probe/_probe_babel_langpath.py`）：删掉后 courlan 判语言的 20 项行为
    与基线**逐项完全一致**（`Locale.parse` 的 `.language` 不读 locale-data）。
+
+⚠️⚠️ 2026-09-22：AI 浏览器下线的连带改动 —— 5 组规则缩到 1 组
+------------------------------------------------------------
+已删除的四条规则，其匹配前缀**全是 `PySide6/`**，各自的实测收益（v0.1.4 产物）：
+
+    P1  pyside6/resources/*.debug.pak                        4 个文件 / 74.8 MB
+    P2  pyside6/translations/**/*.qm                       255 个文件 / 13.4 MB
+    P3  pyside6/translations/qtwebengine_locales/*.pak      51 个文件 / 42.6 MB
+    P4  babel/locale-data/**                             1084 个文件 / 28.5 MB   ← **保留**
+    P5  pyside6/resources/qtwebengine_devtools_resources.pak 1 个文件 / 11.1 MB
+
+PySide6 是随「应用内 AI 浏览器」进包的（要 `QWebEngineView` 当容器），浏览器于
+2026-09-22 下线、`AIStudyCompanion.spec` 也不再收集它 ⇒ **包内已无 `PySide6/` 目录**，
+P1/P2/P3/P5 恒不命中。留着它们的代价不是空间而是**误导**：
+spec 的 `EXPECT_NONZERO` 会每次打包打印「预期非空的分组命中 0」，把一条真告警
+（依赖版本变了 / dest 形态不匹配）稀释成噪声。故整组删除。
+
+P5 还附过一个模块级布尔开关（「要不要保留 F12 / 远程调试的逃生口」，spec 由它取值）——
+随 P5 一并删除；spec 的落盘统计里也不再写该字段。
 """
 
 import os
-import posixpath
 
 # --- 分组标识（报告与日志里按这个口径统计）---
-G_DEBUG_PAK = "P1-debug-pak"
-G_QT_QM = "P2-qt-qm"
-G_WEBENGINE_LOCALE = "P3-webengine-locale"
 G_BABEL_LOCALE_DATA = "P4-babel-locale-data"
-G_DEVTOOLS_PAK = "P5-devtools-pak"
 
-GROUP_ORDER = [G_DEBUG_PAK, G_QT_QM, G_WEBENGINE_LOCALE, G_BABEL_LOCALE_DATA, G_DEVTOOLS_PAK]
+GROUP_ORDER = [G_BABEL_LOCALE_DATA]
 
 GROUP_DESC = {
-    G_DEBUG_PAK: "Chromium 调试版资源包（*.debug.pak）—— release 版不加载",
-    G_QT_QM: "Qt 翻译目录（*.qm）—— 本应用**从不**安装 QTranslator，全部不会被读",
-    G_WEBENGINE_LOCALE: "Chromium 语言包 —— 只保留 en-US（兜底）与 zh-CN（界面语言）",
     G_BABEL_LOCALE_DATA: "babel 的 locale-data 数据（babel 包本身保留，courlan 要 import）",
-    G_DEVTOOLS_PAK: "Chromium DevTools 前端资源 —— 本应用未启用 F12/远程调试",
 }
 
-# 保留集：Chromium 必需兜底 + 本产品界面语言。**只写文件名，比较前统一小写。**
-KEEP_WEBENGINE_LOCALES = frozenset({"en-us.pak", "zh-cn.pak"})
-
-# P5 单独开关：它是第 1 档里唯一「有潜在功能取舍」的一项（失去 F12 / 远程调试的逃生口）。
-# 2026-09-21 实测（阶段1-B）：删掉后 WP12 端到端验收 12/12 通过（含真实导航 load_ok=True、
-# A0 后端仍为 qt）；且前端/后端**没有任何**启用 DevTools 的代码路径
-# （无 DeveloperExtras / 无 QTWEBENGINE_REMOTE_DEBUGGING）⇒ 对产品零回归。
-# 若将来要恢复 F12 能力，把这里改成 False 重新打包即可。
-DROP_DEVTOOLS = True
-DEFAULT_DROP_DEVTOOLS = DROP_DEVTOOLS
-
 # 打包正常时应命中的分组（命中 0 说明依赖版本变了或 dest 形态不匹配 —— spec 会大声提示）
-EXPECT_NONZERO = [G_DEBUG_PAK, G_QT_QM, G_WEBENGINE_LOCALE, G_BABEL_LOCALE_DATA]
+EXPECT_NONZERO = [G_BABEL_LOCALE_DATA]
 
 
 def normalize_dest(dest):
@@ -79,36 +76,15 @@ def normalize_dest(dest):
     return d.lower()
 
 
-def drop_reason(dest, drop_devtools=None):
+def drop_reason(dest):
     """返回该 dest 应被裁掉的**分组名**；不该裁则返回 None。
 
-    drop_devtools=None ⇒ 取 DEFAULT_DROP_DEVTOOLS。
+    ⚠️ 任何新增规则都要同步更新 `_fetch_probe/_t_pack_trim.py` 的期望值与
+    `GROUP_ORDER` / `EXPECT_NONZERO`，否则测试会与产物口径脱节。
     """
-    if drop_devtools is None:
-        drop_devtools = DEFAULT_DROP_DEVTOOLS
     d = normalize_dest(dest)
     if not d:
         return None
-    name = posixpath.basename(d)
-
-    # P1：PySide6/resources/*.debug.pak
-    if d.startswith("pyside6/resources/") and name.endswith(".debug.pak"):
-        return G_DEBUG_PAK
-
-    # P5：PySide6/resources/qtwebengine_devtools_resources.pak（**非** debug 那个）
-    if drop_devtools and d.startswith("pyside6/resources/") and \
-            name == "qtwebengine_devtools_resources.pak":
-        return G_DEVTOOLS_PAK
-
-    # P2：PySide6/translations/**/*.qm（含子目录，虽然目前只有顶层有 .qm）
-    if d.startswith("pyside6/translations/") and name.endswith(".qm"):
-        return G_QT_QM
-
-    # P3：PySide6/translations/qtwebengine_locales/*.pak（保留 KEEP_WEBENGINE_LOCALES）
-    if d.startswith("pyside6/translations/qtwebengine_locales/") and name.endswith(".pak"):
-        if name in KEEP_WEBENGINE_LOCALES:
-            return None
-        return G_WEBENGINE_LOCALE
 
     # P4：babel/locale-data/**
     if d.startswith("babel/locale-data/"):
@@ -117,7 +93,7 @@ def drop_reason(dest, drop_devtools=None):
     return None
 
 
-def filter_toc(entries, drop_devtools=None):
+def filter_toc(entries):
     """过滤 TOC（list of (dest, src, typecode)）。
 
     返回 (kept, dropped, stats)：
@@ -135,7 +111,7 @@ def filter_toc(entries, drop_devtools=None):
         except Exception:
             kept.append(e)
             continue
-        g = drop_reason(dest, drop_devtools=drop_devtools)
+        g = drop_reason(dest)
         if g is None:
             kept.append(e)
             continue

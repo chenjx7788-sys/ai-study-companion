@@ -172,7 +172,17 @@ async function saveOne(it) {
     it.saved = true
     it.material_id = data.id
     it.duplicated = !!data.duplicated
-    ElMessage.success(data.duplicated ? '这篇已在知识库中，未重复入库' : '已加入知识库，正在建立索引')
+    // 配图本地化反馈（2026-09-23 R6）：入库时会把正文配图下载到本地（离线也能看）。
+    // 张数从 `origin_meta.images_saved` 读 —— 与后端 meta 口径一致，不在前端另算一份。
+    // 0 张时不改文案（没图或全部下载失败都不该让用户误以为存了图）。
+    const _nImg = Number((data.origin_meta || {}).images_saved || 0)
+    ElMessage.success(
+      data.duplicated
+        ? '这篇已在知识库中，未重复入库'
+        : (_nImg > 0
+            ? `已加入知识库，配图已存 ${_nImg} 张，正在建立索引`
+            : '已加入知识库，正在建立索引')
+    )
     emit('saved', { item: it, material: data })
   } catch (e) {
     ElMessage.error(errText(e))

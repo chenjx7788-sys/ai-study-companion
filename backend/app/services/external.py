@@ -38,6 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import trafilatura
 from lxml import html as _lxml_html
@@ -433,82 +434,6 @@ def _looks_like_html(content_type: str, html: str) -> bool:
     return "<html" in head or "<!doctype html" in head or "<body" in head
 
 
-# ---------- WP15：从「页面原始源码」抽取（带登录态的浏览器视图路径） ----------
-#
-# 为什么需要这一节（实测，见 `AI伴学助手_WP15内容抽取入库方案-20260921.md` §2）：
-#   ① 服务端裸抓被反爬拒绝的站点（知乎 403 等），在**用户自己的浏览器视图**里不是问题；
-#   ② `QWebEngineView.toHtml()` 给的是**渲染后 DOM 序列化**，`<script>` 已被剥离
-#      → 公众号/小红书正文都在内联脚本变量里，实测正文 **−90.9%**、配图 0 张
-#      （`_probe_wp15_extract_matrix.py`：1413 字/8 图 → 129 字/0 图）；
-#   ③ Qt 的 `QWebEngineCookieStore` **只写不可读**（无 `cookiesForUrl`）→ 无法把会话
-#      导出给服务端重抓（`_probe_wp15_p1_cookie_fetch.py`）。
-#   ⇒ 唯一可行：在**页面内** `fetch(location.href,{credentials:'include'})`
-#      取回**网络层原始响应体**（含 `<script>` 载荷、自动带 cookie / HttpOnly），
-#      再交给**同一条抽取链**处理（`_probe_wp15_p2_page_fetch.py` 已实证）。
-
-# 单页源码截断上限（字符）。依据：本机样本 2.47 MB / 1.45 MB；回调把字符串搬回 Python
-# 要走 Qt IPC，实测 588K 字符拉取约 62 ms（`_probe_wp15_p3_bigstr.py`）—— 压测无问题，
-# 但数 MB × 多标签会拖垮主线程。取 3,000,000 覆盖绝大多数真实页面（含内联脚本的 SSR 页）。
-# ⚠️ 截断**必须保头**：`window.__INITIAL_STATE__` 等载荷都在文档头部（P3 已验「头在尾丢」）。
-SOURCE_MAX_CHARS = 3_000_000
-
-
-def source_fetch_js(cap: int = SOURCE_MAX_CHARS, token: str = "") -> str:
-    """构造「页内取源」JS。结果写 `window.__asc_src`，状态写 `window.__asc_src_*`。
-
-    ⚠️⚠️ 三个「违反就静默出错」的点，均有实测依据：
-      ① **绝不能**在主线程同步等回调（WP13 血泪）：`runJavaScript` 的回调在事件循环里跑，
-         主线程若被 `Event.wait()` 占住 → 事件循环停摆 → 回调永不触发 → **零结果且不报错**。
-         故本 JS 只「发起 + 写全局」，值由调用方在**自己的线程**里轮询。
-      ② `credentials:'include'` **必须有** —— 少了它请求不带会话，登录站点会返回登录墙。
-         实测负样本：`credentials:'omit'` → 抓到「需要登录才能查看」。
-      ③ 截断在 **JS 侧**做：让 IPC 只搬上限内的字节，同时把**截断前的真实长度**
-         如实回报（`__asc_src_len`），供上层判「是否只拿到半篇」。
-
-    ⚠️ `token` 会**原样嵌入 JS 字面量**。调用方只传本项目自生成的短标识
-       （`browser_panel` 用 `t<seq>`），**绝不传页面内容 / URL** —— 否则引号会提前闭合
-       JS 字符串（症状是「取源莫名失败」）。这里仍做一次清洗兜底。
-    """
-    tok = re.sub(r"[^A-Za-z0-9_\-]", "", str(token or ""))[:64]
-    return (
-        "(function(){var CAP=%d,TOK='%s';"
-        "window.__asc_src=null;window.__asc_src_len=-1;window.__asc_trunc=false;"
-        "window.__asc_tok=TOK;window.__asc_err=null;"
-        "fetch(location.href,{credentials:'include'})"
-        ".then(function(r){return r.text();})"
-        ".then(function(t){window.__asc_trunc=t.length>CAP;"
-        "window.__asc_src=window.__asc_trunc?t.slice(0,CAP):t;"
-        "window.__asc_src_len=t.length;})"
-        ".catch(function(e){window.__asc_err=String(e);window.__asc_src_len=-2;});"
-        "return 'started';})()"
-    ) % (int(cap), tok)
-
-
-def dom_text_js(cap: int = SOURCE_MAX_CHARS, token: str = "") -> str:
-    """构造「页内取可见正文」JS（DOM 兜底通道）。结果写 `window.__asc_src` **同一组**全局。
-
-    ⚠️ 与 `source_fetch_js` 共用同一组 window 全局与 token 协议 —— 面板层的
-       轮询 / 防串场机器一份不改，区别只在「取什么」。
-    ⚠️⚠️ 为什么需要这条通道（WP19，实测）：SPA 页面（小红书等）的**分享链接重新 fetch
-       会撞反爬 / 一次性令牌失效**，拿回来的是空壳启动页；而**已渲染 DOM 的可见文本
-       就是用户正在看的内容**。对这类页面，「取源码」反而是错的那条路。
-    ⚠️ 取 `innerText` 而不是 `outerHTML`：天然不含 <script>/<style> 残片，
-       且语义就是「用户可见正文」。代价是丢图片 —— 兜底通道，如实标注即可。
-    """
-    tok = re.sub(r"[^A-Za-z0-9_\-]", "", str(token or ""))[:64]
-    return (
-        "(function(){var CAP=%d,TOK='%s';"
-        "window.__asc_src=null;window.__asc_src_len=-1;window.__asc_trunc=false;"
-        "window.__asc_tok=TOK;window.__asc_err=null;"
-        "try{var t=(document.body?document.body.innerText:'')||'';"
-        "window.__asc_trunc=t.length>CAP;"
-        "window.__asc_src=window.__asc_trunc?t.slice(0,CAP):t;"
-        "window.__asc_src_len=t.length;}"
-        "catch(e){window.__asc_err=String(e);window.__asc_src_len=-2;}"
-        "return 'started';})()"
-    ) % (int(cap), tok)
-
-
 def extract_from_source(url: str, html: str) -> dict:
     """从页面**原始源码**抽取正文 —— 与 `fetch_url` 共用**同一条判定链**。
 
@@ -575,6 +500,10 @@ def extract_from_source(url: str, html: str) -> dict:
     #    （SPA 是"请粘贴正文"，而这里该做的是"重新复制分享链接"）。
     if kind == "xhs" and not text:
         return done("XHS_EXPIRED")
+    # ①.5 解析组件异常：**不能**报成 SPA（那是"请粘贴正文"，而这里该报"组件异常"）。
+    #     顺序放在 SPA 之前 —— 两者都是"正文为空"，只有异常信息能区分开。
+    if not text and out["meta"].get("extract_error"):
+        return done("EXTRACT_ERROR")
     # ② SPA 判定（在长度判定**之前**）：SPA 会返回"提示语正文"，先按长度判会被放过
     haystack = (text or "")[:3000].lower()
     if not text or any(m.lower() in haystack for m in SPA_MARKERS):
@@ -807,8 +736,10 @@ def resolve_action(reason: str, ok: bool) -> str:
     """原因码 + 成败 → 前端动作：ready / paste / blocked"""
     if ok:
         return ACTION_READY
-    if reason in ("SPA_EMPTY", "TOO_SHORT"):
-        # 抓取能力不足 → 降级到粘贴，而不是报错终点（方案 §6.3）
+    if reason in ("SPA_EMPTY", "TOO_SHORT", "EXTRACT_ERROR"):
+        # 抓取能力不足（含解析组件异常）→ 降级到粘贴，而不是报错终点（方案 §6.3）。
+        # ⚠️ EXTRACT_ERROR 也给粘贴通道：用户手上那篇内容照样能收进来，
+        #    不该因为我们的组件出问题就把他挡在门外。
         return ACTION_PASTE
     return ACTION_BLOCKED
 
@@ -824,6 +755,9 @@ def reason_hint(reason: str, kind: str) -> str:
         # 半加载页，旧文案只说「不是文章页」会把用户引向错误归因（实测知乎 ~35s 才稳定）。
         return ("只提取到很短的正文，可能是页面还在加载中，也可能不是文章页。"
                 "你可以等页面加载完成后重试，或粘贴正文后继续。")
+    if reason == "EXTRACT_ERROR":
+        return ("正文解析失败（解析组件异常，通常是安装包不完整）。"
+                "请把正文粘贴到下方继续；也欢迎把这个链接反馈给我们。")
     if reason == "WX_EXPIRED":
         return "公众号链接已失效或文章被删除（临时链接约 6 小时过期）。请在微信里重新打开文章、再分享链接。"
     if reason == "XHS_EXPIRED":
@@ -1149,6 +1083,12 @@ _URL_IN_TEXT_RE = re.compile(r"https?://[^\s\u4e00-\u9fff\u3000-\u303f\uff00-\uf
 # 抽出后要剥掉的**尾部句末标点**（中文标点已被上面的正则排除，ASCII 的会跟着进来）
 _URL_TAIL_PUNCT = ".,;:!?"
 _XHS_IMG_MAX_BYTES = 12 * 1024 * 1024
+# 单篇最多本地化多少张配图（护栏，不是目标）。实测一篇 16 图的产品文章合计仅 0.10 MB，
+# 80 张足够覆盖长图文；超出部分记账到 stat["images_skipped"]，正文里保留原外链。
+_IMG_MAX_PER_ARTICLE = 80
+# 并发下载线程数。实测 16 张：串行 1.5s → 6 线程 0.4s（网络往返占主导，与体积无关）。
+# 不宜再大：同域并发过高易被判异常流量，收益也趋平。
+_IMG_WORKERS = 6
 _XHS_EXT_BY_TYPE = (("webp", ".webp"), ("jpeg", ".jpg"), ("jpg", ".jpg"),
                     ("png", ".png"), ("gif", ".gif"), ("avif", ".avif"))
 
@@ -1363,14 +1303,19 @@ def _xhs_extract(html: str, url: str) -> tuple:
     return title, text, meta
 
 
-def _download_image(url: str, timeout: int = 20) -> tuple:
-    """下载一张图 → (bytes, 扩展名)。非图片响应抛 ValueError（由调用方跳过）。"""
+def _download_image(url: str, timeout: int = 20, opener=None) -> tuple:
+    """下载一张图 → (bytes, 扩展名)。非图片响应抛 ValueError（由调用方跳过）。
+
+    `opener` 默认走本模块绕代理的 opener；图片代理（routers/imgproxy.py）会传一个
+    **不跟随重定向**的 opener 进来 —— 它必须自己逐跳校验目标，否则重定向能绕过 SSRF 防护。
+    """
+
     req = urllib.request.Request(url, headers={
         "User-Agent": _UA,
         "Accept": "image/avif,image/webp,image/png,image/*,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9",
     })
-    resp = _opener_no_proxy.open(req, timeout=timeout)
+    resp = (opener or _opener_no_proxy).open(req, timeout=timeout)
     with resp as r:
         ct = (r.headers.get("Content-Type") or "").lower()
         raw = r.read(_XHS_IMG_MAX_BYTES + 1)
@@ -1380,6 +1325,18 @@ def _download_image(url: str, timeout: int = 20) -> tuple:
         raise ValueError("图片超过上限")
     ext = next((e for k, e in _XHS_EXT_BY_TYPE if k in ct), ".img")
     return raw, ext
+
+
+def fetch_image(url: str, timeout: int = 15, follow_redirects: bool = True) -> tuple:
+    """**公共**取图入口 → (bytes, 扩展名)。失败抛异常，由调用方决定兜底。
+
+    为什么单独开一个公共名，而不是让 `routers/imgproxy.py` 直接调 `_download_image`：
+    口径必须**单点**（UA、`Accept`、12 MB 上限、允许的 Content-Type 都在
+    `_download_image` 里）。代理自己再写一份下载逻辑，两边迟早漂移 ——
+    典型症状是「本地化拿到的图和代理拿到的图不一样」。
+    """
+    opener = _opener_no_proxy if follow_redirects else _opener_noredirect
+    return _download_image(url, timeout, opener=opener)
 
 
 # 正文里的图片：`![alt](https://…)`。URL 里出现 `)` 极罕见，不做括号配对。
@@ -1430,22 +1387,40 @@ def assets_dir(subdir: str) -> Path:
     return Path(settings.data_dir) / "assets" / safe_stem(subdir or "xhs", fallback="xhs")
 
 
-def localize_images(text: str, urls: list, subdir: str, timeout: int = 20) -> tuple:
-    """把正文里的签名外链配图下载到 `data/assets/<subdir>/`，并替换为站内地址。
+def localize_images(text: str, urls: list, subdir: str, timeout: int = 20,
+                    max_images: int = _IMG_MAX_PER_ARTICLE,
+                    workers: int = _IMG_WORKERS) -> tuple:
+    """把正文里的配图下载到 `data/assets/<subdir>/`，并把链接替换为站内地址。
 
-    返回 `(新正文, 统计)`；统计键：images_saved / images_failed /
+    返回 `(新正文, 统计)`；统计键：images_saved / images_failed / images_skipped /
     image_paths / image_failed_urls。
 
     ⚠️ **只在落库时调**（`materials.clip_save`），不在抓取时调：「仅本次阅读」的契约是
-    **不落盘**（方案 §2.3）。临时阅读直接用原始签名 URL 外链即可 —— 当次阅读必然还在有效期内。
+    **不落盘**（方案 §2.3）。临时阅读直接用原始外链即可 —— 当次阅读必然还在有效期内。
+
+    ⚠️ **对全部来源生效**（2026-09-23 起，原为「仅 kind=="xhs"」）：
+      · 小红书：配图是**短时强签名直链**，不落盘过两天必破图（这是最初的动因）；
+      · 普通网页 / 公众号：外链**当前能显示**（实测无防盗链），但站点改版 / CDN 换域名 /
+        断网即破图 —— 本项目是**本地优先**的产品，图片留在远端与定位不符。
+    实测成本（普通网页 16 图）：合计 0.10 MB、并发 0.4s，可忽略。
+
     ⚠️ **逐张容错**：任何一张失败只跳过它、不中断整篇（正文里那条 `![]()` 保留原 URL，
     短时间内仍能显示），失败张数进 meta 让用户知道，而不是静默变少。
+    ⚠️ **只在下载阶段并发**：`text.replace` 留在主线程串行执行，不存在竞态。
     """
-    stat = {"images_saved": 0, "images_failed": 0,
+    stat = {"images_saved": 0, "images_failed": 0, "images_skipped": 0,
             "image_paths": [], "image_failed_urls": []}
     text = text or ""
-    urls = [u for u in (urls or []) if u]
-    if not urls:
+    # 去重且保序：同一张图在正文里出现多次时只下一次（text.replace 本就是全量替换）
+    seen, uniq = set(), []
+    for u in (urls or []):
+        if u and u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    if max_images and len(uniq) > max_images:
+        stat["images_skipped"] = len(uniq) - max_images
+        uniq = uniq[:max_images]
+    if not uniq:
         return text, stat
     # 目录口径来自 assets_dir()（删除侧调的就是它）——本函数不再自己拼路径
     dest = assets_dir(subdir)
@@ -1453,17 +1428,28 @@ def localize_images(text: str, urls: list, subdir: str, timeout: int = 20) -> tu
     try:
         dest.mkdir(parents=True, exist_ok=True)
     except OSError:
-        stat["images_failed"] = len(urls)
-        stat["image_failed_urls"] = list(urls)
+        stat["images_failed"] = len(uniq)
+        stat["image_failed_urls"] = list(uniq)
         return text, stat
-    for idx, u in enumerate(urls, 1):
+
+    net_errs = (urllib.error.HTTPError, urllib.error.URLError, TimeoutError,
+                OSError, ValueError)
+
+    def _fetch(u: str):
         try:
-            raw, ext = _download_image(u, timeout)
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError,
-                OSError, ValueError):
+            return u, _download_image(u, timeout)
+        except net_errs:                 # 逐张容错：失败返回 None，由主线程记账
+            return u, None
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(uniq)))) as pool:
+        fetched = list(pool.map(_fetch, uniq))
+
+    for idx, (u, got) in enumerate(fetched, 1):
+        if got is None:
             stat["images_failed"] += 1
             stat["image_failed_urls"].append(u)
             continue
+        raw, ext = got
         name = "img_%02d%s" % (idx, ext)
         rel = "/api/assets/%s/%s" % (sub, name)
         try:
@@ -1476,7 +1462,6 @@ def localize_images(text: str, urls: list, subdir: str, timeout: int = 20) -> tu
         stat["images_saved"] += 1
         stat["image_paths"].append(rel)
     return text, stat
-
 
 # trafilatura 的 markdown 把图片输出成独立段落（前后都是空行）。
 _MD_IMAGE_ONLY = re.compile(r"^\s*!\[[^\]]*\]\([^)]*\)\s*$")
@@ -1552,9 +1537,19 @@ def _extract(html: str, url: str) -> tuple[str, str, dict]:
             # ⚠️ 默认 False 会把图片型文章的图全部丢掉（见上方说明）
             include_images=True,
         ) or ""
-    except Exception:
+    except Exception as e:          # noqa: BLE001
+        # ⚠️⚠️ 不能只吞成空串：那会把「解析组件异常」伪装成「页面是动态渲染的」，
+        #    用户被指去粘贴正文，而唯一线索（异常本身）丢了。
+        #    实测（2026-09-23）：打包版漏收 trafilatura/settings.cfg →
+        #    extract() 抛 NoOptionError → 这里吞掉 → 对外 SPA_EMPTY，排查绕了很久。
+        #    记进 meta 后，抓一次就能看到真因。
         text = ""
+        _err = "%s: %s" % (type(e).__name__, str(e)[:200])
+    else:
+        _err = ""
     title, meta = _extract_meta(html, url)
+    if _err:
+        meta["extract_error"] = _err
     # 图片：独立成段的图并回上一段（防下游切出"只含图片 URL 的块"），并记下张数。
     # 张数会进 meta → preview_payload → 前端显示"N 张图"，
     # 让"正文以图片为主时字数本来就少"变成用户看得懂的信息，而不是像抓取失败。

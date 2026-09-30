@@ -1,0 +1,17 @@
+# 换行符契约（2026-09-30 新增）
+#
+# 背景：本机 `core.autocrlf=true`，且仓库原先没有 .gitattributes。
+#   autocrlf 的规范是「提交时 CRLF→LF，检出时 LF→CRLF」——macOS/Linux runner 上
+#   Git 默认不转换，所以仓库里存 LF 时远端拿到的也是 LF，历史上能跑通。
+#   但这是**隐式**契约：任何一次环境差异（例如在 Windows 上以 CRLF 直接入库、
+#   或 runner 的 autocrlf 配置变化）都会让 *.sh 带 \r → macOS 上
+#   `bash build_macos.sh` 报 "syntax error near unexpected token"。
+#   ⇒ 显式声明，把隐式契约变成结构性保证。
+#
+# 只声明必要的两类，其余交给 autocrlf 默认行为，避免大范围 renormalize。
+
+*.sh   text eol=lf
+*.bash text eol=lf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf

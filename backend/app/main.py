@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from app_version import __version__ as APP_VERSION
 from .core.config import settings
 from .database import Base, engine
-from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats, podcasts, ephemeral, browser
+from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats, podcasts, ephemeral, imgproxy, ext, simple_learn
 
 Base.metadata.create_all(bind=engine)
 
@@ -45,6 +45,10 @@ def _migrate_columns():
             if "origin_meta" not in cols:
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE materials ADD COLUMN origin_meta TEXT DEFAULT ''"))
+            # 实体抽取内容指纹（重试解析时指纹未变则跳过 LLM 抽取，防重复消耗 token）
+            if "extract_sig" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE materials ADD COLUMN extract_sig VARCHAR(32) DEFAULT ''"))
         if "podcasts" in insp.get_table_names():
             cols = {c["name"] for c in insp.get_columns("podcasts")}
             if "audio_sig" not in cols:
@@ -68,6 +72,10 @@ def _migrate_columns():
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE podcasts ADD COLUMN bgm_label VARCHAR(64) DEFAULT ''"))
                 _backfill_podcast_bgm_label()
+            # 生成方式（two_step / fast / verbatim）。旧记录空串 → 视为 AI 改写，无需回填。
+            if "gen_mode" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE podcasts ADD COLUMN gen_mode VARCHAR(16) DEFAULT ''"))
     except Exception:
         pass
 
@@ -170,7 +178,7 @@ _migrate_columns()
 _backfill_material_origin()
 _migrate_source_folder_to_folder()
 
-app = FastAPI(title="AI 伴学助手", version="0.1.3")
+app = FastAPI(title="知萤 - AI知识中枢", version="0.1.5")
 
 # 自动定时备份（启动后延迟 30s 首备，此后每日一次，保留最近 7 份）
 from .services import auto_backup
@@ -284,13 +292,20 @@ app.include_router(asr.router, prefix="/api")
 app.include_router(folders.router, prefix="/api")
 app.include_router(stats.router, prefix="/api")
 app.include_router(podcasts.router, prefix="/api")
+app.include_router(simple_learn.router, prefix="/api")
 # 「仅本次阅读」+「最近阅读」内存快照（P0-5）。prefix 自带 /ai/ephemeral，
 # 与 ai.router（/ai）并列而不冲突（FastAPI 按更具体的路径优先匹配）。
 app.include_router(ephemeral.router, prefix="/api")
-# 应用内 AI 浏览器（阶段 2 · WP12）：宿主状态与调试接口。
-# ⚠️ 必须与其它 router 一同注册在**下方 SPA catch-all 之前**：catch-all 对 `api/` 前缀
-#    一律 404，晚注册会被吞掉 —— 症状是 404（极像「路径写错了」），见 routers/browser.py 头部。
-app.include_router(browser.router, prefix="/api")
+# 只读图片代理（routers/imgproxy.py）：外链图被防盗链拦掉时，由后端取回再转发。
+# 服务于「不落盘」的临时阅读/剪藏预览，以及 R6 之前入库的历史材料（正文里仍是外链）。
+# ⚠️ 必须与其它 router 一样注册在**下方 SPA catch-all 之前**。
+app.include_router(imgproxy.router, prefix="/api")
+# 浏览器扩展通道（routers/ext.py）：/api/ext/* 强制 X-BrainMate-Token；
+# /token 是免 token 的配对信息端点（带 Sec-Fetch-Site 防护），与受保护端点分两个 router。
+# ⚠️ 同样必须注册在下方 SPA catch-all 之前。
+app.include_router(ext.router, prefix="/api")
+app.include_router(ext.pairing_router, prefix="/api")
+
 
 
 @app.get("/api/health")

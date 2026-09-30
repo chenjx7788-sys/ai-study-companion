@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller 打包配置：把后端 + 前端 dist + BGE 模型打成免安装绿色版（Windows/macOS 通用）"""
 import sys as _sys
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 datas = []
 binaries = []
@@ -12,6 +12,9 @@ _ICON = 'mascot.icns' if _sys.platform == 'darwin' else 'mascot.ico'
 
 # 前端静态产物（单端口化，main.py 里 _MEIPASS/dist 定位）
 datas += [('../frontend/dist', 'dist')]
+
+# 浏览器扩展源码（设置页「下载扩展」现场打包 zip 用，ext.py 里 _MEIPASS/extension 定位）
+datas += [('../extension', 'extension')]
 
 # 收集依赖（动态库 + 数据文件 + 隐藏导入）
 for pkg in ['faster_whisper', 'ctranslate2', 'onnxruntime', 'tokenizers',
@@ -25,7 +28,11 @@ for pkg in ['faster_whisper', 'ctranslate2', 'onnxruntime', 'tokenizers',
     binaries += b
     hiddenimports += h
 
-# macOS 额外收集 pyobjc：pywebview 原生窗口依赖 Cocoa/WebKit（PyInstaller 不自动收集其二进制）
+# macOS 额外收集 pyobjc：pywebview 原生窗口依赖 Cocoa/WebKit（PyInstaller 不自动收集其二进制）。
+# ⚠️ 2026-09-22（AI 浏览器下线）后，**cocoa 是 macOS 的首要后端**而非回落候选：
+#    `webview/guilib.py::initialize` 的 Darwin 分支是 `[import_cocoa, import_qt]`，
+#    此前靠 `PYWEBVIEW_GUI=qt` 把它顶到第二位；该强制设置已移除（见 launcher.py）。
+#    ⇒ 这一段收集**必须存在**，否则 macOS 上会走到 `WebViewException` 或回落失败。
 if _sys.platform == 'darwin':
     for pkg in ['objc', 'Foundation', 'AppKit', 'WebKit', 'PyObjCTools']:
         try:
@@ -36,61 +43,37 @@ if _sys.platform == 'darwin':
         except Exception:
             pass
 
-# ⚠️ 阶段 1（GUI 外壳换 Qt）：必须让包里有 PySide6 / shiboken6 / qtpy。
-#    launcher.py 只 `import webview`，而 pywebview 的 qt 后端是**运行期**按需 import
-#    （webview/guilib.py 里 import webview.platforms.qt），PyInstaller 静态分析看不到 →
-#    不显式收集就会打成「装了 PySide6 但包里缺 QtWebEngine」，且要到真机运行才暴露
-#    （症状：静默回落到 winforms/cocoa，浏览器能力整体不见）。
-#    上方 macOS 的 pyobjc 收集（if _sys.platform == 'darwin'）在阶段 1 后保留，不必删
-#    —— cocoa 仍是回落候选（webview/guilib.py 的 Darwin 分支是 [cocoa, qt]）。
+# ⚠️ 2026-09-22：**本 spec 不再收集任何 Qt 运行时**（原「阶段 1」整段已删）。
+#    阶段 1 曾把两平台外壳从 WebView2 / WKWebView 换到 Qt(QtWebEngine)，为此需要显式
+#    `collect_all('qtpy', 'shiboken6')` + `_QT_HIDDEN`（PySide6 子模块）。换 Qt 的**唯一**
+#    动因是「应用内 AI 浏览器」要在侧栏塞一个 `QWebEngineView`；该功能下线后 launcher
+#    不再设 `PYWEBVIEW_GUI=qt`，各平台回到默认后端：
+#        Windows  `[import_winforms]`（系统 WebView2，缺运行时由 launcher 预检拦住 → 不再静默白屏）
+#        macOS    `[import_cocoa, import_qt]`
+#    ⇒ 连带收益：安装包 -187.6 MB（压缩）/ -324.5 MB（解压），启动 22.8s → 5.7s。
 #
-# ⚠️⚠️ 为什么**不再用** collect_all('PySide6')（阶段 1 · WP10 实测后改的）
-#    collect_all 是**全量**收集，实测把包从 591.2 MB 撑到 1259.3 MB（PySide6 单项 632 MB），
-#    因为它把 Qt3D / QtCharts / QtDesigner / QtMultimedia / QML 全套风格 /
-#    VirtualKeyboard / 18 个 Qt 开发工具 exe（qmlls/assistant/designer/linguist…）全拖了进来。
-#    PyInstaller **自带** hook-PySide6.QtWebEngineWidgets / QtWebEngineCore / QtWidgets …
-#    （→ utils/hooks/qt/add_qt6_dependencies → qt_info.collect_module，**依赖驱动**）。
-#    只要模块名出现在 hiddenimports 里，对应 hook 就会跑，并带上运行期必需的
-#    QtWebEngineProcess 可执行文件、resources/*.pak、icudtl.dat
-#    （由 hook-PySide6.QtWebEngineCore 的 collect_qtwebengine_files 负责）——
-#    所以**不需要** collect_all。
-#    ⚠️ 唯一必须 collect_all 的是 **qtpy**：纯 Python 包（很小），且是**动态**选绑定，
-#       静态分析连 import 都看不见。shiboken6 是 PySide6 的绑定运行时，一并 collect_all。
-#
-# ⚠️ 关于「还能再删什么」：**不要**在这里手写 excludes 白名单。
-#    实测（_fetch_probe/_probe_qt_imports.py 读 PE 导入表）表明 Qt6WebEngineCore 直接依赖
-#    Qt6Quick / Qt6Qml / Qt6Positioning / Qt6WebChannel，Qt6WebEngineWidgets 还依赖
-#    Qt6PrintSupport / Qt6QuickWidgets —— 这些「看起来用不到」的模块其实是硬依赖，
-#    手写清单极容易自相矛盾，且错了只在运行期暴露（静默回落或启动即崩）。
-#    可再裁的候选见报告 §WP10（标注为待实测），要裁必须先跑导入表探针。
-_QT_HIDDEN = ['PySide6.QtWebEngineWidgets', 'PySide6.QtWebEngineCore', 'PySide6.QtWebChannel',
-              'PySide6.QtWidgets', 'PySide6.QtGui', 'PySide6.QtNetwork', 'PySide6.QtCore',
-              'qtpy']
-hiddenimports += _QT_HIDDEN
-
-# ⚠️ 阶段 2（AI 浏览器）：`app.services.browser_panel` 与 `app.services.browser_host`
-#    在源码里是**函数内 import**（`from . import browser_panel`），
-#    这是**有意**的（后端必须能在无 Qt 环境 import 这两个模块，见其 docstring）——
-#    但代价是 **PyInstaller 静态分析看不到它们** → 不显式声明就会漏收 →
-#    打包版表现为「点『AI 浏览器』没反应 / 接口 503」，而源码态一切正常
-#    （与 pywebview 的 qt 后端是同一个坑，见上方注释）。
-#    故此处显式加入。**新增同类「函数内 import」模块时必须同步加到这里。**
-hiddenimports += ['app.services.browser_panel', 'app.services.browser_host']
-
-for pkg in ['qtpy', 'shiboken6']:
-    try:
-        d, b, h = collect_all(pkg)
-        datas += d
-        binaries += b
-        hiddenimports += h
-    except Exception as _e:
-        # ⚠️ 大声失败，绝不静默跳过 —— 静默跳过 = 打出一个「没有 QtWebEngine 的 Qt 客户端」
-        print('[spec] ⚠️ collect_all(%s) 失败：%s: %s' % (pkg, type(_e).__name__, _e))
-        print('[spec] ⚠️ 先装齐依赖再打包：pip install -r backend/requirements.txt'
-              '（含 pywebview[pyside6] 拉来的 PySide6 + qtpy）')
+#    ⚠️ 历史坑记在这里，别重蹈：
+#      · Qt 的 pywebview 后端是**运行期**按需 import（`webview/guilib.py`），PyInstaller
+#        静态分析看不见 → 当年必须显式收集，漏了只在真机暴露（症状：静默回落旧后端）。
+#      · 当年**不要**用 `collect_all('PySide6')`：它是全量收集，实测把包从 591.2 MB 撑到
+#        1259.3 MB（Qt3D / QtCharts / QML 全套 / 18 个开发工具 exe 全被拖进来）。
+#      · 若哪天某个「函数内 import」的新模块又漏收，症状与上面第一条**完全一样**：
+#        源码态正常、打包版功能不见。新增同类模块时必须同步加进 hiddenimports。
 
 # BGE 向量模型随包（启动器首次启动时预置到用户目录）
 datas += [('data/models/bge-small-zh-v1.5', 'data/models/bge-small-zh-v1.5')]
+
+# ⚠️⚠️ 数据文件必须单独收（2026-09-23 实测，R6 时抓到）：
+#   `collect_all()` **只收模块与二进制，不收数据文件** —— 上面那些 `collect_all('webview')`
+#   之类的调用都拿不到 `*.cfg` / `*.txt`。漏收的后果是**静默失效**：
+#     · 缺 `trafilatura/settings.cfg` → `trafilatura.extract()` 抛
+#       `NoOptionError: No option 'min_extracted_size' in section: 'DEFAULT'`
+#       → 被 `_extract` 的 `except Exception` 吞掉 → 正文为空 →
+#       对外报成**误导性的 SPA_EMPTY**（「这个页面是动态渲染的，请粘贴正文」）。
+#   实测对照（同一 URL、同一版本）：源码态 `chars=6660`，漏收的包里 `chars=0`。
+#   ⚠️ 这个差别**在源码态永远看不见**，只有打包版才暴露 —— 与「Qt 溜进包」是同一类陷阱。
+datas += collect_data_files('trafilatura')     # settings.cfg + data/tei_corpus.dtd
+datas += collect_data_files('justext')         # stoplists/*.txt（100 个，兜底抽取用）
 
 a = Analysis(
     ['launcher.py'],
@@ -100,7 +83,22 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=['tkinter', 'matplotlib', 'pytest', 'IPython', 'notebook'],
+    # ⚠️⚠️ 2026-09-22：这里的 Qt 三项是**必须的**，而且不只是为了瘦身 ——
+    #    光删掉 spec 里原来的显式收集**不足以**让 Qt 离开包。实测（下线后首次出包日志）：
+    #      · 照样出现 hook-PySide6.QtQuick / QtQml / QtPositioning / QtQuickWidgets
+    #        与 run-time hook `pyi_rth_pyside6.py`；
+    #      · 真凶是**上面那行 `collect_all('webview')`** —— 它把 `webview.platforms.qt`
+    #        当 hiddenimport 收了进来，而那个模块 `import qtpy / PySide6` →
+    #        整棵 Qt 又进了模块图（PyInstaller 的 PySide6 hook 随之触发）。
+    #    ⇒ 排除 PySide6 / shiboken6 / qtpy 才是**结构性**保证：包不再依赖
+    #      「构建机上恰好没装 PySide6」这个偶然前提。
+    #      ⚠️ 这个差别在 CI 上**看不见**（干净 runner 本来就没装 PySide6），
+    #         只在开发机上静默多出 187 MB —— 属于「必须在源头堵死」的隐性环境差异。
+    #    ⚠️ 排除后 macOS 不受影响：`webview/guilib.py` 的 Darwin 分支是
+    #       `[import_cocoa, import_qt]`，cocoa 在前；`import_qt` 的 ImportError 被吞掉。
+    #    ⚠️ 这条契约由 `_fetch_probe/verify_pack_no_qt.py` 的 S6 守着（带分辨力证明）。
+    excludes=['tkinter', 'matplotlib', 'pytest', 'IPython', 'notebook',
+              'PySide6', 'shiboken6', 'qtpy'],
     noarchive=False,
 )
 
@@ -112,16 +110,17 @@ a = Analysis(
 #    而且不报错、产物照旧 484 MB，属于「静默失效」。
 # ⚠️ 过滤按 dest 名匹配，dest 形态（反斜杠 vs 斜杠、是否有 `_internal/` 前缀）由清单模块归一化。
 #    清单一条都没命中时**不会报错**，所以下面打印计数，并对「全 0」硬失败。
-# ⚠️ 保留集：qtwebengine_locales 必须留 en-US.pak（Chromium 兜底语言包）；
-#    babel 包**本身**不能删（courlan/filters.py:11 是硬 import），只删 babel/locale-data/。
+# ⚠️ 保留集：babel 包**本身**不能删（courlan/filters.py:11 是硬 import），只删 babel/locale-data/。
+# ⚠️⚠️ 2026-09-22：AI 浏览器下线后，第 1 档只剩 babel 这一组规则 —— 原先
+#    P1/P2/P3/P5 四条**全部**按 `PySide6/` 前缀匹配，包内已无该目录（见 asc_pack_trim.py 头注）。
 # =============================================================================
 import os as _os
 _sys.path.insert(0, SPECPATH)          # SPECPATH 由 PyInstaller 注入 = 本 spec 所在目录
 import asc_pack_trim as _trim
 
 _toc_before = len(a.datas) + len(a.binaries)
-_kept_d, _drop_d, _stats_d = _trim.filter_toc(a.datas, drop_devtools=_trim.DROP_DEVTOOLS)
-_kept_b, _drop_b, _stats_b = _trim.filter_toc(a.binaries, drop_devtools=_trim.DROP_DEVTOOLS)
+_kept_d, _drop_d, _stats_d = _trim.filter_toc(a.datas)
+_kept_b, _drop_b, _stats_b = _trim.filter_toc(a.binaries)
 a.datas = _kept_d
 a.binaries = _kept_b
 
@@ -132,8 +131,8 @@ for _g in _trim.GROUP_ORDER:
 _drop_n = len(_drop_d) + len(_drop_b)
 _toc_after = len(a.datas) + len(a.binaries)
 print('[spec] ===== 第 1 档瘦身：COLLECT 输入过滤 =====')
-print('[spec] TOC 条目 %d -> %d（裁掉 %d 项，drop_devtools=%s）'
-      % (_toc_before, _toc_after, _drop_n, _trim.DROP_DEVTOOLS))
+print('[spec] TOC 条目 %d -> %d（裁掉 %d 项）'
+      % (_toc_before, _toc_after, _drop_n))
 print(_trim.format_stats(_merged))
 if _drop_n == 0:
     print('[spec] ❌ 裁剪清单一条都没命中 —— dest 名形态与清单不匹配，产物不会变瘦！')
@@ -147,8 +146,7 @@ try:
     import json as _json
     with open(_os.path.join(SPECPATH, 'build_trim_stats.json'), 'w', encoding='utf-8') as _f:
         _json.dump({'groups': _merged, 'dropped_files': _drop_n,
-                    'toc_before': _toc_before, 'toc_after': _toc_after,
-                    'drop_devtools': _trim.DROP_DEVTOOLS}, _f,
+                    'toc_before': _toc_before, 'toc_after': _toc_after}, _f,
                    ensure_ascii=False, indent=2)
 except Exception as _e:
     print('[spec] ⚠️ 写 build_trim_stats.json 失败：%s: %s' % (type(_e).__name__, _e))

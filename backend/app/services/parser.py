@@ -11,6 +11,7 @@ from pathlib import Path
 from bisect import bisect_right
 import re
 import threading
+import hashlib
 
 from pypdf import PdfReader
 from docx import Document
@@ -54,12 +55,21 @@ def _pdf_section_marks(reader: PdfReader) -> tuple[list[int], list[str]]:
 def parse_pdf(path: str, on_progress=None) -> list[dict]:
     """PDF 按页提取文本；无文本层的页（扫描件/图片页）自动转图走 OCR 兜底。
 
+    此外，对「有文本层」的页，额外提取内嵌图片（图表/公式/流程图截图）单独 OCR，
+    产出带 `[图片]` 前缀标记的独立块——文本层拿不到插图里的文字，需 OCR 补全。
+    - 无文本层的页已由整页 OCR 覆盖，不再对内嵌图重复 OCR。
+    - 内嵌图按 xref 全局去重（页眉 LOGO 跨页复用只认一次）。
+
     on_progress：0-100 进度回调（按已处理页数/总页数估算）。
     """
+    from . import ocr as ocr_svc
+
     reader = PdfReader(path)
     mark_pages, mark_paths = _pdf_section_marks(reader)
     chunks = []
     total = len(reader.pages) or 1
+    img_ocr_available = ocr_svc.is_available()
+    seen_xrefs: set[int] = set()
     for i, page in enumerate(reader.pages):
         text = (page.extract_text() or "").strip()
         if not text:
@@ -67,11 +77,27 @@ def parse_pdf(path: str, on_progress=None) -> list[dict]:
                 text = _ocr_pdf_page(path, i)   # 空文本页 → OCR 兜底
             except Exception:
                 text = ""   # 依赖缺失/识别失败：降级为空，交由上层标记扫描件
-        if text:
-            # 章节 = 页码 ≤ 当前页的最后一个书签（无书签则为空）
+            if text:
+                # 章节 = 页码 ≤ 当前页的最后一个书签（无书签则为空）
+                idx = bisect_right(mark_pages, i + 1) - 1
+                section = mark_paths[idx] if idx >= 0 else ""
+                chunks.append({"content": text, "page_no": i + 1, "section_path": section})
+        else:
+            # 有文本层：正文正常入库，另对内嵌图做 OCR 补漏
             idx = bisect_right(mark_pages, i + 1) - 1
             section = mark_paths[idx] if idx >= 0 else ""
             chunks.append({"content": text, "page_no": i + 1, "section_path": section})
+            if img_ocr_available:
+                try:
+                    img_texts = _ocr_pdf_page_images(path, i, seen_xrefs)
+                except Exception:
+                    img_texts = []
+                for t in img_texts:
+                    chunks.append({
+                        "content": f"[图片] {t}",
+                        "page_no": i + 1,
+                        "section_path": section,
+                    })
         if on_progress:
             on_progress(int((i + 1) / total * 100))
     return chunks
@@ -104,6 +130,99 @@ def _ocr_pdf_page(pdf_path: str, page_index: int, dpi: int = 200) -> str:
     from . import ocr as ocr_svc
     img = _render_pdf_page(pdf_path, page_index, dpi)
     return ocr_svc.ocr_image_to_text(img)
+
+
+# 内嵌图 OCR 的最小/最大尺寸门槛（像素），用于过滤图标、装饰线与整页扫描件
+_IMG_OCR_MIN_PX = 40          # 小于 40px 的图（图标/分隔线/装饰）跳过，OCR 无意义
+_IMG_OCR_MAX_PX = 2000        # 大于 2000px 的图多为整页扫描件，整页 OCR 已覆盖，避免重复
+
+
+def _extract_pdf_page_images(pdf_path: str, page_index: int) -> list:
+    """提取 PDF 单页的内嵌图片（去重 + 尺寸过滤），返回 RGB numpy 数组列表。
+
+    - 用 PyMuPDF `page.get_images()` 枚举该页引用的图片 xref（含跨页复用的页眉 LOGO）。
+    - 按 xref 去重：同一张图在多页复用只 OCR 一次（由调用方维护全局 xref 集合）。
+    - 过滤：过小的图标/装饰线、过大的整页扫描件（后者已由整页 OCR 覆盖）。
+    - `extract_image` 返回的原始字节可能带 alpha / 灰度 / CMYK，统一归一为 RGB。
+    """
+    import pymupdf as fitz
+    import numpy as np
+
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_index]
+        infos = page.get_images(full=True)
+        out = []
+        for info in infos:
+            xref = info[0]                      # 图片对象 xref
+            try:
+                raw = doc.extract_image(xref)
+            except Exception:
+                continue
+            img_bytes = raw.get("image")
+            if not img_bytes:
+                continue
+            arr = np.frombuffer(img_bytes, dtype=np.uint8)
+            img = None
+            try:
+                import cv2
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)   # BGR
+                if img is not None:
+                    img = img[:, :, ::-1]                    # BGR → RGB
+            except Exception:
+                img = None
+            if img is None:
+                continue
+            h, w = img.shape[:2]
+            if min(h, w) < _IMG_OCR_MIN_PX or max(h, w) > _IMG_OCR_MAX_PX:
+                continue
+            out.append((xref, img))
+        return out
+    finally:
+        doc.close()
+
+
+def _ocr_image_blob(blob: bytes) -> str:
+    """图片字节 → OCR 文本（空/失败返回空串）。
+
+    供 Word/EPUB 等「内嵌图以字节形式取出」的解析器复用；PDF 走 numpy 路径不经过这里。
+    解码用 cv2.imdecode（依赖链已含 opencv-headless），与第一刀 PDF 内嵌图同款口径。
+    """
+    from . import ocr as ocr_svc
+    import numpy as np
+    arr = np.frombuffer(blob, dtype=np.uint8)
+    img = None
+    try:
+        import cv2
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is not None:
+            img = img[:, :, ::-1]   # BGR → RGB
+    except Exception:
+        img = None
+    if img is None:
+        return ""
+    h, w = img.shape[:2]
+    if min(h, w) < _IMG_OCR_MIN_PX or max(h, w) > _IMG_OCR_MAX_PX:
+        return ""   # 图标/装饰/超大会话图，与 PDF 口经一致
+    return ocr_svc.ocr_image_to_text(img).strip()
+
+
+def _ocr_pdf_page_images(pdf_path: str, page_index: int, seen_xrefs: set) -> list[str]:
+    """OCR 某页的内嵌图片，返回各图识别文本列表（空文本不计入），并登记已处理的 xref。
+
+    用于「有文本层」的页——文本层能拿到正文，但页内插图（图表/公式/流程图截图）里的
+    文字不会被 `extract_text` 提取，需单独 OCR 补全。
+    """
+    from . import ocr as ocr_svc
+    texts = []
+    for xref, img in _extract_pdf_page_images(pdf_path, page_index):
+        if xref in seen_xrefs:
+            continue
+        seen_xrefs.add(xref)
+        t = ocr_svc.ocr_image_to_text(img)
+        if t.strip():
+            texts.append(t)
+    return texts
 
 
 def parse_image(path: str, on_progress=None) -> list[dict]:
@@ -178,6 +297,37 @@ def _docx_numbering_kinds(doc) -> dict:
         fmt = abstracts.get(aid, "bullet")
         kinds[nid] = "bullet" if fmt in ("bullet", "none") else "number"
     return kinds
+
+
+# 图片的 rId（r:embed）提取：段落 XML 里 a:blip 的 embed 属性。
+_BLIP_TAG = qn("a:blip")
+_EMBED_ATTR = qn("r:embed")
+
+
+def _docx_image_rids(para) -> list[str]:
+    """段落内嵌图片的 rId 列表（按出现顺序、去重）。无图片返回 []。
+
+    图片可内联在 `w:drawing`（浮动/内联图）或 `w:pict`（VML 旧格式，含 Office 剪贴画）里，
+    二者都落到 `a:blip` 的 `r:embed` 属性。用 `iter(_BLIP_TAG)` 遍历（qn 展开完整命名空间，
+    避免 XPath 前缀/namespace 差异），兼容各种现实文档。
+    """
+    rids: list[str] = []
+    for blip in para._p.iter(_BLIP_TAG):
+        rid = blip.get(_EMBED_ATTR)
+        if rid and rid not in rids:
+            rids.append(rid)
+    return rids
+
+
+def _docx_image_blob(doc, rid: str):
+    """按 rId 取图片字节（ImagePart.blob）；非图片关系返回 None。"""
+    part = doc.part.related_parts.get(rid)
+    if part is None:
+        return None
+    blob = getattr(part, "blob", None)
+    if not blob:
+        return None
+    return blob
 
 
 def _docx_list_marker(para, num_kinds: dict) -> tuple[str, int]:
@@ -269,13 +419,21 @@ def parse_docx(path: str) -> list[dict]:
 
     修复点：此前仅遍历 doc.paragraphs，表格内容被整段丢弃（正文写在表格里的文档几乎解析不出内容）。
     page_no 说明：优先按显式分页符翻页；无分页符时按 ~700 字/页估算（python-docx 拿不到真实页码）。
+
+    内嵌图 OCR：段内 `a:blip` 图片单独 OCR，产出 `[图片]` 标记的独立块（挂所在段落位置）。
+    - 按 rId 全局去重（同图多处引用只认一次）。
+    - OCR 依赖缺失时整体跳过（`ocr.is_available()` 短路），不拖慢无 OCR 环境。
     """
+    from . import ocr as ocr_svc
+
     doc = Document(path)
     blocks = list(_docx_iter_blocks(doc))
     has_breaks = any(_docx_page_breaks(b) for b in blocks if isinstance(b, Paragraph))
     num_kinds = _docx_numbering_kinds(doc)
 
     chunks, page, section, chars = [], 1, "", 0
+    img_ocr_available = ocr_svc.is_available()
+    seen_rids: set[str] = set()
 
     def _emit(text: str, bump: int = 0):
         """写入一块，并按估算方式推进页码"""
@@ -290,6 +448,7 @@ def parse_docx(path: str) -> list[dict]:
         if isinstance(b, Paragraph):
             text = b.text.strip()
             n_breaks = _docx_page_breaks(b)
+            para_page = page                      # 段落起始页（图片 chunk 挂这里，与段落同页）
             if text:
                 level = _docx_heading_level(b.style.name if b.style else "")
                 marker, indent = _docx_list_marker(b, num_kinds)
@@ -302,6 +461,26 @@ def parse_docx(path: str) -> list[dict]:
                     _emit(text, n_breaks)
             else:
                 page += n_breaks
+            # 内嵌图 OCR：段内图片（含无文本、只装图的段落）→ [图片] 独立块
+            if img_ocr_available:
+                for rid in _docx_image_rids(b):
+                    if rid in seen_rids:
+                        continue
+                    seen_rids.add(rid)
+                    try:
+                        blob = _docx_image_blob(doc, rid)
+                    except Exception:
+                        blob = None
+                    if not blob:
+                        continue
+                    try:
+                        t = _ocr_image_blob(blob)
+                    except Exception:
+                        t = ""
+                    if t:
+                        chunks.append({"content": f"[图片] {t}",
+                                       "page_no": para_page,
+                                       "section_path": section})
         else:                                            # Table
             for md_table in _docx_table_markdown(b, lambda c: _md_cell(c.text)):
                 _emit(md_table)
@@ -309,8 +488,18 @@ def parse_docx(path: str) -> list[dict]:
 
 
 def parse_pptx(path: str) -> list[dict]:
+    """PPT → 文本块（每页一个正文块 + 表格块；图片单独 OCR 为 `[图片]` 块）。
+
+    图片提取：`shape.shape_type == PICTURE` 时 `shape.image.blob` 直接给字节，
+    无需解 zip（python-pptx 已封装）。按 blob 哈希去重（多页复用同一张图只 OCR 一次）。
+    """
+    from . import ocr as ocr_svc
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
     prs = Presentation(path)
     chunks = []
+    img_ocr_available = ocr_svc.is_available()
+    seen_blobs: set[str] = set()
     for i, slide in enumerate(prs.slides):
         texts = [s.text_frame.text.strip() for s in slide.shapes
                  if s.has_text_frame and s.text_frame.text.strip()]
@@ -321,6 +510,28 @@ def parse_pptx(path: str) -> list[dict]:
             if getattr(s, "has_table", False):
                 for md_table in _docx_table_markdown(s.table, lambda c: _md_cell(c.text)):
                     chunks.append({"content": md_table, "page_no": i + 1, "section_path": f"第{i+1}页"})
+        # 幻灯片内图片 → OCR
+        if img_ocr_available:
+            for s in slide.shapes:
+                if s.shape_type != MSO_SHAPE_TYPE.PICTURE:
+                    continue
+                try:
+                    blob = s.image.blob
+                except Exception:
+                    blob = None
+                if not blob:
+                    continue
+                key = hashlib.md5(blob).hexdigest()
+                if key in seen_blobs:
+                    continue
+                seen_blobs.add(key)
+                try:
+                    t = _ocr_image_blob(blob)
+                except Exception:
+                    t = ""
+                if t:
+                    chunks.append({"content": f"[图片] {t}",
+                                   "page_no": i + 1, "section_path": f"第{i+1}页"})
     return chunks
 
 
@@ -351,12 +562,120 @@ def split_markdown(text: str) -> list[dict]:
 
 
 def parse_md(path: str) -> list[dict]:
-    """Markdown 文件 → 文本块（薄封装，切块逻辑见 split_markdown）"""
+    """Markdown 文件 → 文本块（薄封装，切块逻辑见 split_markdown）。
+
+    内嵌图三种引用都单独 OCR 为 `[图片]` 块：
+    1. 本地相对/绝对路径（`imgs/x.png`）——相对 md 所在目录解析；
+    2. 站内配图 URL（`/api/assets/<sub>/<file>`）——映射到 `data/assets/<sub>/<file>`（图文笔记的主体图）；
+    3. http(s) 外链——不在此处理（走配图本地化 + 防盗链代理体系）。
+
+    若正文引用了「本地相对路径」图片、但文件都不可达（md 单独上传、图片未随迁），
+    追加一条 `[图片]` 提示块引导改用「导入内容→引用原文件」。
+    """
+    from . import ocr as ocr_svc
+    from ..core.config import settings
+
     try:
         text = Path(path).read_text(encoding="utf-8")
     except UnicodeDecodeError:
         text = Path(path).read_text(encoding="gbk", errors="ignore")
-    return split_markdown(text)
+
+    chunks = split_markdown(text)
+
+    img_ocr_available = ocr_svc.is_available()
+    if not img_ocr_available:
+        return chunks
+
+    base_dir = Path(path).resolve().parent
+    assets_root = (Path(settings.data_dir) / "assets").resolve()
+    seen_paths: set[str] = set()
+    local_refs = 0        # 正文里「本地相对路径图片引用」总数（站内 URL 不算）
+    ocr_count = 0         # 成功 OCR 的图片数（含站内配图）
+    # 只识别 `![alt](path)` 形式
+    for target in re.findall(r"!\[[^\]]*\]\(([^)\s]+)\)", text):
+        t = target.strip()
+        if not t or t.lower().startswith(("http://", "https://", "data:")):
+            continue
+        # 去 query/fragment（图片文件路径不带它们）
+        t = t.split("#", 1)[0].split("?", 1)[0]
+        is_asset_url = t.startswith("/api/assets/")
+        p: Path | None = None
+        if is_asset_url:
+            # 站内配图：/api/assets/<sub>/<file> → data/assets/<sub>/<file>
+            rel = t[len("/api/assets/"):].lstrip("/")
+            p = assets_root / rel
+            try:
+                p = p.resolve()
+            except Exception:
+                p = None
+            # 防穿越：解析后必须仍在 assets 根内
+            if p is None or assets_root not in p.parents and p != assets_root:
+                p = None
+        else:
+            # 本地相对/绝对路径
+            p = Path(t)
+            if not p.is_absolute():
+                p = base_dir / p
+            try:
+                p = p.resolve()
+            except Exception:
+                p = None
+            if p is not None:
+                local_refs += 1
+        if p is None:
+            continue
+        key = str(p)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        if not p.is_file():
+            continue
+        try:
+            blob = p.read_bytes()
+        except Exception:
+            continue
+        try:
+            octext = _ocr_image_blob(blob)
+        except Exception:
+            octext = ""
+        if octext:
+            ocr_count += 1
+            # 挂到「图片所在段落」的 page_no + 继承最近的标题章节
+            ipage, isection = _md_img_loc(text, t)
+            chunks.append({"content": f"[图片] {octext}",
+                           "page_no": ipage,
+                           "section_path": isection})
+
+    # 引用了「本地相对路径」图片却一张都没识别出来 → 极可能是「md 单独上传、图片未随迁」
+    if local_refs > 0 and ocr_count == 0:
+        chunks.append({
+            "content": f"[图片] ⚠️ 本文引用了 {local_refs} 张本地图片，但图片未随文件一起导入，"
+                       f"未能识别。可改用「导入内容 → 引用原文件」方式导入，即可识别图片中的文字。",
+            "page_no": 1,
+            "section_path": "",
+        })
+    return chunks
+
+
+def _md_img_loc(text: str, target: str) -> tuple[int, str]:
+    """定位图片所属段落序号与章节路径（对齐 split_markdown 的切割口径）。
+
+    在按空行切出的段落里找含该图引用的段落，返回其 1-based 序号 + 该处生效的最近标题；
+    找不到返回 (1, "")。仅用于给 `[图片]` 块合理位置，不要求精确。
+    """
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    page, section = 1, ""
+    for block in text.split("\n\n"):
+        b = block.strip()
+        if not b:
+            continue
+        first_line = b.splitlines()[0].strip()
+        if first_line.startswith("#"):
+            section = first_line.lstrip("#").strip()
+        if target in b:
+            return page, section
+        page += 1
+    return 1, ""
 
 
 # ---------- EPUB ----------
@@ -370,8 +689,20 @@ def parse_epub(path: str, on_progress=None) -> list[dict]:
     并做句级重叠），parser 层再打包会形成两层切分、重叠内容重复入库；
     且标题若与正文并进同一 chunk，前端 renderBlock 的多行判定会让 `#` 标记现出原形。
     含 DRM 或结构损坏时抛 ValueError（中文原因，上层标记 failed 直接展示给用户）。
+
+    内嵌图 OCR：章节内 `<img>` 单独 OCR，产出 `[图片]` 标记的独立块（挂对应章节）。
+    - 按 zip 内路径去重（同图多章引用只认一次）。
+    - 这是解决「纯图片漫画 / 影印版 EPUB 提取不到文本」的关键补漏。
     """
     from . import epub as epub_svc
+    from . import ocr as ocr_svc
+
+    img_ocr_available = ocr_svc.is_available()
+    seen_imgs: set[str] = set()
+
+    # 纯「[图：alt]」占位块（图片单独成段、无文字）现在由 `[图片]` OCR 块承接，
+    # 不再作为独立块入向量库（避免 alt 噪声向量）。行内图文混排的段仍保留 alt 占位。
+    _SOLO_IMG_PLACEHOLDER = re.compile(r"^\[图：[^\]]*\]$")
 
     with epub_svc.EpubBook(path) as book:
         chapters = book.chapters()
@@ -386,8 +717,35 @@ def parse_epub(path: str, on_progress=None) -> list[dict]:
             if not title:
                 title = next((ln.lstrip("#").strip() for ln in lines if ln.startswith("#")), "")
             title = title or f"第 {ch['index']} 章"
-            chunks.extend({"content": ln, "page_no": ch["index"], "section_path": title}
-                          for ln in lines if ln.strip())
+            for ln in lines:
+                t = ln.strip()
+                if not t:
+                    continue
+                # 仅当 OCR 可用时才过滤纯占位块：`[图片]` 块会承接图内容；
+                # OCR 缺失时保留占位，避免图片信息完全丢失。
+                if img_ocr_available and _SOLO_IMG_PLACEHOLDER.match(t):
+                    continue
+                chunks.append({"content": ln, "page_no": ch["index"], "section_path": title})
+            # 内嵌图 OCR（漫画/影印版补漏）
+            if img_ocr_available:
+                for img_path in book.images(ch["href"]):
+                    if img_path in seen_imgs:
+                        continue
+                    seen_imgs.add(img_path)
+                    try:
+                        blob = book.read(img_path)
+                    except Exception:
+                        blob = None
+                    if not blob:
+                        continue
+                    try:
+                        t = _ocr_image_blob(blob)
+                    except Exception:
+                        t = ""
+                    if t:
+                        chunks.append({"content": f"[图片] {t}",
+                                       "page_no": ch["index"],
+                                       "section_path": title})
             if on_progress:
                 on_progress(min(99, int(ch["index"] / total * 100)))
     return chunks
@@ -533,8 +891,8 @@ MEDIA_FORMATS = {"mp3", "wav", "m4a", "mp4"}
 
 IMAGE_FORMATS = {"jpg", "jpeg", "png", "webp", "bmp"}
 
-# 需要进度回调的格式（OCR / 转写慢，走 on_progress）
-SLOW_FORMATS = {"pdf"} | IMAGE_FORMATS
+# 需要进度回调的格式（OCR / 转写 / 多章节解包慢，走 on_progress）
+SLOW_FORMATS = {"pdf", "epub"} | IMAGE_FORMATS
 
 
 def parse_file(path: str, fmt: str, on_progress=None) -> list[dict]:

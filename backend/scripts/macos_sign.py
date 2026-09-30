@@ -32,7 +32,7 @@
     默认 identity 是 `-`（ad-hoc）。ad-hoc 签名**不能**让 Gatekeeper 放行 ——
     用户从网上下载的 zip 仍带 quarantine 属性，首次打开仍需「右键 → 打开」。
     它真正解决的是**内部一致性**：嵌套 bundle 签名完整，避免 `killed: 9`
-    （macOS 对签名损坏的 QtWebEngineProcess 会直接杀掉）。
+    （macOS 对签名损坏的嵌套可执行会直接杀掉）。
     要真正免右键，需要 Developer ID + 公证（notarization），本脚本已为其预留
     `--identity` 与 `--entitlements` 两个入口。
 """
@@ -300,7 +300,7 @@ def codesign_available(codesign_bin: str):
 
     2026-09-20 的 macOS 跑批就是这样挂的（run #10）：arm64 与 x86_64 **两条 job**
     都一路走过 [1/6] 模型下载 → [4/6] PyInstaller（产物已生成）→ [5/7] 后端健康冒烟
-    → [5b/7] 原生外壳冒烟（`actual_backend = webview.platforms.qt`，R4 被证伪），
+    → [5b/7] 原生外壳冒烟（当时断言的后端 = `webview.platforms.qt`，R4 被证伪），
     唯独 [5c/7] 被这一行判成「本步骤只能在 macOS 上运行」而整步中止。
 
     它之所以躲过了 `--self-test`：自测用的假 codesign **自己实现了 `--version`**
@@ -432,7 +432,7 @@ def sign_and_verify(app: Path, identity: str, entitlements, codesign_bin: str,
             "        报告：%s"
             % (len(failures), len(verify_failures), len(xattr_hits),
                len(problems), report_path))
-    log("[sign] ✅ 全部通过：%d 项已签且验证有效（含嵌套 QtWebEngineProcess.app）" % len(order))
+    log("[sign] ✅ 全部通过：%d 项已签且验证有效（含由深到浅的各层嵌套 bundle）" % len(order))
     return report
 
 

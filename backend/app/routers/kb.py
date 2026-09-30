@@ -5,9 +5,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from ..database import get_db
-from ..models import Material, Note, KbEntry, MaterialChunk
+from ..models import Material, Note, KbEntry, MaterialChunk, Entity, Relation, EntityRef
 from ..services import kb_index, vector as vector_svc, search as search_svc
-
 router = APIRouter(prefix="/kb", tags=["kb"])
 
 
@@ -18,19 +17,21 @@ class RebuildReq(BaseModel):
 @router.get("/overview")
 def kb_overview(search: str | None = None, db: Session = Depends(get_db)):
     """D2 总览：按材料 / 按笔记两个维度"""
-    # 按材料：入库块数 + 笔记数
+    # 按材料：入库块数 + 笔记数 + 实体数（知识图谱生成状态）
     materials = db.query(Material).order_by(Material.created_at.desc()).all()
     by_material = []
     for m in materials:
         chunk_count = (db.query(KbEntry)
                        .filter(KbEntry.material_id == m.id, KbEntry.ref_type == "chunk").count())
         note_count = db.query(Note).filter(Note.material_id == m.id).count()
+        entity_count = db.query(Entity).filter(Entity.material_id == m.id).count()
         if search and search not in m.title:
             continue
         by_material.append({
             "material_id": m.id, "title": m.title, "format": m.format,
             "parsed_status": m.parsed_status,
             "chunk_count": chunk_count, "note_count": note_count,
+            "entity_count": entity_count,
             "indexed": chunk_count > 0,
             "created_at": m.created_at.isoformat() if m.created_at else None,
         })
@@ -113,6 +114,74 @@ def kb_search(payload: dict, db: Session = Depends(get_db)):
     if not query:
         raise HTTPException(400, "query 不能为空")
     return search_svc.search(query, db)
+
+
+@router.get("/entities")
+def kb_entities(db: Session = Depends(get_db)):
+    """知识图谱数据：实体 + 关系 + 引用，供前端可视化。
+
+    返回结构：
+    - entities: [{name, type, material_ids, ref_count}]
+      ref_count = 该实体关联的内容块/笔记数（去重后），作为节点重要度
+    - relations: [{src, rel, dst, material_ids}]（仅保留两端实体都存在的）
+      material_ids 记录该关系出现在哪些材料（跨材料同名实体会使同一条 src-rel-dst 在
+      多个材料各自出现），供前端「按材料隔离」精确过滤——避免只看实体名导致的看 A 显 B。
+    - materials: {id: title} —— 实体来自哪几篇材料
+
+    只读接口；实体由检索端 P1 后台异步抽取产出，可能随时间增长。
+    """
+    ents = db.query(Entity).all()
+    rels = db.query(Relation).all()
+    refs = db.query(EntityRef).all()
+
+    # 实体归并：同名同类型跨材料合并，记录素材 id 集合
+    ent_map: dict[tuple[str, str], dict] = {}
+    for e in ents:
+        key = (e.name, e.type)
+        if key not in ent_map:
+            ent_map[key] = {"name": e.name, "type": e.type, "material_ids": [], "ref_count": 0}
+        if e.material_id not in ent_map[key]["material_ids"]:
+            ent_map[key]["material_ids"].append(e.material_id)
+
+    # 引用计数：按 (entity, ref_type, ref_id) 去重统计（同一内容多处提到同一实体只算一次）。
+    # ⚠️ 用「实体名 → 计数」单次遍历，避免 O(引用数 × 实体数) 双重循环（数据增长会变慢）。
+    name_to_item: dict[str, dict] = {item["name"]: item for item in ent_map.values()}
+    seen_refs: set[tuple[str, str, int]] = set()
+    for r in refs:
+        key = (r.entity, r.ref_type, r.ref_id)
+        if key in seen_refs:
+            continue
+        seen_refs.add(key)
+        item = name_to_item.get(r.entity)
+        if item is not None:
+            item["ref_count"] += 1
+
+    entities = list(ent_map.values())
+
+    # 关系：只保留两端实体都存在的（悬空关系不展示），按 (src, rel, dst) 全局去重，
+    # 同时累计该关系出现的材料集合（跨材料同名实体会让同一条关系在多个材料各自出现）。
+    names = {e["name"] for e in entities}
+    rel_map: dict[tuple[str, str, str], dict] = {}
+    for r in rels:
+        if r.src not in names or r.dst not in names or r.src == r.dst:
+            continue
+        key = (r.src, r.rel, r.dst)
+        if key not in rel_map:
+            rel_map[key] = {"src": r.src, "rel": r.rel, "dst": r.dst, "material_ids": []}
+        if r.material_id not in rel_map[key]["material_ids"]:
+            rel_map[key]["material_ids"].append(r.material_id)
+    relations = list(rel_map.values())
+
+    # 材料标题映射
+    mids = set()
+    for e in entities:
+        mids.update(e["material_ids"])
+    materials = {}
+    if mids:
+        for m in db.query(Material).filter(Material.id.in_(mids)).all():
+            materials[m.id] = m.title
+
+    return {"entities": entities, "relations": relations, "materials": materials}
 
 
 @router.post("/calibrate")

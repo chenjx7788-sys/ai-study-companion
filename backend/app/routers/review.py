@@ -162,18 +162,21 @@ def split_card(req: SplitReq, db: Session = Depends(get_db)):
     content_len = len(note.content or "")
     count = 3 if content_len > 500 else (2 if content_len > 200 else 1)
 
-    # 删除该笔记已有卡（拆卡重建）
+    # ⚠️⚠️ 先出题、拿到**合格题目之后**才删旧卡，且删除与插入在**同一事务**里。
+    #     旧写法是「无条件先删该笔记全部卡，再插新卡」——模型没给出可用题目时
+    #     会静默清空用户的卡连同复习进度（level/ease/review_count 存在卡行内，
+    #     没有独立历史表，删了不可恢复）。
+    qas = llm.generate_review_questions(note.title, note.content, count)
+
     old = db.query(ReviewCard).filter(ReviewCard.note_id == note.id).all()
     for c in old:
         db.delete(c)
+    cards = [_build_card(note, qa, db) for qa in qas]
+    db.add_all(cards)
     db.commit()
 
-    qas = llm.generate_review_questions(note.title, note.content, count)
     created = []
-    for qa in qas:
-        card = _build_card(note, qa, db)
-        db.add(card)
-        db.commit()
+    for card in cards:
         db.refresh(card)
         created.append(card_to_dict(card))
     return {"created": len(created), "cards": created}
@@ -215,20 +218,25 @@ def create_quiz(req: QuizReq, db: Session = Depends(get_db)):
 
     qas = llm.generate_quiz(m.title, core, req.count)
 
-    # 重新生成：删除该资料已有测一测卡
+    # ⚠️⚠️ 必须拿到**合格题目之后**才删，且删除与插入在**同一事务**里：
+    #     generate_quiz 现在遇到「合法 JSON 但字段不合规」会抛错（不再返回空数组），
+    #     但仍按同一约定写——旧写法「先 delete 再 for 插」曾把用户已有的题
+    #     （连同 level/ease/review_count 等复习进度）静默清空，还报「生成成功」。
     db.query(ReviewCard).filter(ReviewCard.material_id == m.id, ReviewCard.source == "quiz").delete()
-    db.commit()
-
-    created = []
-    for qa in qas:
-        card = ReviewCard(
+    cards = [
+        ReviewCard(
             note_id=None, material_id=m.id, material_title=m.title,
             question=qa["question"], answer=qa["explanation"],
             type="choice", options=qa["options"], correct_index=qa["correct_index"],
             source="quiz", level=0, next_review_at=datetime.utcnow(),
         )
-        db.add(card)
-        db.commit()
+        for qa in qas
+    ]
+    db.add_all(cards)
+    db.commit()
+
+    created = []
+    for card in cards:
         db.refresh(card)
         created.append(card_to_dict(card))
     return {"created": len(created), "cards": created}

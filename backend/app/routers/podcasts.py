@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime
@@ -25,7 +26,7 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from ..database import get_db
+from ..database import get_db, SessionLocal
 from ..models import Podcast, Note, Material, Highlight, ReviewCard
 from ..services import podcast as svc
 from ..services import tts
@@ -132,6 +133,22 @@ def _source_missing(p: Podcast, alive: tuple[set[int], set[int]] | None) -> bool
     return any(i not in pool for i in ids)
 
 
+def _public_refs(refs: list, full: bool) -> list:
+    """来源快照序列化：粘贴文本的全文只在详情接口下发。
+
+    列表接口若带上每条 6 万字的原文快照，体积会随作品数线性爆炸；
+    前端回填粘贴框只走详情接口（full=True）。
+    """
+    if full:
+        return refs
+    out = []
+    for r in refs:
+        if isinstance(r, dict) and r.get("type") == "text" and "content" in r:
+            r = {k: v for k, v in r.items() if k != "content"}
+        out.append(r)
+    return out
+
+
 def podcast_to_dict(p: Podcast, db: Session | None = None, *,
                     full: bool = True,
                     alive: tuple[set[int], set[int]] | None = None,
@@ -154,7 +171,8 @@ def podcast_to_dict(p: Podcast, db: Session | None = None, *,
         "id": p.id,
         "title": p.title,
         "source_type": p.source_type,
-        "source_refs": p.source_refs or [],
+        "source_refs": _public_refs(p.source_refs or [], full=full),
+        "gen_mode": getattr(p, "gen_mode", "") or "",
         "style": p.style,
         "target_minutes": p.target_minutes,
         "instruction": p.instruction or "",
@@ -423,8 +441,10 @@ def get_podcast(pid: int, db: Session = Depends(get_db)):
 _GEN_STEPS = {
     "two_step": {"source": 1, "brief": 2, "script": 3, "polish": 3, "save": 3},
     "fast":     {"source": 1, "script": 2, "polish": 2, "save": 2},
+    # 原文朗读无 LLM 调用：抽素材（已在响应前完成）→ 本地分句，一步完成
+    "verbatim": {"source": 1, "split": 1, "save": 1},
 }
-_GEN_TOTAL = {"two_step": 3, "fast": 2}
+_GEN_TOTAL = {"two_step": 3, "fast": 2, "verbatim": 1}
 
 
 def _gen_progress(key: str, detail: dict | None, mode: str) -> dict:
@@ -436,6 +456,8 @@ def _gen_progress(key: str, detail: dict | None, mode: str) -> dict:
         label = "正在提炼知识简报…"
     elif key == "script":
         label = "正在撰写播客脚本…"
+    elif key == "split":
+        label = "正在整理分句…"
     elif key == "polish":
         short = "偏短" if int(d.get("chars") or 0) < int(d.get("target") or 0) else "偏长"
         # ⚠️ short 本身已含「偏」字，格式串里不要再拼一个（否则出现「偏偏短」）
@@ -470,9 +492,10 @@ class GenerateReq(BaseModel):
     style: str = "dialogue"
     target_minutes: int = 3
     voice_map: dict | None = None
-    mode: str = "two_step"        # two_step 两步式 / fast 快速模式
+    mode: str = "two_step"        # two_step 两步式 / fast 快速模式 / verbatim 原文朗读
     instruction: str = ""
     title: str = ""
+    text: str = ""                # 「粘贴文本」来源的内容（verbatim 时原样分句，不经 LLM）
     bgm_id: str = ""              # 空 = 不加背景音乐
     bgm_volume: int = BGM_VOLUME_DEFAULT
 
@@ -489,7 +512,8 @@ def _prepare_generation(db: Session, p: Podcast, req: GenerateReq) -> tuple[str,
     """
     try:
         title, source_text, refs = svc.collect_source(
-            db, req.source_type, req.ref_ids, req.highlight_colors)
+            db, req.source_type, req.ref_ids, req.highlight_colors,
+            pasted_text=req.text, verbatim=(req.mode == "verbatim"))
     except ValueError as e:
         raise HTTPException(400, str(e))
     if not source_text.strip():
@@ -498,6 +522,9 @@ def _prepare_generation(db: Session, p: Podcast, req: GenerateReq) -> tuple[str,
     p.title = svc.sanitize_title(req.title or title)
     p.source_type = req.source_type
     p.source_refs = refs
+    # 生成方式落库：选中作品时生成台要还原「AI 改写 / 原文朗读」，且 verbatim 作品
+    # 的脚本工坊按「朗读文稿」口径展示（旧记录为空串，一律视为 AI 改写）
+    p.gen_mode = req.mode if req.mode in ("two_step", "fast", "verbatim") else "two_step"
     style = req.style if req.style in svc.STYLE_PRESETS else "dialogue"
     p.style = style
     p.target_minutes = req.target_minutes
@@ -520,6 +547,9 @@ def _build_content(req: GenerateReq, title: str, source_text: str, style: str,
     ⚠️ 这里刻意不碰数据库 —— 所以可以放进 worker 线程执行，不受 SQLAlchemy
     session 的线程限制；写库统一由 _commit_generation() 在请求/生成器线程完成。
     """
+    if req.mode == "verbatim":
+        # 原文朗读：不走 LLM，素材原样分句（不改写、不丢字）；简报留空
+        return "", svc.split_verbatim(source_text, on_stage=on_stage)
     if req.mode == "fast":
         # 快速模式：跳过简报，素材直接出脚本（省一次调用，信息密度略降）
         return "", svc.make_script_direct(title, source_text, req.target_minutes,
@@ -908,13 +938,135 @@ def synthesize(pid: int, req: SynthReq, db: Session = Depends(get_db)):
     return podcast_to_dict(p, db)
 
 
+# ---------- 合成任务（与客户端连接解耦） ----------
+
+class _SynthJob:
+    """一次合成任务的服务端状态。SSE 流只是它的「进度订阅者」。
+
+    旧实现把落盘/写库写在 SSE 生成器里：用户离开页面（连接断开）→ 生成器被取消
+    → worker 算出的音频字节随之丢弃，几十秒 TTS 全白烧（用户实测踩中）。
+    现在任务线程自己开 DB 会话、持作品锁直到落盘完成，与连接是否还在无关。
+    """
+
+    def __init__(self):
+        self.status = "running"          # running / done / failed
+        self.done = 0
+        self.total = 0
+        self.error = ""
+        self.podcast: dict | None = None  # 成功后的作品快照（done 事件与状态接口共用）
+        self.subs: list[queue.Queue] = []
+        self.finished_at: float = 0.0
+
+    def broadcast(self, kind: str, payload: dict) -> None:
+        for q in list(self.subs):         # 快照遍历：订阅者可能同时在上/下线
+            q.put((kind, payload))
+
+
+_SYNTH_JOBS: dict[int, _SynthJob] = {}
+_SYNTH_JOBS_LOCK = threading.Lock()
+# 已结束任务保留 10 分钟：够「离开又回来」的前端取到结果；超时清理防无限增长
+_SYNTH_JOB_TTL_SEC = 600
+
+
+def _purge_synth_jobs() -> None:
+    """清理超时任务（调用方须已持有 _SYNTH_JOBS_LOCK）"""
+    now = time.time()
+    for pid, j in list(_SYNTH_JOBS.items()):
+        if j.status != "running" and now - j.finished_at > _SYNTH_JOB_TTL_SEC:
+            _SYNTH_JOBS.pop(pid, None)
+
+
+def _run_synth_job(pid: int, script: list[dict], conf: dict, job: _SynthJob) -> None:
+    """合成任务线程：锁与落盘都在这里，跟 SSE 连接解耦。
+
+    ⚠️ 必须用**自己开的** DB 会话：请求级会话随响应结束关闭，活不到任务结束。
+    """
+    lock = _podcast_lock(pid)
+    if not lock.acquire(timeout=LOCK_WAIT_SEC):
+        job.status = "failed"
+        job.error = "该作品正在执行另一项操作（生成 / 合成 / 保存），请稍等片刻再试"
+        job.broadcast("err", {"message": job.error})
+        return
+    try:
+        db = SessionLocal()
+        try:
+            svc.drop_legacy_parts(pid)   # 旧命名的分句缓存不会再命中，合成前顺手清
+
+            def on_progress(d: int, t: int) -> None:
+                job.done, job.total = d, t
+                job.broadcast("progress", {"done": d, "total": t})
+
+            try:
+                audio, timings = tts.synthesize(
+                    script, conf["voice_map"], rate=conf["rate"],
+                    gap_ms=conf["gap_ms"], provider=conf["provider"],
+                    cache_dir=svc.parts_dir(pid), on_progress=on_progress)
+            except BaseException as e:      # noqa: BLE001
+                # 成功句已缓存 → 再次点击只会补失败的部分，不必整段重做
+                msg = getattr(e, "friendly", None) or f"语音合成失败：{str(e)[:180]}"
+                p = db.get(Podcast, pid)
+                if p:
+                    p.status = "failed"
+                    p.error = str(msg)[:200]
+                    db.commit()
+                job.status = "failed"
+                job.error = str(msg)
+                job.broadcast("err", {"message": job.error})
+                return
+
+            p = db.get(Podcast, pid)
+            try:
+                _finalize_audio(db, p, audio, script, timings, conf["voice_map"])
+            except HTTPException as e:      # _apply_bgm 已写过 status/error
+                job.status = "failed"
+                job.error = str(e.detail)
+                job.broadcast("err", {"message": job.error})
+                return
+            except Exception as e:
+                p.status = "failed"
+                p.error = f"合成结果处理失败：{str(e)[:160]}"
+                db.commit()
+                job.status = "failed"
+                job.error = p.error
+                job.broadcast("err", {"message": job.error})
+                return
+
+            job.status = "done"
+            job.podcast = podcast_to_dict(p, db)
+            job.broadcast("done", {"podcast": job.podcast})
+        finally:
+            db.close()
+    finally:
+        job.finished_at = time.time()
+        lock.release()
+
+
+def _start_or_attach_synth(pid: int, script: list[dict], conf: dict) -> _SynthJob:
+    """启动合成任务；若该作品已有任务在跑 → 直接返回它（调用方附着看进度）。
+
+    「重复点合成」「离开页面后回来」走的都是附着路径，不会起第二个任务
+    （注册表查+插在同一把锁里完成，并发请求不会双双起跑）。
+    """
+    with _SYNTH_JOBS_LOCK:
+        _purge_synth_jobs()
+        job = _SYNTH_JOBS.get(pid)
+        if job and job.status == "running":
+            return job
+        job = _SynthJob()
+        _SYNTH_JOBS[pid] = job
+    threading.Thread(target=_run_synth_job, args=(pid, script, conf, job),
+                     daemon=True).start()
+    return job
+
+
 @router.post("/{pid}/synthesize/stream")
 def synthesize_stream(pid: int, req: SynthReq, db: Session = Depends(get_db)):
     """SSE 流式合成：`meta`（预检）→ `progress`×N → `done` | `error`
 
-    逐句合成十几句要 30–60s（10 分钟档更久），同步接口在这段时间里只有一句
-    「合成中…」，用户无法判断是在跑还是卡死。这里把每完成一句的进度回传。
-    
+    逐句合成十几句要 30–60s（10 分钟档更久）。本接口是「启动或附着」：
+    合成是服务端任务（见 _SynthJob），**用户离开页面任务照跑、落盘照写**；
+    回到页面重新调用本接口即可附着到正在跑的任务上继续看进度。
+
     ⚠️ 前置校验（404 / 400）必须在返回响应之前做完：一旦进入生成器，响应头已发出，
     错误只能作为 error 事件回传，拿不到 HTTP 状态码。
     """
@@ -926,72 +1078,70 @@ def synthesize_stream(pid: int, req: SynthReq, db: Session = Depends(get_db)):
     if not script:
         raise HTTPException(400, "还没有脚本，请先生成或编写脚本")
     conf = _resolve_synth_conf(p, req)
+    # 配置先落库：BGM / 音量属于「这条作品」的选择，即使合成失败也不该丢
+    db.commit()
+    job = _start_or_attach_synth(pid, script, conf)
 
     def gen():
         # 预检走 meta 通道：utils/sse.js 已有 meta 回调（stats 流的元信息也走它），
         # 不必为一个新事件去改公共工具、也不必让所有调用方多传一个占位参数
         yield _sse("meta", precheck)
 
-        # 锁在生成器里拿：响应一返回，路由函数就退出了，锁必须在流的生命周期里持有。
-        lock = _podcast_lock(pid)
-        if not lock.acquire(timeout=LOCK_WAIT_SEC):
-            yield _sse("error", {"message":
-                                 "该作品正在执行另一项操作（生成 / 合成 / 保存），请稍等片刻再试"})
-            return
-        pool = ThreadPoolExecutor(max_workers=1)
         q: queue.Queue = queue.Queue()
+        with _SYNTH_JOBS_LOCK:
+            job.subs.append(q)
         try:
-            db.refresh(p)
-            # 配置先落库：BGM / 音量属于「这条作品」的选择，即使合成失败也不该丢
-            db.commit()
-            svc.drop_legacy_parts(pid)   # 旧命名的分句缓存不会再命中，合成前顺手清
-
-            def worker():
-                try:
-                    audio, timings = tts.synthesize(
-                        script, conf["voice_map"], rate=conf["rate"],
-                        gap_ms=conf["gap_ms"], provider=conf["provider"],
-                        cache_dir=svc.parts_dir(pid),
-                        on_progress=lambda d, t: q.put(("progress", {"done": d, "total": t})))
-                    q.put(("ok", (audio, timings)))
-                except BaseException as e:      # noqa: BLE001
-                    q.put(("err", e))
-
-            pool.submit(worker)
+            # 附着瞬间补一份当前进度快照：中途回来能看到「3/16」而不是干等下一句。
+            # 任务可能在我们订阅前就已结束 → 直接回放终态（广播只发给已注册订阅者，
+            # 不检查会在这里干等到永远）。
+            if job.status == "done":
+                yield _sse("done", {"podcast": job.podcast})
+                return
+            if job.status == "failed":
+                yield _sse("error", {"message": job.error})
+                return
+            if job.total:
+                yield _sse("progress", {"done": job.done, "total": job.total})
             while True:
-                kind, payload = q.get()
+                try:
+                    kind, payload = q.get(timeout=HEARTBEAT_SEC)
+                except queue.Empty:
+                    yield ": ping\n\n"      # 心跳：防连接「看起来死了」（脚本里 \n 是字面两字符）
+                    continue
                 if kind == "progress":
                     yield _sse("progress", payload)
                     continue
                 if kind == "err":
-                    err = payload
-                    msg = getattr(err, "friendly", None) or f"语音合成失败：{str(err)[:180]}"
-                    p.status = "failed"
-                    p.error = str(msg)[:200]
-                    db.commit()
-                    yield _sse("error", {"message": str(msg)})
+                    yield _sse("error", payload)
                     return
-                audio, timings = payload
-                try:
-                    _finalize_audio(db, p, audio, script, timings, conf["voice_map"])
-                except HTTPException as e:      # _apply_bgm 已写过 status/error
-                    yield _sse("error", {"message": str(e.detail)})
-                    return
-                except Exception as e:
-                    p.status = "failed"
-                    p.error = f"合成结果处理失败：{str(e)[:160]}"
-                    db.commit()
-                    yield _sse("error", {"message": p.error})
-                    return
-                yield _sse("done", {"podcast": podcast_to_dict(p, db)})
+                yield _sse("done", payload)
                 return
         finally:
-            # ⚠️ wait=True：客户端中途断开时，worker 可能正在写 parts/ 与 audio.mp3，
-            # 必须等它收尾再放锁，否则紧接着的第二次合成会和它抢同一批文件。
-            pool.shutdown(wait=True, cancel_futures=True)
-            lock.release()
+            with _SYNTH_JOBS_LOCK:
+                if q in job.subs:
+                    job.subs.remove(q)
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+@router.get("/{pid}/synthesize/status")
+def synthesize_status(pid: int, db: Session = Depends(get_db)):
+    """合成任务状态：前端回到页面 / 切换作品时，据此决定「附着看进度」还是「拉新数据」。
+
+    不问这一句的话，后台明明在合成，界面却呈现「没人在跑」的假状态。
+    """
+    if not db.get(Podcast, pid):
+        raise HTTPException(404, "播客不存在")
+    with _SYNTH_JOBS_LOCK:
+        _purge_synth_jobs()
+        job = _SYNTH_JOBS.get(pid)
+    if not job:
+        return {"status": "idle"}
+    d = {"status": job.status, "done": job.done, "total": job.total,
+         "error": job.error}
+    if job.status == "done" and job.podcast:
+        d["podcast"] = job.podcast
+    return d
 
 
 # ---------- 音频 / 文件 ----------

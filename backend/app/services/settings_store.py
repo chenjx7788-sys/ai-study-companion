@@ -1,7 +1,7 @@
 """LLM 配置存储：设置页保存到 data/llm_settings.json，优先于环境变量
 
 多模型：llm_models 为模型列表，每个模型独立配置 base_url/api_key/model；
-summary_model_id / chat_model_id 引用列表中的模型。旧单套配置自动迁移为默认模型。
+summary_model_id / chat_model_id 引用列表中的模型。旧单套配置自动迁移为模型列表（名称记为 DeepSeek）。
 """
 import json
 from pathlib import Path
@@ -16,9 +16,11 @@ FIELDS = ["llm_base_url", "llm_api_key", "summary_model", "chat_model",
           # 知识库切分与去噪（RAG P0 配置化）
           "chunk_size", "chunk_overlap",
           "clean_header_footer", "clean_watermark", "clean_garbled", "clean_dedup",
+          # 知识图谱：导入材料后自动抽取实体（每次调用 LLM 耗 token；重试解析按内容指纹去重免抽）
+          "auto_extract_entities",
           # 笔记检索权重（默认 1.5，检索打分时生效，改动无需重建索引）
           "note_weight",
-          "prompt_summary", "prompt_keywords", "prompt_explain", "prompt_kb_qa", "prompt_general", "prompt_review", "prompt_suggest", "prompt_quiz", "prompt_recall", "prompt_note_rewrite", "prompt_note_expand", "prompt_note_summarize", "prompt_note_continue", "prompt_stats_report", "kb_hit_threshold",
+          "prompt_summary", "prompt_keywords", "prompt_explain", "prompt_kb_qa", "prompt_general", "prompt_review", "prompt_suggest", "prompt_quiz", "prompt_recall", "prompt_note_rewrite", "prompt_note_expand", "prompt_note_summarize", "prompt_note_continue", "prompt_stats_report", "prompt_learn_note", "kb_hit_threshold",
           "prompt_podcast_brief", "prompt_podcast_script", "prompt_podcast_script_direct",
           "prompt_podcast_script_solo", "prompt_podcast_script_solo_direct",
           # AI 播客 · 语音合成（edge-tts 免费音色，无需 Key）
@@ -44,7 +46,7 @@ def _ensure_models(conf: dict) -> dict:
 
     # 仅当配置过旧 key 或模型名时迁移；否则留空列表等用户新建
     if key or chat_model:
-        models.append({"id": "legacy-chat", "name": "默认模型", "base_url": base,
+        models.append({"id": "legacy-chat", "name": "DeepSeek", "base_url": base,
                        "api_key": key, "model": chat_model})
         if summary_model and summary_model != chat_model:
             models.append({"id": "legacy-summary", "name": "总结模型", "base_url": base,
@@ -86,3 +88,52 @@ def resolve_model(model_id: str | None):
                         m.get("api_key") or conf["llm_api_key"],
                         m.get("model") or "")
     return (conf["llm_base_url"], conf["llm_api_key"], "")
+
+
+def resolve_model_strict(model_id: str | None):
+    """严格版：多模型模式下，条目缺 key 或 model 一律返回 None（不回退残留全局字段）。
+
+    用于「用户显式指定某个 model_id」的场景（问答页切换模型）：选了 key 为空的模型时，
+    应报 NEED_SETUP 而不是静默用残留的全局 llm_api_key 跑通。
+    """
+    if not model_id:
+        return None
+    conf = load()
+    for m in conf.get("llm_models") or []:
+        if m.get("id") == model_id:
+            key = m.get("api_key") or ""
+            model = m.get("model") or ""
+            if not key or not model:
+                return None
+            return (m.get("base_url") or conf["llm_base_url"], key, model)
+    return None
+
+
+def resolve_usage(kind: str):
+    """按「用途」解析模型配置，返回 (base_url, api_key, model) 或 None=未配置。
+
+    kind ∈ {'summary', 'chat'}。多模型模式（llm_models 非空）下，用途未选（对应 *_model_id 为空）
+    一律视为**未配置**返回 None —— 不得回退旧的全局单套字段，否则「总结/问答模型没选」也能
+    静默用旧字段跑通（用户实测报的 bug）。纯旧单套模式（llm_models 为空）才回退全局字段。
+    """
+    conf = load()
+    field = "summary_model_id" if kind == "summary" else "chat_model_id"
+    if conf.get("llm_models"):
+        model_id = conf.get(field) or ""
+        if not model_id:
+            return None
+        # 多模型模式：按用途引用解析，条目缺 key/model 时**不回退**旧全局字段
+        # （否则残留的 llm_api_key 会让「模型条目的 key 空」也静默跑通）
+        for m in conf["llm_models"]:
+            if m.get("id") == model_id:
+                key = m.get("api_key") or ""
+                model = m.get("model") or ""
+                if not key or not model:
+                    return None
+                return (m.get("base_url") or conf["llm_base_url"], key, model)
+        return None   # 用途引用的模型不存在（可能被删）
+    # 旧单套配置（无模型列表）：回退全局字段
+    legacy_model = conf["summary_model"] if kind == "summary" else conf["chat_model"]
+    if not conf["llm_api_key"] and not legacy_model:
+        return None
+    return (conf["llm_base_url"], conf["llm_api_key"], legacy_model)

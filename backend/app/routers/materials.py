@@ -200,6 +200,46 @@ def _parse_material(material_id: int):
         m.parse_error = None
         m.parse_progress = 100
         db.commit()
+
+        # 知识图谱实体抽取（P1）：建索引后、标记成功后，后台异步抽取实体+关系并落库。
+        # ⚠️ 独立线程 + 失败静默：图谱是检索增强，绝不能因为 LLM 抽取失败/超时
+        #    拖慢或回退材料的解析成功状态。chunks 已在上面落入 DB（此刻 db 里可查）。
+        # ⚠️ 受设置项 auto_extract_entities 控制（默认关）：每次抽取会调 LLM、消耗 token，
+        #    成本主动权交给用户——需要时在知识库页对单份材料点「生成知识图谱」。
+        #    手动入口不受此开关限制（见 /{material_id}/extract-entities）。
+        from ..services import settings_store as _ss
+        if bool(_ss.load().get("auto_extract_entities", False)):
+            try:
+                _material_id = m.id
+                threading.Thread(
+                    target=_extract_entities_task, args=(_material_id,),
+                    daemon=True).start()
+            except BaseException:
+                pass   # 抽取任务派发失败不影响主流程
+    finally:
+        db.close()
+
+
+def _extract_entities_task(material_id: int):
+    """后台抽取实体：独立会话 + 失败静默（绝不外抛、绝不碰主流程事务）。
+
+    ⚠️ 必须用**自己的 SessionLocal 重新查 chunk**，绝不能复用调用方传进来的 ORM 对象：
+    `_parse_material` 的 db 在 finally 里已 close，其查询出的 chunk 处于 detached 状态，
+    本线程稍后访问 c.content/c.id 会触发 DetachedInstanceError 或读到过期数据。
+    """
+    from ..services import entity as entity_svc
+    from ..models import MaterialChunk
+    db = SessionLocal()
+    try:
+        chunks = (db.query(MaterialChunk)
+                  .filter(MaterialChunk.material_id == material_id)
+                  .order_by(MaterialChunk.page_no, MaterialChunk.id).all())
+        n = entity_svc.persist_entities(db, material_id, chunks)
+        if n:
+            print(f"[entity] 材料 {material_id} 实体抽取完成：{n} 个实体")
+    except BaseException:
+        # ⚠️ BaseException：safe-delete shim / LLM 异常等都不该让后台线程带出异常
+        pass
     finally:
         db.close()
 
@@ -441,10 +481,6 @@ def fulltext_search(q: str, folder_id: int | None = None, db: Session = Depends(
 # 网页正文正常在 5k~30k 字，超过 20 万字基本是异常页面（或抓错了整站索引）。
 MAX_CLIP_CHARS = 200000
 
-# WP15：浏览器视图取回的**页面原始源码**上限（字符）。比 MAX_CLIP_CHARS 大得多是
-# 因为它是**源码**（含内联脚本），抽取之后才会缩到正文字数；这里只防「明显异常的大包」。
-MAX_SOURCE_CHARS = 6_000_000
-
 
 class ClipPreviewReq(BaseModel):
     url: str
@@ -453,9 +489,6 @@ class ClipPreviewReq(BaseModel):
     # 以为粘贴没生效。实测踩过：preview(action=blocked) 而 save 却是好的。
     text: str | None = None
     title: str | None = None
-    # WP15：与 ClipSaveReq 成对（浏览器取源路径）—— 预览与入库必须能走**同一份输入**，
-    # 否则「预览说能存、入库报错」会再次出现（这正是 text 字段当年踩过的坑）。
-    source: str | None = None
 
 
 class ClipSaveReq(BaseModel):
@@ -463,38 +496,22 @@ class ClipSaveReq(BaseModel):
     # 允许前端直接带正文（SPA 降级时由用户粘贴正文）→ 不传 fetch，也不落"抓取失败"的锅
     text: str | None = None
     title: str | None = None
-    # WP15：浏览器视图取回的**页面原始源码**。⚠️ 与 `text` **语义不同**（见 `_clip_fetch`）：
-    # 源码必须**先抽取**，不能直通落库（否则存下去的是整篇 HTML）。
-    source: str | None = None
 
 
 class ClipBatchPreviewReq(BaseModel):
     urls: list[str]
 
 
-def _clip_fetch(req_url: str, text: str | None, title: str | None,
-                source: str | None = None) -> dict:
-    """剪藏路径的正文来源：**页面源码（浏览器视图）> 前端正文（粘贴降级）> 抓取**。
+def _clip_fetch(req_url: str, text: str | None, title: str | None) -> dict:
+    """剪藏路径的正文来源：**前端正文（粘贴降级）> 抓取**。
 
     实现见 `external_svc.fetch_or_passthrough`（单一来源，临时阅读共用）。
     长度策略留在本层：剪藏语义是**入库**，超长一律拒绝 ——
     静默截断用户要保存的内容，比报错更糟。
-
-    ⚠️⚠️ `source` 与 `text` **语义不同，绝不能混用**（WP15 新增）：
-       `text`   = **已抽好的正文**（粘贴降级）→ `fetch_or_passthrough` 直通落库；
-       `source` = **页面原始源码**（浏览器视图取回）→ 必须 `extract_from_source` **抽取**。
-       把源码当 `text` 传 → 落库的是**整篇 HTML**（本项目最忌的「同一资源两个入口
-       给出不同产物」）。所以这里按**先看 source** 的顺序分派，且源码路径**不**做
-       超长拒绝（源码本来就大；抽完之后的正文长度由 `clip_save` 按原有口径判）。
     """
     body = (text or "").strip()
     if body and len(body) > MAX_CLIP_CHARS:
         raise HTTPException(400, f"正文过长（{len(body)} 字），请拆分后保存")
-    src = (source or "").strip()
-    if src:
-        if len(src) > MAX_SOURCE_CHARS:
-            raise HTTPException(400, f"页面源码过大（{len(src)} 字符），无法处理")
-        return external_svc.extract_from_source(req_url, src)
     return external_svc.fetch_or_passthrough(req_url, text, title)
 
 
@@ -540,9 +557,8 @@ def clip_preview(req: ClipPreviewReq, db: Session = Depends(get_db)):
     url = (req.url or "").strip()
     if not url:
         raise HTTPException(400, "请输入网页链接")
-    # 传了 source → 从源码抽取（浏览器视图路径）；传了 text → 粘贴降级；否则抓取。
-    # 三条路共用 _clip_fetch 保证口径一致。
-    r = _clip_fetch(url, req.text, req.title, req.source)
+    # 传了 text → 粘贴降级；否则现场抓取。两条路共用 _clip_fetch 保证口径一致。
+    r = _clip_fetch(url, req.text, req.title)
     payload = external_svc.preview_payload(r)
     # P2-4：预览阶段就把「超长」提示出来，而不是入库时才 400（否则用户白等一次抓取）。
     # 与 clip_save 共用 MAX_CLIP_CHARS 口径，两侧一致。
@@ -583,7 +599,7 @@ def clip_save(req: ClipSaveReq, db: Session = Depends(get_db)):
         d["duplicated"] = True
         return d
 
-    r = _clip_fetch(url, req.text, req.title, req.source)
+    r = _clip_fetch(url, req.text, req.title)
     norm = r.get("url") or ""
     if not r.get("ok"):
         # 抓取失败但没有正文可落库 → 400 + 可读原因（前端已有 hint 可展示）
@@ -616,36 +632,43 @@ def clip_save(req: ClipSaveReq, db: Session = Depends(get_db)):
     title = (req.title or "").strip() or (r.get("title") or "").strip() or "未命名网页"
     title = title[:180]          # 防超长标题撑爆 String(255)
 
-    # 小红书图文：配图是**短时强签名直链**（实测改时间戳 / hash / 后缀任一处即 403），
-    # 必须是**落库这一刻**下载到本地并把正文里的外链换成站内地址，否则用户过两天
-    # 打开就是一片破图。取舍与实测见 `AI伴学助手_小红书图文抓取方案.md`。
+    # 配图本地化 —— **对全部来源生效**（原为「仅 kind == "xhs"」，2026-09-23 放开）：
+    #   · 小红书：配图是**短时强签名直链**（实测改时间戳 / hash / 后缀任一处即 403），
+    #     不落盘过两天必破图（最初的动因，见 `AI伴学助手_小红书图文抓取方案.md`）；
+    #   · 普通网页 / 公众号：外链当前**能显示**（实测 woshipm 无防盗链、16/16 解码成功），
+    #     但站点改版 / CDN 换域名 / 断网即破图 —— 本产品是**本地优先**，把图留在远端与定位不符。
+    #     实测成本：一篇 16 图的产品文章合计 **0.10 MB**、并发下载 **0.4s**（可忽略）。
     # ⚠️ **只在这里调**：「仅本次阅读」的契约是**不落盘**，那边直接用原始 URL 外链即可
     #    —— 当次阅读必然还在有效期内。见 `external.localize_images` 的说明。
     meta = dict(r.get("meta") or {})
-    if kind == "xhs":
-        # ⚠️⚠️ 图片 URL 的来源**不能只看 `meta.image_urls`**（P1-2）：走「仅本次阅读 →
-        #    加入知识库」时是**粘贴降级**分支，那条路的 meta 只有 `{template, passthrough}`
-        #    → 旧写法直接跳过本地化 → 落库正文留着**短时签名外链** → 过几天整篇破图；
-        #    而同样一篇从候选列表直接点「加入知识库」（走抓取）图片却是好的
-        #    —— **同一资源两个入口给出不同产物**，正是本项目反复出现的缺陷模式。
-        #    改成「meta 有就用 meta，没有就从正文抽」：两条路径共用 `image_urls_in_markdown`。
-        img_urls = list(meta.get("image_urls") or []) or external_svc.image_urls_in_markdown(text)
-        # 子目录口径走单一函数（落库 / 删除共用）；note id 抽不到时用 URL 哈希兜底，
-        # ⚠️ 不能退化成固定串（多篇笔记会同目录同名、互相覆盖）
-        subdir = external_svc.assets_subdir_for(norm, meta)
-        meta["xhs_asset_dir"] = subdir
-        if img_urls:
-            text, _img_stat = external_svc.localize_images(text, img_urls, subdir=subdir)
-            # 签名 URL 会过期 → **不当稳定地址存**（留着只会让人以为还能用）
-            meta.pop("image_urls", None)
-            meta["image_paths"] = _img_stat.get("image_paths") or []
-            meta["images_saved"] = int(_img_stat.get("images_saved") or 0)
-            if _img_stat.get("images_failed"):
-                # 逐张容错：失败张数如实记账，而不是静默变少（正文里那条外链保留原 URL）
-                meta["images_failed"] = int(_img_stat["images_failed"])
-            # 正文里的图就是这篇的图：粘贴降级路径没有 meta.images，补上（前端显示「N 张图」）
-            if not meta.get("images"):
-                meta["images"] = len(img_urls)
+    # ⚠️⚠️ 图片 URL 的来源**不能只看 `meta.image_urls`**（P1-2）：走「仅本次阅读 →
+    #    加入知识库」时是**粘贴降级**分支，那条路的 meta 只有 `{template, passthrough}`
+    #    → 旧写法直接跳过本地化 → 落库正文留着**短时签名外链** → 过几天整篇破图；
+    #    而同样一篇从候选列表直接点「加入知识库」（走抓取）图片却是好的
+    #    —— **同一资源两个入口给出不同产物**，正是本项目反复出现的缺陷模式。
+    #    改成「meta 有就用 meta，没有就从正文抽」：两条路径共用 `image_urls_in_markdown`。
+    img_urls = list(meta.get("image_urls") or []) or external_svc.image_urls_in_markdown(text)
+    # 子目录口径走单一函数（落库 / 删除共用）；note id 抽不到时用 URL 哈希兜底，
+    # ⚠️ 不能退化成固定串（多篇笔记会同目录同名、互相覆盖）。
+    # ⚠️ 键名用**中性**的 `assets_dir`（不再叫 `xhs_asset_dir`）：现在四种来源都会落图。
+    #    删除侧 `_material_asset_dir` 按 新键 → 旧键 → 旧 note id 的顺序读，老记录不受影响。
+    subdir = external_svc.assets_subdir_for(norm, meta)
+    meta["assets_dir"] = subdir
+    if img_urls:
+        text, _img_stat = external_svc.localize_images(text, img_urls, subdir=subdir)
+        # 签名 URL 会过期 → **不当稳定地址存**（留着只会让人以为还能用）
+        meta.pop("image_urls", None)
+        meta["image_paths"] = _img_stat.get("image_paths") or []
+        meta["images_saved"] = int(_img_stat.get("images_saved") or 0)
+        if _img_stat.get("images_failed"):
+            # 逐张容错：失败张数如实记账，而不是静默变少（正文里那条外链保留原 URL）
+            meta["images_failed"] = int(_img_stat["images_failed"])
+        if _img_stat.get("images_skipped"):
+            # 超过单篇上限（80 张）的部分：正文里保留原外链，但要让用户知道"还有 N 张没存"
+            meta["images_skipped"] = int(_img_stat["images_skipped"])
+        # 正文里的图就是这篇的图：粘贴降级路径没有 meta.images，补上（前端显示「N 张图」）
+        if not meta.get("images"):
+            meta["images"] = len(img_urls)
 
     markdown = _clip_to_markdown(title, norm, meta, text)
 
@@ -766,6 +789,10 @@ def update_chunk(material_id: int, chunk_id: int, req: ChunkUpdateReq, db: Sessi
     if not content:
         raise HTTPException(400, "内容不能为空")
     c.content = content
+    # 转写校对改了 chunk 内容 → 内容指纹失效，下次生成知识图谱时会重新抽取（否则会误判「未变」）
+    m = db.get(Material, c.material_id)
+    if m and m.extract_sig:
+        m.extract_sig = ""
     db.commit()
     reindex_warning = None
     try:
@@ -790,6 +817,10 @@ def delete_chunk(material_id: int, chunk_id: int, db: Session = Depends(get_db))
         kb_index.deindex_chunk(db, c)
     except Exception:
         pass
+    # 删块改变内容 → 内容指纹失效（否则下次生成图谱会误判「内容未变」而跳过抽取）
+    m = db.get(Material, c.material_id)
+    if m and m.extract_sig:
+        m.extract_sig = ""
     db.delete(c)
     db.commit()
     return {"ok": True}
@@ -817,6 +848,9 @@ def delete_page(material_id: int, page_no: int, db: Session = Depends(get_db)):
     remaining = (db.query(MaterialChunk.page_no)
                  .filter(MaterialChunk.material_id == material_id).all())
     m.page_count = max((r[0] for r in remaining), default=0)
+    # 删页改变内容 → 内容指纹失效（否则下次生成图谱会误判「内容未变」而跳过抽取）
+    if m.extract_sig:
+        m.extract_sig = ""
     db.commit()
     return {"ok": True, "page_count": m.page_count}
 
@@ -1079,6 +1113,51 @@ def reparse_material(material_id: int, db: Session = Depends(get_db)):
     return material_to_dict(m, db)
 
 
+@router.delete("/{material_id}/entities")
+def delete_entities(material_id: int, db: Session = Depends(get_db)):
+    """删除指定材料的知识图谱（实体 + 关系 + 引用）。
+
+    ⚠️ 必须同时清 `extract_sig` 内容指纹：否则下次「生成图谱」时指纹去重会误判
+    「内容未变」而跳过 LLM 抽取 → 删了却生成不回来。
+    删除后可随时点「生成图谱」按需重建（内容没变也会重新抽取，因为指纹已清）。
+    """
+    from ..models import Entity, Relation, EntityRef
+    m = db.get(Material, material_id)
+    if not m:
+        raise HTTPException(404, "材料不存在")
+    n_ent = db.query(Entity).filter(Entity.material_id == material_id).delete()
+    n_rel = db.query(Relation).filter(Relation.material_id == material_id).delete()
+    n_ref = db.query(EntityRef).filter(EntityRef.material_id == material_id).delete()
+    m.extract_sig = ""
+    db.commit()
+    return {"ok": True, "entities": n_ent, "relations": n_rel, "refs": n_ref}
+
+
+@router.post("/{material_id}/extract-entities")
+def extract_entities_manual(material_id: int, db: Session = Depends(get_db)):
+    """手动生成知识图谱：对该材料抽取实体/关系（后台线程）。
+
+    与「自动抽取」的区别：这是用户主动触发的按需抽取，不受 auto_extract_entities 开关限制。
+    幂等+省 token：内容指纹未变且已有实体时，跳过 LLM 调用、只本地重建引用（见
+    services/entity.py::persist_entities 的指纹去重）。
+    """
+    m = db.get(Material, material_id)
+    if not m:
+        raise HTTPException(404, "材料不存在")
+    if m.parsed_status != "success":
+        raise HTTPException(400, f"材料状态为 {m.parsed_status}，需先解析成功")
+    chunks = (db.query(MaterialChunk)
+              .filter(MaterialChunk.material_id == material_id)
+              .order_by(MaterialChunk.page_no, MaterialChunk.id).all())
+    if not chunks:
+        raise HTTPException(400, "该材料无文本块，无法生成知识图谱")
+    # 只传 material_id：task 用自己的 SessionLocal 重查 chunk（复用/传本路由的 ORM 对象
+    # 会在 db 依赖关闭后 detached，见 _extract_entities_task 说明）
+    threading.Thread(target=_extract_entities_task, args=(material_id,),
+                     daemon=True).start()
+    return {"ok": True, "message": "已开始在后台生成知识图谱，稍后可到「知识图谱」页查看"}
+
+
 class DocumentUpdateReq(BaseModel):
     content: str
     title: str | None = None
@@ -1154,15 +1233,20 @@ def _unlink_in_files_dir(p) -> bool:
 def _material_asset_dir(m: Material) -> Path | None:
     """材料所属的「本地化配图」目录（没有则 None）。
 
-    目前只有小红书图文会落这个目录。一个 note id 只可能对应一个材料
-    （`origin_ref` 归一化去重保证），所以目录归属唯一、可以整目录删。
+    2026-09-23 起**四种来源**（网页剪藏 / 公众号 / 小红书 / 其他入库来源）都会落这个目录。
+    `assets_subdir_for` 保证一篇材料一个子目录（note id，或归一化 URL 的短哈希），
+    而 `origin_ref` 归一化去重保证「一个子目录只属于一篇材料」→ 可以整目录删。
 
-    ⚠️ 优先读 `xhs_asset_dir`（落库时写下的**实际子目录名**），回退老记录的 `xhs_note_id`；
-    后者在「note id 抽不到」时为空 → 目录清不掉、留下孤儿图片（P1-2 的连带修复）。
+    ⚠️ **读键顺序（新 → 旧）**：`assets_dir`（中性新键，落库侧现在写的就是它）
+    → `xhs_asset_dir`（小红书时期的旧键）→ `xhs_note_id`（更旧：note id 抽不到时为空）。
+    少读一个旧键，老记录就会「删了材料但图片删不掉」，留下孤儿图片（P1-2 的连带修复）。
+    ⚠️ 落库侧写哪个键，本函数就要读哪个键 —— **两边必须成对**，
+    本项目反复踩过「同一口径两处实现」。
     """
     try:
         meta = m.origin_meta or {}
-        sub = (str(meta.get("xhs_asset_dir") or "").strip()
+        sub = (str(meta.get("assets_dir") or "").strip()
+               or str(meta.get("xhs_asset_dir") or "").strip()
                or str(meta.get("xhs_note_id") or "").strip())
         return external_svc.assets_dir(sub) if sub else None
     except BaseException:      # noqa: BLE001 取不到就不清，绝不阻断删除

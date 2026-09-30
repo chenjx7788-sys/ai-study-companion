@@ -2,8 +2,11 @@
   <el-container class="app-shell" :class="{ 'app-shell-bare': isBare }">
     <aside v-if="!isBare" class="app-aside" :class="{ collapsed: sidebarCollapsed }">
       <div class="logo" @click="$router.push('/')">
-        <img :src="mascot" class="logo-mark-img" alt="伴学猫头鹰" />
-        <span class="logo-text">AI 伴学助手</span>
+        <img :src="mascot" class="logo-mark-img" alt="知萤猫头鹰" />
+        <span class="logo-text">
+          <span class="logo-name">知萤</span>
+          <span class="logo-sub">AI 知识中枢</span>
+        </span>
       </div>
       <nav class="nav">
         <div v-for="item in navItems" :key="item.path"
@@ -14,20 +17,12 @@
           <span v-if="item.path === '/review' && reviewDue > 0" class="due-badge">{{ reviewDue }}</span>
         </div>
       </nav>
-      <!-- AI 浏览器入口（阶段 2 · WP12）：不是路由，而是请求宿主打开 Qt 侧浏览器面板。
-           ⚠️ 独立于上面的 v-for 循环 —— 该循环的 @click 是路由跳转，而这里要发起动作，
-              故不改循环内任何一行（项目既定的「只加不拆」改动姿势）。 -->
-      <div v-if="!isBare" class="nav-help nav-browser" :class="{ active: browserOpen }"
-        title="在应用内打开网页，选中文字直接问 AI" @click="openBrowser">
-        <span class="nav-icon" v-html="browserIcon"></span>
-        <span class="nav-label">AI 浏览器</span>
-      </div>
       <div class="nav-help" :class="{ active: isActive('/help') }"
         :title="sidebarCollapsed ? '使用帮助' : ''" @click="$router.push('/help')">
         <span class="nav-icon" v-html="helpIcon"></span>
         <span class="nav-label">使用帮助</span>
       </div>
-      <div class="aside-footer"><span class="nav-label">个人学习知识中枢</span><span v-if="version" class="ver-tag">v{{ version }}</span></div>
+      <div class="aside-footer"><span v-if="version" class="ver-tag">版本号：v{{ version }}</span></div>
       <div class="collapse-btn" :title="sidebarCollapsed ? '展开菜单' : '折叠菜单'" @click="toggleSidebar">
         <svg v-if="sidebarCollapsed" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5l7 7-7 7"/><path d="M12 5l7 7-7 7"/></svg>
         <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 5l-7 7 7 7"/><path d="M12 5l-7 7 7 7"/></svg>
@@ -43,13 +38,18 @@
         <el-button size="small" type="primary" @click="$router.push('/settings')">前往配置</el-button>
       </div>
       <router-view v-slot="{ Component }">
-        <component :is="Component" @tour="restartTour" />
+        <!-- ⚠️ key 不能省：/study/A → /study/B 命中的是**同一条路由记录**、只换 params，
+             Vue 会复用同一个组件实例（setup 不重跑）→ 页内 push 之后 URL 变了、
+             页面内容却还是 A（显示的讲义 / 「重新生成」/ 划词 / 笔记全作用在 A 上）。
+             用 $route.path 而不是 fullPath：只在**路径**变化时重建，
+             同路径只换 query 的场景仍复用（保住那些页面的既有行为）。 -->
+        <component :is="Component" :key="$route.path" @tour="restartTour" />
       </router-view>
     </el-main>
     <!-- E1 全局悬浮问答入口（问答页自身不显示） -->
     <div v-if="!isBare && $route.path !== '/chat'" class="float-chat" :class="{ 'float-chat-study': $route.path.startsWith('/study') }"
       @click="goChat" title="问伴伴">
-      <img :src="mascot" class="float-mascot" alt="伴学猫头鹰" />
+      <img :src="mascot" class="float-mascot" alt="知萤猫头鹰" />
       <span class="float-bubble">有学习问题，问伴伴</span>
     </div>
 
@@ -92,14 +92,14 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import mascot from './assets/mascot.png'
-import { reviewApi, settingsApi, materialApi, browserApi } from './api'
+import { reviewApi, settingsApi, materialApi } from './api'
 import { ElMessage } from 'element-plus'
 
 const route = useRoute()
 const router = useRouter()
 
-// 「裸布局」（阶段 2 · WP12）：AI 侧栏会被嵌进 Qt 的 QWebEngineView，不能带应用外壳，
-// 否则侧栏里会再套一层 216px 的应用导航栏、可用宽度被挤掉。
+// 「裸布局」开关（预留）：页面内容将不带应用外壳（无 180px 导航栏）。
+// ⚠️ 当前无任何路由使用 bare（原 AI 侧栏路由已随该功能下线）；保留开关以备将来。
 // ⚠️ 只加 v-if 隐藏，不动任何 v-model / @click —— 项目既定的改动安全姿势。
 const isBare = computed(() => !!route.meta.bare)
 
@@ -170,22 +170,6 @@ const navItems = [
 
 const helpIcon = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M6.2 6.2a1.9 1.9 0 1 1 2.7 1.7c-.6.3-.9.8-.9 1.5v.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="11.6" r=".7" fill="currentColor"/></svg>'
 
-// AI 浏览器（阶段 2 · WP12）：入口是**动作**而非路由 —— 它请求宿主在 Qt 侧打开浏览器面板。
-const browserIcon = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.8" y="3" width="12.4" height="10" rx="1.8" stroke="currentColor" stroke-width="1.3"/><path d="M1.8 6.2h12.4" stroke="currentColor" stroke-width="1.3"/><circle cx="4.1" cy="4.6" r=".55" fill="currentColor"/><circle cx="6" cy="4.6" r=".55" fill="currentColor"/></svg>'
-const browserOpen = ref(false)
-async function openBrowser() {
-  // ⚠️ 浏览器模式（无原生窗口）下 opened=false 是**正确值**，不该弹错误吓用户；
-  //    只有真投递失败（host_error 非 host_unavailable）才提示。
-  try {
-    const { data } = await browserApi.open({})
-    browserOpen.value = !!data.opened
-    if (!data.opened && data.host_error && data.host_error !== 'host_unavailable') {
-      ElMessage.warning('浏览器面板打开失败：' + data.host_error)
-    }
-  } catch (e) {
-    ElMessage.warning('浏览器面板打开失败')
-  }
-}
 
 // 首次使用分步引导（localStorage 记忆，仅首次弹出）
 const tourOpen = ref(false)
@@ -212,11 +196,12 @@ function toggleSidebar() {
   sidebarCollapsed.value = !sidebarCollapsed.value
   localStorage.setItem('asc_sidebar_collapsed', sidebarCollapsed.value ? '1' : '0')
 }
-// 进入材料详情页默认折叠菜单（给阅读区腾空间），离开后恢复 localStorage 记忆状态
+// 进入材料详情页 / AI 播客默认折叠菜单（给内容区腾空间），离开后恢复 localStorage 记忆状态
+// （离开时不直接展开而是读回用户偏好：用户手动折叠过的，不被动展开）
 // 离开学习页时错开一帧再展开：先让当前帧完成 StudyView 卸载（PDF canvas / Word 原文 DOM）与目标页挂载，
 // 再触发侧边栏 width 过渡，避免主线程争抢导致「菜单展开卡顿」
 watch(() => route.path, (path) => {
-  if (path.startsWith('/study')) {
+  if (path.startsWith('/study') || path.startsWith('/podcast')) {
     sidebarCollapsed.value = true
   } else {
     requestAnimationFrame(() => {
@@ -229,12 +214,14 @@ watch(() => route.path, (path) => {
 <style scoped>
 .app-shell { height: 100vh; }
 .app-aside {
-  width: 216px; flex-shrink: 0; background: var(--asc-bg);
+  width: 180px; flex-shrink: 0; background: var(--asc-bg);
   border-right: 1px solid var(--asc-border);
   display: flex; flex-direction: column;
   transition: width .2s ease;
 }
 .app-aside.collapsed { width: 64px; }
+/* 折叠后 footer 只剩版本号（且被隐藏），留着就是一条空的分隔线 → 整块隐藏 */
+.app-aside.collapsed .aside-footer { display: none; }
 .app-aside.collapsed .nav-label,
 .app-aside.collapsed .logo-text,
 .app-aside.collapsed .ver-tag { display: none; }
@@ -247,7 +234,7 @@ watch(() => route.path, (path) => {
   display: flex; align-items: center; gap: 6px;
   margin: 0 12px 10px; padding: 10px 12px;
   border-top: 1px solid var(--asc-divider);
-  font-size: 12px; color: var(--asc-text-3); cursor: pointer;
+  font-size: 12.5px; color: var(--asc-text-2); cursor: pointer;
   transition: color .15s ease;
 }
 .collapse-btn:hover { color: var(--asc-primary); }
@@ -259,7 +246,13 @@ watch(() => route.path, (path) => {
   width: 34px; height: 34px; border-radius: 10px;
   background: var(--asc-primary-soft); padding: 1px;
 }
-.logo-text { font-size: 15px; font-weight: 600; letter-spacing: .5px; }
+/* 双行 wordmark：产品名放大、副题收小。
+   ⚠️ 不改成「单行放大」是因为宽度被卡死：文字可用仅 135px，
+   原单行串「知萤 - AI知识中枢」13 字要 126.5px → 单行最多到 16px（还得去掉 .5px 字距），再大必折行。
+   实测见 _probe_aside_width.py：侧栏 172px 是导航「复习巩固+角标」的硬底线，故取 180px。 */
+.logo-text { display: flex; flex-direction: column; gap: 2px; line-height: 1.15; min-width: 0; }
+.logo-name { font-size: 18px; font-weight: 700; letter-spacing: .5px; color: var(--asc-text); }
+.logo-sub { font-size: 12px; font-weight: 500; letter-spacing: .3px; color: var(--asc-text-2); }
 .nav { flex: 1; padding: 8px 12px; }
 .nav-item {
   display: flex; align-items: center; gap: 10px;
@@ -291,17 +284,15 @@ watch(() => route.path, (path) => {
   background: var(--asc-primary-soft); color: var(--asc-primary); font-weight: 500;
   box-shadow: inset 2px 0 0 var(--asc-primary);
 }
-/* AI 浏览器入口：与「使用帮助」同一视觉族，但**去掉上边框**——
-   两者相邻时两条分隔线会连成一段，看起来像把菜单切成了三块。
-   ⚠️ 只覆盖 border-top，其余样式全部继承 .nav-help（减少装饰、避免两处漂移）。 */
-.nav-browser { border-top: 0; }
 .aside-footer {
-  padding: 14px 18px; font-size: 11px; color: var(--asc-text-3);
+  padding: 12px 18px; font-size: 11px; color: var(--asc-text-2);
   border-top: 1px solid var(--asc-border);
   display: flex; align-items: center; gap: 8px;
 }
 .ver-tag {
-  margin-left: auto; font-size: 10.5px; color: var(--asc-text-3);
+  /* 用 #666 而非 --asc-text-2(#6e6e6e)：胶囊底 #f0f0f2 比侧栏底 #f5f5f6 更暗，
+     #6e6e6e 在其上只有 4.48:1（差 0.02 未过 AA 4.5:1），#666 为 5.04:1 */
+  font-size: 11px; color: #666;
   background: var(--asc-surface-2); padding: 1px 7px; border-radius: 8px;
 }
 .app-main { padding: 0; background: var(--asc-bg); }

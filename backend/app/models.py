@@ -44,6 +44,9 @@ class Material(Base):
     parse_progress = Column(Integer, default=0)   # 解析进度 0-100（音视频转写有真实进度）
     page_count = Column(Integer, default=0)
     tags = Column(JSON, default=list)
+    # 实体抽取的内容指纹（MD5 of 全部 chunk 内容）：重试解析时若指纹未变且已有实体，
+    # 跳过 LLM 抽取、只在本地重建引用表（防无意重复消耗 token，B+C 方案的 C）
+    extract_sig = Column(String(32), default="")
     last_read_page = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -196,6 +199,9 @@ class Podcast(Base):
     source_type = Column(String(16), default="article")   # article / notes / highlights / review / mixed
     source_refs = Column(JSON, default=list)              # [{type, id, title}] 来源快照
     style = Column(String(24), default="dialogue")        # dialogue 知识对谈 / solo 单人精讲
+    # 生成方式：two_step 两步式 / fast 快速 / verbatim 原文朗读。
+    # 旧记录为空串（升级前没有这列）→ 一律视为 AI 改写类，行为不变。
+    gen_mode = Column(String(16), default="")
     voice_map = Column(JSON, default=dict)                # {"host": 音色id, "expert": 音色id}
     target_minutes = Column(Integer, default=3)           # 目标时长（分钟）
     # 生成时用户填写的「附加要求」。必须持久化：选中作品时生成台要能完整还原，
@@ -235,4 +241,51 @@ class ActivityLog(Base):
     type = Column(String(16))                  # duration 学习时长 / note_view 笔记回看
     ref_id = Column(Integer, default=0)        # material_id（duration）或 note_id（note_view）
     duration_seconds = Column(Integer, default=0)  # duration 类型：本次时长（秒）
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ---------- 知识图谱（轻量实体索引 · P1） ----------
+
+class Entity(Base):
+    """知识图谱实体：从材料原文中抽取的人物/产品/概念/知识点/方法。
+
+    归并口径：同一材料内「标准化名称 + 类型」唯一（见 services/entity.py 的归一化），
+    跨材料同名实体各自成行（分属不同材料，语义不必强合）。
+    """
+    __tablename__ = "entities"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(128), index=True)          # 标准化后的实体名
+    type = Column(String(16), index=True)           # person/product/concept/knowledge/method
+    material_id = Column(Integer, ForeignKey("materials.id"), index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Relation(Base):
+    """知识图谱关系：src 实体 --rel--> dst 实体（暂不交叉材料，均为同材料内关系）。
+
+    rel 为简短动词短语（如「提出」「包含」「用于判断」）。src/dst 存的是**实体名**而非
+    entity.id —— 抽取层按名对齐（跨 chunk 的实体靠同名归并），存名能跨 chunk 关联，
+    也避免抽取时先查 id 的一次往返。
+    """
+    __tablename__ = "relations"
+    id = Column(Integer, primary_key=True)
+    material_id = Column(Integer, ForeignKey("materials.id"), index=True)
+    src = Column(String(128), index=True)
+    rel = Column(String(64))
+    dst = Column(String(128), index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class EntityRef(Base):
+    """实体 → 内容引用：实体出现在哪些 chunk / note 里（检索扩展的桥梁）。
+
+    ref_type ∈ chunk / note；ref_id 对应 material_chunks.id 或 notes.id。
+    一个实体可引用多处，一处内容也可含多个实体。
+    """
+    __tablename__ = "entity_refs"
+    id = Column(Integer, primary_key=True)
+    entity = Column(String(128), index=True)
+    ref_type = Column(String(16), index=True)       # chunk / note
+    ref_id = Column(Integer, index=True)
+    material_id = Column(Integer, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)

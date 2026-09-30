@@ -1,7 +1,20 @@
 <template>
   <div class="study-page" v-loading="pageLoading">
+    <!-- 材料解析中：整页进度遮罩，解析完成后自动加载内容 -->
+    <div v-if="parsing" class="parsing-overlay">
+      <div class="parsing-card">
+        <div class="parsing-spinner"></div>
+        <div class="parsing-title">{{ parsingLabel }}</div>
+        <div class="parsing-track">
+          <div class="parsing-fill" :class="{ indeterminate: isParsingImage }"
+            :style="isParsingImage ? {} : { width: Math.max(parsePct, 2) + '%' }"></div>
+        </div>
+        <div class="parsing-pct">{{ isParsingImage ? '识别时间取决于图片大小与清晰度' : parsePct + '%' }}</div>
+        <div class="parsing-hint">完成后会自动打开，无需停留在本页等待</div>
+      </div>
+    </div>
     <!-- 左栏：目录 + 笔记 -->
-    <aside class="col-left" :style="{ width: leftWidth + 'px' }">
+    <aside class="col-left" :style="{ width: leftShown + 'px' }">
       <div class="pane-title">目录</div>
       <div class="toc">
         <div v-for="s in sections" :key="s.path" class="toc-item" :class="{ active: s.key === activeSection }">
@@ -10,7 +23,9 @@
             :loading="sectionSummarizing === s.path" @click="summarizeSection(s)">总结</el-button>
         </div>
         <div v-if="sections.length === 0 && !isImage" class="toc-pages">
-          <span v-for="g in pagedChunks" :key="g.page" class="page-chip" @click="scrollToPage(g.page)">{{ g.page }}</span>
+          <span v-for="g in visiblePageChips" :key="g.page" class="page-chip" @click="scrollToPage(g.page)">{{ g.page }}</span>
+          <span v-if="!pagesExpanded && pagedChunks.length > PAGES_COLLAPSE_AT" class="page-chip page-chip-more"
+            @click="pagesExpanded = true">…{{ pagedChunks.length }}</span>
         </div>
       </div>
       <div v-if="hasHighlights" class="hl-legend">
@@ -33,12 +48,19 @@
             <el-radio-button value="text">{{ isMedia ? '转写文本' : '文本视图' }}</el-radio-button>
             <el-radio-button value="origin">{{ isMedia ? '播放' : '原文视图' }}</el-radio-button>
           </el-radio-group>
-          <el-button size="small" text @click="downloadFile">下载文件</el-button>
-          <el-button v-if="material?.storage_mode === 'reference'" size="small" text @click="relocateFile">重新定位</el-button>
-          <el-button v-if="viewMode === 'text'" size="small" text
+          <el-button v-if="viewMode === 'text'" size="small" class="ra-ghost"
             @click="isMd ? editMdDocument() : toggleTranscriptEdit()">{{ isMd ? '编辑文本' : (transcriptEditing ? '完成' : (isMedia ? '编辑转写' : '编辑文本')) }}</el-button>
-          <el-button v-if="viewMode === 'origin' && ['pdf', 'docx', 'epub'].includes(material?.format)" size="small" text
-            @click="toggleFullscreen">{{ isFullscreen ? '退出全屏' : '全屏' }}</el-button>
+          <el-dropdown trigger="click" placement="bottom-end" popper-class="ra-more-pop">
+            <el-button size="small" class="ra-ghost ra-more">更多<el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item @click="downloadFile">下载文件</el-dropdown-item>
+                <el-dropdown-item v-if="material?.storage_mode === 'reference'" @click="relocateFile">重新定位</el-dropdown-item>
+                <el-dropdown-item v-if="viewMode === 'origin' && ['pdf', 'docx', 'epub'].includes(material?.format)"
+                  @click="toggleFullscreen">{{ isFullscreen ? '退出全屏' : '全屏' }}</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
         </div>
       </div>
 
@@ -48,8 +70,9 @@
       <DocxReader v-else-if="viewMode === 'origin' && isDocx" :key="'docx-' + fileTs" :url="fileUrl(material.id)" />
 
       <!-- EPUB「原文视图」：iframe 直出 zip 内章节，原书排版与插图原样生效 -->
-      <EpubReader v-else-if="viewMode === 'origin' && isEpub" :chapters="epubChapters"
-        :index="activePage" :base="epubBase" @change="onEpubChapterChange" />
+      <EpubReader v-else-if="viewMode === 'origin' && isEpub" ref="epubRef" :chapters="epubChapters"
+        :index="activePage" :base="epubBase"
+        @change="onEpubChapterChange" @select="onEpubSelect" @hidesel="hideToolbar" @loaded="applyEpubHighlights" />
 
       <!-- 图片「原文视图」：直接展示原图 -->
       <div v-else-if="viewMode === 'origin' && isImage" class="image-origin">
@@ -70,19 +93,9 @@
           <audio v-else :src="fileUrl(material.id)" controls class="media-audio" />
         </div>
         <div class="reader-inner">
-        <!-- Markdown：整篇渲染成连续文档，不分页 -->
+        <!-- Markdown：整篇渲染成连续文档，不分页（md 编辑统一走 EditorView，此分支无编辑态） -->
         <template v-if="isMd">
-          <div v-if="transcriptEditing" class="md-edit-list">
-            <div v-for="c in chunks" :key="c.id" class="chunk-edit-row">
-              <div class="edit-row-head">
-                <span class="edit-row-label">{{ c.section_path || `段落 ${c.id}` }}</span>
-                <el-button class="edit-del-btn" size="small" text type="danger" @click="deleteChunk(c)">删除此段</el-button>
-              </div>
-              <textarea v-model="transcriptDraft[c.id]" class="edit-textarea" :rows="editRows(transcriptDraft[c.id])"
-                @mouseup.stop="onEditSelect($event, c)" @keyup="onEditSelect($event, c)" @blur="hidePolishBar"></textarea>
-            </div>
-          </div>
-          <div v-else class="md-body">
+          <div class="md-body">
             <div v-for="c in chunks" :key="c.id" :id="'page-' + c.page_no" :data-page="c.page_no" class="md-seg"
               :class="{ 'md-seg-flash': flashLocate && flashLocate.page === c.page_no }"
               v-html="renderMd(c.content)"></div>
@@ -102,16 +115,18 @@
                 <div class="edit-row-head">
                   <el-button class="edit-del-btn" size="small" text type="danger" @click="deleteChunk(c)">删除此块</el-button>
                 </div>
-                <textarea v-model="transcriptDraft[c.id]" class="edit-textarea" :rows="editRows(transcriptDraft[c.id])"
+                <textarea v-show="!editPreviewOn" v-model="transcriptDraft[c.id]" class="edit-textarea" :rows="editRows(transcriptDraft[c.id])"
                   @mouseup.stop="onEditSelect($event, c)" @keyup="onEditSelect($event, c)" @blur="hidePolishBar"></textarea>
+                <div v-if="editPreviewOn" class="edit-preview md-body" v-html="renderMd(transcriptDraft[c.id] || '')"></div>
               </div>
             </template>
-            <p v-else v-for="c in group.items" :key="c.id" class="chunk" :class="{ 'chunk-image': isImage }" :data-page="group.page" :data-chunk="c.id" :data-section="c.section_path || ''" v-html="renderChunk(c)"></p>
+            <component :is="isRichMd ? 'div' : 'p'" v-else v-for="c in group.items" :key="c.id" class="chunk" :class="{ 'chunk-image': isImage, 'rich': isRichMd }" :data-page="group.page" :data-chunk="c.id" :data-section="c.section_path || ''" v-html="renderChunk(c)"></component>
           </template>
           <el-empty v-if="pagedChunks.length === 0" :description="isMedia ? '未识别到语音内容' : (isImage ? '未识别到文字，可在原文视图查看图片' : '无文本内容（扫描件请切换原文视图）')" />
         </template>
         <div v-if="transcriptEditing" class="transcript-save">
           <el-button type="primary" :loading="transcriptSaving" @click="saveTranscript">保存修改</el-button>
+          <el-button v-if="isRichMd" text type="primary" class="edit-preview-btn" @click="editPreview = !editPreview">{{ editPreview ? '继续编辑' : '预览排版' }}</el-button>
           <span class="transcript-hint">修改会同步更新知识库检索，不影响已生成的摘要/知识点</span>
         </div>
         <!-- 语音模型下载引导（音视频未装 Whisper / 下载中时显示） -->
@@ -171,17 +186,18 @@
     </div>
 
     <!-- 右栏：AI 面板 -->
-    <aside class="col-right" :style="{ width: rightWidth + 'px' }">
+    <aside class="col-right" :style="{ width: rightShown + 'px' }">
       <el-tabs v-model="activeTab" class="ai-tabs">
         <!-- 摘要 -->
         <el-tab-pane label="摘要" name="summary">
           <div v-if="summaryError" class="gen-error">
             <span class="gen-error-text">{{ summaryError }}</span>
             <el-button size="small" type="danger" plain @click="genSummary(!!summary)">重试</el-button>
+            <el-button v-if="isNeedSetup(summaryError)" size="small" type="primary" plain @click="goLLMConfig">去配置</el-button>
           </div>
           <div v-if="summary || streamingSummary" class="summary-body pane-wrap">
             <div class="pane-scroll">
-              <div class="md-preview summary-text" v-html="renderMd(streamingSummary || summary.content)" @click="onSummaryClick"></div>
+              <div ref="summaryMdEl" class="md-preview summary-text" v-html="renderSummaryMd(streamingSummary || summary.content)" @click="onSummaryClick"></div>
             </div>
             <div v-if="summaryLoading" class="gen-tip"><span class="asking-dots"><i></i><i></i><i></i></span>{{ summaryProgressTip }}</div>
             <el-progress v-if="summaryLoading && summaryProgress" class="gen-progress"
@@ -203,7 +219,13 @@
             </div>
           </div>
           <div v-else class="pane-empty">
-            <p>生成全文层级大纲，每条要点标注出处页码</p>
+            <div class="pe-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5V5.5z"/><path d="M4 20.5A2.5 2.5 0 0 1 6.5 18H20"/><path d="M9 8h7M9 12h5"/>
+              </svg>
+            </div>
+            <p class="pe-title">生成全文脉络摘要</p>
+            <p class="pe-sub">层级大纲，每条要点标注出处页码</p>
             <el-button type="primary" :loading="summaryLoading" @click="genSummary(false)">生成脉络摘要</el-button>
             <div v-if="summaryLoading" class="gen-tip"><span class="asking-dots"><i></i><i></i><i></i></span>{{ summaryProgressTip }}</div>
             <el-progress v-if="summaryLoading && summaryProgress" class="gen-progress"
@@ -216,6 +238,7 @@
           <div v-if="keywordsError" class="gen-error">
             <span class="gen-error-text">{{ keywordsError }}</span>
             <el-button size="small" type="danger" plain @click="genKeywords(keywords.length > 0)">重试</el-button>
+            <el-button v-if="isNeedSetup(keywordsError)" size="small" type="primary" plain @click="goLLMConfig">去配置</el-button>
           </div>
           <div v-if="keywords.length" class="kw-list pane-wrap">
             <div class="pane-scroll">
@@ -242,7 +265,13 @@
             </div>
           </div>
           <div v-else class="pane-empty">
-            <p>提炼最值得记忆的核心概念，附出处页码</p>
+            <div class="pe-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.3 11 2.9 2.9 0 0 1 1.3 2.4V17h4v-.6a2.9 2.9 0 0 1 1.3-2.4A6 6 0 0 0 12 3z"/>
+              </svg>
+            </div>
+            <p class="pe-title">提炼核心知识点</p>
+            <p class="pe-sub">最值得记忆的概念，附出处页码</p>
             <el-button type="primary" :loading="keywordsLoading" @click="genKeywords(false)">提炼核心知识点</el-button>
             <div v-if="keywordsLoading" class="gen-tip"><span class="asking-dots"><i></i><i></i><i></i></span>正在提炼知识点，长文档约需 1-2 分钟…</div>
           </div>
@@ -280,7 +309,13 @@
           </div>
           </div>
           <div v-else class="pane-empty chains-empty">
-            <p>划线圈选后「AI 解读」吃透，或直接在下方输入问题</p>
+            <div class="pe-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12a8 8 0 0 1-8 8H5l-2 2V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8z"/><path d="M8.5 12h.01M12 12h.01M15.5 12h.01"/>
+              </svg>
+            </div>
+            <p class="pe-title">边读边问</p>
+            <p class="pe-sub">划线圈选后「AI 解读」吃透，或直接在下方输入问题</p>
           </div>
           <div v-if="activeChain" class="ask-mode-bar">
             <span class="ask-mode-text">正在追问「{{ (activeChain.items[0]?.anchor?.selected_text || '').slice(0, 15) }}…」</span>
@@ -304,6 +339,7 @@
           <div v-if="quizError" class="gen-error">
             <span class="gen-error-text">{{ quizError }}</span>
             <el-button size="small" type="danger" plain @click="genQuiz">重试</el-button>
+            <el-button v-if="isNeedSetup(quizError)" size="small" type="primary" plain @click="goLLMConfig">去配置</el-button>
           </div>
           <div v-if="quizCards.length" class="quiz-list pane-wrap">
             <div class="pane-scroll">
@@ -327,9 +363,76 @@
             </div>
           </div>
           <div v-else class="pane-empty">
-            <p>AI 基于资料核心内容出题，并同步到复习模块</p>
+            <div class="pe-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="9"/><path d="M9.5 9.3a2.6 2.6 0 0 1 5 .9c0 1.7-2.5 2.2-2.5 3.6"/><path d="M12 17h.01"/>
+              </svg>
+            </div>
+            <p class="pe-title">测一测掌握程度</p>
+            <p class="pe-sub">AI 基于资料核心内容出题，并同步到复习模块</p>
             <el-button type="primary" :loading="quizLoading" @click="genQuiz">生成测试题</el-button>
             <div v-if="quizLoading" class="gen-tip"><span class="asking-dots"><i></i><i></i><i></i></span>正在出题，请稍候…</div>
+          </div>
+        </el-tab-pane>
+
+        <!-- 简单学习：一键生成结构化讲义 + 出题入复习 -->
+        <el-tab-pane label="简单学" name="simplelearn">
+          <div v-if="learnError" class="gen-error">
+            <span class="gen-error-text">{{ learnError }}</span>
+            <el-button size="small" type="danger" plain @click="genLearn">重试</el-button>
+            <el-button v-if="isNeedSetup(learnError)" size="small" type="primary" plain @click="goLLMConfig">去配置</el-button>
+          </div>
+          <!-- 生成中（尚无任何讲义内容）：阶段提示 + 进度 -->
+          <div v-if="learnLoading && !learnDisplayContent" class="pane-empty">
+            <div class="pe-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3v3M12 18v3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M3 12h3M18 12h3M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/>
+              </svg>
+            </div>
+            <p class="pe-title">{{ learnStageText }}</p>
+            <p class="pe-sub">可离开本页，稍后回来继续查看</p>
+            <el-progress class="gen-progress" :percentage="learnPercent" :stroke-width="8" :show-text="false" />
+          </div>
+          <!-- 已有讲义（含流式实时打字 / 已落库） -->
+          <div v-else-if="learnNote || learnDisplayContent" class="summary-body pane-wrap">
+            <div class="pane-scroll">
+              <div ref="learnMdEl" class="md-preview summary-text" v-html="renderLearnMd(learnDisplayContent)" @click="onSummaryClick"></div>
+            </div>
+            <div v-if="learnLoading" class="gen-tip"><span class="asking-dots"><i></i><i></i><i></i></span>{{ learnStageText }}</div>
+            <!-- 讲义生成成功、只是出题失败：只提示这一项，不判整体失败 -->
+            <div v-if="learnQuizError && !learnLoading" class="learn-quiz-tip is-error">
+              <span>{{ learnQuizError }}</span>
+              <el-button size="small" text type="primary" :loading="learnQuizLoading"
+                @click="retryLearnQuiz">重试出题</el-button>
+            </div>
+            <div v-if="learnQuizCount > 0" class="learn-quiz-tip">
+              <span>{{ learnQuizCount }} 道题已同步到「测一测」</span>
+              <el-button size="small" text type="primary" @click="activeTab = 'quiz'">去查看</el-button>
+            </div>
+            <div class="summary-ops">
+              <el-button v-if="!learnSavedNote" size="small" text type="primary"
+                :disabled="learnLoading" @click="learnToNote">转笔记</el-button>
+              <template v-else>
+                <el-button size="small" text type="success"
+                  @click="openNoteEditor(learnSavedNote)">✓ 已转笔记 · 查看</el-button>
+                <el-button v-if="learnSavedStale" size="small" text type="warning"
+                  :disabled="learnLoading" @click="learnToNote">讲义已更新 · 更新笔记</el-button>
+              </template>
+            </div>
+            <div class="regen-row">
+              <el-button size="large" :loading="learnLoading" @click="genLearn">重新生成</el-button>
+            </div>
+          </div>
+          <!-- 空态 -->
+          <div v-else class="pane-empty">
+            <div class="pe-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5V5.5z"/><path d="M4 20.5A2.5 2.5 0 0 1 6.5 18H20"/><path d="M12 7v5M9.5 9.5h5"/>
+              </svg>
+            </div>
+            <p class="pe-title">一键生成学习讲义</p>
+            <p class="pe-sub">结构化笔记 + 记忆钩子，并出题同步到复习</p>
+            <el-button type="primary" :loading="learnLoading" @click="genLearn">生成学习讲义</el-button>
           </div>
         </el-tab-pane>
 
@@ -375,7 +478,15 @@
                     <span v-if="n.content" class="note-len">{{ n.content.length }} 字</span>
                   </div>
                 </div>
-                <div v-if="notes.length === 0" class="note-empty">暂无笔记，划线或转 AI 内容试试</div>
+                <div v-if="notes.length === 0" class="pane-empty note-empty-pane">
+                  <div class="pe-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+                    </svg>
+                  </div>
+                  <p class="pe-title">暂无笔记</p>
+                  <p class="pe-sub">划线圈选、转 AI 内容，或点右上角「新建」</p>
+                </div>
               </div>
             </div>
           </div>
@@ -398,132 +509,10 @@
       </div>
     </el-dialog>
 
-    <!-- 笔记编辑弹窗（编辑/预览切换 + 锚点跳原文） -->
-    <el-dialog v-model="noteDialog.show" width="560px" class="note-dialog" :close-on-click-modal="false">
-      <template #header>
-        <div class="nd-header">
-          <div class="nd-title-row">
-            <span class="nd-title">{{ noteDialog.id ? '编辑笔记' : '新建笔记' }}</span>
-            <span class="nd-src-tag" :class="noteDialog.sourceType === 'ai_asset' ? 'is-ai' : ''">
-              {{ noteDialog.sourceType === 'ai_asset' ? 'AI 生成' : '手动' }}
-            </span>
-          </div>
-          <div class="nd-sub">
-            <span v-if="material?.title">来自《{{ material.title }}》</span>
-            <span v-if="noteDialog.anchor?.page_no">第 {{ noteDialog.anchor.page_no }} 页</span>
-          </div>
-        </div>
-      </template>
-
-      <div class="nd-body">
-        <div class="nd-field">
-          <label class="nd-label" for="nd-title-input">标题</label>
-          <el-input id="nd-title-input" v-model="noteDialog.title" placeholder="给这条笔记起个标题" maxlength="80" />
-        </div>
-
-        <div class="nd-field">
-          <div class="nd-field-head">
-            <label class="nd-label">内容</label>
-            <div class="nd-seg" role="tablist" aria-label="笔记内容编辑方式">
-              <button type="button" class="nd-seg-btn" :class="{ active: noteDialog.mode === 'edit' }"
-                role="tab" :aria-selected="noteDialog.mode === 'edit'" @click="noteDialog.mode = 'edit'">编辑</button>
-              <button type="button" class="nd-seg-btn" :class="{ active: noteDialog.mode === 'preview' }"
-                role="tab" :aria-selected="noteDialog.mode === 'preview'" @click="noteDialog.mode = 'preview'">预览</button>
-            </div>
-          </div>
-          <textarea v-if="noteDialog.mode === 'edit'" v-model="noteDialog.content" :rows="10" class="nd-textarea"
-            placeholder="支持 Markdown，可直接粘贴"
-            @mouseup.stop="onNoteSelect" @keyup="onNoteSelect" @blur="hideNoteSel"></textarea>
-          <div v-else class="md-preview nd-preview" v-html="renderMd(noteDialog.content)"></div>
-          <div v-if="noteSel.show" class="nd-sel-bar">
-            <span class="nd-sel-count">已选中 {{ noteSel.text.length }} 字</span>
-            <span class="nd-sel-sep" aria-hidden="true"></span>
-            <el-button text type="primary" size="small" @mousedown.prevent @click="noteTransform('rewrite', noteSel)">改写</el-button>
-            <el-button text type="primary" size="small" @mousedown.prevent @click="noteTransform('expand', noteSel)">扩写</el-button>
-            <el-button text type="primary" size="small" @mousedown.prevent @click="noteTransform('continue', noteSel)">续写</el-button>
-            <el-button text type="primary" size="small" @mousedown.prevent @click="noteTransform('summarize', noteSel)">总结</el-button>
-            <el-button text size="small" @mousedown.prevent @click="hideNoteSel">取消</el-button>
-          </div>
-          <div class="nd-count">{{ noteDialog.content.length }} 字</div>
-        </div>
-      </div>
-
-      <div v-if="noteDialog.content.trim()" class="nd-ai">
-        <span class="nd-ai-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor">
-            <path d="M12 2l1.7 5.3L19 9l-5.3 1.7L12 16l-1.7-5.3L5 9l5.3-1.7L12 2z"/>
-            <path d="M19 14l.9 2.6 2.6.9-2.6.9L19 21l-.9-2.6-2.6-.9 2.6-.9L19 14z"/>
-          </svg>
-        </span>
-        <span class="nd-ai-label">AI 加工</span>
-        <span class="nd-ai-sep" aria-hidden="true"></span>
-        <el-tooltip content="换个说法，保持原意与事实" placement="top" :show-after="250">
-          <el-button text type="primary" size="small" @click="noteTransform('rewrite')">改写</el-button>
-        </el-tooltip>
-        <el-tooltip content="补充细节、例子与解释，让笔记更充实" placement="top" :show-after="250">
-          <el-button text type="primary" size="small" @click="noteTransform('expand')">扩写</el-button>
-        </el-tooltip>
-        <el-tooltip content="接着已有内容往下续写，补全或延伸思路" placement="top" :show-after="250">
-          <el-button text type="primary" size="small" @click="noteTransform('continue')">续写</el-button>
-        </el-tooltip>
-        <el-tooltip content="压缩成精炼要点，突出核心结论" placement="top" :show-after="250">
-          <el-button text type="primary" size="small" @click="noteTransform('summarize')">总结</el-button>
-        </el-tooltip>
-      </div>
-
-      <div v-if="noteDialog.id || noteDialog.anchor?.page_no" class="nd-shortcuts">
-        <el-button v-if="noteDialog.anchor?.page_no" text size="small" @click="jumpToAnchor(noteDialog.anchor)">
-          跳转原文 P{{ noteDialog.anchor.page_no }}
-        </el-button>
-        <el-tooltip v-if="noteDialog.id" content="把这条笔记出成选择题，进复习队列定期重考（再认）" placement="top" :show-after="250">
-          <el-button text type="warning" size="small" :loading="addingReview" @click="addToReview">
-            加入复习
-          </el-button>
-        </el-tooltip>
-        <el-tooltip v-if="noteDialog.id" content="出成引导题，先自己讲一遍再对照答案，练主动回忆（费曼）" placement="top" :show-after="250">
-          <el-button text type="primary" size="small" :loading="addingRecall" @click="addToRecall">
-            生成复述卡
-          </el-button>
-        </el-tooltip>
-        <el-button v-if="noteDialog.id && noteDialog.content.length > 200" text type="warning" size="small"
-          :loading="splittingReview" @click="splitToReview">
-          拆成多卡
-        </el-button>
-        <span v-if="noteDialog.id" class="nd-sep"></span>
-        <el-popconfirm v-if="noteDialog.id" title="删除这条笔记？不可恢复"
-          confirm-button-text="删除" confirm-button-type="danger" cancel-button-text="取消"
-          @confirm="deleteNote">
-          <template #reference>
-            <el-button type="danger" text size="small">删除</el-button>
-          </template>
-        </el-popconfirm>
-      </div>
-
-      <template #footer>
-        <div class="nd-footer">
-          <div class="nd-actions">
-            <el-button @click="noteDialog.show = false">取消</el-button>
-            <el-button type="primary" :loading="noteDialog.saving" @click="saveNote">保存</el-button>
-          </div>
-        </div>
-      </template>
-    </el-dialog>
-
-    <!-- 笔记加工结果弹窗（原文 vs 结果，采用/放弃） -->
-    <el-dialog v-model="transformDialog.show" :title="noteTransformTitle" width="560px" class="note-dialog">
-      <div class="polish-block">
-        <div class="polish-label">原文</div>
-        <div class="polish-text">{{ transformDialog.original }}</div>
-      </div>
-      <div class="polish-block polish-block-new">
-        <div class="polish-label">{{ transformDialog.mode === 'continue' ? '续写内容' : (TRANSFORM_LABELS[transformDialog.mode] + '后') }}</div>
-        <div class="polish-text">{{ transformDialog.result }}<span v-if="transformDialog.streaming" class="stream-cursor">▍</span></div>
-      </div>
-      <template #footer>
-        <el-button @click="transformDialog.show = false">放弃</el-button>
-        <el-button type="primary" :disabled="transformDialog.streaming" @click="adoptTransform">{{ transformDialog.mode === 'continue' ? '插入' : '采用' }}</el-button>
-      </template>
-    </el-dialog>
+    <!-- 笔记编辑弹窗（全屏 Vditor，共用组件：与知识库/统计/播客页同一内核） -->
+    <NoteEditorDialog v-model="noteDialog.show" :note-id="noteDialog.id" :material-title="material?.title || ''"
+      :create-draft="noteDialog.id ? null : { title: noteDialog.title, content: noteDialog.content, anchor: noteDialog.anchor, materialId }"
+      :create-handler="onCreateNote" :jump-handler="onJumpAnchor" @changed="refreshNotes" />
 
     <!-- 编辑视图文本加工结果弹窗（原文 vs 结果，采用/放弃） -->
     <el-dialog v-model="editTransform.show" :title="editTransformTitle" width="560px" class="note-dialog">
@@ -556,10 +545,12 @@
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { ArrowDown } from '@element-plus/icons-vue'
 import { createMd } from '../utils/md'
-import { materialApi, aiApi, noteApi, reviewApi, kbApi, statsApi } from '../api'
+import { materialApi, aiApi, noteApi, reviewApi, kbApi, statsApi, simpleLearnApi } from '../api'
 import { errMsg } from '../api/http'
 import PdfReader from '../components/PdfReader.vue'
+import NoteEditorDialog from '../components/NoteEditorDialog.vue'
 import DocxReader from '../components/DocxReader.vue'
 import EpubReader from '../components/EpubReader.vue'
 import { useAsr } from '../composables/useAsr'
@@ -572,18 +563,117 @@ import { streamSSE } from '../utils/sse'
 const md = createMd({ breaks: true, linkify: true })
 const renderMd = (text) => md.render(text || '')
 
+// ---------- 摘要 / 讲义：按结构适配的线性图标（只作用于渲染，不入库） ----------
+// ⚠️ 为什么必须另建实例：上面的 `md` 被材料正文（transcript）/ 题目解析 / 片段弹窗共用，
+//    在它上面挂 heading 规则会把图标一并带到那些地方去。
+// ⚠️ 为什么不做进内容层：摘要/讲义的 content 是**落库**的（AIAsset），且「转笔记」是
+//    原文搬运（content: ln.content）→ 图标若进内容层会污染 DB / 笔记 / 知识库检索，
+//    换一次图标规则还得全量重生成。
+const mdSummary = createMd({ breaks: true, linkify: true })
+const mdLearn = createMd({ breaks: true, linkify: true })
+headingNumRule(mdSummary)
+headingIconRule(mdLearn)
+const renderSummaryMd = (text) => mdSummary.render(text || '')
+const renderLearnMd = (text) => mdLearn.render(text || '')
+
+// 讲义骨架标签 → 图标名。骨架由 prompt_learn_note 写死，实测 5 篇讲义命中率 100%
+// （### C{n} 78 / ## B{n} 24 / ### 引入 24 / ### 本节小结 24 / ## 必记要点 5 / ## 探索历程 5）。
+// ⚠️ `引入` 用**整词**匹配：若按前缀匹配，摘要里出现「## 一、引入…」这类原文标题会被误挂图标。
+// ⚠️ `B\d+` / `C\d+` 后面必须跟 空格 / 冒号 —— 否则 `## B2B 产品设计`、`## C919 首飞`
+//    这类正文标题会被当成章序号（产品语料里 B2B 是高频词，实测必须这么收）。
+const LEARN_ICONS = [
+  [/^必记要点/, 'target'],
+  [/^探索历程/, 'route'],
+  [/^记忆钩子/, 'anchor'],
+  [/^B\d+[\s:：]/, 'book'],
+  [/^C\d+[\s:：]/, 'dot'],
+  [/^本节小结/, 'summary'],
+  [/^引入$/, 'compass'],
+  [/^(总结|全篇回顾|速查|要点回顾)/, 'flag'],
+]
+
+// 摘要侧只做「章节序号」标记：## 标题以序号开头时，把序号从正文里剥出来单独做成胶囊。
+// ⚠️ 不按标题内容猜图标 —— 实测 380 条要点行里 9 类语义规则只命中 33%、兜底 67% 且含误命中
+//    （「避免高估…难度」会被判成风险、「即可…」会被判成定义），
+//    结果是「有的有图标有的没有」比「全都没有」更乱。
+// ⚠️ 限定 1~2 位数字 + 分隔符，避免把 `## 2025 年是爆发年` 的正文数字当序号。
+const HEAD_NUM_RE = /^(?:第[一二三四五六七八九十\d]{1,3}[章节讲篇部分]\s*|[（(]?[一二三四五六七八九十]{1,3}[）)、.．]\s*|\d{1,2}[、.．]\s?|\d{1,2}\s+)/
+
+function headingIconRule(md) {
+  const base = md.renderer.rules.heading_open || ((t, i, o, e, s) => s.renderToken(t, i, o))
+  md.renderer.rules.heading_open = (tokens, idx, options, env, self) => {
+    const open = tokens[idx]
+    const inline = tokens[idx + 1]
+    const raw = ((inline && inline.content) || '').trim()
+    if (raw) {
+      for (const [re, ico] of LEARN_ICONS) {
+        if (re.test(raw)) { open.attrSet('data-ico', ico); break }
+      }
+    }
+    return base(tokens, idx, options, env, self)
+  }
+}
+
+function headingNumRule(md) {
+  const base = md.renderer.rules.heading_open || ((t, i, o, e, s) => s.renderToken(t, i, o))
+  md.renderer.rules.heading_open = (tokens, idx, options, env, self) => {
+    const open = tokens[idx]
+    const inline = tokens[idx + 1]
+    const raw = ((inline && inline.content) || '').trim()
+    // 只在 ## 上做；且要求「剥掉序号后还剩标题正文」（>=2 字）——流式打字时
+    // 会先出现「## 一、」这种半截标题，不加这条会先闪一个孤零零的胶囊。
+    if (raw && open.tag === 'h2') {
+      const m = raw.match(HEAD_NUM_RE)
+      if (m && raw.length - m[0].length >= 2) {
+        const first = inline.children && inline.children[0]
+        // ⚠️ 只在首个子节点是纯文本时就地截断；若标题以 **加粗** 开头则整条跳过，
+        //    绝不改写 children 结构（宁可这一条没有胶囊）。
+        if (first && first.type === 'text' && first.content.startsWith(m[0])) {
+          first.content = first.content.slice(m[0].length)
+          open.attrSet('data-num', m[0].trim().replace(/[.．、）)]$/, ''))
+        }
+      }
+    }
+    return base(tokens, idx, options, env, self)
+  }
+}
+
 const route = useRoute()
 const router = useRouter()
 const materialId = Number(route.params.id)
+
+// 「未配置模型」类错误判断：后端 NEED_SETUP 文案剥掉信号前缀后的稳定关键词
+function isNeedSetup(msg) {
+  if (!msg) return false
+  return /指定用途|未配置完整|API Key|配置 LLM 模型/.test(msg)
+}
+// 跳转 LLM 配置页（中心 → 大模型配置）
+function goLLMConfig() {
+  router.push('/settings')
+}
 
 const pageLoading = ref(true)
 const material = ref(null)
 const chunks = ref([])
 const notes = ref([])
 const viewMode = ref('text')
+// 材料解析中：整页进度遮罩 + 轮询，完成后自动加载
+const parsing = ref(false)
+const parsingFormat = ref('')
+const parsePct = ref(0)
+let parsePollTimer = null
+const isParsingImage = computed(() => ['jpg', 'jpeg', 'png', 'webp', 'bmp'].includes(parsingFormat.value))
+const parsingLabel = computed(() => {
+  if (['mp3', 'wav', 'm4a', 'mp4'].includes(parsingFormat.value)) return '正在转写音视频…'
+  if (isParsingImage.value) return '正在 OCR 识别图片…'
+  return '正在解析材料…'
+})
 const isMedia = computed(() => ['mp3', 'wav', 'm4a', 'mp4'].includes(material.value?.format))
 const isImage = computed(() => ['jpg', 'jpeg', 'png', 'webp', 'bmp'].includes(material.value?.format))
 const isMd = computed(() => ['md', 'markdown'].includes(material.value?.format))
+// docx/epub/pptx 的 chunk.content 在解析层已是 Markdown 语法（标题/列表/表格，见 parser.py），
+// 文本视图按 md 整段渲染；pdf/图片 OCR/音视频转写是纯文本，维持原渲染（避免偶然字符被误当 md 语法）
+const isRichMd = computed(() => ['docx', 'doc', 'epub', 'pptx', 'ppt'].includes(material.value?.format))
 // Word「原文视图」仅支持 OOXML（.docx）；旧版 .doc 无法在浏览器端还原版面
 const isDocx = computed(() => material.value?.format === 'docx')
 // EPUB「原文视图」：章节清单按 spine 解析，index 与 chunk.page_no 一一对应
@@ -657,31 +747,55 @@ const explaining = ref(false)
 const sectionSummarizing = ref('')
 const sectionDialog = reactive({ show: false, section: '', content: '', anchor: null })
 
-const toolbar = reactive({ show: false, x: 0, y: 0, text: '', page: 1, chunkId: null, range: null, hasHighlight: false })
+const toolbar = reactive({ show: false, x: 0, y: 0, text: '', page: 1, chunkId: null, range: null, hasHighlight: false, epub: false })
 
 // 编辑模式选中文字 → AI 加工（改写/扩写/续写/总结，textarea 选区，非 window.getSelection）
 const polishBar = reactive({ show: false, x: 0, y: 0, text: '', chunkId: null, page: 0, start: 0, end: 0 })
 
 // 笔记加工（改写/扩写/总结）
 const TRANSFORM_LABELS = { rewrite: '改写', expand: '扩写', continue: '续写', summarize: '总结' }
-const transformDialog = reactive({ show: false, mode: 'rewrite', original: '', result: '', streaming: false, sel: null })
-// 笔记内容选区：选中指定文字后浮出加工工具（sel 为 null=整条笔记）
-const noteSel = reactive({ show: false, text: '', start: 0, end: 0 })
-const noteTransformTitle = computed(() => {
-  const act = TRANSFORM_LABELS[transformDialog.mode] || '加工'
-  return transformDialog.sel ? `${act}选中文字` : `${act}笔记`
-})
 const readerRef = ref(null)
 const colCenterRef = ref(null)
+
+// ⚠️ 这三个 ref 会被 setup 阶段的 watch（见「摘要/讲义出处标注」）getter 直接读取，
+//    watch 注册时会立即执行一次 getter → 必须在 ref 声明区就定义好，
+//    否则触发 TDZ「Cannot access 'learnNote' before initialization」→ 整页白屏。
+const learnNote = ref(null)          // 最新一版学习讲义（AIAsset type=learn_note）
+const summaryMdEl = ref(null)        // 摘要 md 容器（供 (P页码) 后处理精确定位）
+const learnMdEl = ref(null)          // 讲义 md 容器（同上）
 const isFullscreen = ref(false)
+const learnLive = ref('')            // 流式生成中的讲义正文累积（仅生成中有效；落库后由 learnNote 接管）
 
 // 三栏拖拽调宽（左目录 / 右 AI 面板，中栏自适应）
 const LEFT_MIN = 180, LEFT_MAX = 480, LEFT_DEFAULT = 240
 const RIGHT_MIN = 260, RIGHT_MAX = 560, RIGHT_DEFAULT = 340
 const WIDTHS_KEY = 'asc_study_widths'
 const clampW = (v, min, max) => Math.min(max, Math.max(min, v))
+// 用户可拖拽保存的左右栏宽度（响应式缩窄不影响这两个「用户值」，见下方 leftShown/rightShown）
 const leftWidth = ref(LEFT_DEFAULT)
 const rightWidth = ref(RIGHT_DEFAULT)
+// 响应式：小屏下自动压低左/右栏「上限」，让中间阅读区（flex:1）拿到更多宽度。
+// 用户拖拽保存的宽度不动（rightWidth/leftWidth 仍是用户值），只在展示层 min() 取响应式上限，
+// 因此拖到更大的窗口即恢复用户宽度，且不会把临时缩窄写回 localStorage 污染偏好。
+const windowWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 1440)
+let resizeTimer = null
+function onWinResize() {
+  clearTimeout(resizeTimer)
+  resizeTimer = setTimeout(() => { windowWidth.value = window.innerWidth }, 80)
+}
+// 右栏展示上限：随窗口变窄逐档收紧（默认 340 也不得超过最大值）
+// 2026-09-30：三档各 +20px，缓解小屏下 AI 面板（6 个 Tab）拥挤；中栏仍有充足阅读宽度
+const rightCap = computed(() => {
+  const w = windowWidth.value
+  if (w <= 1080) return 260
+  if (w <= 1200) return 280
+  if (w <= 1366) return 320
+  return RIGHT_MAX
+})
+// 左栏展示上限：窄屏同样让位，但保留目录基本可读宽度
+const leftCap = computed(() => windowWidth.value <= 1200 ? 200 : LEFT_MAX)
+const leftShown = computed(() => Math.min(leftWidth.value, leftCap.value))
+const rightShown = computed(() => Math.min(rightWidth.value, rightCap.value))
 
 function loadWidths() {
   try {
@@ -729,7 +843,7 @@ function toggleFullscreen() {
 }
 function onFsChange() { isFullscreen.value = !!document.fullscreenElement }
 
-const noteDialog = reactive({ show: false, id: null, title: '', content: '', anchor: null, saving: false, mode: 'edit', sourceType: 'manual' })
+const noteDialog = reactive({ show: false, id: null, title: '', content: '', anchor: null, sourceType: 'manual' })
 
 // 按页分组
 const pagedChunks = computed(() => {
@@ -740,6 +854,13 @@ const pagedChunks = computed(() => {
   }
   return [...map.entries()].sort((a, b) => a[0] - b[0]).map(([page, items]) => ({ page, items }))
 })
+
+// 无章节材料的页码导航：超过 24 页折叠，点「…N」展开全部（防页码矩阵像调试面板）
+const PAGES_COLLAPSE_AT = 24
+const pagesExpanded = ref(false)
+const visiblePageChips = computed(() =>
+  pagesExpanded.value ? pagedChunks.value : pagedChunks.value.slice(0, PAGES_COLLAPSE_AT)
+)
 
 // 目录：章节首现页（key 为归一化标题，用于当前章节「定位选择」高亮）
 const normPath = (t) => (t || '').replace(/\s+/g, ' ').trim()
@@ -918,8 +1039,13 @@ function scrollToPage(page) {
   }
   // PDF 原文视图：直接定位到对应页（页面容器常驻，可滚动）
   const pdfPage = document.querySelector('.pdf-page[data-page="' + page + '"]')
-  if (viewMode.value === 'origin' && pdfPage) {
-    pdfPage.scrollIntoView({ behavior: 'smooth' })
+  if (viewMode.value === 'origin' && material.value?.format === 'pdf') {
+    if (pdfPage) {
+      pdfPage.scrollIntoView({ behavior: 'smooth' })
+    } else {
+      // 页容器尚未渲染（挂载初期）：轮询等待，不能落入下方「切回文本视图」
+      restoreReadingPosition('origin', page)
+    }
     return
   }
   viewMode.value = 'text'
@@ -995,11 +1121,6 @@ function scrollToSection(s) {
     }
   }
   scrollToPage(s.page)
-}
-
-function jumpToAnchor(anchor) {
-  noteDialog.show = false
-  locateAndFlash(anchor.page_no, anchor.selected_text)
 }
 
 // ---------- B7 分章总结 ----------
@@ -1155,13 +1276,26 @@ function splitTableBlocks(text) {
 
 const MD_HEADING = /^(#{1,6})\s+(.+)$/
 
+// 是否「内嵌图 OCR」块：content 以 `[图片]` 前缀开头（后端 parser 的独占约定）
+const isImgOcr = (c) => (c.content || '').trimStart().startsWith('[图片]')
+
 function renderChunk(c) {
-  const content = c.content || ''
-  const blocks = splitTableBlocks(content)
-  if (blocks.length === 1 && !blocks[0].table) return renderBlock(c, blocks[0].text)
-  return blocks.map(b => (b.table
-    ? `<div class="md-table">${md.render(b.text)}</div>`
-    : renderBlock(c, b.text))).join('')
+  let html
+  if (isRichMd.value) {
+    html = renderChunkRich(c)
+  } else {
+    const content = c.content || ''
+    const blocks = splitTableBlocks(content)
+    if (blocks.length === 1 && !blocks[0].table) {
+      html = renderBlock(c, blocks[0].text)
+    } else {
+      html = blocks.map(b => (b.table
+        ? `<div class="md-table">${md.render(b.text)}</div>`
+        : renderBlock(c, b.text))).join('')
+    }
+  }
+  // 内嵌图 OCR 块：包一层卡片，视觉上与正文区分（span 保证在 <p>/<div> 容器内均合法）
+  return isImgOcr(c) ? `<span class="imgocr-card">${html}</span>` : html
 }
 
 // 单块渲染：标题 → 标题样式（去掉 # 标记后再定位高亮，保证偏移正确）；其余走纯文本 + 高亮
@@ -1175,12 +1309,14 @@ function renderBlock(c, text) {
   return renderChunkPlain(c, text)
 }
 
-function renderChunkPlain(c, content) {
+// ---- 高亮共用件：mark 收集 / 优先级切分 / span 生成（纯文本路径与 rich-md 路径必须同源，
+//      否则同一页划线在两种渲染下表现不一致） ----
+const HL_KIND_PRIORITY = { 'flash-temp': 4, flash: 3, note: 2, chain: 1, yellow: 0, green: 0, blue: 0 }
+const HL_KIND_TIP = { chain: '已 AI 解读，点击查看追问', note: '已转笔记', flash: '来源定位', 'flash-temp': '' }
+const HL_USER_COLORS = ['yellow', 'green', 'blue']
+
+function collectChunkMarks(c) {
   const fl = flashLocate.value
-  // 临时定位闪烁：无具体文本时整段高亮
-  if (fl && fl.page === c.page_no && !fl.text) {
-    return `<span class="hl-flash-temp">${escapeHtml(content)}</span>`
-  }
   const marks = [...(hlByPage.value.get(c.page_no) || [])]
   marks.push(...(userHlByPage.value.get(c.page_no) || []))
   if (flashHl.value && flashHl.value.page === c.page_no) {
@@ -1189,33 +1325,83 @@ function renderChunkPlain(c, content) {
   if (fl && fl.page === c.page_no && fl.text) {
     marks.push({ text: fl.text, kind: 'flash-temp' })
   }
+  return marks
+}
+
+// 边界切分：重叠区间按优先级取胜者（flash 来源跳转 > note 笔记 > chain 解读 > 用户划线），
+// 返回互不重叠、按起点排序的获胜区间 [{s, e, kind, refId}]；无命中返回 []
+function segmentHighlightRanges(content, marks) {
   let ranges = []
   for (const m of marks) {
     for (const [s, e] of findRanges(content, m.text)) ranges.push({ s, e, kind: m.kind, refId: m.refId })
   }
-  if (!ranges.length) return escapeHtml(content)
-  // 边界切分：重叠区间按优先级渲染（flash 来源跳转 > note 笔记 > chain 解读 > 用户划线），
-  // 否则闪烁高亮会被已存在的常驻高亮吞掉
-  const KIND_PRIORITY = { 'flash-temp': 4, flash: 3, note: 2, chain: 1, yellow: 0, green: 0, blue: 0 }
-  const KIND_TIP = { chain: '已 AI 解读，点击查看追问', note: '已转笔记', flash: '来源定位', 'flash-temp': '' }
-  const USER_COLORS = ['yellow', 'green', 'blue']
+  if (!ranges.length) return []
   const points = new Set([0, content.length])
   for (const r of ranges) { points.add(r.s); points.add(r.e) }
   const sorted = [...points].sort((a, b) => a - b)
-  let html = ''
+  const segs = []
   for (let i = 0; i < sorted.length - 1; i++) {
     const s = sorted[i], e = sorted[i + 1]
     if (s >= e) continue
     const covering = ranges.filter(r => r.s < e && r.e > s)
-    const seg = escapeHtml(content.slice(s, e))
-    if (!covering.length) { html += seg; continue }
-    covering.sort((a, b) => KIND_PRIORITY[b.kind] - KIND_PRIORITY[a.kind])
-    const kind = covering[0].kind
-    const isUser = USER_COLORS.includes(kind)
-    const cls = isUser ? `hl-user hl-${kind}` : `hl hl-${kind}`
-    const refAttr = (kind === 'note' || kind === 'chain') && covering[0].refId ? ` data-ref-id="${covering[0].refId}"` : ''
-    html += `<span class="${cls}"${refAttr}${isUser ? '' : ` title="${KIND_TIP[kind]}"`}>${seg}</span>`
+    if (!covering.length) continue
+    covering.sort((a, b) => HL_KIND_PRIORITY[b.kind] - HL_KIND_PRIORITY[a.kind])
+    segs.push({ s, e, kind: covering[0].kind, refId: covering[0].refId })
   }
+  return segs
+}
+
+function hlSpanOpen(kind, refId) {
+  const isUser = HL_USER_COLORS.includes(kind)
+  const cls = isUser ? `hl-user hl-${kind}` : `hl hl-${kind}`
+  const refAttr = (kind === 'note' || kind === 'chain') && refId ? ` data-ref-id="${refId}"` : ''
+  return `<span class="${cls}"${refAttr}${isUser ? '' : ` title="${HL_KIND_TIP[kind]}"`}>`
+}
+
+function renderChunkPlain(c, content) {
+  const fl = flashLocate.value
+  // 临时定位闪烁：无具体文本时整段高亮
+  if (fl && fl.page === c.page_no && !fl.text) {
+    return `<span class="hl-flash-temp">${escapeHtml(content)}</span>`
+  }
+  const segs = segmentHighlightRanges(content, collectChunkMarks(c))
+  if (!segs.length) return escapeHtml(content)
+  let html = ''
+  let cursor = 0
+  for (const seg of segs) {
+    html += escapeHtml(content.slice(cursor, seg.s))
+    html += hlSpanOpen(seg.kind, seg.refId) + escapeHtml(content.slice(seg.s, seg.e)) + '</span>'
+    cursor = seg.e
+  }
+  html += escapeHtml(content.slice(cursor))
+  return html
+}
+
+// docx/epub/pptx：chunk 已是 md 语法 → 整段交给 markdown-it。
+// 高亮不能渲染后再找（raw 偏移 ≠ HTML 偏移），做法：先把获胜区间用 PUA 令牌包进 md 源码
+// （\uE000..\uE003 不会被 markdown-it 转义/改写），渲染后整串替换为 <span>。
+// ⚠️ 令牌只对「获胜区间」注入（互不重叠），天然避免了交叉区间的非法嵌套。
+function renderChunkRich(c) {
+  const content = c.content || ''
+  const fl = flashLocate.value
+  if (fl && fl.page === c.page_no && !fl.text) {
+    return `<div class="hl-flash-temp">${md.render(content)}</div>`
+  }
+  const segs = segmentHighlightRanges(content, collectChunkMarks(c))
+  if (!segs.length) return md.render(content)
+  let src = ''
+  let cursor = 0
+  segs.forEach((seg, i) => {
+    src += content.slice(cursor, seg.s)
+    src += `\uE000${i}\uE001` + content.slice(seg.s, seg.e) + `\uE002${i}\uE003`
+    cursor = seg.e
+  })
+  src += content.slice(cursor)
+  let html = md.render(src)
+  segs.forEach((seg, i) => {
+    html = html.split(`\uE000${i}\uE001`).join(hlSpanOpen(seg.kind, seg.refId))
+    html = html.split(`\uE002${i}\uE003`).join('</span>')
+  })
   return html
 }
 
@@ -1264,6 +1450,7 @@ function onSelect(e) {
   toolbar.page = pageEl ? Number(pageEl.dataset.page) : 0
   toolbar.chunkId = chunkEl ? Number(chunkEl.dataset.chunk) : null
   toolbar.range = range.cloneRange()   // 克隆保存，点击工具条导致 selection 清除后仍可用
+  toolbar.epub = false
   toolbar.hasHighlight = matchingHighlights(text, toolbar.chunkId, toolbar.page).length > 0
   toolbar.x = Math.min(rect.left, window.innerWidth - 320)
   toolbar.y = rect.bottom + 8
@@ -1271,6 +1458,37 @@ function onSelect(e) {
 }
 
 function hideToolbar() { toolbar.show = false }
+
+// ---------- EPUB 原文视图选区（划线 / AI 解读 / 转笔记 / 复制共用入口） ----------
+
+const epubRef = ref(null)
+
+// EpubReader 已把选区坐标换算到顶层视口；原文视图没有 chunk 锚点（与 PDF 原文一致）
+function onEpubSelect({ text, page, x, y }) {
+  toolbar.text = text
+  toolbar.page = page
+  toolbar.chunkId = null
+  toolbar.range = null        // 选区在 iframe 内，划线视觉走「文本匹配重刷」而非 range 操作
+  toolbar.epub = true
+  toolbar.hasHighlight = matchingHighlights(text, null, page).length > 0
+  toolbar.x = x
+  toolbar.y = y
+  toolbar.show = true
+}
+
+// 把当前章的划线（含文本视图同章打的）推给 EpubReader 重刷；章加载完成 / 划线变动时调用
+function applyEpubHighlights() {
+  if (!isEpub.value || viewMode.value !== 'origin') return
+  const list = highlights.value.filter(h => h.page_no === activePage.value)
+  epubRef.value?.applyHighlights(list)
+}
+watch(highlights, applyEpubHighlights, { deep: true })
+
+// 主文档与 iframe 的选区都要清（划线/解读完成后）
+function clearAnySelection() {
+  window.getSelection()?.removeAllRanges()
+  if (toolbar.epub) epubRef.value?.clearSelection()
+}
 
 // ---------- 划线高亮（3 色） ----------
 
@@ -1359,11 +1577,12 @@ async function applyMdHighlights() {
 }
 
 async function doHighlight(color) {
-  // 使用 onSelect 时保存的选中信息，不依赖实时 selection（点击工具条会清除 selection）
+  // 使用 onSelect/onEpubSelect 时保存的选中信息，不依赖实时 selection（点击工具条会清除 selection）
   const text = (toolbar.text || '').trim()
   const range = toolbar.range
-  if (!text || !range) return
-  const startEl = range.startContainer.parentElement
+  const isEpubFrame = toolbar.epub
+  if (!text || (!range && !isEpubFrame)) return
+  const startEl = range?.startContainer?.parentElement
   const chunkId = toolbar.chunkId
   const page = toolbar.page
   const isPdf = !!startEl?.closest('.textLayer')
@@ -1385,26 +1604,29 @@ async function doHighlight(color) {
       })
       highlights.value.push(data)
     }
-    // 刷新展示：PDF 直接操作 span，md 重刷，纯文本靠 renderChunk 响应式重渲染
+    // 刷新展示：PDF 直接操作 span，EPUB 重刷 iframe，md 重刷，纯文本靠 renderChunk 响应式重渲染
     if (isPdf) {
       setPdfHighlight(range, color)
+    } else if (isEpubFrame) {
+      applyEpubHighlights()
     } else if (isMd.value) {
       await refreshMdHighlights()
     }
   } catch (e) {
     ElMessage.error(errMsg(e, '划线失败'))
   }
-  window.getSelection()?.removeAllRanges()
+  clearAnySelection()
   hideToolbar()
 }
 
 async function doUnhighlight() {
   const text = (toolbar.text || '').trim()
   const range = toolbar.range
-  if (!text || !range) return
+  const isEpubFrame = toolbar.epub
+  if (!text || (!range && !isEpubFrame)) return
   const chunkId = toolbar.chunkId
   const page = toolbar.page
-  const isPdf = !!range.startContainer.parentElement?.closest('.textLayer')
+  const isPdf = !!range?.startContainer?.parentElement?.closest('.textLayer')
   try {
     const matched = matchingHighlights(text, chunkId, page)
     for (const h of matched) {
@@ -1415,13 +1637,15 @@ async function doUnhighlight() {
     }
     if (isPdf) {
       setPdfHighlight(range, null)
+    } else if (isEpubFrame) {
+      applyEpubHighlights()
     } else if (isMd.value) {
       await refreshMdHighlights()
     }
   } catch (e) {
     ElMessage.error(errMsg(e, '取消划线失败'))
   }
-  window.getSelection()?.removeAllRanges()
+  clearAnySelection()
   hideToolbar()
 }
 
@@ -1433,7 +1657,7 @@ const streamingChain = ref(null)   // { _tmp, type, question, content, selected_
 async function doExplain() {
   explaining.value = true
   hideToolbar()
-  window.getSelection()?.removeAllRanges()
+  clearAnySelection()
   activeTab.value = 'chains'
   const sel = toolbar.text
   streamingChain.value = { _tmp: Date.now(), type: 'explain', question: '', content: '', selected_text: sel }
@@ -1572,13 +1796,17 @@ async function genSummary(regen) {
     streamingSummary.value = ''
     summaryProgress.value = null
     // streamingSummary 清空后 v-html 切换到 summary.content，需重新包裹 (P数字) 为可点击
-    nextTick(makeSummaryPageClickable)
+    nextTick(() => makeSummaryPageClickable(summaryMdEl.value))
   }
 }
 
 // 把摘要里的出处标注 (P数字) / (P数字-数字) 包裹成可点击跳转
-function makeSummaryPageClickable() {
-  const el = document.querySelector('.summary-text')
+function makeSummaryPageClickable(root) {
+  // 不传（undefined）→ 回退第一个 .summary-text（兼容旧调用）；
+  // 传了但为 null（容器未渲染）→ 直接返回，绝不误伤其它 Tab 的容器。
+  // ⚠️ 多个 Tab 都有 .summary-text，且 el-tab-pane 渲染后会留在 DOM，
+  //    所以必须按 ref 精确指定，否则只会命中 DOM 里第一个（摘要）。
+  const el = root === undefined ? document.querySelector('.summary-text') : root
   if (!el) return
   // 幂等：先还原已有包裹，避免重复嵌套
   el.querySelectorAll('.sum-page-link').forEach(s => {
@@ -1619,11 +1847,13 @@ function onSummaryClick(e) {
   locateAndFlash(Number(link.dataset.page))
 }
 
-// 摘要渲染完成 / 切回摘要 tab 时，把 (P数字) 出处标注做成可点击
-watch([() => summary.value?.content, activeTab], async () => {
-  if (activeTab.value !== 'summary') return
+// 摘要/讲义渲染完成或切回对应 tab 时，把 (P数字) 出处标注做成可点击
+// ⚠️ watch 注册时会立即跑一次 getter → getter 里读到的 ref 必须声明在本行之前，
+//    新增 ref 到 getter 时先确认它已在 ref 声明区（learnNote/summaryMdEl/learnMdEl 即为此前置）。
+watch([() => summary.value?.content, () => learnNote.value?.content, activeTab], async () => {
   await nextTick()
-  makeSummaryPageClickable()
+  if (activeTab.value === 'summary') makeSummaryPageClickable(summaryMdEl.value)
+  else if (activeTab.value === 'simplelearn') makeSummaryPageClickable(learnMdEl.value)
 })
 
 // ---------- 材料全文摘要 → 笔记 ----------
@@ -1803,55 +2033,15 @@ async function addAllToReview() {
   }
 }
 
-// 拆卡：长笔记拆成多张复习卡
-const splittingReview = ref(false)
-async function splitToReview() {
-  splittingReview.value = true
-  ElMessage.info('正在拆分生成复习卡，请稍候…')
-  try {
-    const { data } = await reviewApi.split(noteDialog.id)
-    ElMessage.success(`已拆成 ${data.created} 张复习卡`)
-  } catch (e) {
-    ElMessage.error(errMsg(e, '拆卡失败'))
-  } finally {
-    splittingReview.value = false
-  }
-}
-
-// 加入复习：AI 出题生成自测卡片
-const addingReview = ref(false)
-async function addToReview() {
-  addingReview.value = true
-  ElMessage.info('正在出题生成复习卡，请稍候…')
-  try {
-    const { data } = await reviewApi.createCard(noteDialog.id)
-    ElMessage.success(data.created ? `已加入复习：「${data.question.slice(0, 24)}…」` : '该笔记已在复习队列中')
-  } catch (e) {
-    ElMessage.error(errMsg(e, '加入复习失败'))
-  } finally {
-    addingReview.value = false
-  }
-}
-
-// 生成复述卡：费曼学习法（主动复述而非再认）
-const addingRecall = ref(false)
-async function addToRecall() {
-  addingRecall.value = true
-  ElMessage.info('正在生成复述卡，请稍候…')
-  try {
-    const { data } = await reviewApi.createRecallCard(noteDialog.id)
-    ElMessage.success(data.created ? `已生成复述卡：「${data.question.slice(0, 24)}…」` : '该笔记已有复述卡')
-  } catch (e) {
-    ElMessage.error(errMsg(e, '生成复述卡失败'))
-  } finally {
-    addingRecall.value = false
-  }
-}
-
 // 转写校对：编辑音视频转写文本（纠同音字），保存后同步向量索引
 const transcriptEditing = ref(false)
 const transcriptDraft = reactive({})
 const transcriptSaving = ref(false)
+
+// 编辑态 md 预览（仅解析层产出 md 语法的 docx/epub/pptx；退出编辑自动复位）
+const editPreview = ref(false)
+const editPreviewOn = computed(() => editPreview.value && isRichMd.value)
+watch(transcriptEditing, (v) => { if (!v) editPreview.value = false })
 
 // 编辑框高度随内容自适应：估行数（min 3 / max 24），让长内容不再挤在小框里
 function editRows(content) {
@@ -2004,6 +2194,175 @@ async function loadQuiz() {
   } catch { /* 静默 */ }
 }
 
+// ---------- 简单学习：一键生成结构化讲义 + 出题入复习 ----------
+//
+// 出的题落 source='quiz'，与「测一测」同口径 → 会自动出现在测一测里，
+// 故本 Tab 只负责「生成 + 展示讲义」，不重复实现题目展示。
+// 生成走服务端后台任务：离开页面任务照跑，回来重连 SSE 即附着看进度。
+const learnLoading = ref(false)
+const learnError = ref('')
+const learnStage = ref('')           // prepare / note / quiz
+const learnQuizCount = ref(0)        // 本次生成入队的题目数
+const learnQuizError = ref('')       // 讲义成功但**出题失败**时的提示（不判整体失败）
+const learnQuizLoading = ref(false)  // 「重试出题」进行中
+
+const LEARN_STAGE_TEXT = {
+  prepare: '正在准备材料…',
+  note: '正在转译结构化讲义，长材料约需 1-3 分钟…',
+  quiz: '正在出题并同步到复习…',
+}
+const LEARN_STAGE_PCT = { prepare: 12, note: 48, quiz: 82 }
+const learnStageText = computed(() => LEARN_STAGE_TEXT[learnStage.value] || '正在生成…')
+const learnPercent = computed(() => LEARN_STAGE_PCT[learnStage.value] || (learnLoading.value ? 5 : 0))
+// 讲义展示正文：流式生成中优先显示实时累积（逐 token 打字），落库后切回 learnNote
+const learnDisplayContent = computed(() => learnLive.value || (learnNote.value?.content || ''))
+
+async function loadLearn() {
+  try {
+    const { data } = await simpleLearnApi.note(materialId)
+    learnNote.value = data || null
+  } catch { learnNote.value = null }   // 404「尚未生成」属正常空态
+}
+
+// 回到页面：仍在生成 → 附着看进度；否则读回已有讲义
+async function resumeLearn() {
+  try {
+    const { data } = await simpleLearnApi.status(materialId)
+    if (data?.note) learnNote.value = data.note
+    if (data?.status === 'running') { genLearn(); return }   // 附着（后端会补一份状态快照）
+    if (data?.status === 'failed') {
+      // ⚠️ 旧实现只判 running → 上次失败的记录回到页面完全不可见，用户只看到「从没生成过」。
+      learnError.value = data.error || '上次生成失败，请重试'
+      return
+    }
+    if (data?.quiz?.error) learnQuizError.value = data.quiz.error   // 讲义成功、只是出题失败
+    if (data?.quiz?.created) learnQuizCount.value = data.quiz.created
+    if (data?.note) return
+  } catch { /* 静默 */ }
+  await loadLearn()
+}
+
+// 「生成中」这条 SSE 的控制器：组件卸载时必须 abort，
+// 否则每进出一次页面就多留一条挂到后台任务结束的不死连接。
+let learnAbort = null
+
+async function genLearn() {
+  if (learnLoading.value) return
+  learnLoading.value = true
+  learnError.value = ''
+  learnStage.value = 'prepare'
+  learnQuizCount.value = 0
+  learnQuizError.value = ''
+  learnLive.value = ''                 // 清空上一轮流式累积，准备接收新一轮 token
+  learnAbort = new AbortController()
+  try {
+    await streamSSE(
+      simpleLearnApi.runStreamUrl,
+      { material_id: materialId },
+      (t) => { learnLive.value += t },  // token：逐字累积，实时渲染讲义
+      (payload) => {                    // done
+        if (payload.note) learnNote.value = payload.note
+        learnLive.value = ''            // 落库完成，切回 learnNote 展示
+        learnQuizCount.value = payload.quiz?.created || 0
+        // ⚠️ 出题失败是「降级」：后端在 done 里带 quiz.error（status 仍是 done）。
+        //    旧实现只读 created → 出题失败被当成成功，用户完全不知情。
+        learnQuizError.value = payload.quiz?.error || ''
+      },
+      (msg) => { learnError.value = msg || '生成失败' },   // error
+      undefined,
+      (payload) => {                    // progress
+        if (payload.stage) learnStage.value = payload.stage
+        if (payload.note) learnNote.value = payload.note
+        if (payload.quiz?.error) learnQuizError.value = payload.quiz.error
+      },
+      learnAbort.signal,                // ⚠️ 第 8 参：离开页面时断开这条长连接
+    )
+    if (!learnError.value) {
+      if (learnQuizError.value) {
+        ElMessage.warning('学习讲义已生成，但出题失败，可点「重试出题」')
+      } else {
+        ElMessage.success(learnQuizCount.value > 0
+          ? `学习讲义已生成，${learnQuizCount.value} 道题已同步到复习`
+          : '学习讲义已生成')
+      }
+      loadQuiz()                        // 新题落 source=quiz → 刷新「测一测」
+    }
+  } catch (e) {
+    if (e?.name !== 'AbortError') learnError.value = errMsg(e, '生成失败')
+  } finally {
+    learnAbort = null
+    learnLoading.value = false
+    learnStage.value = ''
+    learnLive.value = ''
+  }
+}
+
+// 出题失败后的重试：只重跑出题，**不动讲义**
+// （旧「重试」走 genLearn 全量重跑：多花一次 token，讲义 version 还会白涨）
+async function retryLearnQuiz() {
+  if (learnQuizLoading.value) return
+  learnQuizLoading.value = true
+  learnQuizError.value = ''
+  try {
+    const { data } = await simpleLearnApi.quiz(materialId)
+    learnQuizCount.value = data?.created || 0
+    if (data?.error) {
+      learnQuizError.value = data.error
+    } else {
+      ElMessage.success(learnQuizCount.value > 0
+        ? `已重新出题，${learnQuizCount.value} 道题已同步到复习`
+        : '已重新出题')
+      loadQuiz()
+    }
+  } catch (e) {
+    learnQuizError.value = errMsg(e, '出题失败')
+  } finally {
+    learnQuizLoading.value = false
+  }
+}
+
+// ---------- 学习讲义 → 笔记 ----------
+// 口径与「摘要转笔记」一致：认 notes 里 anchor.kind === 'learn_note' 的那条（同一材料只沉淀一条讲义笔记）。
+// ⚠️⚠️ kind **不能**用 'summary'：摘要 Tab 的「覆盖更新」是按 anchor.kind 认领的，
+//    共用 summary 会让它误认领讲义笔记 → 弹出错误的「摘要已更新」确认（本项目已踩过这个坑）。
+// ⚠️ 也不要用 source_asset_id 判断：「重新生成」会新建 AIAsset（id 变化）→ 按钮会错误地翻回「转笔记」。
+const learnSavedNote = computed(
+  () => notes.value.find(n => n.source_type === 'ai_asset' && n.anchor?.kind === 'learn_note') || null)
+// 「讲义已更新」用 version 比对（绝不比对正文 —— 用户编辑过笔记会被误判为过期）
+const learnSavedStale = computed(() => {
+  const n = learnSavedNote.value, ln = learnNote.value
+  if (!n || !ln) return false
+  return Number(n.anchor?.version) !== Number(ln.version)
+})
+
+async function learnToNote() {
+  const ln = learnNote.value
+  if (!ln?.content) return
+  if (learnLoading.value) { ElMessage.warning('讲义生成中，请稍候再转笔记'); return }
+  try {
+    if (learnSavedNote.value) {
+      await ElMessageBox.confirm(
+        `已存在该讲义的笔记「${learnSavedNote.value.title}」，用当前讲义覆盖它的内容？你在笔记里做过的编辑会被覆盖。`,
+        '更新学习讲义笔记', { confirmButtonText: '覆盖更新', cancelButtonText: '取消', type: 'warning' })
+      await noteApi.update(learnSavedNote.value.id, {
+        title: learnSavedNote.value.title,
+        content: ln.content,
+        // 同步更新 anchor.version，否则版本比对会一直判定「讲义已更新」
+        anchor: { ...(learnSavedNote.value.anchor || {}), kind: 'learn_note', version: ln.version },
+      })
+      await refreshNotes()
+      ElMessage.success('笔记已更新为当前讲义')
+    } else {
+      const title = `学习讲义：${(material.value?.title || '材料').slice(0, 40)}`
+      await createNote(title, ln.content, 'ai_asset', ln.id, { kind: 'learn_note', version: ln.version })
+      ElMessage.success('已转笔记')
+    }
+  } catch (e) {
+    if (e === 'cancel' || e === 'close') return   // ElMessageBox 取消
+    ElMessage.error(errMsg(e, '转笔记失败'))
+  }
+}
+
 function openNoteEditor(n) {
   // 笔记回看埋点（模块 H）
   if (n?.id) statsApi.track({ type: 'note_view', ref_id: n.id }).catch(() => {})
@@ -2011,35 +2370,18 @@ function openNoteEditor(n) {
   noteDialog.title = n?.title || ''
   noteDialog.content = n?.content || ''
   noteDialog.anchor = n?.anchor || null
-  noteDialog.mode = 'edit'
   noteDialog.sourceType = n?.source_type || 'manual'
   noteDialog.show = true
 }
 
-async function saveNote() {
-  noteDialog.saving = true
-  try {
-    let reindexWarning = null
-    if (noteDialog.id) {
-      const { data } = await noteApi.update(noteDialog.id, { title: noteDialog.title, content: noteDialog.content })
-      reindexWarning = data.reindex_warning
-    } else {
-      await createNote(noteDialog.title || '未命名笔记', noteDialog.content, 'manual', null, null)
-    }
-    noteDialog.show = false
-    await refreshNotes()
-    if (reindexWarning) ElMessage.warning(reindexWarning)
-    else ElMessage.success('已保存')
-  } finally {
-    noteDialog.saving = false
-  }
+// 新建笔记保存（NoteEditorDialog 的 create-handler）：绑定当前材料
+async function onCreateNote({ title, content }) {
+  await createNote(title || '未命名笔记', content, 'manual', null, null)
 }
 
-async function deleteNote() {
-  await noteApi.remove(noteDialog.id)
-  noteDialog.show = false
-  await refreshNotes()
-  ElMessage.success('已删除')
+// 「跳转原文」（NoteEditorDialog 的 jump-handler）：本页内定位 + 闪高亮
+function onJumpAnchor(anchor) {
+  locateAndFlash(anchor.page_no, anchor.selected_text)
 }
 
 function copySelection() {
@@ -2132,66 +2474,6 @@ async function adoptEditTransform() {
   }
 }
 
-// ---------- 笔记加工：改写/扩写/续写/总结 ----------
-// 笔记内容选区：选中文字后浮出加工工具
-function onNoteSelect(e) {
-  const el = e.target
-  if (!el || typeof el.selectionStart !== 'number') return
-  const start = el.selectionStart, end = el.selectionEnd
-  const text = el.value.substring(start, end)
-  if (!text.trim()) { noteSel.show = false; noteSel.text = ''; return }
-  noteSel.text = text
-  noteSel.start = start
-  noteSel.end = end
-  noteSel.show = true
-}
-function hideNoteSel() { noteSel.show = false; noteSel.text = '' }
-
-async function noteTransform(mode, sel) {
-  const content = sel ? sel.text : noteDialog.content?.trim()
-  if (!content) { ElMessage.warning(sel ? '请先选中文字' : '笔记还没有内容'); return }
-  transformDialog.mode = mode
-  transformDialog.original = content
-  transformDialog.result = ''
-  transformDialog.sel = sel ? { start: sel.start, end: sel.end } : null
-  transformDialog.streaming = true
-  transformDialog.show = true
-  noteSel.show = false
-  try {
-    await streamSSE('/api/ai/note/transform/stream',
-      { content, mode, title: noteDialog.title },
-      (t) => { transformDialog.result += t },
-      () => {},
-      (msg) => { throw new Error(msg) },
-    )
-  } catch (e) {
-    ElMessage.error(e.message || '加工失败')
-    transformDialog.show = false
-  } finally {
-    transformDialog.streaming = false
-  }
-}
-
-function adoptTransform() {
-  if (!transformDialog.result.trim()) { ElMessage.warning('结果为空，无法采用'); return }
-  if (transformDialog.sel) {
-    const { start, end } = transformDialog.sel
-    if (transformDialog.mode === 'continue') {
-      // 续写：保留原选段，续写内容追加在选区之后
-      noteDialog.content = noteDialog.content.substring(0, end) + '\n\n' + transformDialog.result + noteDialog.content.substring(end)
-    } else {
-      noteDialog.content = noteDialog.content.substring(0, start) + transformDialog.result + noteDialog.content.substring(end)
-    }
-  } else if (transformDialog.mode === 'continue') {
-    // 整条续写：原文保留，续写内容追加到末尾
-    noteDialog.content = noteDialog.content.trimEnd() + '\n\n' + transformDialog.result
-  } else {
-    noteDialog.content = transformDialog.result
-  }
-  transformDialog.show = false
-  ElMessage.success(transformDialog.mode === 'continue' ? '已续写，记得保存' : '已采用，记得保存')
-}
-
 // ---------- 学习时长埋点（模块 H：心跳 30s，切后台暂停，无操作暂停） ----------
 const studyTrack = { startTs: 0, timer: null }
 let studyLastActive = Date.now()
@@ -2229,7 +2511,8 @@ function stopStudyTrack() {
 
 // ---------- 初始化 ----------
 
-onMounted(async () => {
+// 材料解析完成后的完整加载（首次进入 / 解析中轮询结束后共用）
+async function initAfterParsed() {
   try {
     const [{ data: m }, { data: c }] = await Promise.all([
       materialApi.detail(materialId),
@@ -2237,9 +2520,12 @@ onMounted(async () => {
     ])
     material.value = m
     chunks.value = c
+    // PDF / 图片材料默认「原文视图」（扫描件/图片的文本视图常为空，原文才是主内容）
+    if (m.format === 'pdf' || isImage.value) viewMode.value = 'origin'
     if (isMedia.value) loadAsr()
     if (isEpub.value) loadEpubChapters()
     await Promise.all([refreshNotes(), loadChains(), loadQuiz(), loadHighlights()])
+    resumeLearn()   // 简单学习：附着进行中的生成，或读回已有讲义（不阻塞其余加载）
     const { data: assets } = await aiApi.assets(materialId)
     if (assets.summary) summary.value = assets.summary
     if (assets.keywords) {
@@ -2251,9 +2537,13 @@ onMounted(async () => {
   } finally {
     pageLoading.value = false
   }
-  // E4 来源跳转 ?page=N 优先；否则 B8 恢复上次阅读位置
-  const targetPage = Number(route.query.page) || material.value?.last_read_page || 0
-  if (targetPage) scrollToPage(targetPage)
+  // E4 来源跳转 ?page=N 优先（显式跳转，scrollToPage 负责落到能展示的视图）；
+  // 否则 B8 恢复上次阅读位置：默认原文视图时不走 scrollToPage（它会切回文本视图）
+  const queryPage = Number(route.query.page) || 0
+  const targetPage = queryPage || material.value?.last_read_page || 0
+  if (queryPage) scrollToPage(queryPage)
+  else if (targetPage && viewMode.value === 'origin') restoreReadingPosition('origin', targetPage)
+  else if (targetPage) scrollToPage(targetPage)
   // Markdown 渲染后恢复划线高亮
   if (isMd.value) await applyMdHighlights()
   // 点击空白处收起工具条
@@ -2263,31 +2553,123 @@ onMounted(async () => {
   document.addEventListener('fullscreenchange', onFsChange)
   // 学习时长埋点启动（模块 H）
   startStudyTrack()
+}
+
+// 解析中轮询：拿到最新进度，解析结束后自动进入完整加载
+function pollParse() {
+  parsePollTimer = setTimeout(async () => {
+    let m0 = null
+    try {
+      const { data } = await materialApi.detail(materialId)
+      m0 = data
+    } catch {
+      pollParse()   // 网络抖动：继续等
+      return
+    }
+    parsePct.value = m0.parse_progress || 0
+    if (m0.parsed_status === 'parsing') {
+      pollParse()
+      return
+    }
+    parsing.value = false
+    if (m0.parsed_status === 'failed') {
+      ElMessage.error('解析失败：' + (m0.parse_error || '未知原因'))
+    }
+    await initAfterParsed()
+  }, 1500)
+}
+
+onMounted(async () => {
+  window.addEventListener('resize', onWinResize)
+  // 材料仍在后台解析（从知识库/直链进入）：先展示解析进度，完成后自动加载
+  try {
+    const { data: m0 } = await materialApi.detail(materialId)
+    if (m0.parsed_status === 'parsing') {
+      parsing.value = true
+      parsingFormat.value = m0.format || ''
+      parsePct.value = m0.parse_progress || 0
+      pageLoading.value = false
+      pollParse()
+      return
+    }
+  } catch { /* 详情探测失败则走正常加载，由 initAfterParsed 统一报错 */ }
+  await initAfterParsed()
 })
 
 onUnmounted(() => {
+  window.removeEventListener('resize', onWinResize)
+  if (resizeTimer) clearTimeout(resizeTimer)
   document.removeEventListener('fullscreenchange', onFsChange)
   stopStudyTrack()
+  if (parsePollTimer) clearTimeout(parsePollTimer)
   if (flashLocateTimer) clearTimeout(flashLocateTimer)
   if (flashQueryTimer) clearTimeout(flashQueryTimer)
+  // ⚠️ 断开简单学的 SSE：后端生成是独立线程、照跑不误（回来还能附着），
+  //    但这条读连接不能跟着一直挂着。genLearn 里已捕获 AbortError、不会误报失败。
+  learnAbort?.abort()
 })
 </script>
 
 <style scoped>
 .study-page { display: flex; height: 100vh; overflow: hidden; }
 
+/* ===== 材料解析中遮罩 ===== */
+.parsing-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  background: var(--asc-bg);
+  display: flex; align-items: center; justify-content: center;
+}
+.parsing-card { width: 320px; text-align: center; }
+.parsing-spinner {
+  width: 36px; height: 36px; margin: 0 auto 18px;
+  border: 3px solid var(--asc-border); border-top-color: var(--asc-primary);
+  border-radius: 50%; animation: parsing-spin .9s linear infinite;
+}
+@keyframes parsing-spin { to { transform: rotate(360deg); } }
+.parsing-title { font-size: 15px; font-weight: 600; color: var(--asc-text); margin-bottom: 16px; }
+.parsing-track {
+  height: 6px; border-radius: 3px; overflow: hidden;
+  background: var(--asc-border);
+}
+.parsing-fill {
+  height: 100%; border-radius: 3px; background: var(--asc-primary);
+  transition: width .5s ease;
+}
+.parsing-fill.indeterminate {
+  width: 40%; animation: parsing-slide 1.2s ease-in-out infinite;
+}
+@keyframes parsing-slide {
+  0% { margin-left: -40%; }
+  100% { margin-left: 100%; }
+}
+.parsing-pct { margin-top: 10px; font-size: 12px; color: var(--asc-text-2); }
+.parsing-hint { margin-top: 6px; font-size: 12px; color: var(--asc-text-3); }
+
 /* ===== 左栏（Obsidian 侧栏灰） ===== */
 .col-left {
   flex-shrink: 0;
   background: var(--asc-bg); overflow-y: auto; padding: 20px 14px;
 }
-/* 拖拽分隔线（左-中 / 中-右 共用） */
+/* 拖拽分隔线（左-中 / 中-右 共用）：默认发丝细线，hover/拖拽时变紫色指示条。
+   ⚠️⚠️ 不能把「局部 .col-divider:hover」与「半全局 :global(body.dragging-col) .col-divider」
+   塞进同一条逗号分组：scoped 编译时 :global 只包住它自己那一段，后面的 .col-divider::before
+   会被丢弃，整条规则退化成 body.dragging-col { background: var(--asc-primary) } →
+   拖拽瞬间把 <body> 染成紫色，整页内容被盖住（用户看到的「紫色遮挡」）。必须拆成两条规则。 */
 .col-divider {
-  width: 6px; flex-shrink: 0; cursor: col-resize;
-  background: var(--asc-divider);
-  transition: background .15s;
+  width: 7px; flex-shrink: 0; cursor: col-resize;
+  position: relative; background: transparent;
 }
-.col-divider:hover, :global(body.dragging-col) .col-divider { background: var(--asc-primary); }
+.col-divider::before {
+  content: ""; position: absolute; left: 3px; top: 0; bottom: 0;
+  width: 1px; background: var(--asc-divider); transition: background .15s;
+}
+.col-divider:hover::before {
+  left: 2px; width: 3px; border-radius: 2px; background: var(--asc-primary);
+}
+/* 拖拽态：整个选择器放进 :global()，避免上面说的退化；transition 收窄到 background 防抖动 */
+:global(body.dragging-col .col-divider::before) {
+  left: 2px; width: 3px; border-radius: 2px; background: var(--asc-primary); transition: none;
+}
 :global(body.dragging-col) { user-select: none; cursor: col-resize; }
 :global(body.dragging-col .col-center) { pointer-events: none; }
 .pane-title {
@@ -2323,125 +2705,44 @@ onUnmounted(() => {
   padding: 2px 2px 8px; white-space: nowrap; gap: 8px;
 }
 .notes-count { font-size: 12px; color: var(--asc-text-3); }
-.note-empty { font-size: 12px; color: var(--asc-text-3); padding: 20px 4px; text-align: center; }
+.note-empty-pane { padding-top: 40px; }
 
-/* ===== 笔记编辑弹窗（note-dialog）视觉排版 ===== */
+/* ===== note-dialog 通用弹窗骨架（编辑视图加工弹窗等仍在用；笔记弹窗已迁入 NoteEditorDialog 组件） ===== */
 .note-dialog :deep(.el-dialog__header) { padding: 20px 24px 14px; margin: 0; }
 .note-dialog :deep(.el-dialog__body) { padding: 6px 24px 4px; }
-.note-dialog :deep(.el-dialog__footer) { padding: 14px 24px 20px; }
+.note-dialog :deep(.el-dialog__footer) { padding: 14px 24px 20px; border-top: 1px solid var(--asc-divider); }
 
-.nd-header { display: flex; flex-direction: column; gap: 6px; }
-.nd-title-row { display: flex; align-items: center; gap: 10px; }
-.nd-title { font-size: 17px; font-weight: 600; color: var(--asc-text); }
-.nd-src-tag {
-  font-size: 11px; font-weight: 500; line-height: 1; padding: 4px 8px; border-radius: 6px;
-  background: var(--asc-surface-2); color: var(--asc-text-2); letter-spacing: .5px;
+.toc-item {
+  display: flex; justify-content: space-between; align-items: center;
+  border-radius: 6px; padding-right: 4px; margin: 1px 0; position: relative;
 }
-.nd-src-tag.is-ai { background: var(--asc-primary-soft); color: var(--asc-primary); }
-.nd-sub { font-size: 12px; color: var(--asc-text-3); display: flex; gap: 8px; }
-
-.nd-body { display: flex; flex-direction: column; gap: 16px; }
-.nd-field { display: flex; flex-direction: column; gap: 8px; }
-.nd-label { font-size: 13px; font-weight: 500; color: var(--asc-text-2); }
-.nd-field-head { display: flex; align-items: center; justify-content: space-between; }
-
-/* 编辑/预览 分段切换 */
-.nd-seg {
-  display: inline-flex; padding: 3px; gap: 2px;
-  background: var(--asc-surface-2); border-radius: 8px;
-}
-.nd-seg-btn {
-  border: none; background: transparent; cursor: pointer;
-  font-size: 12px; font-weight: 500; color: var(--asc-text-2);
-  padding: 5px 14px; border-radius: 6px; line-height: 1.4;
-  transition: all .16s ease;
-}
-.nd-seg-btn:hover { color: var(--asc-text); }
-.nd-seg-btn.active {
-  background: var(--asc-card); color: var(--asc-primary);
-  box-shadow: 0 1px 4px rgba(0, 0, 0, .08);
-}
-
-/* 预览内容：卡片容器 */
-.nd-preview {
-  background: var(--asc-surface-2); border-radius: 8px;
-  padding: 14px 16px; min-height: 220px; max-height: 360px; overflow-y: auto;
-  font-size: 14px;
-}
-
-/* 字数统计：右下角浅灰 */
-.nd-count {
-  align-self: flex-end; font-size: 11px; color: var(--asc-text-3);
-  margin-top: 2px; font-variant-numeric: tabular-nums;
-}
-
-/* AI 加工面板：浅紫卡片，图标 + 标签 + 三动作 */
-.nd-ai {
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-  margin-top: 8px;
-  padding: 9px 12px;
-  background: var(--asc-primary-soft);
-  border: 1px solid rgba(124, 92, 252, .14);
-  border-radius: 10px;
-}
-.nd-ai-icon { display: inline-flex; color: var(--asc-primary); line-height: 0; }
-.nd-ai-label { font-size: 12px; font-weight: 500; color: var(--asc-primary); }
-.nd-ai-sep { width: 1px; height: 12px; background: rgba(124, 92, 252, .22); margin: 0 2px; }
-
-/* 原生 textarea 复刻 el-textarea 视觉（选区捕获需原生元素） */
-.nd-textarea {
-  width: 100%; border: none; outline: none; resize: vertical;
-  background: var(--asc-card); box-shadow: 0 0 0 1px var(--asc-border) inset;
-  border-radius: 6px; padding: 8px 12px;
-  font-family: inherit; font-size: 14px; line-height: 1.6; color: var(--asc-text);
-  transition: box-shadow .18s ease;
-}
-.nd-textarea:focus { box-shadow: 0 0 0 1.5px var(--asc-primary) inset; }
-
-/* 选区加工工具条：选中文字后浮出 */
-.nd-sel-bar {
-  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
-  padding: 7px 10px;
-  background: var(--asc-surface-2); border-radius: 8px;
-}
-.nd-sel-count { font-size: 12px; color: var(--asc-text-2); }
-.nd-sel-sep { width: 1px; height: 12px; background: var(--asc-border); margin: 0 2px; }
-
-/* 快捷操作栏：正文与 footer 之间，虚线弱分隔 */
-.nd-shortcuts {
-  display: flex; align-items: center; gap: 2px; flex-wrap: wrap;
-  margin-top: 12px; padding: 12px 0 0; border-top: 1px dashed var(--asc-divider);
-}
-.nd-sep { width: 1px; height: 14px; background: var(--asc-divider); margin: 0 6px; flex-shrink: 0; }
-
-/* footer：仅保留取消/保存，右对齐，实线分隔 */
-.nd-footer {
-  display: flex; align-items: center; justify-content: flex-end; gap: 12px;
-}
-.nd-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-.note-dialog :deep(.el-dialog__footer) { border-top: 1px solid var(--asc-divider); }
-
-.toc-item { display: flex; justify-content: space-between; align-items: center; border-radius: 6px; padding-right: 4px; }
 .toc-text {
-  font-size: 13px; padding: 7px 0 7px 10px; cursor: pointer; flex: 1;
+  font-size: 13px; padding: 7px 0 7px 12px; cursor: pointer; flex: 1;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: color .15s;
 }
 .toc-text:hover { color: var(--asc-primary); }
-.toc-item:hover { background: var(--asc-primary-soft); }
+.toc-item:hover { background: var(--asc-surface-2); }
 .toc-item.active { background: var(--asc-primary-soft); }
+.toc-item.active::before {
+  content: ""; position: absolute; left: 3px; top: 22%; bottom: 22%;
+  width: 3px; border-radius: 2px; background: var(--asc-primary);
+}
 .toc-item.active .toc-text { color: var(--asc-primary); font-weight: 600; }
 .toc-sum { visibility: hidden; flex-shrink: 0; }
 .toc-item:hover .toc-sum { visibility: visible; }
 /* 无章节时的页码导航 */
-.toc-pages { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 6px; }
+.toc-pages { display: flex; flex-wrap: wrap; gap: 5px; padding: 2px 6px; }
 .page-chip {
-  min-width: 30px; height: 26px; padding: 0 6px; display: inline-flex;
+  min-width: 28px; height: 24px; padding: 0 5px; display: inline-flex;
   align-items: center; justify-content: center;
-  font-size: 12px; color: var(--asc-text-2);
+  font-size: 11.5px; color: var(--asc-text-2); font-variant-numeric: tabular-nums;
   background: var(--asc-card); border: 1px solid var(--asc-border);
   border-radius: 6px; cursor: pointer; transition: all .15s;
 }
 .page-chip:hover { color: var(--asc-primary); border-color: var(--asc-primary); }
+.page-chip-more {
+  color: var(--asc-text-3); border-style: dashed; letter-spacing: .5px;
+}
 .toc-empty { font-size: 12px; color: var(--asc-text-3); padding: 8px 10px; }
 .note-item {
   position: relative; padding: 12px 12px 12px 16px; border-radius: 10px; cursor: pointer;
@@ -2487,11 +2788,40 @@ onUnmounted(() => {
 .col-center:fullscreen .pdf-reader { background: #525659; }
 .reader-header {
   display: flex; justify-content: space-between; align-items: center;
-  padding: 16px 32px; border-bottom: 1px solid var(--asc-divider);
+  padding: 12px 28px; border-bottom: 1px solid var(--asc-divider);
   gap: 16px;
 }
 .reader-title-wrap { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.reader-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.reader-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+/* 视图切换：分段控件（药丸容器 + 白色激活块） */
+.reader-actions :deep(.el-radio-group) {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: var(--asc-surface-2); border-radius: 8px; padding: 2px;
+}
+.reader-actions :deep(.el-radio-button__inner) {
+  border: none; background: transparent; box-shadow: none;
+  border-radius: 6px; font-size: 12.5px; line-height: 22px; padding: 0 14px;
+  color: var(--asc-text-2);
+  transition: color .16s ease, background .16s ease, box-shadow .16s ease;
+}
+.reader-actions :deep(.el-radio-button:first-child .el-radio-button__inner) { border-left: none; }
+/* 未选中项 hover：浅色浮层 + 文字加深（原来没有任何反馈） */
+.reader-actions :deep(.el-radio-button:not(.is-active) .el-radio-button__inner:hover) {
+  color: var(--asc-text); background: rgba(255, 255, 255, .6);
+}
+.reader-actions :deep(.el-radio-button.is-active .el-radio-button__inner),
+.reader-actions :deep(.el-radio-button.is-active .el-radio-button__inner:hover) {
+  background: var(--asc-card); color: var(--asc-primary); font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .08);
+}
+/* 头部次级按钮：幽灵态，不抢标题与分段控件 */
+.ra-ghost.el-button, .ra-ghost.el-button:focus {
+  border-color: transparent; background: transparent; color: var(--asc-text-2);
+}
+.ra-ghost.el-button:hover {
+  color: var(--asc-primary); background: var(--asc-primary-soft); border-color: transparent;
+}
+.ra-more.el-button { padding-left: 12px; padding-right: 8px; }
 .reader-fmt {
   font-size: 10px; font-weight: 700; color: #fff; letter-spacing: .5px;
   border-radius: 4px; padding: 3px 7px; flex-shrink: 0;
@@ -2513,19 +2843,37 @@ onUnmounted(() => {
 .reader-inner { max-width: 720px; margin: 0 auto; }
 .page-marker {
   display: flex; align-items: center; gap: 14px;
-  margin: 48px 0 26px;
-  color: var(--asc-text-3); font-size: 11px; letter-spacing: 2px;
+  margin: 40px 0 20px;
+  color: var(--asc-text-3); font-size: 10px; letter-spacing: 1.5px;
 }
 .page-marker::before, .page-marker::after {
   content: ""; flex: 1; height: 1px; background: var(--asc-divider);
 }
 .chunk {
-  font-size: 15px; line-height: 2.05; margin: 0 0 18px;
-  color: #363632; text-align: justify; word-break: break-word;
+  font-size: 15px; line-height: 1.95; margin: 0 0 16px;
+  color: #363632; text-align: left; word-break: break-word;
 }
 .chunk::selection { background: rgba(124, 92, 252, .22); }
 /* 图片材料：OCR 结果为多行文本，保留换行、左对齐（不拉伸短行） */
 .chunk-image { white-space: pre-line; text-align: left; }
+
+/* 内嵌图 OCR 块：灰底卡片 + 图片图标标签，视觉上与正文区分（识别出来的图片文字）。
+   ⚠️ 这类元素由 renderChunk 的字符串经 v-html 注入，**不带 scoped 的 data-v 属性**，
+   必须挂 .chunk（模板元素，有 data-v）再用 :deep() 穿透，否则选择器永不匹配、样式失效。 */
+.chunk :deep(.imgocr-card) {
+  display: flex; align-items: flex-start; gap: 10px;
+  background: var(--asc-surface-2, #f5f5f7);
+  border: 1px solid var(--asc-border, #e5e5e8);
+  border-left: 3px solid var(--asc-primary, #7c5cfc);
+  border-radius: 8px;
+  padding: 10px 14px; margin: 4px 0 16px;
+  font-size: 14px; line-height: 1.8; color: var(--asc-text-2, #6e6e6e);
+  white-space: pre-line; word-break: break-word; text-align: left;
+}
+.chunk :deep(.imgocr-card)::before {
+  content: "🖼"; flex: none; margin-top: 1px;
+  font-size: 15px; line-height: 1.6;
+}
 
 /* ---- 表格 / 标题：Word/PPT 解析产物由 v-html 注入，**不带 scoped 的 data-v 属性**，
        所以不能以 .md-table / .chunk-h 自身当锚点（那样选择器永不匹配、表格会没有边框），
@@ -2547,6 +2895,37 @@ onUnmounted(() => {
 }
 .chunk :deep(tbody tr:nth-child(even) td),
 .md-body :deep(tbody tr:nth-child(even) td) { background: rgba(124, 92, 252, .045); }
+
+/* rich-md 块（docx/epub/pptx）：markdown-it 输出的排版样式，与 .md-body 同族但更紧凑 */
+.chunk.rich :deep(h1), .chunk.rich :deep(h2), .chunk.rich :deep(h3),
+.chunk.rich :deep(h4), .chunk.rich :deep(h5), .chunk.rich :deep(h6) {
+  font-weight: 600; color: var(--asc-text); line-height: 1.5; margin: 14px 0 6px;
+}
+.chunk.rich :deep(h1:first-child), .chunk.rich :deep(h2:first-child), .chunk.rich :deep(h3:first-child),
+.chunk.rich :deep(h4:first-child), .chunk.rich :deep(h5:first-child), .chunk.rich :deep(h6:first-child) { margin-top: 0; }
+.chunk.rich :deep(h1) { font-size: 19px; }
+.chunk.rich :deep(h2) { font-size: 16.5px; padding-left: 10px; border-left: 3px solid var(--asc-primary); }
+.chunk.rich :deep(h3) { font-size: 15px; color: var(--asc-text-2); }
+.chunk.rich :deep(h4), .chunk.rich :deep(h5), .chunk.rich :deep(h6) { font-size: 14px; color: var(--asc-text-2); }
+.chunk.rich :deep(p) { margin: 0; }
+.chunk.rich :deep(ul), .chunk.rich :deep(ol) { padding-left: 22px; margin: 4px 0; }
+.chunk.rich :deep(li) { margin: 4px 0; }
+.chunk.rich :deep(li::marker) { color: var(--asc-primary); }
+.chunk.rich :deep(strong) { font-weight: 600; }
+.chunk.rich :deep(code) { background: var(--asc-surface-2); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+.chunk.rich :deep(blockquote) {
+  margin: 6px 0; padding: 6px 12px; border-left: 3px solid var(--asc-border);
+  background: var(--asc-surface-2); border-radius: 0 8px 8px 0; color: var(--asc-text-2);
+}
+.chunk.rich :deep(blockquote p) { margin: 0; }
+
+/* 编辑态 md 预览（排版效果与正文一致，浅色底与 textarea 区分） */
+.edit-preview {
+  border: 1px dashed var(--asc-border); border-radius: 8px;
+  background: var(--asc-surface-2); padding: 10px 14px; min-height: 40px;
+  font-size: 15px; line-height: 1.85; color: var(--asc-text);
+}
+.edit-preview :deep(p) { margin: 6px 0; }
 
 /* Word 标题（解析时带 # 前缀，渲染为标题样式） */
 .chunk :deep(.chunk-h) {
@@ -2597,19 +2976,33 @@ onUnmounted(() => {
   background: var(--asc-bg);
   display: flex; flex-direction: column; overflow: hidden;
 }
-.ai-tabs { flex: 1; display: flex; flex-direction: column; padding: 0 10px; overflow: hidden; }
-.ai-tabs :deep(.el-tabs__nav) { width: 100%; display: flex; }
+.ai-tabs { flex: 1; display: flex; flex-direction: column; padding: 12px 12px 0; overflow: hidden; }
+.ai-tabs :deep(.el-tabs__header) { margin: 0 0 10px; }
+.ai-tabs :deep(.el-tabs__nav-wrap)::after { display: none; }
+.ai-tabs :deep(.el-tabs__nav) {
+  width: 100%; display: flex; gap: 2px; padding: 3px;
+  background: var(--asc-surface-2); border: none; border-radius: 10px;
+}
+.ai-tabs :deep(.el-tabs__active-bar) { display: none; }
 .ai-tabs :deep(.el-tabs__item) {
-  flex: 1; text-align: center;
-  padding: 0 4px !important;   /* 覆盖 EP 默认 0 20px，5 个 tab 在窄栏才放得下 */
-  font-size: 13px; white-space: nowrap; min-width: 0;
+  flex: 1; text-align: center; height: 30px; line-height: 30px;
+  padding: 0 2px !important;   /* 覆盖 EP 默认 0 20px，5 个 tab 在窄栏才放得下 */
+  font-size: 12.5px; white-space: nowrap; min-width: 0;
+  border-radius: 8px; color: var(--asc-text-2); transition: all .16s ease;
+}
+.ai-tabs :deep(.el-tabs__item:hover) { color: var(--asc-text); }
+.ai-tabs :deep(.el-tabs__item.is-active) {
+  background: var(--asc-card); color: var(--asc-primary); font-weight: 600;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .08);
 }
 .ai-tabs :deep(.el-tabs__content) { flex: 1; overflow: hidden; }
 .ai-tabs :deep(.el-tab-pane) { height: 100%; }
 .quiz-card {
   background: var(--asc-card); border: 1px solid var(--asc-border);
-  border-radius: 10px; padding: 12px 14px; margin-bottom: 12px;
+  border-radius: 12px; padding: 14px 16px; margin-bottom: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .04); transition: all .18s ease;
 }
+.quiz-card:hover { border-color: var(--asc-primary); box-shadow: var(--asc-shadow-hover); transform: translateY(-1px); }
 .quiz-q { font-size: 14px; font-weight: 600; margin-bottom: 8px; line-height: 1.5; }
 .quiz-opts { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
 .quiz-opt {
@@ -2633,7 +3026,7 @@ onUnmounted(() => {
 .quiz-pick-hint { font-size: 12px; color: var(--asc-text-3); text-align: center; padding: 4px 0; }
 .quiz-exp { font-size: 12.5px; color: var(--asc-text-3); border-top: 1px dashed var(--asc-border); padding-top: 6px; }
 .pane-empty { text-align: center; color: var(--asc-text-2); font-size: 13px; padding: 48px 16px; line-height: 1.8; }
-.chains-empty { flex: 1; display: flex; align-items: center; justify-content: center; padding: 24px 16px; }
+.chains-empty { flex: 1; justify-content: flex-start; padding: 24px 16px; }
 
 /* 摘要面板：去边框融入面板（提高优先级压过 .md-preview 的 400px 限高） */
 .summary-body .md-preview { border: none; background: transparent; padding: 4px 2px; max-height: none; overflow: visible; }
@@ -2692,10 +3085,11 @@ onUnmounted(() => {
 
 /* 知识点卡片 */
 .kw-card {
-  background: var(--asc-card); border: 1px solid var(--asc-border); border-radius: 10px;
-  padding: 13px 14px; margin-bottom: 10px; transition: all .18s ease;
+  background: var(--asc-card); border: 1px solid var(--asc-border); border-radius: 12px;
+  padding: 13px 15px; margin-bottom: 10px; transition: all .18s ease;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .04);
 }
-.kw-card:hover { border-color: var(--asc-primary); box-shadow: var(--asc-shadow-hover); }
+.kw-card:hover { border-color: var(--asc-primary); box-shadow: var(--asc-shadow-hover); transform: translateY(-1px); }
 .kw-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
 .kw-concept { font-weight: 600; font-size: 13px; }
 .kw-page {
@@ -2710,7 +3104,8 @@ onUnmounted(() => {
 /* 追问链卡片 */
 .chain {
   background: var(--asc-card); border: 1px solid var(--asc-border);
-  border-radius: 10px; padding: 13px 14px; margin-bottom: 12px;
+  border-radius: 12px; padding: 13px 15px; margin-bottom: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .04);
 }
 .chain-quote {
   font-size: 12px; color: var(--asc-text-2); background: var(--asc-primary-soft);
@@ -2788,12 +3183,9 @@ onUnmounted(() => {
 .media-only .media-video { width: 100%; max-height: 70vh; border-radius: 12px; background: #000; }
 .media-only .media-audio { width: 100%; margin-top: 24px; }
 
-.media-only { flex: 1; padding: 28px 40px; background: var(--asc-bg); }
-.media-only .media-video { width: 100%; max-height: 70vh; border-radius: 12px; background: #000; }
-.media-only .media-audio { width: 100%; margin-top: 24px; }
-
 .image-origin { flex: 1; overflow-y: auto; padding: 28px 40px; background: var(--asc-bg); }
-.image-origin img { width: 100%; border-radius: 12px; box-shadow: var(--asc-shadow-hover); }
+/* 原图按自然尺寸居中展示，不放大；仅当宽过阅读栏时才等比缩小 */
+.image-origin img { display: block; margin: 0 auto; max-width: 100%; border-radius: 12px; box-shadow: var(--asc-shadow-hover); }
 
 .page-marker.seekable { cursor: pointer; }
 .page-marker.seekable:hover span { color: var(--asc-primary); }
@@ -2811,7 +3203,6 @@ onUnmounted(() => {
   display: flex; align-items: center; justify-content: space-between;
   margin-bottom: 4px;
 }
-.edit-row-label { font-size: 12px; color: var(--asc-text-3); }
 /* 编辑模式原生 textarea（替换 el-input，选区事件更可靠） */
 .edit-textarea {
   width: 100%; border: none; outline: none; resize: vertical;
@@ -2830,7 +3221,7 @@ onUnmounted(() => {
 .md-reader .reader-inner { max-width: 760px; }
 .md-body {
   font-size: 15px; line-height: 1.9; color: #363632;
-  padding: 8px 0 32px; text-align: justify;
+  padding: 8px 0 32px; text-align: left;
 }
 .md-seg { scroll-margin-top: 16px; }
 .md-seg:empty { display: none; }
@@ -2872,7 +3263,6 @@ onUnmounted(() => {
   display: block;
   margin: 12px auto;
 }
-.md-edit-list { display: flex; flex-direction: column; }
 .transcript-save { display: flex; align-items: center; gap: 12px; padding: 10px 0 4px; }
 .transcript-hint { font-size: 12px; color: var(--asc-text-3); }
 
@@ -2911,4 +3301,89 @@ onUnmounted(() => {
 .related-page { font-size: 11px; color: var(--asc-primary); font-weight: 500; }
 .related-type { font-size: 11px; color: var(--asc-text-3); background: var(--asc-surface-2); border-radius: 4px; padding: 1px 6px; }
 .related-snippet { font-size: 12px; color: var(--asc-text-3); line-height: 1.6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ===== 学习页美化（2026-09-22 · 方案B 结构重排） ===== */
+/* 空态：图标 + 主标题 + 副说明（原为单行灰字） */
+.pane-empty { display: flex; flex-direction: column; align-items: center; padding: 56px 24px; }
+.chains-empty { flex-direction: column; }
+.pe-icon {
+  width: 52px; height: 52px; border-radius: 14px; margin-bottom: 14px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--asc-primary); background: var(--asc-primary-soft);
+}
+.pe-title { font-size: 14px; font-weight: 600; color: var(--asc-text); margin: 0 0 4px; line-height: 1.5; }
+.pe-sub { font-size: 12.5px; color: var(--asc-text-3); margin: 0 0 16px; line-height: 1.6; }
+/* 面板滚动区留白 & 笔记卡容器感与右栏卡片统一 */
+.pane-scroll { padding: 6px 4px; }
+.note-item { border-radius: 12px; box-shadow: 0 1px 3px rgba(0, 0, 0, .04); }
+.notes-batch { border-radius: 12px; }
+/* 底部操作行：与分段控件同代语言（圆角 8、留白一致） */
+.regen-row { padding: 12px 2px 10px; }
+.regen-row .el-button { height: 34px; border-radius: 8px; }
+.regen-row :deep(.el-textarea__inner) { border-radius: 8px; }
+/* 左栏收紧，与右栏 12px 边距对齐 */
+.col-left { padding: 18px 12px; }
+.learn-quiz-tip {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  /* ⚠️⚠️ 右侧必须留出 76px：本提示条贴在内容区底部、按钮右对齐，会与「study 页悬浮问答球」
+     （App.vue `.float-chat-study`：right 26px + 宽 56px + z-index 90）**重叠**。
+     实测（1440×960）：按钮 box x∈[1346,1416] y∈[840,864]，悬浮球 x∈[1358,1414] y∈[796,852]
+     → 点按钮右半部分会被悬浮球抢走点击（Playwright 表现为 click 超时）。
+     26+56=82 是悬浮球占用的水平宽度；扣掉按钮自身内边距，76px 足够让按钮整体移出重叠区。 */
+  padding: 8px 76px 8px 12px; margin: 10px 0 0; flex-shrink: 0;
+  background: var(--asc-primary-soft); border-radius: 8px;
+  font-size: 12px; color: var(--asc-text-2);
+}
+/* 出题失败提示：与「摘要」Tab 的错误色一致 */
+.learn-quiz-tip.is-error {
+  background: rgba(210, 78, 78, .08); color: #b23c3c;
+}
+
+
+/* ===== 摘要 / 讲义：按结构适配的线性图标 ===== 
+   由 script 区的 headingIconRule / headingNumRule 在渲染时写入
+   data-ico（讲义骨架）/ data-num（摘要章节序号），只作用于渲染结果。
+   ⚠️ 不写回 content：这两处内容落库，且「转笔记」为原文搬运，
+      图标若进内容层会污染 DB / 笔记 / 知识库检索。 */
+.summary-text :deep([data-ico])::before {
+  content: '';
+  display: inline-block;
+  width: 15px; height: 15px;
+  margin-right: 6px;
+  vertical-align: -2px;
+  background-color: var(--asc-primary);
+  -webkit-mask-image: var(--ico); mask-image: var(--ico);
+  -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+  -webkit-mask-position: center; mask-position: center;
+  -webkit-mask-size: contain; mask-size: contain;
+}
+/* 小节级图标（引入 / C{n}）降为次要灰；本节小结保留主色 —— 它是每章的落点 */
+.summary-text :deep([data-ico="compass"])::before,
+.summary-text :deep([data-ico="dot"])::before { background-color: var(--asc-text-3); }
+/* 讲义章节标题改用图标，撤掉 h2 的左侧色条（避免「色条 + 图标」两层竖线堆叠） */
+.summary-text :deep(h2[data-ico]) { border-left: none; padding-left: 0; }
+
+/* 摘要侧：章节序号胶囊 */
+.summary-text :deep(h2[data-num])::before {
+  content: attr(data-num);
+  display: inline-block;
+  min-width: 18px; height: 18px;
+  padding: 0 5px; margin-right: 7px;
+  vertical-align: 1px;
+  border-radius: 5px;
+  background-color: var(--asc-primary-soft);
+  color: var(--asc-primary);
+  font-size: 11px; font-weight: 600;
+  line-height: 18px; text-align: center;
+}
+
+/* 图标资源：单色线性，用 mask 承载 → 颜色由上面的 background-color 决定 */
+.summary-text :deep([data-ico="target"]) { --ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='8.4'/%3E%3Ccircle cx='12' cy='12' r='3.4'/%3E%3C/svg%3E"); }
+.summary-text :deep([data-ico="route"]) { --ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='5.2' cy='18' r='2'/%3E%3Ccircle cx='18.8' cy='6' r='2'/%3E%3Cpath d='M7.2 18h5.3a3 3 0 0 0 0-6H9.5a3 3 0 0 1 0-6h7.3'/%3E%3C/svg%3E"); }
+.summary-text :deep([data-ico="book"]) { --ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5V5.5z'/%3E%3Cpath d='M4 20.5A2.5 2.5 0 0 1 6.5 18H20'/%3E%3C/svg%3E"); }
+.summary-text :deep([data-ico="compass"]) { --ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='8.4'/%3E%3Cpath d='m15.2 8.8-2.1 4.3-4.3 2.1 2.1-4.3z'/%3E%3C/svg%3E"); }
+.summary-text :deep([data-ico="dot"]) { --ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='3.6' fill='black' stroke='none'/%3E%3C/svg%3E"); }
+.summary-text :deep([data-ico="summary"]) { --ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6.5h8.5M4 12h8.5M4 17.5h5'/%3E%3Cpath d='m14.4 16.6 2.2 2.2 4.4-4.8'/%3E%3C/svg%3E"); }
+.summary-text :deep([data-ico="anchor"]) { --ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='4.8' r='1.9'/%3E%3Cpath d='M12 6.7V21'/%3E%3Cpath d='M4.8 13.2a7.2 7.2 0 0 0 14.4 0'/%3E%3Cpath d='M9 9.6h6'/%3E%3C/svg%3E"); }
+.summary-text :deep([data-ico="flag"]) { --ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5.4 21V3.9'/%3E%3Cpath d='M5.4 4.7h11.2l-1.9 3.9 1.9 3.9H5.4'/%3E%3C/svg%3E"); }
 </style>

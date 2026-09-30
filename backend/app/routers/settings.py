@@ -70,6 +70,8 @@ def get_settings():
         "clean_watermark": bool(conf.get("clean_watermark", True)),
         "clean_garbled": bool(conf.get("clean_garbled", True)),
         "clean_dedup": bool(conf.get("clean_dedup", True)),
+        # 知识图谱：导入材料后自动抽取实体（默认关，省 token；可手动按材料生成）
+        "auto_extract_entities": bool(conf.get("auto_extract_entities", False)),
         # 笔记检索权重（检索打分时读取，改动即时生效）
         "note_weight": float(conf.get("note_weight") or 1.5),
         # 提示词：自定义值（空字符串 = 使用默认模板）
@@ -79,7 +81,9 @@ def get_settings():
         # 预设标签库（材料库可先建标签，再打给材料）
         "preset_tags": conf.get("preset_tags") or [],
         "prompt_defaults": llm_svc.DEFAULT_PROMPTS,
-        "configured": bool(conf["llm_api_key"]) or bool(conf.get("llm_models")),
+        "configured": bool(conf["llm_api_key"]) or any(
+            (m.get("api_key") and m.get("model")) for m in (conf.get("llm_models") or [])
+        ),
     }
 
 

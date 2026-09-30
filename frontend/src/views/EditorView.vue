@@ -197,7 +197,9 @@ onMounted(async () => {
   }
 
   initialTitle = title.value
-  initialContent = initial
+  // ⚠️ trim 对齐 getContent() 的口径：正文 getContent 返回 trim 后的值，若 initialContent 保留原文尾随换行，
+  //    打开「原文末尾带空白的 md」（本地导入常态）即 hasChanges 恒真 → 误报「未保存」、反复写草稿。
+  initialContent = initial.trim()
   wordCount.value = initial.length
 
   vditor.value = new Vditor('vditor', {
@@ -302,6 +304,7 @@ function adoptAi() {
   }
   ai.show = false
   vditor.value.focus()
+  markUnsaved()   // setValue/insertValue 不触发 input 回调 → 必须显式标记未保存，否则直接关闭即丢
   ElMessage.success(ai.action === 'continue' ? '已续写' : '已采用，记得保存')
 }
 
@@ -324,6 +327,7 @@ function applyFormat(type) {
   vditor.value.updateValue(out)
   hideSelBar()
   vditor.value.focus()
+  markUnsaved()   // 程序化替换同样不依赖 input 回调保证 → 显式标记
 }
 
 async function startSelTransform(mode) {
@@ -358,6 +362,7 @@ function adoptSelTransform() {
   }
   hideSelBar()
   vditor.value.focus()
+  markUnsaved()   // 程序化替换不依赖 input 回调 → 显式标记
   ElMessage.success(selBar.mode === 'continue' ? '已续写' : '已替换')
 }
 

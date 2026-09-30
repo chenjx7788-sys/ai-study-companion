@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     clean_watermark: bool = True       # 高频短句水印
     clean_garbled: bool = True         # 乱码行
     clean_dedup: bool = True           # 重复块去重
+    # 知识图谱：导入材料后是否自动抽取实体/关系（每次抽取调用 LLM，消耗 token）。
+    # ⚠️ 默认关闭：成本主动权交给用户——需要时在知识库页对单份材料点「生成知识图谱」。
+    auto_extract_entities: bool = False
     kb_top_k: int = 8            # 问答检索条数
     # 命中阈值：BGE-small-zh 实测 相关 0.18~0.51 / 无关 <0，取 0.15 为界
     # （若改用其他 embedding 模型需重新校准）

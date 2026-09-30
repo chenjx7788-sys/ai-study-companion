@@ -16,7 +16,7 @@
 #     SIGN_IDENTITY  代码签名身份。默认 '-'（ad-hoc）。正式分发传
 #                    "Developer ID Application: <名字> (<TEAMID>)"。
 #                    ⚠️ ad-hoc **不能**免掉「右键 → 打开」，只解决内部一致性
-#                    （嵌套 QtWebEngineProcess.app 签名完整，避免 killed: 9）。
+#                    （嵌套 bundle 签名完整，避免 killed: 9）。
 #     SKIP_SIGN      设 1 则跳过签名步骤（仅本地调试用；CI 不要设）
 #     SKIP_NATIVE_SMOKE 设 1 则跳过原生外壳冒烟（无 GUI 的 CI runner 才需要）
 # =============================================================================
@@ -116,24 +116,28 @@ fi
 echo "后端健康冒烟通过：/api/health 正常响应"
 
 echo ""
-echo "=== [5b/7] 原生外壳冒烟：断言实际后端确为 Qt（WP8b） ==="
+echo "=== [5b/7] 原生外壳冒烟：断言实际后端确为 cocoa（WP8b） ==="
 # 不设 ASC_BROWSER → 起真实原生窗口 → 读 data_dir/launcher_backend.log 里的 backend=。
-# 这条判据针对 R4 的失败形态：spec 漏收 PySide6/QtWebEngine 时，pywebview 会**静默回落**
-# 到 cocoa（Darwin 候选列表是 [qt, cocoa]）—— 不报错、不警告，上一步照样全绿。
+# 这条判据针对「静默回落」：`webview/guilib.py` 的后端选择是列表回退（Darwin 是
+# [cocoa, qt]），回落时**不抛异常、不报警**，上一步（ASC_BROWSER=1 的 /api/health 冒烟）
+# 照样全绿。
+# ⚠️ 2026-09-22（AI 浏览器下线）：不再强制 PYWEBVIEW_GUI=qt，Darwin 回到首选项 cocoa，
+#    故期望值从 webview.platforms.qt 改为 **webview.platforms.cocoa**。
+#    若哪天又要走 qt，这里必须同步改回 —— 否则这条冒烟会以「回落」的名义恒红。
 if [ "${SKIP_NATIVE_SMOKE:-0}" = "1" ]; then
-  echo "[WARN] SKIP_NATIVE_SMOKE=1，跳过原生外壳冒烟（本次**没有**验证 Qt 外壳）"
+  echo "[WARN] SKIP_NATIVE_SMOKE=1，跳过原生外壳冒烟（本次**没有**验证原生外壳）"
 else
   SMOKE_DATA_DIR="${SMOKE_DATA_DIR:-$(mktemp -d /tmp/asc_native_smoke.XXXXXX)}"
   if python3 "$BACKEND_DIR/scripts/smoke_native_shell.py" \
        --app-bin "$APP_BIN" \
-       --expect-backend webview.platforms.qt \
+       --expect-backend webview.platforms.cocoa \
        --port "${NATIVE_SMOKE_PORT:-8125}" \
        --timeout "${NATIVE_SMOKE_TIMEOUT:-90}" \
        --report "$BACKEND_DIR/dist/smoke_native_shell.json"; then
-    echo "原生外壳冒烟通过：backend=webview.platforms.qt"
+    echo "原生外壳冒烟通过：backend=webview.platforms.cocoa"
   else
-    echo "[ERROR] 原生外壳冒烟失败 —— 打出的包实际没用 Qt 外壳。" >&2
-    echo "        典型原因：spec 漏收 PySide6/QtWebEngine（R4）。" >&2
+    echo "[ERROR] 原生外壳冒烟失败 —— 打出的包没用 cocoa 外壳。" >&2
+    echo "        典型原因：spec 漏收 pyobjc（Cocoa/WebKit），pywebview 静默换了后端。" >&2
     echo "        证据：$BACKEND_DIR/dist/smoke_native_shell.json" >&2
     exit 1
   fi
@@ -146,7 +150,7 @@ echo "=== [5c/7] 代码签名（WP8 · R5） ==="
 #   （osx.py：PYINSTALLER_STRICT_BUNDLE_CODESIGN_ERROR 默认 0）→
 #   「签名失败但构建成功」的包会照常进 zip 发出去。本步骤把它变成会失败、有证据。
 # 顺序由 macos_sign.py 自己保证：Mach-O → 嵌套 .app/.framework（由深到浅）→ 外层 bundle。
-# 嵌套的 QtWebEngineProcess.app 必须被单独签 —— 它没签好，用户那边是 killed: 9。
+# 嵌套的 bundle（.app / .framework，若有）必须被单独签 —— 没签好，用户那边是 killed: 9。
 if [ "${SKIP_SIGN:-0}" = "1" ]; then
   echo "[WARN] SKIP_SIGN=1，跳过签名（本次产物**未签名**，不可分发）"
 else

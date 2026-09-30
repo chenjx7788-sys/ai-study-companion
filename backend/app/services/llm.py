@@ -46,7 +46,7 @@ def get_client(base_url: str | None = None, api_key: str | None = None) -> OpenA
     base_url = base_url or conf["llm_base_url"]
     api_key = api_key or conf["llm_api_key"]
     if not api_key:
-        raise HTTPException(400, "请先在「管理中心」配置 LLM 模型的 API Key")
+        raise HTTPException(400, "[NEED_SETUP]请先在「管理中心」配置 LLM 模型的 API Key")
     return OpenAI(base_url=base_url, api_key=api_key)
 
 
@@ -108,10 +108,20 @@ def log_usage(kind: str, model: str, prompt_tokens: int, completion_tokens: int,
 
 def chat(messages: list[dict], model: str | None = None, kind: str = "chat") -> str:
     """非问答、非总结场景（划线解读/追问、相关问题推荐）用问答模型：
-    与 summary_chat 一致，按 chat_model_id 解析多模型配置，否则旧单套配置下会拿到空 key 而报 400。"""
+    与 summary_chat 一致，按 chat_model_id 解析多模型配置。
+    ⚠️ 多模型模式下「问答模型」未选 = 未配置，直接报 NEED_SETUP（不回退旧字段）。"""
     conf = settings_store.load()
-    base_url, api_key, resolved = settings_store.resolve_model(conf.get("chat_model_id"))
-    use_model = model or resolved or conf["chat_model"]
+    if model:
+        r = settings_store.resolve_model_strict(model)
+        if r is None:
+            raise HTTPException(400, "[NEED_SETUP]该模型未配置完整（缺少 API Key 或模型名），请到「管理中心」检查")
+        base_url, api_key, resolved = r
+    else:
+        r = settings_store.resolve_usage("chat")
+        if r is None:
+            raise HTTPException(400, "[NEED_SETUP]请先在「管理中心」为问答模型指定用途")
+        base_url, api_key, resolved = r
+    use_model = model or resolved
     try:
         resp = _chat_create(get_client(base_url, api_key), use_model, messages)
     except HTTPException:
@@ -129,10 +139,18 @@ def chat_stream(messages: list[dict], model_id: str | None = None, reasoning_eff
     reasoning_effort：None=关闭推理（默认，thinking=disabled），low/high/max=开启推理。
     kind：记账业务场景（全局问答默认 chat；解读/提问/文本加工等流式入口需显式传入对应 kind）"""
     conf = settings_store.load()
-    # 未显式指定模型时回退到「问答模型」chat_model_id —— 不能直接传空给 resolve_model，
-    # 否则会回退到全局 llm_base_url/llm_api_key（多模型模式下为空）而报 400。
-    base_url, api_key, model = settings_store.resolve_model(model_id or conf.get("chat_model_id"))
-    use_model = model or conf["chat_model"]
+    # 未显式指定模型时走到「问答用途」解析；多模型模式下用途未选 = 未配置（报 NEED_SETUP，不回退旧字段）
+    if model_id:
+        r = settings_store.resolve_model_strict(model_id)
+        if r is None:
+            raise HTTPException(400, "[NEED_SETUP]该模型未配置完整（缺少 API Key 或模型名），请到「管理中心」检查")
+        base_url, api_key, model = r
+    else:
+        r = settings_store.resolve_usage("chat")
+        if r is None:
+            raise HTTPException(400, "[NEED_SETUP]请先在「管理中心」为问答模型指定用途")
+        base_url, api_key, model = r
+    use_model = model
     thinking = "enabled" if reasoning_effort else "disabled"
     try:
         resp = _chat_create(get_client(base_url, api_key), use_model, messages,
@@ -160,10 +178,13 @@ def chat_stream(messages: list[dict], model_id: str | None = None, reasoning_eff
 
 
 def summary_chat(messages: list[dict], kind: str = "summary") -> str:
-    """总结/解读/出题等非问答场景：用配置的总结模型（summary_model_id）"""
+    """总结/解读/出题等非问答场景：用配置的总结模型（summary_model_id）。
+    ⚠️ 多模型模式下「总结模型」未选 = 未配置，直接报 NEED_SETUP（不回退旧字段）。"""
     conf = settings_store.load()
-    base_url, api_key, model = settings_store.resolve_model(conf.get("summary_model_id"))
-    use_model = model or conf["summary_model"]
+    r = settings_store.resolve_usage("summary")
+    if r is None:
+        raise HTTPException(400, "[NEED_SETUP]请先在「管理中心」为总结模型指定用途")
+    base_url, api_key, use_model = r
     try:
         # thinking=disabled：总结/出题类任务无需推理，关闭思考直接输出（推理模型默认开启会显著变慢）
         resp = _chat_create(get_client(base_url, api_key), use_model, messages, thinking="disabled")
@@ -177,10 +198,13 @@ def summary_chat(messages: list[dict], kind: str = "summary") -> str:
 
 
 def summary_chat_stream(messages: list[dict], kind: str = "summary"):
-    """总结类（摘要等）流式输出：用总结模型逐 token yield text"""
+    """总结类（摘要等）流式输出：用总结模型逐 token yield text。
+    ⚠️ 多模型模式下「总结模型」未选 = 未配置，直接报 NEED_SETUP（不回退旧字段）。"""
     conf = settings_store.load()
-    base_url, api_key, model = settings_store.resolve_model(conf.get("summary_model_id"))
-    use_model = model or conf["summary_model"]
+    r = settings_store.resolve_usage("summary")
+    if r is None:
+        raise HTTPException(400, "[NEED_SETUP]请先在「管理中心」为总结模型指定用途")
+    base_url, api_key, use_model = r
     try:
         # thinking=disabled：摘要流式同样关闭推理，直接输出
         resp = _chat_create(get_client(base_url, api_key), use_model, messages, stream=True, thinking="disabled")
@@ -254,6 +278,43 @@ DEFAULT_PROMPTS = {
     "prompt_recall": """你是一名学习教练，擅长用费曼学习法帮人巩固知识。根据用户的学习笔记生成一道「复述题」，严格输出 JSON（不要输出其他内容）：
 {"question": "复述指令（如「请用自己的话解释：XXX」，考察能否讲清核心概念）", "answer": "参考答案要点（≤120字，列出应涵盖的关键点，供用户对照）"}
 要求：聚焦一个核心概念，引导用户主动组织语言复述，而非简单回忆定义。""",
+    "prompt_learn_note": """你是一名顶尖学习教练。你的任务不是"总结"，而是把给定材料【转译】成一份结构化的学习笔记：让一个非本专业的初学者，不看原文也能在最短时间内抓住知识骨架、理解核心概念、并记住要点。
+
+## 输出结构（必须严格照此，缺一不可）
+
+1. 标题用 `# {材料名} · 学习笔记`
+
+2. `## 必记要点 Top N`（3~5 条）
+   —— 全篇最该记住的要点，编号列出，每条一句话点透。
+
+3. `## 探索历程`
+   —— 用一个统一的场景比喻，把全篇串成 3~5 幕（"第一幕/第二幕/..."），
+      每幕点明对应哪个章节，让读者先建立整体心智模型。
+
+4. 逐章展开（每章 B1/B2/... 结构完全一致）：
+   - `## B{n} 标题`
+     - `### 引入`：章前总览（本章核心问题，一句话点透）+ 逻辑链条（C1..Cn 清单）
+     - `### C{n} 小节`：转译正文
+     - `### 本节小结`：固定 ◆ 三条，每条一句话
+
+## 转译规则（决定"看得懂"）
+
+- 否定式纠偏：能破除刻板印象的，用「不是 X，而是 Y」句式。
+- 表格降维：凡线性罗列的概念，能压成 Markdown 表格就压成表格。
+- 章回式比喻：比喻要统一、克制，点到为止，不淹没干货。
+- 每次只讲一次：一个概念首次出现给完整解释，后文一律用指代，严禁重复展开。
+- 本节小结（◆三点）不得与正文重复措辞：小结是「提炼出的结论」，正文是「展开的讲解」，若正文本就只有一句判断，小结应换角度概括而非原句复述。
+
+## 记忆钩子（决定"记得住"）
+
+- 把抽象概念压成一句可复述的口诀（如"七宗罪=手术刀，马斯洛=地图"）。
+
+## 硬约束（绝不违犯）
+
+- 绝不编造原文没有的内容；不确定的信息宁可不写。
+- 术语首次出现必须给一句通俗解释。
+- 用页码标注出处（页码取自原文 [P数字] 标记），正文要点末尾标 (P页码)。
+- 输出纯 Markdown，每章结构一致、可复现。""",
     "prompt_material_ask": """你是一名伴学助手。请基于给定的材料内容回答用户的问题。要求：1. 回答严格依据材料，不编造材料中没有的信息；2. 可适当总结、解释，帮助用户理解；3. 回答简洁聚焦，直接回应问题。""",
     "prompt_note_rewrite": """你是一名文字加工助手。请把下面这段文字改写得更通顺、更专业、更简洁，保持原意、事实和关键数字不变，不增删信息。直接输出改写后的文字，不要加任何前后缀或解释。""",
     "prompt_note_expand": """你是一名文字加工助手。请在保持原意和事实不变的前提下，对下面这段文字进行扩写：补充必要的背景、细节、例子或解释，让内容更充实、更容易理解；不得编造原文中没有的事实。直接输出扩写后的文字，不要加任何前后缀。""",
@@ -361,34 +422,6 @@ DEFAULT_PROMPTS = {
    共 {seg_count} 句，每句平均约 {avg_chars} 字。写超和写少都视为不合格。
 5. 每句 20-120 字，适合朗读；不要出现 Markdown 符号、括号注释、表情符号
 6. 不编造素材中没有的事实和数据""",
-    "prompt_browser_explain": """你是一名伴学助手。用户在用内置浏览器读网页时选中了一段文字，想让你解释。请：
-1. 先用一两句话说明这段文字在讲什么；
-2. 再解释其中的关键概念、术语或隐含前提；
-3. 必要时举一个具体例子帮助理解；
-4. 直接输出正文，不要复述原文，不要写「好的」「以下是」这类开场话。
-如果这段文字像是从句子中间截断的，就按现有内容尽力解释，不要因此拒答。""",
-    "prompt_browser_summarize": """你是一名伴学助手。用户在用内置浏览器读网页时选中了一段文字，想要一个摘要。请：
-1. 用 2-4 句话概括这段文字的核心意思；
-2. 若原文有分点结构，用 Markdown 无序列表列出要点；
-3. 只概括已给出的内容，不补充网页里没有的信息；
-4. 直接输出，不要复述原文，不要写开场话。""",
-    "prompt_browser_quiz": """你是一名测评出题助手。用户在用内置浏览器读网页时选中了一段文字，想据此自测。请：
-1. 依据这段文字出 3 道单选题，考察理解而不是死记；
-2. 每题 4 个选项，只有 1 个正确，干扰项要似是而非（常见误区 / 易混淆概念）；
-3. 用 Markdown 输出，每题固定写成：
-   **1. 题干**
-   - A. ……
-   - B. ……
-   - C. ……
-   - D. ……
-   答案：X —— 一句话解析
-4. 不出这段文字里无法判断的题。""",
-    "prompt_browser_ask": """你是一名伴学助手。用户在用内置浏览器读网页时选中了一段文字，并围绕它在追问。请：
-1. 直接回答用户这一次的问题，不要重述之前已经答过的内容；
-2. 只依据【选中的文字】与你们的往来作答；文字里判断不了的，就明确说「这段文字里没有提到」，不要脑补；
-3. 答案要短、可读：需要分点时用 Markdown 列表，能一句话说清就一句话；
-4. 直接输出正文，不要写「好的」「根据你选中的文字」这类开场话。
-如果这个问题与选中的文字无关，就按你的理解回答，并说明这是文字之外的补充。""",
 }
 
 
@@ -487,6 +520,94 @@ def generate_keywords(chunks: list[dict], instruction: str | None = None) -> lis
         raise HTTPException(500, "知识点解析失败，请重试")
 
 
+# ---------- 结构化学习笔记（简单学习） ----------
+
+# 与摘要共用同一「输出 token 驱动耗时」判断：单次调用输出越长越慢。
+# 一期不做两段式，超长材料截断到 MAX_SINGLE_CHARS（先跑通，P1 验收后再评估分组）。
+LEARN_NOTE_MAX_CHARS = 24000
+
+# 截断时写进讲义正文的固定标记（前端/转出的笔记据此识别「这份讲义没有覆盖全文」）
+LEARN_TRUNC_MARK = "覆盖范围提示"
+
+
+def learn_note_coverage(chunks: list[dict]) -> dict:
+    """讲义覆盖度（纯字符串长度计算，不调 LLM）。
+
+    材料超长时 generate_learn_note 会截断到 LEARN_NOTE_MAX_CHARS，**末尾章节整段丢失**。
+    调用方可据此提示用户「讲义只覆盖了材料的一部分」，避免误以为覆盖全文。
+    """
+    total = len(format_chunks(chunks))
+    used = min(total, LEARN_NOTE_MAX_CHARS)
+    return {
+        "total_chars": total,
+        "used_chars": used,
+        "ratio": round(used / total, 4) if total else 1.0,
+        "truncated": total > LEARN_NOTE_MAX_CHARS,
+    }
+
+
+def _learn_note_inputs(chunks: list[dict], title: str | None = None) -> tuple[list[dict], dict, str]:
+    """组装讲义生成的 messages / 覆盖度 / 截断后的前置提示（供一次性与流式共用）。"""
+    text = format_chunks(chunks)
+    cov = learn_note_coverage(chunks)
+    if cov["truncated"]:
+        text = text[:LEARN_NOTE_MAX_CHARS]
+    head = f"（材料标题「{title}」仅作理解主题用，笔记标题请用它）\n" if title else ""
+    if cov["truncated"]:
+        head += ("⚠️ 本次只提供了材料的前一部分（材料过长已被截断）："
+                 "请在讲义第 1 行之前如实写出覆盖范围，不要声称已覆盖全文。\n")
+    messages = [
+        {"role": "system", "content": get_prompt("prompt_learn_note")},
+        {"role": "user", "content": f"{head}以下是材料原文（含页码标记）：\n\n{text}"},
+    ]
+    warn = ""
+    if cov["truncated"]:
+        warn = (f"> ⚠️ **{LEARN_TRUNC_MARK}**：本材料共约 {cov['total_chars']:,} 字，"
+                f"单次处理上限 {LEARN_NOTE_MAX_CHARS:,} 字，"
+                f"本讲义仅覆盖前 {cov['used_chars']:,} 字（约 {cov['ratio'] * 100:.1f}%），"
+                f"未覆盖的章节不会出现在本讲义中。\n\n")
+    return messages, cov, warn
+
+
+def generate_learn_note(chunks: list[dict], title: str | None = None) -> str:
+    """把材料转译成结构化学习笔记（简单学习核心产物）。
+
+    输入 chunks 与摘要/知识点一致（含 page_no）；返回 Markdown 结构化笔记。
+    骨架写死在 prompt_learn_note（必记要点 / 探索历程 / 逐章转译 / ◆三点小结 / 重点加权 / 去重）。
+
+    ⚠️ 材料超过 LEARN_NOTE_MAX_CHARS 时只取前一段（末尾章节会丢）。此时：
+    ① prompt 里明确告知模型「只看了一部分」，避免它声称覆盖全文；
+    ② 正文开头插入「覆盖范围提示」块——它随讲义一起落库、转笔记，任何入口都看得见。
+    """
+    messages, cov, warn = _learn_note_inputs(chunks, title)
+    body_txt = summary_chat(messages, kind="learn_note")
+    if not cov["truncated"]:
+        return body_txt
+    return warn + body_txt.lstrip()
+
+
+def generate_learn_note_stream(chunks: list[dict], title: str | None = None):
+    """流式版学习笔记：逐 token yield 字符串（供 SSE 逐字推给前端）。
+
+    与 generate_learn_note 完全同构（同一 messages、同一覆盖度处理），
+    只是把 summary_chat 换成 summary_chat_stream，并把截断提示块放在
+    首个 token 之前 yield（保证「覆盖范围提示」出现在讲义最前头，任何入口都看得见）。
+    """
+    messages, cov, warn = _learn_note_inputs(chunks, title)
+    if warn:
+        yield warn
+    first = True
+    for piece in summary_chat_stream(messages, kind="learn_note"):
+        # 正文首段 Lstrip：一次性路径里 warn 后跟 body_txt.lstrip()，
+        # 流式无法预知首段，退化为「截断时把首个非空 token 的前导空白去掉」。
+        if first and cov["truncated"] and piece:
+            piece = piece.lstrip()
+            first = False
+        else:
+            first = False
+        yield piece
+
+
 # ---------- 划线解读 / 追问（B4/B5） ----------
 
 def explain_messages(selected_text: str, context: str, history: list[dict], question: str | None = None) -> list[dict]:
@@ -506,112 +627,6 @@ def explain_messages(selected_text: str, context: str, history: list[dict], ques
 
 def explain(selected_text: str, context: str, history: list[dict], question: str | None = None) -> str:
     return chat(explain_messages(selected_text, context, history, question), kind="explain")
-
-
-# ---------- WP16：浏览器选区三动作（解释 / 总结 / 出题） ----------
-# ⚠️ 与上面的「划线解读」是**同一族**（短输入、强交互、要秒回），故复用问答模型 `chat()`，
-#    不新造第二套「哪个动作走哪个模型」的规则 —— 那种规则一定会跟主流程分叉。
-
-BROWSER_ACTION_PROMPTS = {
-    "explain": "prompt_browser_explain",
-    "summarize": "prompt_browser_summarize",
-    "quiz": "prompt_browser_quiz",
-}
-
-
-def browser_selection_messages(action: str, selection: str, title: str = "", url: str = "") -> list[dict]:
-    """浏览器选区三动作 → messages。
-
-    ⚠️ `action` 不合法时**直接 KeyError**，不静默回退到 explain：
-       静默回退会让「点了总结却得到解释」这种病**不报错、只错内容**。
-       调用方 `browser_actions.start_action()` 已经先闸过一次，这里是第二道闸。
-    ⚠️ 标题与地址只作**定位线索**（帮助模型判断语境），不要求它在回答里复述。
-    """
-    key = BROWSER_ACTION_PROMPTS[action]
-    head = []
-    if title:
-        head.append("【页面标题】%s" % title)
-    if url:
-        head.append("【页面地址】%s" % url)
-    ctx = ("\n".join(head) + "\n\n") if head else ""
-    return [
-        {"role": "system", "content": get_prompt(key)},
-        {"role": "user", "content": "%s【选中的文字】\n%s" % (ctx, selection)},
-    ]
-
-
-def browser_selection_action(action: str, selection: str, title: str = "", url: str = "") -> str:
-    """执行一次浏览器选区动作，返回模型输出（Markdown）。
-
-    ⚠️ `kind` **逐动作区分**（`browser_explain` / `browser_summarize` / `browser_quiz`）：
-       记账表按 kind 聚合，合成一个之后再也回答不了「三个动作各花了多少 token、
-       各自多慢」—— 而这三个动作的输入长度与期望输出长度差异很大，必须分开看。
-    """
-    return chat(
-        browser_selection_messages(action, selection, title=title, url=url),
-        kind="browser_%s" % action)
-
-
-def browser_selection_stream(action: str, selection: str, title: str = "", url: str = ""):
-    """流式版三个动作：逐 token yield **文本**（不是 `(kind, text)` 元组）。
-
-    ⚠️ 与 `browser_selection_action` 共用同一个 `kind`（`browser_<action>`）：
-       两个入口若各算一个 kind，记账表会把同一个动作拆成两行，
-       以后再也回答不了「解释这个动作一共花了多少 token、多慢」。
-    ⚠️ 只 yield `kind == "content"`：三个动作是短输入强交互，推理 token 会让侧栏
-       先刷一大段用户看不见的思考再出答案（侧栏只渲染答案）。
-    """
-    for kind, text in chat_stream(
-            browser_selection_messages(action, selection, title=title, url=url),
-            kind="browser_%s" % action):
-        if kind == "content":
-            yield text
-
-
-def browser_ask_messages(selection: str, history, question: str,
-                         title: str = "", url: str = "") -> list[dict]:
-    """侧栏追问 → messages。
-
-    ⚠️ `history` 由**前端携带**（服务端无状态、不落库）—— 与 `ephemeral.explain` 同口径。
-       侧栏刷新后不「记得」上一轮是**有意**的（N04：浏览内容不落库）。
-    ⚠️ 选区**每次重发**，不从 history 里找：选区是「被问的东西」，
-       混进 history 会让用户换了选区之后仍被引用旧文字，且**不报错**。
-    ⚠️ 角色白名单在**本模块**做，是这条链上**唯一**的清洗点 ——
-       调用方（`browser_actions`）不要再清洗一遍（两处清洗迟早分叉）。
-    """
-    head = []
-    if title:
-        head.append("【页面标题】%s" % title)
-    if url:
-        head.append("【页面地址】%s" % url)
-    ctx = ("\n".join(head) + "\n\n") if head else ""
-    msgs = [
-        {"role": "system", "content": get_prompt("prompt_browser_ask")},
-        {"role": "user", "content": "%s【选中的文字】\n%s" % (ctx, selection)},
-    ]
-    for m in (history or []):
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role")
-        content = m.get("content")
-        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
-            msgs.append({"role": role, "content": content})
-    msgs.append({"role": "user", "content": question})
-    return msgs
-
-
-def browser_ask_stream(selection: str, history, question: str,
-                       title: str = "", url: str = ""):
-    """流式追问：逐 token yield **文本**。
-
-    ⚠️ `kind="browser_ask"` **独立于三个动作**：追问的输入长度随轮数增长，
-       与一次性动作的 token 曲线完全不同，合成一个 kind 就再也分不清两者。
-    """
-    for kind, text in chat_stream(
-            browser_ask_messages(selection, history, question, title=title, url=url),
-            kind="browser_ask"):
-        if kind == "content":
-            yield text
 
 
 # ---------- 文本加工（改写/扩写/续写/总结；笔记与材料文本共用） ----------
@@ -723,27 +738,44 @@ def generate_review_questions(note_title: str, note_content: str, count: int = 3
         {"role": "user", "content": f"笔记标题：{note_title}\n\n笔记内容：\n{note_content[:3000]}"},
     ], kind="review")
     start, end = raw.find("["), raw.rfind("]")
+    keys = ("question", "options", "correct_index", "explanation")
     try:
         items = json.loads(raw[start:end + 1])
-        keys = ("question", "options", "correct_index", "explanation")
-        return [i for i in items if all(k in i for k in keys)][:count]
+        qas = [i for i in items
+               if isinstance(i, dict) and all(k in i for k in keys)][:count]
     except Exception:
         raise HTTPException(500, "拆卡失败，请重试")
+    if not qas:
+        # ⚠️ 同 generate_quiz：绝不能返回空数组 —— 调用方 /review/cards/split 是
+        #     「先删该笔记全部卡、再插新卡」，空数组会静默清空用户的卡与复习进度。
+        raise HTTPException(500, "拆卡失败：模型未返回可用题目，请重试")
+    return qas
 
 
-def generate_quiz(material_title: str, core_text: str, count: int = 8) -> list[dict]:
-    """基于资料核心内容生成 count 道单选题（测一测）"""
+def generate_quiz(material_title: str, core_text: str, count: int = 8, kind: str = "quiz") -> list[dict]:
+    """基于资料核心内容生成 count 道单选题
+
+    kind 决定 token 统计归口：默认 "quiz"（测一测）；「简单学」入口传 "learn_note"，
+    让该入口的讲义与出题两段消耗都归到「简单学」名下（提示词模板仍是共用的 prompt_quiz）。
+    """
     raw = summary_chat([
         {"role": "system", "content": get_prompt("prompt_quiz").replace("{count}", str(count))},
         {"role": "user", "content": "资料标题：" + material_title + "\n\n核心内容：\n" + core_text[:6000]},
-    ], kind="quiz")
+    ], kind=kind)
     start, end = raw.find("["), raw.rfind("]")
+    keys = ("question", "options", "correct_index", "explanation")
     try:
         items = json.loads(raw[start:end + 1])
-        keys = ("question", "options", "correct_index", "explanation")
-        return [i for i in items if all(k in i for k in keys)][:count]
+        qas = [i for i in items
+               if isinstance(i, dict) and all(k in i for k in keys)][:count]
     except Exception:
         raise HTTPException(500, "出题失败，请重试")
+    if not qas:
+        # ⚠️⚠️ 绝不能返回空数组：调用方是「先删旧卡再插新卡」，
+        #     空数组会让它把用户已有的题（连同复习进度）全部清空，还报「生成成功」。
+        #     模型回了合法 JSON 但字段名不合规时就会走到这里——长材料下并不罕见。
+        raise HTTPException(500, "出题失败：模型未返回可用题目，请重试")
+    return qas
 
 
 # ---------- 数据统计面板 · AI 分析报告（模块 H） ----------

@@ -41,69 +41,6 @@ export const clipApi = {
   batchPreview: (payload) => http.post('/materials/clip/batch/preview', payload, { timeout: 300000 }),
 }
 
-// 应用内 AI 浏览器（阶段 2 · WP12）：宿主状态 + 侧栏数据面。
-// ⚠️ 后端把 `/api/browser/*` 注册在 SPA catch-all **之前**；若哪天挪到之后，
-//    这里所有请求会变成 404（症状像"路径写错了"），排查请先看 main.py 的注册顺序。
-export const browserApi = {
-  // 宿主只读状态；浏览器模式下 ready 恒为 false，是**正确值**不是故障
-  state: () => http.get('/browser/state'),
-  // 侧栏载荷（无载荷时是确定空态：四个字段都在、值为空串）
-  sidebarPayload: () => http.get('/browser/sidebar/payload'),
-  // 把选中内容投递给侧栏；返回 payload_saved（数据面）与 host_shown（显示面）两个独立字段
-  openSidebar: (payload) => http.post('/browser/sidebar/open', payload),
-  clearSidebar: () => http.post('/browser/sidebar/clear'),
-  // 打开浏览器面板（可选带 url）。opened=false 表示无原生窗口可放面板（浏览器模式），非故障
-  open: (payload) => http.post('/browser/open', payload || {}),
-  // 导航；error 为 invalid_url 时是用户输入问题（要提示），host_unavailable 则静默
-  navigate: (url) => http.post('/browser/navigate', { url }),
-  close: () => http.post('/browser/close'),
-  // 仅调试/验收：主线程回读面板真实 Qt 状态
-  selfcheck: () => http.get('/browser/panel/selfcheck'),
-  // URL 归一化：前端取「身份」必须与后端同规则（抓取仍用原始输入）
-  normalize: (url) => http.get('/browser/url/normalize', { params: { url } }),
-  // 导航动作：back/forward/reload/stop。三个字段分开读 —— available=false 是「按钮该灰」，
-  // error 非空才是真失败；合成一个布尔会让界面分不清两者。
-  action: (action) => http.post('/browser/action', { action }),
-  // 导航状态（WP13）：state/url/title/progress/can_back/can_forward/error 七键恒定
-  nav: () => http.get('/browser/nav'),
-  // 多标签（WP14）。⚠️ tab_limit / last_tab 是**正常约束**（界面该禁用按钮），
-  // 与「执行失败」是两件事，不要合并成一个布尔。
-  tabs: () => http.get('/browser/tabs'),
-  tabNew: (payload) => http.post('/browser/tab/new', payload || {}),
-  tabClose: (payload) => http.post('/browser/tab/close', payload || {}),
-  tabSwitch: (payload) => http.post('/browser/tab/switch', payload || {}),
-  // 取当前活跃标签的页面**原始源码**并抽取正文（WP15）。带用户自己的登录态 →
-  // 服务端被抓 403 的站点（知乎等）在这里可取。
-  // ⚠️ 它**不回传"已入库"**：入库仍走 clipApi.save（把返回的 source 一起传过去）。
-  // ⚠️ 长页面源码可达数 MB → 超时放宽到 60s。
-  extract: () => http.post('/browser/extract', {}, { timeout: 60000 }),
-  // WP18 清除浏览数据（cookie/缓存/访问记录/页内历史）。`cleared` 键恒定，逐键可读。
-  // ⚠️ 只清浏览数据，不动材料/笔记/设置；浏览器模式下 503（环境不支持，静默）。
-  clearData: () => http.post('/browser/data/clear', {}),
-  // WP18 N04 隐私口径的可验证形式（纯数据面）：history_tables 应为空、
-  // storage_under_data_dir 应为真 —— 设置页直接展示 `cookie_note`，口径单一来源。
-  privacy: () => http.get('/browser/privacy'),
-  // WP16 选区三动作。⚠️ 与本文件的 `sidebarPayload` 分工不同，**不要合并**：
-  //    这里读的是「页面上**选了什么**」（含 seq / path / err —— 用来区分"没选"与"选了但桥不通"）；
-  //    `sidebarPayload` 读的是「侧栏**要显示什么**」（含动作与其结果）。
-  selection: () => http.get('/browser/selection'),
-  // 执行动作：explain / summarize / quiz。**异步** —— 立刻回来的只是 status="running"，
-  // 结果要回 `sidebarPayload` 读（后端用 gen 配对，防"旧答案盖新选区"）。
-  // ⚠️ 不传 selection 时后端取「当前选区」—— 这正是「点网页浮动工具栏」与「点侧栏按钮」
-  //    走同一条链的原因：两个入口都只发一个 action，不允许各自维护一套参数。
-  selectionAction: (payload) => http.post('/browser/selection/action', payload || {}),
-  // WP17 追问：围绕**当前选区**继续提问。`history` 由前端携带（服务端无状态、不落库）——
-  // 与 ephemeral/explain 同口径：侧栏刷新后不「记得」上一轮是**有意**的（N04）。
-  // ⚠️ 同为**异步**：立刻回来的只是 status="running"，正文仍回 `sidebarPayload` 读。
-  // ⚠️ 追问**不是第四个动作**：它不进后端 ACTION_ORDER（那会打红 WP16 的「工具栏三个按钮」判据）。
-  selectionAsk: (payload) => http.post('/browser/selection/ask', payload || {}),
-  // WP17 流式订阅走 `POST /browser/sidebar/stream`（SSE）—— 用 `utils/sse.js::streamSSE` 发起，
-  // 本对象**不包**它：那条链是「长连接 + 逐事件回调」，与本文件「一发一收」的形状不同。
-  // 仅真机 / 验收：让活跃标签重新注入工具栏与桥，并**回读**页面侧真实状态。
-  // ⚠️ `ok` 是"我发起了注入"，`probe.has_el` 才是"页面上真有节点" —— 必须分开读，
-  //    否则"注入没生效"会给出全绿。
-  inject: () => http.post('/browser/inject'),
-}
 
 // AI 理解（PRD 模块 B）；生成类接口长文档可能需数分钟，超时放宽到 300s
 export const aiApi = {
@@ -152,6 +89,9 @@ export const kbApi = {
   overview: (params) => http.get('/kb/overview', { params }),
   rebuild: (materialId) => http.post(`/kb/rebuild`, { material_id: materialId }),
   search: (query) => http.post('/kb/search', { query }),
+  entities: () => http.get('/kb/entities'),
+  extractEntities: (materialId) => http.post(`/materials/${materialId}/extract-entities`),
+  deleteEntities: (materialId) => http.delete(`/materials/${materialId}/entities`),
 }
 
 // 文件夹（材料库扩展）
@@ -192,6 +132,16 @@ export const reviewApi = {
   quizAnswer: (cardId, correct) => http.post('/review/quiz-answer', { card_id: cardId, correct }),
   remove: (id) => http.delete(`/review/cards/${id}`),
   stats: () => http.get('/review/stats')
+}
+
+// 简单学习（V 新增）：选材料 → 一键生成结构化学习笔记 + 出题入复习队列
+export const simpleLearnApi = {
+  // SSE 流式生成（启动或附着），要完整路径（streamSSE 走 fetch，不走 axios 前缀）
+  runStreamUrl: '/api/simple-learn/run/stream',
+  status: (materialId) => http.get('/simple-learn/run/status', { params: { material_id: materialId } }),
+  note: (materialId) => http.get('/simple-learn/note', { params: { material_id: materialId } }),
+  // 只重跑出题（讲义不动）：用于「讲义已生成但出题失败」时的重试
+  quiz: (materialId, quizCount) => http.post('/simple-learn/quiz', { material_id: materialId, quiz_count: quizCount }),
 }
 
 // 语音模型（Whisper 转写模型：状态 / 下载 / 进度）
@@ -238,6 +188,7 @@ export const podcastApi = {
   synthesize: (id, payload) => http.post(`/podcasts/${id}/synthesize`, payload || {}, { timeout: 600000 }),
   // SSE 流式合成（带逐句进度）。streamSSE 要完整路径，不走 axios 的 /api 前缀
   synthesizeStreamUrl: (id) => `/api/podcasts/${id}/synthesize/stream`,
+  synthStatus: (id) => http.get(`/podcasts/${id}/synthesize/status`),
   rename: (id, title) => http.put(`/podcasts/${id}`, { title }),
   remove: (id) => http.delete(`/podcasts/${id}`),
   // v 传音频字节数：重新合成后字节数变化 → URL 变化 → <audio> 才会丢掉旧缓冲

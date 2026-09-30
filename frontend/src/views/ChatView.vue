@@ -57,7 +57,7 @@
         <div class="msg-col">
         <div v-if="messages.length === 0" class="chat-empty">
           <div class="mascot-hero">
-            <img :src="mascot" class="empty-mascot" alt="伴学猫头鹰" />
+            <img :src="mascot" class="empty-mascot" alt="知萤猫头鹰" />
           </div>
           <!-- 未配置模型：先引导配置（替代示例问题，避免点击直撞后端「请先配置」报错） -->
           <template v-if="!configured">
@@ -134,7 +134,15 @@
               <div v-if="!m.kb_hit && m.content" class="kb-miss-bar">
                 知识库中未找到相关内容，以下为通用回答
               </div>
-              <div class="md-body" v-html="renderAnswer(m)" @click="onMdClick(m, $event)"></div>
+              <!-- 未配置模型：气泡内错误态（重试 + 去配置） -->
+              <div v-if="m._error" class="ai-config-error">
+                <div class="ai-config-error-text">{{ m._error }}</div>
+                <div class="ai-config-error-ops">
+                  <el-button size="small" type="primary" plain @click="retryQuestion(m)">重试</el-button>
+                  <el-button size="small" type="primary" @click="router.push('/settings')">去配置</el-button>
+                </div>
+              </div>
+              <div v-else class="md-body" v-html="renderAnswer(m)" @click="onMdClick(m, $event)"></div>
               <span v-if="m._streaming" class="cursor">▍</span>
               <!-- 相关问题推荐（回答后生成，点击直接发问） -->
               <div v-if="!m._streaming && m.suggestions?.length" class="suggestions">
@@ -886,6 +894,24 @@ function cancelEdit(m) {
   m._editing = false
 }
 
+function retryQuestion(m) {
+  if (asking.value) return
+  const q = m._errorQuestion
+  if (!q) return
+  // 移除这条错误气泡及其前面的用户消息，然后重新发问
+  const idx = messages.value.indexOf(m)
+  if (idx >= 0) {
+    const userIdx = idx - 1
+    if (userIdx >= 0 && messages.value[userIdx]?.role === 'user') {
+      messages.value.splice(userIdx, 2)
+    } else {
+      messages.value.splice(idx, 1)
+    }
+  }
+  question.value = q
+  send()
+}
+
 async function confirmEdit(m, index) {
   const text = (m._editText || '').trim()
   if (!text || asking.value) return
@@ -970,8 +996,15 @@ async function send() {
   } catch (e) {
     aiMsg._streaming = false
     aiMsg.content = aiMsg.content || ''
-    ElMessage.error(e.message || '问答失败')
-    if (!aiMsg.content) messages.value = messages.value.filter(m => m !== aiMsg)
+    // 未配置模型：气泡内展示错误态（含「重试」「去配置」按钮），不弹全局引导，也不移除气泡
+    if ((e.message || '').includes('[NEED_SETUP]')) {
+      aiMsg._error = (e.message || '').replace('[NEED_SETUP]', '').replace(/^\d{3}:\s*/, '') || '尚未配置可用的 AI 模型'
+      aiMsg._errorQuestion = q
+      scrollBottom()
+    } else {
+      ElMessage.error(e.message || '问答失败')
+      if (!aiMsg.content) messages.value = messages.value.filter(m => m !== aiMsg)
+    }
   } finally {
     asking.value = false
   }
@@ -993,7 +1026,9 @@ onMounted(async () => {
   try {
     const { data: st } = await settingsApi.get()
     chatModels.value = st.llm_models || []
-    selectedModelId.value = st.chat_model_id || (chatModels.value[0]?.id || '')
+    // ⚠️ 默认模型 = 后端「问答用途」配置；不兜底到列表第一条，否则「问答模型没选」时
+    // 会静默用列表第一个模型发请求、绕过 NEED_SETUP 校验（用户实测报过）。
+    selectedModelId.value = st.chat_model_id || ''
     configured.value = st.configured !== false
   } catch { /* 静默 */ }
   // 从资料详情页进入：自动关联当前资料为检索范围
@@ -1187,6 +1222,13 @@ function closeCitePop(e) {
   font-size: 12px; color: var(--asc-text-2); background: var(--asc-surface-2); border-radius: 8px;
   padding: 6px 12px; margin-bottom: 10px;
 }
+/* 未配置模型：「重试 + 去配置」气泡内错误态 */
+.ai-config-error {
+  font-size: 13px; color: var(--asc-text-2); background: var(--asc-surface-2); border-radius: 8px;
+  padding: 10px 12px; margin-bottom: 8px;
+}
+.ai-config-error-text { margin-bottom: 8px; line-height: 1.5; }
+.ai-config-error-ops { display: flex; gap: 8px; }
 .md-body :deep(h1) { font-size: 18px; font-weight: 600; margin: 16px 0 8px; line-height: 1.4; }
 .md-body :deep(h2) { font-size: 16px; font-weight: 600; margin: 14px 0 8px; padding-left: 10px; border-left: 3px solid var(--asc-primary); line-height: 1.4; }
 .md-body :deep(h3) { font-size: 15px; font-weight: 600; margin: 12px 0 6px; line-height: 1.4; }

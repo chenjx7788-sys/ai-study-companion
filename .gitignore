@@ -51,3 +51,16 @@ backend/build_trim_stats.json
 # ⚠️ 它们是**回滚保险**，不是构建产物 —— 只忽略、不删除。
 *.patchbak
 *.bak
+
+# 本地构建残留与临时标记（2026-09-30 补）
+# ⚠️ stash 目录是「改名前暂存旧 dist」的产物；临时标记是重启/端口排查留下的。
+#    它们都不该进仓库 —— 尤其 stash 目录单个可达 600MB+。
+_dist_stash_*/
+frontend/_dist_stash_*/
+dist_bak_*/
+frontend/dist_bak_*/
+frontend/_dist_bak_*/
+_restart*.txt
+_rst*.txt
+_port*.txt
+_proc*.txt

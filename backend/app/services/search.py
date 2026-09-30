@@ -47,6 +47,7 @@ def _rrf_fuse(ranked_lists: list[list[dict]], k: int = RRF_K) -> list[dict]:
                 prev = docs[key]
                 prev["from_vector"] = prev.get("from_vector", False) or h.get("from_vector", False)
                 prev["from_fts"] = prev.get("from_fts", False) or h.get("from_fts", False)
+                prev["from_entity"] = prev.get("from_entity", False) or h.get("from_entity", False)
                 if h.get("vec_score") is not None:
                     prev["vec_score"] = h["vec_score"]
                 if h.get("fts_score") is not None:
@@ -85,6 +86,92 @@ def _rerank(hits: list[dict], note_weight: float = NOTE_WEIGHT) -> list[dict]:
     return selected
 
 
+def _entity_hits(db, query: str, kinds=("chunk", "note"), limit: int = 8) -> list[dict]:
+    """知识图谱召回：问题命中实体 → 扩展召回该实体关联的块/笔记。
+
+    这是「轻量实体索引」的唯一检索用途——不做关系多跳、不做图谱可视化，
+    只走「实体 → 关联块」这条最短路径，把跨材料的关联内容串回来。
+
+    命中逻辑：问题里的关键词能子串匹配到某实体的 name，则该实体命中；
+    取命中的实体 → 找 entity_refs 里它关联的 chunk / note → 还原为和 vector/fts
+    同构的 hit。score 用命中实体数（RRF 只看名次）。
+    """
+    from ..models import Entity, EntityRef, MaterialChunk, Note
+
+    kws = fts_svc._keywords(query)
+    if not kws:
+        return []
+
+    ref_types = [t for t in kinds if t in ("chunk", "note")]
+    if not ref_types:
+        return []
+
+    # 命中的实体名（任一关键词是实体名的子串，或实体名是关键词的子串）
+    entity_rows = db.query(Entity).all()
+    matched_names: set[str] = set()
+    for e in entity_rows:
+        en = e.name or ""
+        if not en:
+            continue
+        for k in kws:
+            if k and (k in en or en in k):
+                matched_names.add(en)
+                break
+    if not matched_names:
+        return []
+
+    refs = (db.query(EntityRef).filter(
+        EntityRef.ref_type.in_(ref_types),
+        EntityRef.entity.in_(matched_names)).all())
+
+    hits = []
+    seen: set[tuple[str, int]] = set()
+    for ref in refs:
+        key = (ref.ref_type, ref.ref_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        text = ""
+        material_id = ref.material_id
+        metadata = {}
+        if ref.ref_type == "chunk":
+            c = db.get(MaterialChunk, ref.ref_id)
+            if not c:
+                continue
+            text = c.content or ""
+            material_id = c.material_id
+            title = c.material.title if c.material else ""
+            metadata = {"ref_type": "chunk", "ref_id": c.id, "material_id": c.material_id,
+                        "material_title": title, "page_no": c.page_no,
+                        "section_path": c.section_path or ""}
+        else:
+            n = db.get(Note, ref.ref_id)
+            if not n:
+                continue
+            text = f"{n.title}\n{n.content or ''}".strip()
+            material_id = n.material_id
+            title = n.material.title if n.material else ""
+            metadata = {"ref_type": "note", "ref_id": n.id, "material_id": n.material_id,
+                        "note_title": n.title, "material_title": title,
+                        "page_no": (n.anchor or {}).get("page_no", 0)}
+        if not text:
+            continue
+        hits.append({
+            "ref_type": ref.ref_type,
+            "ref_id": ref.ref_id,
+            "material_id": material_id,
+            "text": text,
+            "metadata": metadata,
+            "score": float(len(matched_names)),
+            "from_fts": False,
+            "from_vector": False,
+            "from_entity": True,
+        })
+    # 命中实体多在前（名次越靠前 RRF 分越高；此处按实体命中数降序，稳定排序）
+    hits.sort(key=lambda h: (-h["score"], h["ref_id"]))
+    return hits[:limit]
+
+
 def search(query: str, db, kinds=("chunk", "note"), where: dict | None = None,
            top_k: int | None = None) -> list[dict]:
     """多路召回统一入口，返回重排后的 hits（结构与 vector.search 兼容）。
@@ -117,7 +204,14 @@ def search(query: str, db, kinds=("chunk", "note"), where: dict | None = None,
         h["from_fts"] = True
         h["fts_score"] = h["score"]
 
-    merged = _rrf_fuse([vec, fts])
+    # 第三路：知识图谱实体召回（命中实体 → 扩展关联块）。失败/无实体时为空，不影响主链路。
+    ent: list[dict] = []
+    try:
+        ent = _entity_hits(db, query, kinds=kinds, limit=top_k)
+    except Exception:
+        ent = []
+
+    merged = _rrf_fuse([vec, fts, ent])
     # 每次检索现读笔记权重（默认 1.5），改动即时生效，无需重建索引
     note_w = float(settings_store.load().get("note_weight") or NOTE_WEIGHT)
     merged = _rerank(merged, note_w)

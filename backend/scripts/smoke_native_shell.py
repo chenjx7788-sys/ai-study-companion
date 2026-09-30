@@ -1,34 +1,49 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""打包产物「原生外壳」冒烟测试：断言实际后端是 Qt（阶段 1 · WP8b）
+"""打包产物「原生外壳」冒烟测试：断言原生外壳**没有静默回落**
 
-【为什么需要它 —— 原来的冒烟测试结构上测不到 Qt】
+【为什么需要它 —— 普通的 /api/health 冒烟结构上测不到外壳】
 
-`build_macos.sh` 原第 [5/6] 步是：
-    ASC_BROWSER=1 ASC_PORT=... "$APP_BIN" &
-    curl -sf http://127.0.0.1:$PORT/api/health
-`ASC_BROWSER=1` 会让 `launcher.py` **整段跳过 pywebview 原生窗口**（直接走浏览器 fallback）
-→ 这一步只证明了「后端能起来」，**一个字节都没碰 Qt 路径**。
+`build_macos.sh` / `build_windows.sh` 的健康冒烟都带 `ASC_BROWSER=1`：
+它会让 `launcher.py` **整段跳过 pywebview 原生窗口**（直接走浏览器 fallback）
+→ 那一步只证明了「后端能起来、原生库能 import」，**一个字节都没碰 pywebview**。
 
-后果：R4 的失败形态（spec 漏收 PySide6/QtWebEngine → 运行期**静默回落**旧后端）
-在这个冒烟测试下**照样通过** —— 打出一个「装了 Qt 但实际没在用」的包也发现不了。
-而 `guilib.py` 的后端候选是**列表回退**（Win `[qt, winforms]` / Darwin `[qt, cocoa]`），
-回落时**不报错、不警告**。
+后果：一旦原生外壳静默回落，这种包在上述冒烟下**照样全绿**，发现不了。
+（`webview/guilib.py::try_import` 是**列表回退**，回落时不抛异常、不报警，
+只写一行 logger。）
+
+【各平台的「期望后端」与回落会落到哪】
+
+    Windows  guis = [import_winforms]                ← **只有一项**，没有并列候选
+             winforms 内部再分叉：有 WebView2 运行时 → Chromium(edgechromium)；
+             **没有则静默回落 mshtml(IE 引擎)**。那是本产品最危险的形态：
+             前端产物是现代 ES module，IE 执行不了 → **窗口打开、白屏、零报错**
+             （故 `mshtml` 在本脚本里单独判红并给出这条解释）。
+             ⇒ 期望 `webview.platforms.winforms`
+    macOS    guis = [import_cocoa, import_qt]         ← cocoa 优先
+             ⇒ 期望 `webview.platforms.cocoa`
+    Linux    guis = [import_gtk, import_qt]           （本产品未在 Linux 发布，仅兜底）
+             依据：`webview/guilib.py::initialize` 的分支表（本机已核对 pywebview 6.2.1）。
+
+⚠️ 2026-09-22（AI 浏览器下线）前，这里硬编码期望 `webview.platforms.qt` —— 那时
+launcher 用 `PYWEBVIEW_GUI=qt` 把两平台都强制顶到 Qt。那次下线移除了该强制设置，
+各平台的**默认首选项**才重新成为正确期望值（见 `default_expect_backend()`）。
 
 【判据】
     不设 ASC_BROWSER → 起原生窗口 → 读 `data_dir/launcher_backend.log`
-    → 断言其中出现 `backend=<期望后端>`。
-这条信号正是阶段 1 的 WP0 专门做出来的（`_report_webview_backend()` 读
+    → 断言其中**最后一个** `backend=<期望后端>`。
+这条信号是阶段 1 的 WP0 专门做出来的（`_report_webview_backend()` 读
 `webview.guilib.__name__` 写盘），所以成本几乎为零。
 
 【诚实边界】
-本脚本证明的是「**后端模块**确为 Qt」，即 R4 的失败形态。
-它**不**证明页面渲染成功 —— 渲染进程若起不来（如 R9 的命令沙箱注入），
-`guilib` 仍然是 qt。渲染验证属阶段 0 探针（`probe_macos_qtwebengine.py`）的职责。
+本脚本证明的是「**原生外壳后端模块**符合本平台预期」。
+它**不**证明页面渲染成功 —— 渲染进程若起不来（沙箱注入、显卡/权限问题），
+`guilib` 的名字照旧。逐页渲染验证属 `_fetch_probe/verify_stage1_page_equiv.py` 的职责。
 
 【用法】
-    python3 smoke_native_shell.py --app-bin <可执行文件> --expect-backend webview.platforms.qt
-    python3 smoke_native_shell.py --self-test        # 任意平台可跑，验本脚本自身逻辑
+    python3 smoke_native_shell.py --app-bin <可执行文件>   # 期望后端按平台自动取
+    python3 smoke_native_shell.py --app-bin <exe> --expect-backend webview.platforms.cocoa
+    python3 smoke_native_shell.py --self-test             # 任意平台可跑，验本脚本自身逻辑
 """
 from __future__ import annotations
 
@@ -52,6 +67,20 @@ def parse_backend(text: str):
     """从 launcher_backend.log 内容里取**最后一个** backend 值（None = 还没写）。"""
     hits = _BACKEND_RE.findall(text or "")
     return hits[-1] if hits else None
+
+
+def default_expect_backend() -> str:
+    """按当前平台取「期望后端」。
+
+    ⚠️ 2026-09-22 前这里（调用方）硬编码 `webview.platforms.qt` —— 那时 launcher 用
+    `PYWEBVIEW_GUI=qt` 把两平台都强制顶到 Qt。AI 浏览器下线后不再强制，
+    **各平台自己的默认首选项**才是正确期望值（依据见模块 docstring 的 guilib 分支表）。
+    """
+    if sys.platform == "darwin":
+        return "webview.platforms.cocoa"
+    if os.name == "nt":
+        return "webview.platforms.winforms"
+    return "webview.platforms.gtk"
 
 
 def isolate_env(data_dir: Path, port: int, base_env=None):
@@ -161,9 +190,16 @@ def run_smoke(app_cmd, expect_backend: str, port: int, timeout: float,
     elif found is None:
         diag = ("日志里没有任何 backend= 记录 → 原生窗口**没走到** pywebview.start()"
                 "（ASC_BROWSER 被设了？或 create_window 抛异常回落浏览器模式）")
+    elif found.endswith("mshtml"):
+        diag = ("后端是 %s → **这台机器缺 WebView2 运行时**，pywebview 静默用了 IE 引擎。"
+                "本产品前端产物是现代 ES module，IE 执行不了 ⇒ 用户看到的是"
+                "**白屏、零报错**。请确认 app/core/webview2_check.py 的预检是否真的跑过"
+                "（预检结果应写进 launcher_backend.log 的 webview2= 行）"
+                % found)
     else:
-        diag = ("后端回落成 %s（期望 %s）→ 典型 R4：包里缺 PySide6/QtWebEngine，"
-                "pywebview 静默用了旧后端" % (found, expect_backend))
+        diag = ("后端为 %s（期望 %s）→ 原生外壳落到了非预期后端。"
+                "各平台可能值：Windows=winforms|mshtml，macOS=cocoa|qt，Linux=gtk|qt"
+                % (found, expect_backend))
 
     report = {
         "ok": ok,
@@ -196,20 +232,29 @@ def run_smoke(app_cmd, expect_backend: str, port: int, timeout: float,
 # 自测：用「假可执行文件」验证判据的分辨力
 # --------------------------------------------------------------------------
 def run_self_test() -> int:
-    """四条判据，覆盖「该绿时绿、该红时红」：
+    """五条判据，覆盖「该绿时绿、该红时红」：
 
-      T1 日志写 backend=webview.platforms.qt      → 必须 PASS
-      T2 日志写 backend=webview.platforms.cocoa   → 必须 FAIL（回落被抓住 = R4 的分辨力）
-      T3 日志里**没有** backend= 行              → 必须 FAIL（没起窗口不能被当成过）
-      T4 日志里**含期望字符串、但不在 backend= 位**
-         （fallback=webview.platforms.qt）        → 必须 FAIL（正则必须锚在 backend= 上，
-                                                     "全文搜期望串" 这种松判据会假绿）
+      T1 日志写 backend=<本平台期望值>   → 必须 PASS（基线）
+      T2 日志写 backend=webview.platforms.qt（非期望）→ 必须 FAIL
+      T3 日志里**没有** backend= 行      → 必须 FAIL（没起窗口不能被当成过）
+      T4 日志里含期望串、但不在 backend= 位
+         （fallback=<期望值>）            → 必须 FAIL（正则必须锚在 backend= 上，
+                                            "全文搜期望串" 这种松判据会假绿）
+      T5 日志写 backend=webview.platforms.mshtml → 必须 FAIL
+                                        （缺 WebView2 的最危险形态：白屏无提示）
 
-    基线守卫：T1 未过 → T2/T3/T4 记 SKIP 而不是 PASS。
-      （假进程若根本没跑起来，三条负向自检会**以错误的理由**全绿 —— 实测过。）
-    """
+    基线守卫：T1 未过 → T2..T5 记 SKIP 而不是 PASS。
+      （假进程若根本没跑起来，负向自检会**以错误的理由**全绿 —— 实测过。）
+
+    ⚠️ 期望值不是硬编码的：假进程按 FAKE_EXPECT 环境变量写 `backend=`，
+       T1 用它、T2/T4 拿它做「差一点」的对照 —— 这样本自测在任何平台上都成立，
+       且顺带验证了 `default_expect_backend()` 本身。"""
     results = []
     baseline_failed = []
+    expect_default = default_expect_backend()
+    assert expect_default != "webview.platforms.qt", (
+        "平台默认期望值不应是 qt —— 那是被 PYWEBVIEW_GUI 强制切换的后端，"
+        "会掩盖「launcher 是否真的不再强制」这件事（见 default_expect_backend 注释）")
 
     def chk(name, cond, detail="", gated=False):
         if gated and baseline_failed:
@@ -224,14 +269,16 @@ def run_self_test() -> int:
         fake.write_text(
             "import os, sys, time\n"
             "from pathlib import Path\n"
-            "mode = os.environ.get('FAKE_MODE', 'qt')\n"
+            "mode = os.environ.get('FAKE_MODE', 'expect')\n"
+            "exp = os.environ.get('FAKE_EXPECT', 'webview.platforms.winforms')\n"
             "d = Path(os.environ['ASC_DATA_DIR']); d.mkdir(parents=True, exist_ok=True)\n"
             "assert not os.environ.get('ASC_BROWSER'), 'ASC_BROWSER 不该被设'\n"
             "txt = {\n"
-            "  'qt': '2026-01-01 00:00:00  backend=webview.platforms.qt  want=PYWEBVIEW_GUI=qt\\n',\n"
-            "  'cocoa': '2026-01-01 00:00:00  backend=webview.platforms.cocoa  want=PYWEBVIEW_GUI=qt\\n',\n"
+            "  'expect': '2026-01-01 00:00:00  backend=' + exp + '  want=PYWEBVIEW_GUI=<unset>\\n',\n"
+            "  'other': '2026-01-01 00:00:00  backend=webview.platforms.qt  want=PYWEBVIEW_GUI=<unset>\\n',\n"
+            "  'mshtml': '2026-01-01 00:00:00  backend=webview.platforms.mshtml  want=PYWEBVIEW_GUI=<unset>\\n',\n"
             "  'empty': '',\n"
-            "  'decoy': '2026-01-01 00:00:00  want=PYWEBVIEW_GUI=qt  fallback=webview.platforms.qt\\n',\n"
+            "  'decoy': '2026-01-01 00:00:00  want=PYWEBVIEW_GUI=<unset>  fallback=' + exp + '\\n',\n"
             "}[mode]\n"
             "(d / 'launcher_backend.log').write_text(txt, encoding='utf-8')\n"
             "time.sleep(30)\n",
@@ -242,16 +289,18 @@ def run_self_test() -> int:
         fake_cmd = [sys.executable, str(fake)]
 
         cases = [
-            ("T1 后端=qt → PASS", "qt", "webview.platforms.qt", True),
-            ("T2 回落 cocoa → 必须 FAIL", "cocoa", "webview.platforms.qt", False),
-            ("T3 无 backend= 行 → 必须 FAIL", "empty", "webview.platforms.qt", False),
-            ("T4 仅别处字样 → 必须 FAIL", "decoy", "webview.platforms.qt", False),
+            ("T1 后端=平台期望值 → PASS", "expect", True),
+            ("T2 后端=qt（非期望）→ 必须 FAIL", "other", False),
+            ("T3 无 backend= 行 → 必须 FAIL", "empty", False),
+            ("T4 仅别处字样（fallback=期望值）→ 必须 FAIL", "decoy", False),
+            ("T5 后端=mshtml → 必须 FAIL（缺 WebView2 的最危险形态）", "mshtml", False),
         ]
-        for name, mode, expect, want_ok in cases:
+        for name, mode, want_ok in cases:
             os.environ["FAKE_MODE"] = mode
+            os.environ["FAKE_EXPECT"] = expect_default
             rep = tmp / ("report_%s.json" % mode)
             try:
-                r = run_smoke(fake_cmd, expect, 8231, timeout=12, report_path=rep,
+                r = run_smoke(fake_cmd, expect_default, 8231, timeout=12, report_path=rep,
                               log=lambda *_: None)
                 got_ok = r["ok"]
                 detail = "actual=%r" % r["actual_backend"]
@@ -259,10 +308,11 @@ def run_self_test() -> int:
                 got_ok, detail = False, str(e)
             finally:
                 os.environ.pop("FAKE_MODE", None)
-            if mode == "qt" and got_ok != want_ok:
+                os.environ.pop("FAKE_EXPECT", None)
+            if mode == "expect" and got_ok != want_ok:
                 baseline_failed.append(name)
             chk(name, got_ok == want_ok, "want_ok=%s got_ok=%s %s" % (want_ok, got_ok, detail),
-                gated=(mode != "qt"))
+                gated=(mode != "expect"))
 
     print("=" * 74)
     print("smoke_native_shell.py 自测（假可执行文件，任意平台可跑）")
@@ -283,9 +333,11 @@ def run_self_test() -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="打包产物原生外壳冒烟：断言实际后端为 Qt")
+    ap = argparse.ArgumentParser(
+        description="打包产物原生外壳冒烟：断言后端符合平台预期（Win=winforms / macOS=cocoa）")
     ap.add_argument("--app-bin", help="打包后的可执行文件")
-    ap.add_argument("--expect-backend", default="webview.platforms.qt")
+    ap.add_argument("--expect-backend", default=None,
+                    help="留空则按当前平台自动取（Windows=winforms / macOS=cocoa）")
     ap.add_argument("--port", type=int, default=8123)
     ap.add_argument("--timeout", type=float, default=120)
     ap.add_argument("--report", default=None)
@@ -298,7 +350,8 @@ def main() -> int:
         ap.error("需要 --app-bin（或用 --self-test）")
     app_bin = Path(args.app_bin)
     rep = Path(args.report) if args.report else app_bin.parent / "smoke_native_shell.json"
-    r = run_smoke(app_bin, args.expect_backend, args.port, args.timeout, rep)
+    expect = args.expect_backend or default_expect_backend()
+    r = run_smoke(app_bin, expect, args.port, args.timeout, rep)
     return 0 if r["ok"] else 1
 
 
