@@ -6,8 +6,11 @@ name: Build Windows
 #
 # 与 build-macos.yml 对称：同一个 tag 下，macOS（arm64 / x86_64）+ Windows 三个产物
 # 并发上传到**同一个** Release。softprops/action-gh-release@v2 在 release 已存在时
-# 会取出并复用，不会互相覆盖；这里**不设** generate_release_notes（那一步交给
-# macOS job 独占），避免三个 job 同时改写 release 正文。
+# 会取出并复用，不会互相覆盖；这里**只上传产物、不碰正文** ——
+# Release 正文由 build-macos.yml 的 release-notes job **独占**写入
+# （它从 CHANGELOG.md 抽取，见 backend/scripts/extract_release_notes.py）。
+# ⚠️ 千万不要在本文件里加 generate_release_notes / body_path：
+#    多个 job 各写一次会让正文攒出重复内容（v0.1.5 曾出现 12 遍重复行）。
 on:
   workflow_dispatch:
   push:

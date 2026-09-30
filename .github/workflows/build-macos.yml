@@ -106,10 +106,49 @@ jobs:
           path: backend/dist/ai-study-companion-macos-${{ matrix.arch }}.zip
           if-no-files-found: error
 
+      # ⚠️ 这里**只上传产物、绝不碰正文** —— 正文由文件末尾的 release-notes job 独占写入。
+      #    原因见那个 job 的注释（两个 matrix job 各写一次会攒出重复行）。
       - name: 发布到 GitHub Releases（仅 tag 触发时）
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: backend/dist/ai-study-companion-macos-${{ matrix.arch }}.zip
           fail_on_unmatched_files: true
-          generate_release_notes: true
+
+  # ── 发布说明：Release 正文的**唯一写入者** ────────────────────────────────
+  # ⚠️⚠️ 为什么要单独开一个 job（2026-09-30 实测教训，别删）：
+  #    原先两个 matrix job 都带 `generate_release_notes: true`，而 softprops 在
+  #    release 已存在时是**追加**生成的说明 —— v0.1.5 的正文因此变成 **12 遍重复的
+  #    「Full Changelog」链接**（本轮为让 Windows 构建跑通移动了 4 次 tag，2 个
+  #    matrix job 每次各追加一行）。仓库 `CHANGELOG.md` 里明明写得很完整，
+  #    却一个字都没进正文。
+  #    现在：正文由 `backend/scripts/extract_release_notes.py` 从 CHANGELOG 抽取，
+  #    且只在**这一个** job 写 → 结构上不可能重复。
+  # ⚠️ 不要把它并回 matrix job，也不要给 matrix job 加回 generate_release_notes。
+  # ⚠️ needs build-macos：matrix 失败时本 job 跳过，不写半截说明。
+  release-notes:
+    needs: build-macos
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 版本号从 tag 来（GITHUB_REF_NAME）；CHANGELOG 里没有该版本时**不判红**，
+      # 而是把「为什么这里是空的」写进正文（这一步跑在产物上传之后，
+      # 为一条文案把流水线判红得不偿失）。
+      - name: 从 CHANGELOG 生成发布说明
+        run: python backend/scripts/extract_release_notes.py
+
+      - name: 写入 Release 正文
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: backend/dist/release_body.md
