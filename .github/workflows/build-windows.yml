@@ -50,11 +50,12 @@ jobs:
 
       # 打包脚本自带：BGE 模型下载 → 前端构建 → PyInstaller → 冒烟 → zip + 内容守卫。
       # 冒烟失败会以非零退出码中止（不会把「起不来的包」当成功发出去）。
+      # ⚠️ 模型下载源默认 https://huggingface.co（脚本读 HF_ENDPOINT）。runner 在境外，
+      #    直连即可；若哪天换自托管 runner（国内网络），在本步加一行
+      #    `env: { HF_ENDPOINT: https://hf-mirror.com }` ——
+      #    ⚠️ 不要留「只有注释的 env:」，它会被 YAML 解析成 null，
+      #       导致整个 workflow 文件在 schema 校验阶段就被拒（连 job 都不创建）。
       - name: 打包 Windows 应用
-        env:
-          # runner 在境外，直连 huggingface.co 即可。
-          # 若哪天改自托管 runner（国内网络），把它换成 https://hf-mirror.com
-          # HF_ENDPOINT: https://hf-mirror.com
         run: python backend/scripts/build_windows_ci.py
 
       # 版本号只有 backend/app_version.py 一个来源；zip 实际文件名由脚本写出，
