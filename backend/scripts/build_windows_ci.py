@@ -21,6 +21,17 @@
   [4/5] 冒烟：ASC_BROWSER=1 起后端，轮询 /api/health
   [5/5] 打包 zip + 内容守卫
 
+失败时留下什么（2026-09-30 追加，起因见下）：
+  ⚠️ job 日志要仓库 admin 权限才拉得到（`GET /actions/runs/{id}/logs` → 403
+     Must have admin rights），于是这一步一红就又回到「零证据」：只知道
+     「Process completed with exit code 1」，不知道哪一步、为什么。
+  所以本脚本自己产出三份证据，全部落在 backend/dist/（由 artifact 收走）：
+     build_log.txt          全量控制台输出（Python 层 Tee）
+     step_logs/NN-*.log     每个外部命令（npm ci / vite / PyInstaller）的原始输出
+     failure.txt            失败报告：异常 + 环境 + 失败步骤输出的头尾
+  并把失败摘要写成 GitHub **annotation**（`::error::`）—— 公开仓库的
+  check-run annotations 无需鉴权即可读取，是拿不到 job 日志时的唯一可读通道。
+
 用法：
   python backend/scripts/build_windows_ci.py
 
@@ -39,23 +50,19 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.request
 import zipfile
 from pathlib import Path
-
-# ── 控制台编码：GitHub Actions 的 windows runner 上 stdout 可能是 cp1252，
-#    直接 print 中文会抛 UnicodeEncodeError 把整个构建打断（而且报错信息本身也是中文）。
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = BACKEND_DIR.parent
 FRONTEND_DIR = REPO_ROOT / "frontend"
 DIST_DIR = BACKEND_DIR / "dist"
 BUILD_DIR = BACKEND_DIR / "build"
+STEP_LOG_DIR = DIST_DIR / "step_logs"
+BUILD_LOG = DIST_DIR / "build_log.txt"
+FAILURE_REPORT = DIST_DIR / "failure.txt"
 MODEL_REL = Path("data") / "models" / "bge-small-zh-v1.5"
 MODEL_DIR = BACKEND_DIR / MODEL_REL
 APP_NAME = "AIStudyCompanion"
@@ -66,6 +73,57 @@ APP_DIR = DIST_DIR / APP_NAME
 MODEL_MIN_BYTES = 20_000_000
 # 整包体积下限：本地实测 257 MB。低于 100 MB 一定是漏收了运行库。
 ZIP_MIN_BYTES = 100 * 1024 * 1024
+# 失败报告/注解里保留的「输出尾部」行数（GitHub 单条注解上限 64KB）
+TAIL_LINES = 40
+HEAD_LINES = 20
+
+
+# ── 控制台编码：GitHub Actions 的 windows runner 上 stdout 可能是 cp1252，
+#    直接 print 中文会抛 UnicodeEncodeError 把整个构建打断（而且报错信息本身也是中文）。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
+class _Tee:
+    """把 Python 层的 stdout/stderr 同时写到控制台与 build_log.txt。
+
+    只覆盖 Python 自己写的东西；外部命令的输出由 run() 捕获后 print 出来，
+    因此最终都会汇进同一份日志。
+    """
+
+    def __init__(self, stream, fh):
+        object.__setattr__(self, "_stream", stream)
+        object.__setattr__(self, "_fh", fh)
+
+    def write(self, s):
+        try:
+            self._stream.write(s)
+        except Exception:
+            pass
+        try:
+            self._fh.write(s)
+            self._fh.flush()
+        except Exception:
+            pass
+        return len(s)
+
+    def flush(self):
+        for target in (object.__getattribute__(self, "_stream"),
+                       object.__getattribute__(self, "_fh")):
+            try:
+                target.flush()
+            except Exception:
+                pass
+
+    def __getattr__(self, name):
+        # 转发 isatty / encoding / fileno 等（第三方库会问），但别碰私有名，
+        # 否则 __init__ 之前的取值会递归回自己。
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(object.__getattribute__(self, "_stream"), name)
 
 
 def log(msg: str = "") -> None:
@@ -77,6 +135,147 @@ def step(title: str) -> None:
     log("=" * 72)
     log(title)
     log("=" * 72)
+
+
+# ── 失败证据 ────────────────────────────────────────────────────────────────
+def _gha_escape(text: str) -> str:
+    """GitHub 注解消息的转义：% 要最先处理，换行用 %0A。"""
+    return text.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+
+
+def emit_annotation(title: str, lines) -> None:
+    """写一条 ::error:: 注解。无鉴权读 check-run annotations 是拿不到 job 日志时的兜底通道。"""
+    body = _gha_escape("\n".join(lines))
+    if len(body) > 60_000:
+        body = body[-60_000:]
+    print("::error title=%s::%s" % (title, body), flush=True)
+
+
+def _try_ver(argv) -> str:
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        out = (p.stdout or "").strip() or (p.stderr or "").strip()
+        return out.splitlines()[0] if out else "(空输出 rc=%s)" % p.returncode
+    except Exception as exc:  # noqa: BLE001
+        return "(失败 %s: %s)" % (type(exc).__name__, exc)
+
+
+def _count_items(p: Path) -> str:
+    try:
+        if not p.exists():
+            return "不存在"
+        return "%d 项" % sum(1 for _ in p.rglob("*"))
+    except Exception as exc:  # noqa: BLE001
+        return "(统计失败 %s)" % exc
+
+
+def collect_env() -> str:
+    """环境快照。不用猜「runner 上装没装 npm」，直接打出来。"""
+    out = []
+    out.append("python          = %s" % sys.version.replace("\n", " "))
+    out.append("sys.executable  = %s" % sys.executable)
+    out.append("cwd             = %s" % os.getcwd())
+    out.append("sys.platform    = %s" % sys.platform)
+    for name in ("npm.cmd", "npm", "node", "git", "taskkill"):
+        try:
+            out.append("which %-9s = %s" % (name, shutil.which(name)))
+        except Exception as exc:  # noqa: BLE001
+            out.append("which %-9s = (异常 %s)" % (name, exc))
+    out.append("node --version  = %s" % _try_ver(["node", "--version"]))
+    out.append("npm  --version  = %s" % _try_ver(["npm", "--version"]))
+    out.append("PATH 长度       = %d" % len(os.environ.get("PATH", "")))
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+                "HF_ENDPOINT", "SKIP_SMOKE", "SMOKE_PORT", "VERSION"):
+        out.append("%-15s = %r" % (key, os.environ.get(key)))
+    for label, p in (("frontend", FRONTEND_DIR),
+                     ("frontend/package.json", FRONTEND_DIR / "package.json"),
+                     ("frontend/package-lock.json", FRONTEND_DIR / "package-lock.json"),
+                     ("frontend/node_modules", FRONTEND_DIR / "node_modules"),
+                     ("frontend/node_modules/vditor/dist", FRONTEND_DIR / "node_modules" / "vditor" / "dist"),
+                     ("frontend/dist", FRONTEND_DIR / "dist"),
+                     ("AIStudyCompanion.spec", BACKEND_DIR / "AIStudyCompanion.spec"),
+                     ("backend/data/models", MODEL_DIR)):
+        out.append("exists %-30s = %s" % (label, p.exists()))
+    try:
+        probe = DIST_DIR if DIST_DIR.exists() else BACKEND_DIR
+        free = shutil.disk_usage(str(probe)).free
+        out.append("磁盘可用        = %.2f GB (%s)" % (free / 1024 ** 3, probe))
+    except Exception as exc:  # noqa: BLE001
+        out.append("磁盘可用        = (读取失败 %s)" % exc)
+    return "\n".join(out)
+
+
+class StepFailure(SystemExit):
+    """带上下文的步骤失败：把子进程原始输出一并带走，供失败报告使用。"""
+
+    def __init__(self, desc: str, rc, output: str):
+        self.desc = desc
+        self.rc = rc
+        self.output = output or ""
+        super().__init__("[ERROR] %s 失败（退出码 %s）" % (desc, rc))
+
+
+def report_failure(exc: BaseException) -> None:
+    """把失败写成文件 + 注解。**绝不外抛** —— 它自己失败不该盖掉原始失败。"""
+    try:
+        lines = []
+        lines.append("=" * 72)
+        lines.append("Windows CI 构建失败报告")
+        lines.append("=" * 72)
+        lines.append("时间     = %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        lines.append("异常类型 = %s" % type(exc).__name__)
+        lines.append("异常内容 = %s" % exc)
+        lines.append("")
+        lines.append("—— 环境 ——")
+        lines.append(collect_env())
+        lines.append("")
+        lines.append("—— 现场（半成品目录）——")
+        for label, p in (("frontend/node_modules", FRONTEND_DIR / "node_modules"),
+                         ("frontend/public/vditor", FRONTEND_DIR / "public" / "vditor"),
+                         ("frontend/dist", FRONTEND_DIR / "dist"),
+                         ("backend/data/models", MODEL_DIR),
+                         ("backend/dist", DIST_DIR),
+                         ("backend/build", BUILD_DIR)):
+            lines.append("%-26s = %s" % (label, _count_items(p)))
+
+        brief = ["ASC-CI-Windows 失败：%s" % type(exc).__name__,
+                 "%s" % exc]
+        if isinstance(exc, StepFailure):
+            lines.append("")
+            lines.append("—— 失败步骤 ——")
+            lines.append("步骤   = %s" % exc.desc)
+            lines.append("退出码 = %s" % exc.rc)
+            lines.append("输出共 = %d 字节（完整见 backend/dist/step_logs/）" % len(exc.output))
+            o_lines = exc.output.splitlines()
+            lines.append("")
+            lines.append("—— 该步骤输出 · 头部 %d 行 ——" % min(HEAD_LINES, len(o_lines)))
+            lines.extend(o_lines[:HEAD_LINES])
+            lines.append("")
+            lines.append("—— 该步骤输出 · 尾部 %d 行 ——" % min(TAIL_LINES, len(o_lines)))
+            lines.extend(o_lines[-TAIL_LINES:])
+            brief.append("失败步骤：%s（退出码 %s）" % (exc.desc, exc.rc))
+            brief.append("—— 该步骤输出 · 尾部 ——")
+            brief.extend(o_lines[-TAIL_LINES:])
+        else:
+            tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+            lines.append("")
+            lines.append("—— 回溯 ——")
+            lines.extend("".join(tb).splitlines())
+            brief.append("—— 回溯 · 尾部 ——")
+            brief.extend("".join(tb).splitlines()[-TAIL_LINES:])
+
+        body = "\n".join(lines)
+        try:
+            FAILURE_REPORT.write_text(body, encoding="utf-8")
+        except Exception:
+            pass
+        log("")
+        log(body)
+        log("")
+        log("失败报告已写入：%s" % FAILURE_REPORT)
+        emit_annotation("ASC-CI-Windows", brief)
+    except BaseException:  # noqa: BLE001 — 报告自身失败绝不外抛
+        pass
 
 
 def read_version() -> str:
@@ -100,16 +299,50 @@ def which_npm() -> str:
     raise SystemExit("[ERROR] 找不到 npm（Node 未安装或不在 PATH）")
 
 
+_step_counter = [0]
+
+
 def run(cmd, cwd: Path, desc: str, env=None) -> None:
-    """执行一步，失败即中止。cmd 里的元素原样传给内核，不做 shell 解析。"""
+    """执行一步，失败即中止。
+
+    ⚠️ 这里**捕获**子进程输出（而非让它继承控制台）：CI 的 job 日志要 admin 权限，
+       失败时必须自带证据 —— 输出同时进 ① 控制台（build_log.txt）
+       ② backend/dist/step_logs/NN-<desc>.log ③ 失败报告。
+    """
+    _step_counter[0] += 1
+    idx = _step_counter[0]
     log(">>> %s" % desc)
     log("    cwd=%s" % cwd)
     log("    cmd=%s" % " ".join(str(c) for c in cmd))
     t0 = time.time()
-    proc = subprocess.run(list(cmd), cwd=str(cwd), env=env)
-    if proc.returncode != 0:
-        raise SystemExit("[ERROR] %s 失败（退出码 %d）" % (desc, proc.returncode))
-    log("<<< %s 完成（%.0fs）" % (desc, time.time() - t0))
+    try:
+        proc = subprocess.run(list(cmd), cwd=str(cwd), env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        raw = proc.stdout or b""
+        rc = proc.returncode
+    except Exception as exc:  # noqa: BLE001 — 文件不存在 / 不可执行等
+        raw = ("%s: %s" % (type(exc).__name__, exc)).encode("utf-8", "replace")
+        rc = -1
+    text = raw.decode("utf-8", errors="replace")
+
+    try:
+        STEP_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        # 文件名走 ASCII slug（Windows 上非 ASCII 文件名容易被编码搞坏），
+        # 所以中文描述会被清成下划线 —— 「这是哪一步」靠写入文件头的那几行还原。
+        safe = re.sub(r"[^0-9A-Za-z._-]+", "_", desc).strip("_._") or "step"
+        header = ("# %s\n# cwd=%s\n# cmd=%s\n# 退出码=%s\n# 原始输出 %d 字节\n"
+                  % (desc, cwd, " ".join(str(c) for c in cmd), rc, len(raw))
+                  ).encode("utf-8", "replace")
+        (STEP_LOG_DIR / ("%02d-%s.log" % (idx, safe[:48]))).write_bytes(header + raw)
+    except Exception:
+        pass
+
+    for line in text.splitlines():
+        log("    | " + line)
+
+    if rc != 0:
+        raise StepFailure(desc, rc, text)
+    log("<<< %s 完成（%.0fs，输出 %d 字节）" % (desc, time.time() - t0, len(raw)))
 
 
 def download(url: str, dest: Path, min_bytes: int = 1) -> None:
@@ -125,12 +358,14 @@ def download(url: str, dest: Path, min_bytes: int = 1) -> None:
             tmp = dest.with_suffix(dest.suffix + ".part")
             # 关掉代理：runner 上若有 HTTP(S)_PROXY 指向内网，直连 HF 会被绕进代理
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            t0 = time.time()
             with opener.open(url, timeout=120) as resp, open(tmp, "wb") as fh:
                 shutil.copyfileobj(resp, fh, 1024 * 1024)
             if tmp.stat().st_size < min_bytes:
                 raise IOError("下载体积异常：%d bytes < %d" % (tmp.stat().st_size, min_bytes))
             tmp.replace(dest)
-            log("  完成：%s（%d bytes）" % (dest.name, dest.stat().st_size))
+            log("  完成：%s（%d bytes，%.1fs）"
+                % (dest.name, dest.stat().st_size, time.time() - t0))
             return
         except Exception as exc:  # noqa: BLE001 — 网络类异常全部重试
             last = exc
@@ -166,34 +401,44 @@ def main() -> int:
     log("  python     = %s (%s)" % (sys.version.split()[0], sys.executable))
     log("  version    = %s" % version)
     log("  zip 目标   = %s" % zip_path)
+    log("  node       = %s" % _try_ver(["node", "--version"]))
+    log("  npm        = %s" % _try_ver(["npm", "--version"]))
 
     # ── [1/5] 模型 ────────────────────────────────────────────────────────
     step("[1/5] 下载 BGE 向量模型")
     hf = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
     base = "%s/Xenova/bge-small-zh-v1.5/resolve/main" % hf
     log("  下载源：%s" % hf)
+    t_model = time.time()
     download("%s/onnx/model_quantized.onnx" % base, MODEL_DIR / "model.onnx", MODEL_MIN_BYTES)
     download("%s/tokenizer.json" % base, MODEL_DIR / "tokenizer.json", 1000)
-    log("  模型就绪：%s（%.1f MB）"
-        % (MODEL_DIR, sum(p.stat().st_size for p in MODEL_DIR.glob("*")) / 1024 / 1024))
+    log("  模型就绪：%s（%.1f MB，本步累计 %.0fs）"
+        % (MODEL_DIR, sum(p.stat().st_size for p in MODEL_DIR.glob("*")) / 1024 / 1024,
+           time.time() - t_model))
 
     # ── [2/5] 前端 ────────────────────────────────────────────────────────
     step("[2/5] 前端构建（vite build → frontend/dist）")
     npm = which_npm()
+    log("  使用 npm：%s" % npm)
     rmtree(FRONTEND_DIR / "dist")
+    t_fe = time.time()
     run([npm, "ci"], FRONTEND_DIR, "npm ci")
+    log("  npm ci 之后：node_modules/%s；vditor/dist 存在=%s"
+        % (_count_items(FRONTEND_DIR / "node_modules"),
+           (FRONTEND_DIR / "node_modules" / "vditor" / "dist").exists()))
     run([npm, "run", "build"], FRONTEND_DIR, "npm run build")
     fe_index = FRONTEND_DIR / "dist" / "index.html"
     if not fe_index.exists():
         raise SystemExit("[ERROR] 前端产物缺失：%s" % fe_index)
     fe_files = [p for p in (FRONTEND_DIR / "dist").rglob("*") if p.is_file()]
-    log("  前端产物：%d 个文件，index.html %d bytes"
-        % (len(fe_files), fe_index.stat().st_size))
+    log("  前端产物：%d 个文件，index.html %d bytes；本步累计 %.0fs"
+        % (len(fe_files), fe_index.stat().st_size, time.time() - t_fe))
 
     # ── [3/5] PyInstaller ────────────────────────────────────────────────
     step("[3/5] PyInstaller 打包（onedir）")
     rmtree(APP_DIR)
     rmtree(BUILD_DIR / APP_NAME)
+    t_pyi = time.time()
     run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
          "--distpath", str(DIST_DIR), "--workpath", str(BUILD_DIR),
          "AIStudyCompanion.spec"],
@@ -203,7 +448,8 @@ def main() -> int:
     if not exe.exists():
         raise SystemExit("[ERROR] 未找到产物 exe：%s" % exe)
     app_bytes = sum(p.stat().st_size for p in APP_DIR.rglob("*") if p.is_file())
-    log("  打包产物：%s（%.1f MB）" % (APP_DIR, app_bytes / 1024 / 1024))
+    log("  打包产物：%s（%.1f MB，本步 %.0fs）"
+        % (APP_DIR, app_bytes / 1024 / 1024, time.time() - t_pyi))
 
     # ── [4/5] 冒烟 ───────────────────────────────────────────────────────
     step("[4/5] 冒烟测试（ASC_BROWSER=1 → 轮询 /api/health）")
@@ -358,4 +604,28 @@ def assert_package(zip_path: Path, fe_count: int, model_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _log_fh = None
+    try:
+        DIST_DIR.mkdir(parents=True, exist_ok=True)
+        _log_fh = open(BUILD_LOG, "w", encoding="utf-8", errors="replace")
+        sys.stdout = _Tee(sys.stdout, _log_fh)
+        sys.stderr = _Tee(sys.stderr, _log_fh)
+    except Exception:
+        _log_fh = None
+
+    _rc = 0
+    try:
+        _rc = main()
+    except BaseException as _exc:  # noqa: BLE001 — SystemExit 也要留下证据
+        try:
+            report_failure(_exc)
+        except BaseException:
+            pass
+        _rc = 1
+    finally:
+        try:
+            if _log_fh is not None:
+                _log_fh.flush()
+        except Exception:
+            pass
+    sys.exit(_rc)

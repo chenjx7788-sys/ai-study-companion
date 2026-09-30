@@ -88,7 +88,24 @@ jobs:
           path: |
             backend/dist/size_report_win.txt
             backend/dist/smoke_backend_stdout.txt
+            backend/dist/build_log.txt
+            backend/dist/failure.txt
+            backend/dist/step_logs/*.log
           if-no-files-found: ignore
+
+      # 没有仓库 admin 权限时拉不到 job 日志（GET /actions/runs/{id}/logs → 403），
+      # 所以把失败报告**回显到日志里**，并用 ::error:: 写一条 check-run 注解
+      # （公开仓库的 annotations 无需鉴权即可读）——两条通道总有一条能拿到。
+      - name: 失败时回显 failure.txt
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f backend/dist/failure.txt ]; then
+            echo "========== backend/dist/failure.txt =========="
+            cat backend/dist/failure.txt
+          else
+            echo "（未生成 failure.txt —— 失败发生在脚本启动之前）"
+          fi
 
       - name: 上传打包产物（artifact）
         uses: actions/upload-artifact@v4
