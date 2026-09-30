@@ -1,0 +1,104 @@
+name: Build Windows
+
+# 触发方式：
+#   1. 手动触发（Actions 页 → Run workflow）
+#   2. 推送 v* 标签（git push origin v<版本>）→ 自动打包并发布到 Releases
+#
+# 与 build-macos.yml 对称：同一个 tag 下，macOS（arm64 / x86_64）+ Windows 三个产物
+# 并发上传到**同一个** Release。softprops/action-gh-release@v2 在 release 已存在时
+# 会取出并复用，不会互相覆盖；这里**不设** generate_release_notes（那一步交给
+# macOS job 独占），避免三个 job 同时改写 release 正文。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    # Windows 侧耗时：pip 装 onnxruntime / chromadb / faster-whisper 等（冷缓存约 5-10min）
+    # + npm ci + vite build + PyInstaller onedir + 逐文件 zip（约 257MB）。
+    # 90 分钟是余量，不是预期；首次跑批拿到真实耗时可下调。
+    timeout-minutes: 90
+    # 允许 GITHUB_TOKEN 创建 release（默认只读，否则 softprops 报 "Resource not accessible by integration"）
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: 安装 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装 Python 依赖 + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt pyinstaller
+
+      # 打包脚本自带：BGE 模型下载 → 前端构建 → PyInstaller → 冒烟 → zip + 内容守卫。
+      # 冒烟失败会以非零退出码中止（不会把「起不来的包」当成功发出去）。
+      - name: 打包 Windows 应用
+        env:
+          # runner 在境外，直连 huggingface.co 即可。
+          # 若哪天改自托管 runner（国内网络），把它换成 https://hf-mirror.com
+          # HF_ENDPOINT: https://hf-mirror.com
+        run: python backend/scripts/build_windows_ci.py
+
+      # 版本号只有 backend/app_version.py 一个来源；zip 实际文件名由脚本写出，
+      # 这里读回来 —— workflow 里**不再硬编码 vX.Y.Z**，改版本时不需要动本文件。
+      - name: 读取产物文件名
+        id: asset
+        shell: bash
+        run: |
+          NAME=$(tr -d '\r\n' < backend/dist/win_asset_name.txt)
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Release 资产名：$NAME"
+
+      # 原设计里 job 一旦失败就是**零证据**：build 脚本 exit 1 → 后续 step 全跳过，
+      # 而体积报告与冒烟原始输出本来就不在上传列表。这两步无条件把证据收走。
+      - name: 记录产物体积（证据）
+        if: always()
+        shell: bash
+        run: |
+          if [ -f backend/dist/size_report_win.txt ]; then
+            cat backend/dist/size_report_win.txt
+          else
+            echo "size_report_win.txt 未生成（构建在打包完成前就失败了）"
+          fi
+
+      - name: 上传诊断证据（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-win
+          path: |
+            backend/dist/size_report_win.txt
+            backend/dist/smoke_backend_stdout.txt
+          if-no-files-found: ignore
+
+      - name: 上传打包产物（artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-study-companion-windows
+          path: backend/dist/${{ steps.asset.outputs.name }}
+          if-no-files-found: error
+
+      - name: 发布到 GitHub Releases（仅 tag 触发时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: backend/dist/${{ steps.asset.outputs.name }}
+          fail_on_unmatched_files: true
