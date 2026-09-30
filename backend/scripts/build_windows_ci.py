@@ -345,6 +345,23 @@ def run(cmd, cwd: Path, desc: str, env=None) -> None:
     log("<<< %s 完成（%.0fs，输出 %d 字节）" % (desc, time.time() - t0, len(raw)))
 
 
+def child_env(extra=None) -> dict:
+    """构造子进程环境：**强制 UTF-8 输出编码**。
+
+    ⚠️ 本模块顶部对 sys.stdout 的 reconfigure **不会传给子进程**。而 GitHub Actions
+       的 windows runner 控制台是 cp1252 —— 编不出 CJK 时 print 直接抛
+       UnicodeEncodeError 打断构建。
+       （2026-09-30 实测：Build Windows #3/#4 都是 PyInstaller 执行 .spec 时倒在
+         spec 里那句中文 print 上；macOS 是 UTF-8、本机是中文 Windows 所以都没事。）
+       PYTHONIOENCODING 是唯一能跨进程生效的开关。
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    if extra:
+        env.update(extra)
+    return env
+
+
 def download(url: str, dest: Path, min_bytes: int = 1) -> None:
     """带重试的下载。已存在且体积达标则跳过（本地重复跑时不重复拉 24MB）。"""
     if dest.exists() and dest.stat().st_size >= min_bytes:
@@ -442,7 +459,7 @@ def main() -> int:
     run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
          "--distpath", str(DIST_DIR), "--workpath", str(BUILD_DIR),
          "AIStudyCompanion.spec"],
-        BACKEND_DIR, "PyInstaller")
+        BACKEND_DIR, "PyInstaller", env=child_env())
 
     exe = APP_DIR / (APP_NAME + ".exe")
     if not exe.exists():
@@ -461,13 +478,17 @@ def main() -> int:
         # 四个 ASC_* 一起隔离（照 backend/scripts/smoke_native_shell.py 的做法）：
         # 只设 ASC_DATA_DIR 的话，材料文件仍会落进 runner 的用户目录。
         data_dir = Path(tempfile.mkdtemp(prefix="asc_ci_smoke_"))
-        env = dict(os.environ)
-        env["ASC_BROWSER"] = "1"
-        env["ASC_PORT"] = str(smoke_port)
-        env["ASC_DATA_DIR"] = str(data_dir)
-        env["ASC_FILES_DIR"] = str(data_dir / "files")
-        env["ASC_DB_URL"] = "sqlite:///%s" % (data_dir / "app.db").as_posix()
-        env["ASC_CHROMA_DIR"] = str(data_dir / "chroma")
+        # ⚠️ 必须走 child_env()：应用本身是中文的，在没有 PYTHONIOENCODING 的
+        #    cp1252 环境下，它自己 print 中文就会崩在启动阶段（表现成「冒烟失败」），
+        #    而且输出文件会被写成 cp1252 字节 —— 我们按 utf-8 读就成了乱码证据。
+        env = child_env({
+            "ASC_BROWSER": "1",
+            "ASC_PORT": str(smoke_port),
+            "ASC_DATA_DIR": str(data_dir),
+            "ASC_FILES_DIR": str(data_dir / "files"),
+            "ASC_DB_URL": "sqlite:///%s" % (data_dir / "app.db").as_posix(),
+            "ASC_CHROMA_DIR": str(data_dir / "chroma"),
+        })
 
         # ⚠️ 应用输出**不能**丢 /dev/null：这一步失败时它是唯一的原始线索。
         with open(smoke_out, "wb") as fh:

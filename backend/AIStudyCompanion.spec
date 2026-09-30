@@ -3,6 +3,19 @@
 import sys as _sys
 from PyInstaller.utils.hooks import collect_all, collect_data_files
 
+# ⚠️ 控制台编码：本 spec 有多处中文/emoji 的 print（第 1 档瘦身的统计输出，见下方 [spec] 行）。
+#    PyInstaller 是**独立进程**，父脚本里做的 sys.stdout.reconfigure 传不进来；
+#    而 GitHub Actions 的 windows runner 控制台是 **cp1252**，编不出 CJK ——
+#    第一个中文 print 就抛 UnicodeEncodeError，把整个打包打断。
+#    （2026-09-30 实测：Build Windows #3 / #4 都倒在这一行；macOS 是 UTF-8、本机是
+#     中文 Windows（cp936）所以两边都「一直是绿的」，只有英文 runner 才炸。）
+#    就地兜住即可，只影响**输出编码**，不改任何打包内容。
+try:
+    _sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    _sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 datas = []
 binaries = []
 hiddenimports = []
