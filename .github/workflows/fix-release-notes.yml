@@ -82,6 +82,35 @@ jobs:
           echo "================================="
           echo "Release 标题：$(cat backend/dist/release_name.txt)"
 
+      # ⚠️⚠️ 写回之前**必须**先证明「正文里写的文件名真实存在」。
+      #    文件名会随打包约定漂移（2026-10-08 实测：macOS 产物名被加上版本号
+      #    `ai-study-companion-v0.1.5-macos-arm64.zip`，而正文若还写旧名 → 点开 404）。
+      #    文案对不上不会报错、只会静静地给用户一个死链 —— 所以这里 **fail-closed**。
+      - name: 校验正文里的文件名都真实存在
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          # ⚠️ `comm` 要求两边**按同一 collation 排好序**，否则会给出 'file 1 is not
+          #    in sorted order' 警告、结果也不可靠。固定 LC_ALL=C 就不依赖 runner 的 locale。
+          export LC_ALL=C
+          have=$(gh release view "$TAG" --json assets --jq -r '.assets[].name' | sort)
+          # 正文里的下载表把文件名写成 `xxx.zip`（反引号包裹），这里全取出来
+          want=$(grep -o '`[^`]*\.zip`' backend/dist/release_body.md | tr -d '`' | sort -u)
+          if [ -z "$want" ]; then
+            echo "::error title=正文里没找到任何 .zip 文件名::下载表可能没生成出来"
+            exit 1
+          fi
+          echo "---- Release 上真实存在的资产 ----"; echo "$have"
+          echo "---- 正文里引用的文件名 ----"; echo "$want"
+          missing=$(comm -23 <(echo "$want") <(echo "$have"))
+          if [ -n "$missing" ]; then
+            echo "::error title=下载文件名对不上::下面这些写在正文里、但 Release 上不存在（写回去就是 404）—— 请先修正 backend/scripts/extract_release_notes.py 里的命名常量："
+            echo "$missing"
+            exit 1
+          fi
+          echo "全部对得上，可以写回。"
+
       # ⚠️ 用 `gh release edit` 而不是 softprops/action-gh-release：
       #    前者的语义就是「编辑既有 Release」——不会创建 Release、不会顺带改写
       #    draft/prerelease、也绝不会碰资产。这正是本 workflow 想要的。
