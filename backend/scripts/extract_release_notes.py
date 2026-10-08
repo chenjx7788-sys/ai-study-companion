@@ -38,9 +38,11 @@ PRODUCT_TAGLINE = "本地私有的 AI 学习知识中枢"
 
 # ⚠️ 与 build_windows_ci.py 的 zip_name / build_macos.sh 的产物名**必须一致**。
 #    改了命名这里不跟着改 → Release 说明里的文件名点开是 404。
+# ⚠️ 2026-10-08：macOS 产物名也带上版本号（与 Windows 对齐）。
+#    **不要**退回不带版本号的写法 —— 官网下载区按带版本号的名字硬编码，退回即官网 macOS 链接 404。
 WIN_ZIP = "AIStudyCompanion-v%s-win.zip"
-MAC_ARM64_ZIP = "ai-study-companion-macos-arm64.zip"
-MAC_X86_64_ZIP = "ai-study-companion-macos-x86_64.zip"
+MAC_ARM64_ZIP = "ai-study-companion-v%s-macos-arm64.zip"
+MAC_X86_64_ZIP = "ai-study-companion-v%s-macos-x86_64.zip"
 
 # `## [v0.1.5] - 2026-09-28 · 简单学` / `## [0.1.5]` / `## v0.1.5` 都认。
 # 末尾的「副标题」用 `·` 引出，只用于 Release 的**标题**（如 v0.1.3 的「AI 播客」）。
@@ -98,8 +100,8 @@ def build_body(version: str, section: dict | None) -> str:
         "| 平台 | 文件 |",
         "|---|---|",
         "| Windows 10 / 11（64 位） | `%s` |" % (WIN_ZIP % ver),
-        "| macOS · Apple Silicon | `%s` |" % MAC_ARM64_ZIP,
-        "| macOS · Intel | `%s` |" % MAC_X86_64_ZIP,
+        "| macOS · Apple Silicon | `%s` |" % (MAC_ARM64_ZIP % ver),
+        "| macOS · Intel | `%s` |" % (MAC_X86_64_ZIP % ver),
         "",
         "免安装绿色版：Windows 解压后双击 `AIStudyCompanion.exe`；macOS 解压后打开 `.app`"
         "（首次需右键 → 打开）。本地向量模型已随包内置（可切换在线 API），"

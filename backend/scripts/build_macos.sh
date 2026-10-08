@@ -9,6 +9,7 @@
 #   ARCH=arm64 bash backend/scripts/build_macos.sh
 #   可选环境变量：
 #     ARCH        产物架构标签（arm64 / x86_64），仅用于 zip 命名，默认 arm64
+#     VERSION     产物版本号（写进 zip 名），默认读 backend/app_version.py
 #     HF_ENDPOINT BGE 模型下载源，默认 https://huggingface.co
 #                 （国内本地打包可设 https://hf-mirror.com）
 #
@@ -31,6 +32,20 @@ HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
 # 对「分支内才定义、分支外引用」的变量在报错文本/行号上表现不可靠；
 # 全局先定义后，任何分支的引用都无条件安全。
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+# 产物名带版本号：`ai-study-companion-v<VERSION>-macos-<arch>.zip`
+# （与 Windows 的 `AIStudyCompanion-v<VERSION>-win.zip` 对齐）。
+# 版本号唯一来源 backend/app_version.py，可用 VERSION 环境变量覆盖。
+# ⚠️ 版本号是产物名的组成部分、也是 workflow 读回来的依据：
+#    读不到就**直接判红**，不静默退化成「没有版本号的名字」——
+#    那会让官网（按带版本号的新名硬编码）命中 404。
+VERSION="${VERSION:-}"
+if [ -z "${VERSION}" ]; then
+  VERSION="$(sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${BACKEND_DIR}/app_version.py" 2>/dev/null | head -1 || true)"
+fi
+if [ -z "${VERSION}" ]; then
+  echo "[ERROR] 无法从 backend/app_version.py 读到 __version__" >&2
+  exit 1
+fi
 
 echo "=== [1/6] 下载 BGE 向量模型（data/ 被 .gitignore，仓库内无此模型） ==="
 mkdir -p "$BACKEND_DIR/data/models/bge-small-zh-v1.5"
@@ -179,11 +194,14 @@ echo ""
 echo "=== [6/7] 打包 zip 产物 ==="
 # ⚠️ 顺序：签名**必须**在 zip 之前。zip 之后签没用 —— 用户解压出来是新的文件树。
 cd "$BACKEND_DIR/dist"
-ZIP_NAME="ai-study-companion-macos-${ARCH}.zip"
+ZIP_NAME="ai-study-companion-v${VERSION}-macos-${ARCH}.zip"
 rm -f "$ZIP_NAME"
 # 保留符号链接与权限（zip 默认会展开 symlink，这里用 -y 存符号链接）
 zip -qry "$ZIP_NAME" "AIStudyCompanion.app"
 ZIP_PATH="$BACKEND_DIR/dist/$ZIP_NAME"
+# 把产物名写出来给 workflow 读（workflow 里**不再硬编码 vX.Y.Z**，
+# 与 Windows 侧 backend/dist/win_asset_name.txt 同一套做法）。
+printf '%s\n' "${ZIP_NAME}" > "${BACKEND_DIR}/dist/macos_asset_name_${ARCH}.txt"
 echo "产物：${ZIP_PATH}（$(du -sh "$ZIP_PATH" | cut -f1)）"
 
 echo ""

@@ -61,6 +61,28 @@ jobs:
           # HF_ENDPOINT: https://hf-mirror.com
         run: bash backend/scripts/build_macos.sh
 
+      # ⚠️ 产物名带版本号（`ai-study-companion-v0.1.5-macos-arm64.zip`），名字由
+      #    build_macos.sh 从 backend/app_version.py 读出后写进
+      #    backend/dist/macos_asset_name_<arch>.txt —— 本文件**不再硬编码 vX.Y.Z**，
+      #    改版本时不需要动这里（对齐 Windows 侧读 win_asset_name.txt 的做法）。
+      # ⚠️ 构建半路失败时该文件不存在：这里给一个**一定不存在**的名字，让下游
+      #    upload-artifact 以 if-no-files-found: error 正常判红；否则
+      #    `${{ steps.asset.outputs.name }}` 为空会让路径退化成 `backend/dist/`，
+      #    把整个构建目录当产物传上去（比判红更糟）。
+      - name: 读取产物文件名
+        id: asset
+        if: always()
+        shell: bash
+        run: |
+          F="backend/dist/macos_asset_name_${{ matrix.arch }}.txt"
+          if [ -f "$F" ]; then
+            NAME=$(tr -d '\r\n' < "$F")
+          else
+            NAME="__asset_name_missing__"
+          fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Release 资产名：$NAME"
+
       # 2026-09-20 预检新增：原来的 job 在失败时**零 artifact** ——
       #   build_macos.sh exit 1 → 后续 step 全部跳过；而 sign_report.json /
       #   smoke_native_shell.json 本来就不在上传列表里。
@@ -72,11 +94,13 @@ jobs:
           mkdir -p backend/dist
           {
             echo "arch=${{ matrix.arch }}  runner=${{ matrix.os }}"
-            ZIP="backend/dist/ai-study-companion-macos-${{ matrix.arch }}.zip"
+            ZIP="backend/dist/${{ steps.asset.outputs.name }}"
             if [ -f "$ZIP" ]; then
+              echo "zip_name=${{ steps.asset.outputs.name }}"
               echo "zip_bytes=$(stat -f%z "$ZIP")"
               echo "zip_mb=$(du -m "$ZIP" | cut -f1)"
             else
+              echo "zip_name=${{ steps.asset.outputs.name }}（未生成）"
               echo "zip_bytes=NA"
             fi
             if [ -d backend/dist/AIStudyCompanion.app ]; then
@@ -97,13 +121,14 @@ jobs:
             backend/dist/sign_report.json
             backend/dist/smoke_native_shell.json
             backend/dist/smoke_backend_stdout.txt
+            backend/dist/macos_asset_name_${{ matrix.arch }}.txt
           if-no-files-found: ignore
 
       - name: 上传打包产物（artifact）
         uses: actions/upload-artifact@v4
         with:
           name: ai-study-companion-macos-${{ matrix.arch }}
-          path: backend/dist/ai-study-companion-macos-${{ matrix.arch }}.zip
+          path: backend/dist/${{ steps.asset.outputs.name }}
           if-no-files-found: error
 
       # ⚠️ 这里**只上传产物、绝不碰正文** —— 正文由文件末尾的 release-notes job 独占写入。
@@ -112,7 +137,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: backend/dist/ai-study-companion-macos-${{ matrix.arch }}.zip
+          files: backend/dist/${{ steps.asset.outputs.name }}
           fail_on_unmatched_files: true
 
   # ── 发布说明：Release 正文的**唯一写入者** ────────────────────────────────
