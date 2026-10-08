@@ -148,7 +148,18 @@ jobs:
       - name: 从 CHANGELOG 生成发布说明
         run: python backend/scripts/extract_release_notes.py
 
-      - name: 写入 Release 正文
+      # 标题（页面顶部那个）与正文分开：正文从 CHANGELOG 抽，标题的副标题
+      # 来自 CHANGELOG 版本行的 `· 副标题`（对齐 v0.1.3 的 `v0.1.3 · AI 播客`）。
+      - name: 读出 Release 标题
+        id: rel
+        shell: bash
+        run: |
+          NAME=$(tr -d '\r\n' < backend/dist/release_name.txt)
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Release 标题：$NAME"
+
+      - name: 写入 Release 正文与标题
         uses: softprops/action-gh-release@v2
         with:
+          name: ${{ steps.rel.outputs.name }}
           body_path: backend/dist/release_body.md

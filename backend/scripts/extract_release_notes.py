@@ -42,9 +42,17 @@ WIN_ZIP = "AIStudyCompanion-v%s-win.zip"
 MAC_ARM64_ZIP = "ai-study-companion-macos-arm64.zip"
 MAC_X86_64_ZIP = "ai-study-companion-macos-x86_64.zip"
 
-# `## [v0.1.5] - 2026-09-28` / `## [0.1.5]` / `## v0.1.5` 都认
-SECTION_RE = re.compile(r"^##\s*\[?v?(\d+\.\d+\.\d+)\]?\s*(?:[-—·]\s*(\d{4}-\d{2}-\d{2}))?\s*$",
-                        re.M)
+# `## [v0.1.5] - 2026-09-28 · 简单学` / `## [0.1.5]` / `## v0.1.5` 都认。
+# 末尾的「副标题」用 `·` 引出，只用于 Release 的**标题**（如 v0.1.3 的「AI 播客」）。
+# ⚠️ 日期是固定宽度的 YYYY-MM-DD、不可能含 `·`，所以用 `·` 当副标题分隔符
+#    不会跟日期分隔符（这里也允许 `·`）混淆。
+SECTION_RE = re.compile(
+    r"^##\s*\[?v?(\d+\.\d+\.\d+)\]?"          # 版本号
+    r"(?:\s*[-—·]\s*(\d{4}-\d{2}-\d{2}))?"        # 可选日期
+    r"(?:\s*·\s*(.+?))?"                            # 可选副标题
+    r"\s*$",
+    re.M,
+)
 
 
 def parse_sections(text: str) -> list:
@@ -58,7 +66,8 @@ def parse_sections(text: str) -> list:
         # ⚠️ CHANGELOG 用 `---` 分节，切出来会带着尾部那条水平线 → 正文里会多一条
         #    孤零零的 `---`（实测）。这里剔掉尾部所有水平线与空行。
         body = re.sub(r"(?:\s*\n)?\s*-{3,}\s*$", "", body).strip("\n")
-        out.append({"version": m.group(1), "date": m.group(2) or "", "body": body})
+        out.append({"version": m.group(1), "date": m.group(2) or "",
+                    "subtitle": (m.group(3) or "").strip(), "body": body})
     return out
 
 
@@ -102,6 +111,18 @@ def build_body(version: str, section: dict | None) -> str:
     return "\n".join(parts).rstrip("\n") + "\n"
 
 
+def build_name(version: str, section: dict | None, override: str = "") -> str:
+    """Release 的**标题**（页面顶部那个）：`v0.1.5 · 简单学`。
+
+    对齐 v0.1.3 的既有风格（`v0.1.3 · AI 播客`）。
+    ⚠️ 副标题优先取 `--name-subtitle`，其次取 CHANGELOG 标题行上的 `· 副标题`；
+       两者都没有时**只输出 `vX.Y.Z`** —— 不编造副标题。
+    """
+    ver = norm_version(version)
+    subtitle = (override or "").strip() or ((section or {}).get("subtitle") or "").strip()
+    return "v%s · %s" % (ver, subtitle) if subtitle else "v%s" % ver
+
+
 def pick_version(sections: list, explicit: str) -> tuple:
     """返回 (version, section 或 None, 来源说明)。"""
     if explicit:
@@ -120,6 +141,8 @@ def main() -> int:
     ap.add_argument("--version", default=os.environ.get("GITHUB_REF_NAME", ""),
                     help="如 v0.1.5；默认取 GITHUB_REF_NAME")
     ap.add_argument("--out", default=str(DEFAULT_OUT))
+    ap.add_argument("--name-subtitle", default="",
+                    help="Release 标题的副标题；留空则用 CHANGELOG 标题行上的")
     ap.add_argument("--print", dest="to_stdout", action="store_true")
     args = ap.parse_args()
 
@@ -133,6 +156,7 @@ def main() -> int:
 
     version, section, src = pick_version(sections, args.version)
     body = build_body(version, section)
+    name = build_name(version, section, args.name_subtitle)
 
     if section:
         print("[OK] 版本 %s（来自 %s）→ 正文 %d 字符 / %d 行"
@@ -148,6 +172,11 @@ def main() -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(body.encode("utf-8"))     # ⚠️ write_bytes，绝不 write_text（会翻 CRLF）
+    # Release 标题单独落一个文件（workflow 读它填 `name:`）——
+    # ⚠️ 用 utf-8：副标题是中文；文件名本身走 ASCII 规避开 Windows 的非 ASCII 文件名坑。
+    name_out = out.parent / "release_name.txt"
+    name_out.write_bytes((name + "\n").encode("utf-8"))
+    print("[OK] Release 标题：%s" % name)
     print("[OK] 已写出 %s（%d 字节）" % (out, out.stat().st_size))
     return 0
 
