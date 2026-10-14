@@ -51,7 +51,7 @@
 
 > 当前提供 **Windows 10 / 11（64 位）** 与 **macOS 13 或更高（Apple Silicon / Intel）** 绿色版，免安装。
 
-1. 到 [Releases](https://github.com/chenjx7788-sys/ai-study-companion/releases) 下载最新版 —— Windows：`AIStudyCompanion-v0.1.6-win.zip`（约 260 MB）；macOS：`ai-study-companion-v0.1.6-macos-arm64.zip`（约 239 MB，Apple Silicon）/ `ai-study-companion-v0.1.6-macos-x86_64.zip`（约 256 MB，Intel）
+1. 到 [Releases](https://github.com/chenjx7788-sys/ai-study-companion/releases) 下载最新版 —— Windows：`AIStudyCompanion-v0.1.6-win.zip`（约 290 MB）；macOS：`ai-study-companion-v0.1.6-macos-arm64.zip`（约 269 MB，Apple Silicon）/ `ai-study-companion-v0.1.6-macos-x86_64.zip`（约 287 MB，Intel）
 2. Windows 解压后双击 `AIStudyCompanion/AIStudyCompanion.exe`；macOS 解压后打开 `.app`（首次需右键 → 打开）。首次启动会自动就位内置向量模型（约 10 秒）
 3. 打开「管理中心 → 大模型配置」填入你的 **LLM API Key**（DeepSeek 等任意 OpenAI 兼容厂商，注册即得）即可使用全部 AI 能力
 
