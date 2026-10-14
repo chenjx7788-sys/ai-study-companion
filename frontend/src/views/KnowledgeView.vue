@@ -207,7 +207,7 @@
         </div>
         <div class="kb-chunks-meta">
           <span v-if="chunksLoading">正在加载切块…</span>
-          <span v-else>共 {{ chunksDrawer.list.length }} 块 · 按页码顺序</span>
+          <span v-else>共 {{ chunksDrawer.list.length }} 块 · 按页码顺序<span v-if="chunksDrawer.hiddenCount">（另有 {{ chunksDrawer.hiddenCount }} 段图片文字未显示）</span></span>
         </div>
         <div v-loading="chunksLoading" class="kb-chunks-body">
           <div v-if="!chunksLoading && !chunksDrawer.list.length" class="kb-chunks-empty">
@@ -246,17 +246,23 @@ const router = useRouter()
 const route = useRoute()
 const noteDialog = reactive({ show: false, id: null, materialTitle: '' })
 // 切块抽屉：点「已入库 · N 块」查看该材料的解析切块（只读）
-const chunksDrawer = reactive({ show: false, title: '', list: [] })
+const chunksDrawer = reactive({ show: false, title: '', list: [], hiddenCount: 0 })
 const chunksLoading = ref(false)
 
 async function openChunks(row) {
   chunksDrawer.title = row.title
   chunksDrawer.list = []
+  chunksDrawer.hiddenCount = 0
   chunksDrawer.show = true
   chunksLoading.value = true
   try {
     const { data } = await materialApi.chunks(row.material_id)
-    chunksDrawer.list = data || []
+    const all = data || []
+    // 图片 OCR 文字（kind=img_ocr）与学习页同一口径：默认不展示。
+    // ⚠️ 不动「已入库 N 块」那个计数 —— 它说的是知识库索引，确实含这些块；
+    //    只在抽屉里如实标注还有多少段没显示，避免「60 块 / 抽屉里 43 块」对不上。
+    chunksDrawer.hiddenCount = all.filter(c => (c.kind || 'body') === 'img_ocr').length
+    chunksDrawer.list = all.filter(c => (c.kind || 'body') !== 'img_ocr')
   } catch (e) {
     ElMessage.error(errMsg(e, '切块加载失败'))
   } finally {

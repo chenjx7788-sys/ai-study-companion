@@ -555,8 +555,9 @@ def script_chars(script: list[dict]) -> int:
 
 def script_signature(script: list[dict], voice_map: dict | None = None,
                      bgm_id: str = "", bgm_volume: int | None = None,
-                     rate: str | None = None, gap_ms: int | None = None) -> str:
-    """音频指纹：判断已合成音频是否对应当前脚本 + 音色 + 语速 + 停顿 + 背景音乐。
+                     rate: str | None = None, gap_ms: int | None = None,
+                     provider: str | None = None) -> str:
+    """音频指纹：判断已合成音频是否对应当前脚本 + 音色 + 语速 + 停顿 + 背景音乐 + 合成引擎。
 
     - 只取「说话人 + 音色 + 文本」，**不含时间戳** —— 合成后会回填 start_ms/end_ms，
       若把时间戳算进去，刚合成完就会被判定为「音频过期」。
@@ -565,9 +566,12 @@ def script_signature(script: list[dict], voice_map: dict | None = None,
     - 背景音乐同样纳入：换 BGM 或调音量后，旧音频的听感就不对了。
     - **语速与句间停顿同样纳入**：它们改的是成品的节奏与总时长，改了之后不只是
       「听感不同」，逐句时间戳也会整体对不上。
-      ⚠️ 三项都是「**取默认值时不追加任何字符**」：bgm_id 为空、rate 为 +0%、
-      gap_ms 为 280 时，本函数结果与升级前的算法逐字节一致 —— 否则历史记录
-      （指纹是旧口径算出来的）会被全部误判成「音频过期」。
+    - **合成引擎（provider）同样纳入**：edge-tts（在线）与 ZipVoice（本地）是两套
+      声学模型，切引擎后旧音频的音色/音质都不对；不纳入的话，用户切到本地合成后
+      界面不会提示「音频过期」，会以为听到的还是当前配置的产物。
+      ⚠️ 四项都是「**取默认值时不追加任何字符**」：bgm_id 为空、rate 为 +0%、
+      gap_ms 为 280、provider 为 edge 时，本函数结果与升级前的算法逐字节一致 ——
+      否则历史记录（指纹是旧口径算出来的）会被全部误判成「音频过期」。
     """
     vm = voice_map or {}
     parts = []
@@ -585,18 +589,21 @@ def script_signature(script: list[dict], voice_map: dict | None = None,
         key += f"\n#rate:{rate.strip()}"
     if gap_ms is not None and int(gap_ms) != tts.DEFAULT_GAP_MS:
         key += f"\n#gap:{int(gap_ms)}"
+    if provider and provider.strip() and provider.strip() != tts.DEFAULT_PROVIDER:
+        key += f"\n#tts:{provider.strip()}"
     return hashlib.md5(key.encode("utf-8")).hexdigest()
 
 
 def audio_is_stale(podcast, rate: str | None = None,
-                   gap_ms: int | None = None) -> bool:
+                   gap_ms: int | None = None,
+                   provider: str | None = None) -> bool:
     """音频是否为「上一版脚本」的产物。
 
-    音频与脚本是两份数据：改了脚本、换了音色、改了语速/停顿或换了 BGM，
-    音频立刻与当前配置分叉，界面必须显式标注，否则用户会以为听到的就是当前文案。
-    老数据（升级前未记录指纹）在启动迁移时已回填，不会误报。
+    音频与脚本是两份数据：改了脚本、换了音色、改了语速/停顿、换了 BGM 或
+    换了合成引擎，音频立刻与当前配置分叉，界面必须显式标注，否则用户会以为
+    听到的就是当前文案。老数据（升级前未记录指纹）在启动迁移时已回填，不会误报。
 
-    rate / gap_ms 不传时从当前语音设置读取；列表接口会算一次后统一传入，
+    rate / gap_ms / provider 不传时从当前语音设置读取；列表接口会算一次后统一传入，
     避免逐条记录都去读一遍设置文件。
     """
     if not (getattr(podcast, "audio_name", "") or ""):
@@ -604,17 +611,19 @@ def audio_is_stale(podcast, rate: str | None = None,
     sig = (getattr(podcast, "audio_sig", "") or "").strip()
     if not sig:
         return False
-    if rate is None or gap_ms is None:
+    if rate is None or gap_ms is None or provider is None:
         conf = settings_store.load()
         if rate is None:
             rate = conf.get("tts_rate") or tts.DEFAULT_RATE
         if gap_ms is None:
             gap_ms = int(conf.get("tts_gap_ms") or tts.DEFAULT_GAP_MS)
+        if provider is None:
+            provider = conf.get("tts_provider") or tts.DEFAULT_PROVIDER
     cur = script_signature(getattr(podcast, "script", None) or [],
                            getattr(podcast, "voice_map", None) or {},
                            (getattr(podcast, "bgm_id", "") or ""),
                            getattr(podcast, "bgm_volume", None),
-                           rate=rate, gap_ms=gap_ms)
+                           rate=rate, gap_ms=gap_ms, provider=provider)
     return sig != cur
 
 
@@ -656,6 +665,28 @@ def script_to_srt(script: list[dict]) -> str:
                       f"{_srt_time(s['start_ms'])} --> {_srt_time(s['end_ms'])}\n"
                       f"{who}：{text}\n")
     return "\n".join(blocks)
+
+
+def _vtt_time(ms) -> str:
+    # WebVTT 与 SRT 只差一处：毫秒分隔符用点不用逗号
+    return _srt_time(ms).replace(",", ".")
+
+
+def script_to_vtt(script: list[dict]) -> str:
+    """脚本 → WebVTT 字幕（与 script_to_srt **同一条时间轴**，只换封装格式）。
+
+    ⚠️ 浏览器的 <track> 只认 WebVTT、不认 SRT —— 播放器内字幕开关必须走这里，
+       导出下载仍走 SRT（本地播放器兼容性更好）。两者同源，绝不各算一份时间轴。
+    """
+    cues = []
+    for s in script or []:
+        text = (s.get("text") or "").strip()
+        if not text or s.get("start_ms") is None or s.get("end_ms") is None:
+            continue
+        who = "主持人" if s.get("speaker") == "host" else "专家"
+        cues.append(f"{_vtt_time(s['start_ms'])} --> {_vtt_time(s['end_ms'])}\n"
+                    f"{who}：{text}")
+    return "WEBVTT\n\n" + "\n\n".join(cues) + ("\n" if cues else "")
 
 
 def sanitize_title(raw: str) -> str:

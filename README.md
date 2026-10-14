@@ -4,11 +4,11 @@
 > 资料、笔记、向量索引全部存在你自己电脑上——**数据不出设备，只需一个 LLM API Key**。
 
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue)
-![version](https://img.shields.io/badge/version-v0.1.5-purple)
+![version](https://img.shields.io/badge/version-v0.1.6-purple)
 ![local](https://img.shields.io/badge/data-100%25%20local-brightgreen)
-[![download](https://img.shields.io/badge/%E4%B8%8B%E8%BD%BD-v0.1.5%20zip-orange)](https://github.com/chenjx7788-sys/ai-study-companion/releases/latest)
+[![download](https://img.shields.io/badge/%E4%B8%8B%E8%BD%BD-v0.1.6%20zip-orange)](https://github.com/chenjx7788-sys/ai-study-companion/releases/latest)
 
-> 👉 **下载体验版**：点击上方橙色「下载」徽章，或到 [Releases 页面](https://github.com/chenjx7788-sys/ai-study-companion/releases/latest) 下载 —— **Windows**：`AIStudyCompanion-v0.1.5-win.zip`（解压双击 `AIStudyCompanion.exe`）；**macOS**：`ai-study-companion-v0.1.5-macos-arm64.zip`（Apple Silicon）/ `ai-study-companion-v0.1.5-macos-x86_64.zip`（Intel），解压后打开 `.app`（首次需右键 → 打开）。
+> 👉 **下载体验版**：点击上方橙色「下载」徽章，或到 [Releases 页面](https://github.com/chenjx7788-sys/ai-study-companion/releases/latest) 下载 —— **Windows**：`AIStudyCompanion-v0.1.6-win.zip`（解压双击 `AIStudyCompanion.exe`）；**macOS**：`ai-study-companion-v0.1.6-macos-arm64.zip`（Apple Silicon）/ `ai-study-companion-v0.1.6-macos-x86_64.zip`（Intel），解压后打开 `.app`（首次需右键 → 打开）。
 
 ---
 
@@ -29,8 +29,9 @@
 - 🗂 **文件夹管理**：多级文件夹组织资料，导入保留目录层级，问答可限定在指定文件夹（含子夹）
 - 🧠 **科学抗遗忘**：AI 出题 + 简化 SM-2 间隔复习，误触可撤销、忘了当日重学
 - 🎧 **听得见的知识**：把材料与笔记生成 AI 播客（知识简报 → 对话脚本 → 本地合成音频），14 种音色可试听、可选背景音乐，通勤路上接着学
+- 🎬 **看得见的知识**：把材料做成 AI 口播视频（讲稿 → 分镜 → 本地渲染出片），可选口播形象与视觉皮肤，含字幕导出
 
-## 🧩 九大模块
+## 🧩 十一大模块
 
 | 模块 | 你能做什么 |
 |---|---|
@@ -40,6 +41,8 @@
 | **知识库** | 原文 + 笔记自动向量化；多路召回检索（向量语义 + 全文精确双路）；笔记权重可调，一键重建索引；笔记按问答 / AI / 周报 / 播客 / 手动分类 |
 | **AI 问答** | SSE 流式回答；范围选择（全库 / 资料 / 笔记 / 文件夹）；内联引用可溯源；回答一键转笔记；编辑提问、一键复制 |
 | **AI 播客** | 材料 / 划线 / 笔记 / 错题卡 → 知识简报 → 对话脚本（知识对谈 / 单人精讲，3 / 5 / 10 分钟）→ 本地合成音频；14 种音色可试听、6 首内置氛围音或自传背景音乐、逐句跟读、导出文稿与 SRT 字幕 |
+| **AI 视频** | 把材料做成口播视频：讲稿生成 → 结构化分镜（逐镜头版式与要点）→ 真机渲染出片；口播形象（上传 / 预置头像）与多套视觉皮肤可选，含字幕与背景音乐，全程本地渲染、任务离开页面照跑 |
+| **AI 陪练** | 模拟面试式练习：自选范围（材料 / 笔记 / 错题卡）出题 → 逐题念题 → 口述作答 → 即时点评与结算，自动汇总薄弱点 |
 | **复习巩固** | AI 出题（选择 / 复述 / 测一测）；简化 SM-2 间隔调度；题型筛选、误触撤销、遗忘曲线、连续打卡 |
 | **数据统计** | 学习 / 问答 / 复习四维可视化看板；AI 学习报告（一键生成 + 每周自动周报），薄弱点自动诊断 |
 | **管理中心** | 多模型并存配置、单模型测试连接、动态拉取模型清单；向量本地 / 在线切换；提示词自定义（含播客 / 周报，支持分类与搜索）；备份恢复；Token 统计 |
@@ -48,7 +51,7 @@
 
 > 当前提供 **Windows 10 / 11（64 位）** 与 **macOS 13 或更高（Apple Silicon / Intel）** 绿色版，免安装。
 
-1. 到 [Releases](https://github.com/chenjx7788-sys/ai-study-companion/releases) 下载最新版 —— Windows：`AIStudyCompanion-v0.1.5-win.zip`（约 260 MB）；macOS：`ai-study-companion-v0.1.5-macos-arm64.zip`（约 239 MB，Apple Silicon）/ `ai-study-companion-v0.1.5-macos-x86_64.zip`（约 256 MB，Intel）
+1. 到 [Releases](https://github.com/chenjx7788-sys/ai-study-companion/releases) 下载最新版 —— Windows：`AIStudyCompanion-v0.1.6-win.zip`（约 260 MB）；macOS：`ai-study-companion-v0.1.6-macos-arm64.zip`（约 239 MB，Apple Silicon）/ `ai-study-companion-v0.1.6-macos-x86_64.zip`（约 256 MB，Intel）
 2. Windows 解压后双击 `AIStudyCompanion/AIStudyCompanion.exe`；macOS 解压后打开 `.app`（首次需右键 → 打开）。首次启动会自动就位内置向量模型（约 10 秒）
 3. 打开「管理中心 → 大模型配置」填入你的 **LLM API Key**（DeepSeek 等任意 OpenAI 兼容厂商，注册即得）即可使用全部 AI 能力
 
@@ -62,7 +65,7 @@
 前端：Vue 3 · Vite · Element Plus · Pinia · pdf.js
 后端：FastAPI · SQLite · ChromaDB（向量）· faster-whisper（本地 ASR）· RapidOCR（本地 OCR）
 向量：本地 BGE-small-zh-v1.5（量化 ONNX）/ 可切换在线向量 API
-语音：edge-tts（云端免费合成，无需额外 Key）+ PyAV 本地混音（内置背景音乐）
+语音：edge-tts（云端免费合成，无需额外 Key）+ ZipVoice（本地合成，模型按需下载、断网可用）+ PyAV 本地混音（内置背景音乐）
 客户端：PyInstaller 绿色打包 + pywebview 原生窗口（单端口运行）
 ```
 
@@ -70,7 +73,7 @@
 
 ## 📝 更新日志
 
-完整按版本记录见 [CHANGELOG.md](./CHANGELOG.md)。v0.1.3 主要新增：**AI 播客**（材料 / 笔记 → 知识简报 → 对话脚本 → 本地音频，含背景音乐与字幕导出）、**EPUB 支持**、**「转笔记」覆盖全部 8 个 AI 产物入口**；并修复长文档摘要耗时长、音频与脚本不一致、Word 表格内容丢失等一批问题。
+完整按版本记录见 [CHANGELOG.md](./CHANGELOG.md)。v0.1.6 主要新增：**AI 视频**（讲稿 → 分镜 → 本地渲染出片，口播形象与视觉皮肤）、**AI 陪练**（出题 · 念题 · 口述作答 · 即时点评）、**ZipVoice 本地语音合成**（断网可用，模型按需下载）；并修复 edge-tts 合成端点失效、语音错误提示不准确等问题。
 
 ## 🚀 从源码运行（开发者）
 

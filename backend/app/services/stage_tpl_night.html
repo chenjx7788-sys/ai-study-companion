@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<style>
+/* =========================================================================
+   舞台页 · night 深色电台（解压型皮肤）。
+   画面：AI 预生成夜景插画背景（内置资产，本地）+ 旋转唱片 + 音频波形 + 字幕。
+   ⚠️ 动效一律 `ms → 状态` 纯函数；底部渐变遮罩兼作盖插画水印。
+   ========================================================================= */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: #0d1020; overflow: hidden; }
+.stage {
+  position: relative; width: 1920px; height: 1080px; overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+}
+.bg { position: absolute; inset: 0; background-size: cover; background-position: center 30%; }
+.bg::after { content: ''; position: absolute; inset: 0; background: rgba(9,11,24,.30); }
+/* 自定义背景时加强遮罩：0.55 是实测值（`_bg_alpha_dense_20261012/`）。
+   ⚠️ 内置夜景是**为这套 UI 调过的暗图**（0.30 足够）；用户照片明暗不可控，
+      0.30 时亮背景上的唱片与波形条最差只有 1.12 → 提到 0.55 才全部兜住。
+   ⚠️ 用深蓝黑（#090b18 = 皮肤底色）而不是纯黑：纯黑会把夜景压成死灰，
+      与「深色电台」的冷调不符。 */
+.stage[data-bg="user"] .bg::after { background: rgba(9,11,24,.55); }
+
+/* ---------- 用户背景时的进度条 ----------
+   ⚠️ 探针实测（`_bg_probe_run1.txt`）：浅色填充压在**明亮照片**的遮罩上只有 3.48:1，
+      而进度条是「读到哪了」的唯一指示 → 给它一条深色轨道。
+      实测（黑白灰三种极端底图）：轨道 rgba(0,0,0,.60) + 浅色填充 → 4.7 ~ 16.8:1。
+   ⚠️ 只作用于 `[data-bg="user"]`：皮肤自带的插画是深色的，原样即可，不必动它。 */
+.stage[data-bg="user"] .progress { background: rgba(0, 0, 0, .60); }
+.bottomshade {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 330px; pointer-events: none;
+  background: linear-gradient(to top, rgba(7,9,20,.94) 30%, rgba(7,9,20,0));
+}
+.progress { position: absolute; left: 0; right: 0; top: 0; height: 3px; background: rgba(255,255,255,.14); }
+.progress i { display: block; height: 100%; width: 0; background: #e8e4f5; }
+.disc { position: absolute; left: 50%; top: 148px; transform: translateX(-50%); width: 372px; height: 372px; }
+.disc svg { display: block; }
+.brand {
+  position: absolute; left: 0; right: 0; top: 576px; text-align: center;
+  font-family: KaiTi, "楷体", "STKaiti", serif; font-style: italic;
+  font-size: 58px; letter-spacing: 14px; color: #f0eefb; text-shadow: 0 2px 18px rgba(5,7,18,.6);
+}
+.bars {
+  position: absolute; left: 50%; top: 720px; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 10px; height: 110px;
+}
+.bars i { width: 7px; border-radius: 3.5px; background: #efeeff; display: block;
+          box-shadow: 0 0 10px rgba(239,238,255,.25); }
+.subs {
+  position: absolute; left: 0; right: 0; bottom: 118px; text-align: center;
+  font-size: 37px; font-weight: 500; color: #f4f2fa; letter-spacing: 1px; padding: 0 120px;
+  text-shadow: 0 2px 14px rgba(4,6,16,.7);
+}
+/* 字幕「影子层」：与 #subTxt 同形同位，只在交叉淡入时显形（上一句淡出）。
+   ⚠️ MOTION=0 时永远空文本 + opacity:0 → 不参与渲染（逐像素零回归）。 */
+.subs.subghost { opacity: 0; }
+/* 前景星点层（慢闪）：位置 / 相位 / 周期全部来自确定性哈希（禁用 Math.random）。
+   ⚠️ MOTION=0 时 display:none。 */
+.stars { position: absolute; inset: 0; display: none; pointer-events: none; }
+.stars i {
+  position: absolute; border-radius: 50%; background: #fff; opacity: 0;
+  box-shadow: 0 0 6px rgba(206,224,255,.85);
+}
+/* 唱片外扩散音晕（音频响应）：随响度脉动，颜色跟着变体的强调色走。 */
+.discglow {
+  position: absolute; left: 50%; top: 334px; transform: translate(-50%, -50%);
+  width: 640px; height: 640px; display: none; pointer-events: none; opacity: 0;
+  background: radial-gradient(closest-side, rgba(240,208,128,.55), rgba(240,208,128,0) 70%);
+}
+.stage[data-variant="violet"] .discglow {
+  background: radial-gradient(closest-side, rgba(201,167,245,.55), rgba(201,167,245,0) 70%);
+}
+.stage[data-variant="teal"] .discglow {
+  background: radial-gradient(closest-side, rgba(127,212,200,.55), rgba(127,212,200,0) 70%);
+}
+/* ---------- 预设变体（2026-10-12）：紫罗兰 violet / 墨青 teal ----------
+   ⚠️ 默认套（data-variant="" 或缺省）不命中任何覆盖 → 与改造前逐像素一致（存量零回归）。
+   ⚠️ 夜景插画随变体换（stage.py 按 variant 选 assets/night/ 的 PNG）；这里只换
+      叠加元素的成套色调（唱片 / 品牌字 / 波形 / 字幕 / 遮罩）。
+   ⚠️ 遮罩与底部渐变的色相随皮肤底色走（不用纯黑：纯黑会把夜景压成死灰）。 */
+.stage[data-variant="violet"] { background: #16102a; }
+.stage[data-variant="violet"] .bg::after { background: rgba(22,16,42,.30); }
+.stage[data-variant="violet"][data-bg="user"] .bg::after { background: rgba(22,16,42,.55); }
+.stage[data-variant="violet"] .bottomshade { background: linear-gradient(to top, rgba(18,11,38,.94) 30%, rgba(18,11,38,0)); }
+.stage[data-variant="violet"] .progress i { background: #e9e2f7; }
+.stage[data-variant="violet"] .disc circle:nth-of-type(1) { fill: #1c1438; stroke: #4a3a78; }
+.stage[data-variant="violet"] .disc circle:nth-of-type(2),
+.stage[data-variant="violet"] .disc circle:nth-of-type(3) { stroke: #332752; }
+.stage[data-variant="violet"] .disc circle:nth-of-type(4) { fill: #2e2054; }
+.stage[data-variant="violet"] .disc circle:nth-of-type(5) { stroke: #4a3a78; }
+.stage[data-variant="violet"] .disc circle:nth-of-type(6) { fill: #16102a; }
+.stage[data-variant="violet"] .disc path { stroke: #c9a7f5; }
+.stage[data-variant="violet"] .brand { color: #efe8fb; text-shadow: 0 2px 18px rgba(8,5,20,.6); }
+.stage[data-variant="violet"] .bars i { background: #ece4ff; box-shadow: 0 0 10px rgba(236,228,255,.25); }
+.stage[data-variant="violet"] .subs { color: #f3eefc; text-shadow: 0 2px 14px rgba(6,4,14,.7); }
+.stage[data-variant="teal"] { background: #081a1c; }
+.stage[data-variant="teal"] .bg::after { background: rgba(8,26,28,.30); }
+.stage[data-variant="teal"][data-bg="user"] .bg::after { background: rgba(8,26,28,.55); }
+.stage[data-variant="teal"] .bottomshade { background: linear-gradient(to top, rgba(5,17,19,.94) 30%, rgba(5,17,19,0)); }
+.stage[data-variant="teal"] .progress i { background: #dff3ee; }
+.stage[data-variant="teal"] .disc circle:nth-of-type(1) { fill: #0e2a2e; stroke: #2a565c; }
+.stage[data-variant="teal"] .disc circle:nth-of-type(2),
+.stage[data-variant="teal"] .disc circle:nth-of-type(3) { stroke: #1d4248; }
+.stage[data-variant="teal"] .disc circle:nth-of-type(4) { fill: #123238; }
+.stage[data-variant="teal"] .disc circle:nth-of-type(5) { stroke: #2a565c; }
+.stage[data-variant="teal"] .disc circle:nth-of-type(6) { fill: #081a1c; }
+.stage[data-variant="teal"] .disc path { stroke: #7fd4c8; }
+.stage[data-variant="teal"] .brand { color: #e6f5f0; text-shadow: 0 2px 18px rgba(3,10,11,.6); }
+.stage[data-variant="teal"] .bars i { background: #dff5ef; box-shadow: 0 0 10px rgba(223,245,239,.25); }
+.stage[data-variant="teal"] .subs { color: #eef8f4; text-shadow: 0 2px 14px rgba(3,10,11,.7); }
+</style>
+</head>
+<body>
+<div class="stage" id="stage" data-bg="__BG_KIND__" data-variant="__VARIANT__">
+  <div class="bg" id="bg"></div>
+  <div class="stars" id="stars"></div>
+  <div class="bottomshade"></div>
+  <div class="progress"><i id="progFill"></i></div>
+  <div class="discglow" id="discglow"></div>
+  <div class="disc">
+    <svg id="discSvg" viewBox="0 0 200 200" width="372" height="372" aria-hidden="true">
+      <circle cx="100" cy="100" r="94" fill="#151b36" stroke="#3d4a75" stroke-width="2.5"/>
+      <circle cx="100" cy="100" r="76" fill="none" stroke="#28324f" stroke-width="1.2"/>
+      <circle cx="100" cy="100" r="60" fill="none" stroke="#28324f" stroke-width="1.2"/>
+      <circle cx="100" cy="100" r="42" fill="#26325a"/>
+      <circle cx="100" cy="100" r="40" fill="none" stroke="#3d4a75" stroke-width="1"/>
+      <path d="M 74 100 a 26 26 0 0 1 52 0" fill="none" stroke="#f0d080" stroke-width="3"/>
+      <path d="M 82 100 a 18 18 0 0 1 36 0" fill="none" stroke="#f0d080" stroke-width="2.4"/>
+      <circle cx="100" cy="100" r="5" fill="#0d1020"/>
+    </svg>
+  </div>
+  <div class="brand" id="brand"></div>
+  <div class="bars" id="bars"></div>
+  <div class="subs" id="subTxt"></div>
+  <div class="subs subghost" id="subGhost"></div>
+</div>
+<script>
+const SEGS = __SEGS__;
+const LEVELS = __LEVELS__;
+const BG = "__BG__";
+/* ⚠️ 这里**不带引号**：__BRAND__ 注入的是 JSON 字面量（stage.py 的 _j）。
+   署名是用户输入，塞进引号里时一个引号 / 换行 / 脚本结束标签就能把脚本块打断。
+   ⚠️⚠️ 所以那个「脚本结束标签」在这条注释里也**不能按字面写**：HTML 解析器在
+      <script> 块内遇到它就直接闭合脚本，不管它是不是写在 JS 注释里
+      （2026-10-13 实测踩中：night 整个页面脚本全废、画面只剩一张静态唱片）。 */
+const BRAND = __BRAND__;
+const TOTAL = __TOTAL__;
+const FPS = 30;
+
+/* ---------- 动效（2026-10-12）----------
+   ⚠️ 唯一时钟是 render(ms) 传进来的 ms —— 绝不用 performance.now() / Math.random()：
+      同一 ms 必须永远同一画面（成片走 CDP 实时抓帧、验收走 seek(ms) 截帧，共用这一条）。
+   ⚠️ MOTION=0（__MOTION__ 注入 0）时全部旁路：不写 inline 样式、新元素 display:none
+      → 页面与改造前逐像素一致（存量零回归判据 X1' 就靠这条）。 */
+/* ⚠️ 用 typeof 守卫而不是直接引用：有几个验收探针**手工拼 HTML**（不走 stage.py）
+   → 会漏注入 __MOTION__ → 直接引用会 ReferenceError 把整段脚本炸掉（__stage 全无、
+   页面空白，实测踩中过）。漏注入仍会被 relax_stage_gen 的「残留占位符」判据抓住。 */
+const MOTION = (typeof __MOTION__ === 'undefined') ? 1 : __MOTION__;
+const SUB_FADE = 260;         // 字幕交叉淡入时长（ms）
+const BRAND_MS = 900;         // 品牌字入场淡入时长（ms）
+const STAR_N = 30;            // 前景星点数量
+const clamp01 = (x) => (x < 0 ? 0 : (x > 1 ? 1 : x));
+/* 确定性伪随机（sin 哈希）：同一 i 永远同一值 —— 两次渲染必须同画面 */
+const hash01 = (i, a, b) => { const x = Math.sin(i * a + b) * 43758.5453; return x - Math.floor(x); };
+
+/* ---------- 字幕分条：长句拆成多条，每条 ≤ 2 行 ----------
+   ⚠️ 复用播客音轨时讲稿是「播客长句」（实测最长 176 字 = 6 行 · 250px），
+      字幕会一路向上盖住波形。这里只在**显示层**把长句按句读标点拆成多条，
+      时间按字符数比例分配 —— 不改讲稿、不改音轨、不改总时长、不改分镜。
+   ⚠️ CUE_MAX=64 是真机标定值：1920 宽 / 37px 字号下，64 字稳定 2 行（100px）。
+      改这个值必须重跑 _probe_radio_cue_calib_20261010.py 重新标定。
+   ⚠️ 纯函数（同一文本 → 同一结果），逐帧截图与 seekTo 验收仍然一致。 */
+const CUE_MAX = 64;
+const CUE_STOPS = "，。！？；：、,.;:!?";
+function packCues(text, maxChars) {
+  const atoms = []; let cur = "";
+  for (const ch of text) { cur += ch; if (CUE_STOPS.indexOf(ch) >= 0) { atoms.push(cur); cur = ""; } }
+  if (cur) atoms.push(cur);
+  const merged = []; let buf = "";
+  for (const a of atoms) {
+    if (!buf) { buf = a; continue; }
+    if ((buf + a).length <= maxChars) buf += a; else { merged.push(buf); buf = a; }
+  }
+  if (buf) merged.push(buf);
+  const fin = [];
+  for (const p of merged) {
+    if (p.length <= maxChars) { fin.push(p); continue; }
+    for (let i = 0; i < p.length; i += maxChars) fin.push(p.slice(i, i + maxChars));
+  }
+  return fin;
+}
+function buildCues(segs, maxChars) {
+  const out = [];
+  for (const s of segs) {
+    const t = String(s.t || "");
+    if (t.length <= maxChars) { out.push({ t: t, a: s.a, b: s.b }); continue; }
+    const parts = packCues(t, maxChars);
+    let total = 0;
+    for (const p of parts) total += p.length;
+    if (!total) total = 1;
+    const span = s.b - s.a;
+    let cur = s.a;
+    for (const p of parts) {
+      const dur = Math.round(span * p.length / total);
+      out.push({ t: p, a: cur, b: cur + dur });
+      cur += dur;
+    }
+    out[out.length - 1].b = s.b;
+  }
+  return out;
+}
+const CUES = buildCues(SEGS, CUE_MAX);
+
+const $ = (id) => document.getElementById(id);
+
+/* ---------- 署名排印自适应（2026-10-13） ----------
+   署名来自用户（brand_text 或作品标题，≤20 字），而 .brand 的 58px / 14px 字距是按
+   2-3 个字设计的：20 个字原样排出来是 1440px 宽的一整条，不像署名、像一行正文。
+   这里按字数**降档**（字号与字距一起收），让长署名仍保持「一行署名」的观感。
+   ⚠️ 纯函数（同一文本 → 同一档位）：逐帧抓帧与 seek(ms) 验收必须一致。
+   ⚠️ 档位表是实测标定的，不是拍的 —— 改一次就要重跑 `_probe_brand_fit_cmd_20261013.py`
+      （真模板 + Range 量文本渲染宽度）重新标定，并把结果同步回那张探针。
+   ⚠️ 前 5 字保持 58/14 原样：短署名（「且 听」这类 2-3 字）与改造前逐像素一致。 */
+const BRAND_TIERS = [[5, 58, 14], [9, 50, 10], [13, 42, 6], [17, 36, 4], [20, 32, 2]];
+function fitBrand(el, text) {
+  const n = String(text || '').length;
+  let fs = 32, ls = 2;
+  for (let i = 0; i < BRAND_TIERS.length; i++) {
+    if (n <= BRAND_TIERS[i][0]) { fs = BRAND_TIERS[i][1]; ls = BRAND_TIERS[i][2]; break; }
+  }
+  el.style.fontSize = fs + 'px';
+  el.style.letterSpacing = ls + 'px';
+}
+
+let bgReady = false;
+(function preloadBg() {
+  $('bg').style.backgroundImage = 'url("' + BG + '")';
+  $('brand').textContent = BRAND;
+  fitBrand($('brand'), BRAND);
+  const im = new Image();
+  im.onload = function () { bgReady = true; };
+  im.onerror = function () { bgReady = true; };
+  im.src = BG;
+})();
+
+const N_BARS = 26;
+const barHost = $('bars');
+const bars = [];
+for (let i = 0; i < N_BARS; i++) {
+  const b = document.createElement('i');
+  barHost.appendChild(b);
+  bars.push(b);
+}
+const discSvg = $('discSvg');
+const discglowEl = $('discglow');
+const starsHost = $('stars');
+const stars = [];
+if (MOTION) {
+  discglowEl.style.display = 'block';
+  starsHost.style.display = 'block';
+  for (let i = 0; i < STAR_N; i++) {
+    const f1 = hash01(i, 12.9898, 78.233);
+    const f2 = hash01(i, 39.3468, 11.135);
+    const f3 = hash01(i, 73.1560, 52.719);
+    const el = document.createElement('i');
+    const sz = 1.6 + f3 * 2.2;
+    el.style.left = (36 + f1 * 1848).toFixed(1) + 'px';
+    el.style.top = (26 + f2 * 742).toFixed(1) + 'px';
+    el.style.width = sz.toFixed(1) + 'px';
+    el.style.height = sz.toFixed(1) + 'px';
+    starsHost.appendChild(el);
+    stars.push({ el: el, ph: f3 * 6.2832, sp: 2600 + f2 * 3600, base: 0.22 + f1 * 0.34 });
+  }
+}
+
+function levelAt(ms) {
+  const k = Math.min(LEVELS.length - 1, Math.max(0, Math.floor(ms / 1000 * FPS)));
+  return LEVELS[k] || 0;
+}
+function idxAt(ms) {
+  let last = 0;
+  for (let i = 0; i < CUES.length; i++) { if (ms >= CUES[i].a) last = i; else break; }
+  return last;
+}
+
+const subGhostEl = $('subGhost');
+
+let curSub = -1;
+function render(ms) {
+  const lv = levelAt(ms);
+  for (let i = 0; i < N_BARS; i++) {
+    const ph = 0.5 + 0.5 * Math.sin(i * 0.63 + ms / 1100);
+    bars[i].style.height = (9 + lv * 86 * (0.35 + 0.65 * ph)) + 'px';
+  }
+  discSvg.style.transform = 'rotate(' + ((ms / 4200 * 360) % 360).toFixed(2) + 'deg)';
+  if (MOTION) {
+    /* 星点慢闪：各自相位 / 周期（确定性哈希给），亮不起眼、不抢字幕 */
+    for (let i = 0; i < stars.length; i++) {
+      const s = stars[i];
+      const tw = 0.5 + 0.5 * Math.sin(ms / s.sp * 6.2832 + s.ph);
+      s.el.style.opacity = (s.base * (0.25 + 0.75 * tw)).toFixed(3);
+    }
+    /* 唱片外扩散音晕：随响度脉动（音频响应） */
+    discglowEl.style.opacity = (0.10 + lv * 0.46).toFixed(3);
+    discglowEl.style.transform =
+      'translate(-50%, -50%) scale(' + (0.92 + lv * 0.14).toFixed(3) + ')';
+    /* 品牌字入场淡入 */
+    $('brand').style.opacity = clamp01(ms / BRAND_MS).toFixed(3);
+  }
+  const si = idxAt(ms);
+  if (si !== curSub) { $('subTxt').textContent = CUES[si] ? CUES[si].t : ''; curSub = si; }
+  if (MOTION) {
+    /* 字幕交叉淡入：新句淡入、上一句在影子层淡出（切句不再硬切） */
+    const cue = CUES[si];
+    const q = cue ? clamp01((ms - cue.a) / SUB_FADE) : 1;
+    $('subTxt').style.opacity = q.toFixed(3);
+    if (si > 0) {
+      subGhostEl.textContent = CUES[si - 1].t;
+      subGhostEl.style.opacity = (1 - q).toFixed(3);
+    } else {
+      subGhostEl.textContent = '';
+    }
+  }
+}
+function paint(ms) {
+  const p = Math.min(1, Math.max(0, ms / TOTAL));
+  $('progFill').style.width = (p * 100) + '%';
+}
+
+window.__stage = {
+  total: TOTAL, ms: 0, t0: 0, done: false, running: false,
+  data: { segs: SEGS, cues: CUES.length, levels: LEVELS.length },
+  ready: function () {
+    if (document.fonts && document.fonts.status !== 'loaded') return false;
+    return bgReady;
+  },
+  seek: function (ms) { render(ms); paint(ms); window.__stage.ms = ms; },
+  start: function () {
+    const self = window.__stage;
+    self.t0 = performance.now();
+    self.ms = 0; self.done = false; self.running = true;
+    function tick() {
+      if (!self.running) return;
+      const ms = Math.min(TOTAL, performance.now() - self.t0);
+      self.ms = ms;
+      render(ms); paint(ms);
+      if (ms >= TOTAL) { self.done = true; self.running = false; return; }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  },
+  stop: function () { window.__stage.running = false; },
+  state: function () {
+    const self = window.__stage;
+    return { ms: self.ms, t0: self.t0, done: self.done, running: self.running,
+             clock: performance.now() - self.t0 };
+  }
+};
+render(0); paint(0);
+window.__stage_ready = true;
+</script>
+</body>
+</html>

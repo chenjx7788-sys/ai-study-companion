@@ -200,6 +200,58 @@
       </div>
     </el-card>
 
+    <!-- 语音合成模型（本地 ZipVoice）：按需下载，不入安装包 -->
+    <el-card class="set-card" shadow="never">
+      <template #header>
+        <div class="card-head">
+          <span>语音合成模型（本地合成）</span>
+          <el-tag :type="zvInstalled ? 'success' : 'info'" size="small">
+            {{ zvInstalled ? '已就绪' : '未下载' }}
+          </el-tag>
+        </div>
+      </template>
+      <p class="asr-tip">
+        播客配音默认用在线语音（edge-tts，音色好但依赖网络，且上游接口无 SLA 保证）。
+        下载本地模型后，把下方 <b>合成引擎</b> 切到「本地」即可：纯本机运算、断网可用，更稳定。
+      </p>
+      <div class="asr-pref">
+        <span class="asr-pref-label">合成引擎</span>
+        <el-radio-group v-model="ttsProvider" size="small" @change="saveTtsProvider">
+          <el-radio-button value="edge">在线（edge-tts）</el-radio-button>
+          <el-radio-button value="zipvoice">本地（ZipVoice）</el-radio-button>
+        </el-radio-group>
+        <span class="field-hint" style="margin-left:0;">
+          在线音色更丰富、依赖网络；本地纯离线更稳定（切换后播客需重新合成才会换音色）
+        </span>
+      </div>
+      <div class="asr-list">
+        <div v-for="m in zvModels" :key="m.id" class="asr-item">
+          <div class="asr-info">
+            <div class="asr-name-row">
+              <span class="asr-name">{{ m.name }}</span>
+              <span class="asr-size">{{ m.size_mb }}MB · {{ m.quality }}质量</span>
+              <el-tag v-if="m.installed" size="small" type="success">已就绪</el-tag>
+            </div>
+            <div class="asr-desc"><span class="asr-ok">✓ {{ m.pros }}</span></div>
+            <div class="asr-desc"><span class="asr-warn">△ {{ m.cons }}</span></div>
+          </div>
+          <div class="asr-op">
+            <template v-if="zvDownloading">
+              <el-progress :percentage="zvProgress" :stroke-width="10" style="width: 120px" />
+              <span class="asr-size" style="margin-left:8px;">{{ zvDownloadedMb }} / {{ zvTotalMb }} MB</span>
+            </template>
+            <el-button v-else-if="!m.installed" size="small" type="primary"
+              :disabled="zvDownloading" @click="downloadZipvoice()">立即下载</el-button>
+            <span v-else class="asr-done">✓ 已安装</span>
+          </div>
+        </div>
+      </div>
+      <div v-if="zvError" class="asr-error">
+        <span class="asr-error-text">{{ zvError }}</span>
+        <el-button size="small" type="danger" plain @click="downloadZipvoice()">重试</el-button>
+      </div>
+    </el-card>
+
     <!-- 模型编辑弹窗 -->
     <el-dialog v-model="modelDialog.show" :title="modelDialog.id ? '编辑模型' : '添加模型'" width="550px" append-to-body>
       <!-- 快速选择厂商：一键填充 Base URL 与模型名，降低填写门槛 -->
@@ -432,6 +484,42 @@
       <p class="ext-note">主应用需保持运行；扩展不联网，只和本机主应用通信。</p>
     </el-card>
       </el-tab-pane>
+
+      <el-tab-pane label="陪练" name="drill">
+      <el-card class="set-card" shadow="never">
+      <template #header><span>AI 陪练 · 难度自适应</span></template>
+      <p class="storage-tip">陪练出题时按**前序得分**自动升降难度。下列四项决定升降规则，保存后**下一次出题即生效**（已完成的场次不受影响）。</p>
+      <el-form label-width="132px" class="drill-form">
+        <el-form-item label="答得好判定线">
+          <div class="drill-row">
+            <el-input-number v-model="adaptUpScore" :min="50" :max="100" :step="5" size="small" />
+            <span class="drill-hint">单题得分 ≥ 该分数记为「答得好」（默认 80）</span>
+          </div>
+        </el-form-item>
+        <el-form-item label="答得差判定线">
+          <div class="drill-row">
+            <el-input-number v-model="adaptDownScore" :min="0" :max="79" :step="5" size="small" />
+            <span class="drill-hint">单题得分 ≤ 该分数记为「答得差」（默认 50）</span>
+          </div>
+        </el-form-item>
+        <el-form-item label="连续题数">
+          <div class="drill-row">
+            <el-input-number v-model="adaptStreak" :min="1" :max="10" :step="1" size="small" />
+            <span class="drill-hint">连续 N 题同向即调一档；连续 2N 题调两档（默认 2）</span>
+          </div>
+        </el-form-item>
+        <el-form-item label="最大档差">
+          <div class="drill-row">
+            <el-input-number v-model="adaptMaxShift" :min="0" :max="2" :step="1" size="small" />
+            <span class="drill-hint">相对题纲难度最多升降几档，0 = 关闭自适应（默认 2）</span>
+          </div>
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" :loading="saving" @click="save()">保存</el-button>
+        </el-form-item>
+      </el-form>
+    </el-card>
+      </el-tab-pane>
     </el-tabs>
   </div>
 </template>
@@ -443,7 +531,9 @@ import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { useRouter, useRoute } from 'vue-router'
 import { settingsApi } from '../api'
 import http from '../api/http'
+import { errMsg } from '../api/http'
 import { useAsr } from '../composables/useAsr'
+import { useZipvoice } from '../composables/useZipvoice'
 import PageHead from '../components/PageHead.vue'
 
 const embedOptions = [
@@ -461,6 +551,13 @@ const {
   downloading: asrDownloading, dlSize: asrDlSize, progress: asrProgress,
   error: asrError, load: loadAsr, download: downloadAsr,
 } = useAsr()
+
+// 语音合成模型（ZipVoice，本地离线）状态与下载：与 ASR 同构
+const {
+  models: zvModels, installed: zvInstalled, downloading: zvDownloading,
+  progress: zvProgress, downloadedMb: zvDownloadedMb, totalMb: zvTotalMb,
+  error: zvError, load: loadZipvoice, download: downloadZipvoice,
+} = useZipvoice()
 
 const router = useRouter()
 const route = useRoute()
@@ -645,6 +742,23 @@ const cleanSwitches = reactive({ header_footer: true, watermark: true, garbled: 
 // 关闭时仍可在知识库页对单份材料手动点「生成图谱」）
 const autoExtractEntities = ref(false)
 const asrModelSize = ref('')   // 语音模型默认转写版本：''=自动，'small'/'base'=强制
+// 语音合成引擎：'edge'=在线 / 'zipvoice'=本地（改动即时保存，播客页下次合成生效）
+const ttsProvider = ref('edge')
+
+async function saveTtsProvider() {
+  try {
+    await settingsApi.update({ tts_provider: ttsProvider.value })
+    ElMessage.success(ttsProvider.value === 'zipvoice'
+      ? '已切到本地合成（ZipVoice）' : '已切到在线合成（edge-tts）')
+  } catch (e) {
+    ElMessage.error(errMsg(e, '保存失败'))
+  }
+}
+// 陪练 · 难度自适应参数（管理中心可调；出题时读取，改动即时生效）
+const adaptUpScore = ref(80)
+const adaptDownScore = ref(50)
+const adaptStreak = ref(2)
+const adaptMaxShift = ref(2)
 const calibrating = ref(false)
 const calibResult = ref('')
 
@@ -674,7 +788,12 @@ const promptFields = [
   { key: 'prompt_review', label: '复习出题', desc: '从笔记生成自测卡片（保留 JSON 输出格式说明）', category: 'study' },
   { key: 'prompt_suggest', label: '相关问题推荐', desc: '问答回答后生成 3 个追问建议（保留 JSON 数组格式）', category: 'study' },
   { key: 'prompt_quiz', label: '测一测出题', desc: '基于资料核心内容生成测试题（保留 JSON 数组格式）', category: 'study' },
-  { key: 'prompt_learn_note', label: '简单学 · 学习讲义', desc: '把材料转译成结构化学习笔记（必记要点 / 逐章转译 / 三点小结 / 重点加权）。出题复用「测一测出题」模板', category: 'study' },
+  { key: 'prompt_learn_note', label: '简单学 · 讲义（叙事类）', desc: '叙事类材料（电子书 / 传记 / 小说）的讲义工艺：必记要点 / 探索历程 / 逐章转译 / ◆三点小结。⚠️ 未判定内容性质的老材料也走这套（默认工艺）', category: 'study' },
+  { key: 'prompt_learn_note_conceptual', label: '简单学 · 讲义（认知思维类）', desc: '认知类材料（心理 / 商业 / 理论）的讲义工艺：核心问题 / 底层假设 / 思维框架 / 适用边界；有清晰章节时沿用章回体', category: 'study' },
+  { key: 'prompt_learn_note_practical', label: '简单学 · 讲义（工具实用类）', desc: '工具类材料（技术手册 / 操作指南 / 规范）的讲义工艺：操作流程 S{n} / 判断标准 / 禁忌坑点 / 适用边界；不套场景比喻', category: 'study' },
+  { key: 'prompt_learn_note_fragment', label: '简单学 · 讲义（碎片内容）', desc: '图片 OCR / 音视频转写的要点清单工艺：逐条信息点 + 标注出处；禁止编造章节与隐喻、禁止补全与拔高', category: 'study' },
+  { key: 'prompt_drill_examiner', label: 'AI 陪练 · 出题', desc: '按考点出题 / 追问（出题纲·出题·追问三模式共用，注意保留 JSON 输出格式说明）', category: 'study' },
+  { key: 'prompt_drill_judge', label: 'AI 陪练 · 评分', desc: '对作答打分并给出维度评价 / 遗漏点 / 追问建议（注意保留 JSON 输出格式说明）', category: 'study' },
   { key: 'prompt_note_rewrite', label: '文本改写', desc: '改写选中文字或整条内容（笔记 / 材料文本共用，更通顺/专业/简洁）', category: 'note' },
   { key: 'prompt_note_expand', label: '文本扩写', desc: '补充背景/例子/细节，展开要点（笔记 / 材料文本共用）', category: 'note' },
   { key: 'prompt_note_summarize', label: '文本总结', desc: '提炼压缩为精炼要点（笔记 / 材料文本共用）', category: 'note' },
@@ -683,12 +802,17 @@ const promptFields = [
   { key: 'prompt_podcast_brief', label: 'AI 播客 · 知识简报', desc: '素材提炼成结构化简报（提炼层，可单独转笔记）。注意保留 {brief_chars} 字数占位符', category: 'podcast' },
   { key: 'prompt_podcast_script', label: 'AI 播客 · 对话脚本', desc: '知识简报改写成双人对话（两步式）。保留 JSON 数组输出说明与 {script_chars} / {max_chars} / {seg_count} / {avg_chars} 占位符', category: 'podcast' },
   { key: 'prompt_podcast_script_solo', label: 'AI 播客 · 单人精讲脚本', desc: '知识简报改写成单人精讲口播（两步式）。保留 JSON 数组输出说明与 {script_chars} / {max_chars} / {seg_count} / {avg_chars} 占位符', category: 'podcast' },
+  // ---- AI 视频（模块 K）：三条提示词构成一条链路 —— 讲稿 → 结构图元素 → 定位锚点 ----
+  { key: 'prompt_video_script', label: 'AI 视频 · 讲稿', desc: '素材改写成单人讲解口播。保留 JSON 数组输出说明与 {script_chars} / {seg_count} / {max_chars} / {avg_chars} 占位符；每句里要有原文原样存在的多字短语（4-12 字），否则画面定位不到', category: 'video' },
+  { key: 'prompt_video_points', label: 'AI 视频 · 结构图', desc: '讲稿拆成结构图元素（三类：概念 / 好处 / 代价）。保留 JSON 输出格式说明与 {point_count} / {per_seg} / {seg_count} / {max_group} 占位符。⚠️ {point_count} 是**密度下限**不是参考值：少给会让画面长时间静止、过不了质量自检', category: 'video' },
+  { key: 'prompt_video_anchor', label: 'AI 视频 · 定位锚点', desc: '为每句挑 1-4 个用于在材料原件里定位的锚点短语。系统会把材料的原文片段一并交给模型，锚点必须从那一段里原样摘取（不给原文时模型只能猜，定位命中率上不去）', category: 'video' },
   { key: 'prompt_stats_report', label: '学习周报', desc: '统计页周报：按数据摘要 / 问题诊断 / 行动建议 / 进阶方法四段输出', category: 'other' },
   { key: 'prompt_recall', label: '复述卡', desc: '从笔记生成自我复述提示（保留 JSON 输出格式说明）', category: 'other' },
 ]
 const prompts = reactive({
   prompt_summary: '', prompt_keywords: '', prompt_explain: '',
   prompt_kb_qa: '', prompt_general: '', prompt_review: '', prompt_suggest: '', prompt_quiz: '', prompt_learn_note: '',
+  prompt_learn_note_conceptual: '', prompt_learn_note_practical: '', prompt_learn_note_fragment: '',
   prompt_note_rewrite: '', prompt_note_expand: '', prompt_note_summarize: '', prompt_note_continue: '',
 })
 const promptDefaults = reactive({})
@@ -698,10 +822,14 @@ const saving = ref(false)
 const promptSearch = ref('')
 const activePromptCategory = ref('all')
 
+// ⚠️ 新增一个提示词分类要**同时**改这里和下面的 promptCategories()：
+//    分组标题取自本表（漏了 → 标题渲染成 undefined），而左侧分类导航是显式枚举的
+//    （漏了 → 新分类的 chips 压根不存在，用户只能靠搜索框找到那些提示词）。
 const CATEGORY_LABELS = {
   study: '学习理解',
   note: '笔记加工',
   podcast: 'AI 播客',
+  video: 'AI 视频',
   other: '其他工具',
 }
 
@@ -715,6 +843,7 @@ const promptCategories = computed(() => {
     { key: 'study', label: CATEGORY_LABELS.study, count: counts.study },
     { key: 'note', label: CATEGORY_LABELS.note, count: counts.note },
     { key: 'podcast', label: CATEGORY_LABELS.podcast, count: counts.podcast },
+    { key: 'video', label: CATEGORY_LABELS.video, count: counts.video },
     { key: 'other', label: CATEGORY_LABELS.other, count: counts.other },
   ]
 })
@@ -774,8 +903,9 @@ const usage = reactive({ today: { _total: { calls: 0, tokens: 0 } }, all: { _tot
 
 // Token 统计业务展示顺序（按业务流），未收录的新 kind 自动排在最后
 const KIND_ORDER = ['summary', 'section_summary', 'keywords', 'explain', 'ask', 'transform',
-                    'chat', 'suggest', 'review', 'quiz', 'learn_note', 'stats_report',
-                    'podcast_brief', 'podcast_script', 'knowledge_graph']
+                    'chat', 'suggest', 'review', 'quiz', 'learn_note', 'drill', 'drill_judge', 'stats_report',
+                    'podcast_brief', 'podcast_script', 'video_script', 'video_points',
+                    'knowledge_graph']
 const usageKinds = computed(() => {
   const { _total, ...rest } = usage.all
   const ordered = {}
@@ -792,7 +922,9 @@ const kindLabel = (k) => ({
   explain: '解读/追问', ask: '材料提问', transform: '文本加工',
   chat: '问答', suggest: '追问建议', review: '复习出题', quiz: '测一测',
   learn_note: '简单学',
+  drill: 'AI 陪练', drill_judge: '陪练评分',
   stats_report: '学习报告', podcast_brief: '播客简报', podcast_script: '播客脚本',
+  video_script: '视频讲稿', video_points: '视频结构图',
   knowledge_graph: '知识图谱',
 }[k] || k)
 const fmtTokens = (n) => n >= 10000 ? (n / 10000).toFixed(1) + 'w' : (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n))
@@ -899,11 +1031,17 @@ onMounted(async () => {
   cleanSwitches.dedup = data.clean_dedup ?? true
   autoExtractEntities.value = data.auto_extract_entities ?? false
   asrModelSize.value = data.asr_model_size || ''
+  ttsProvider.value = data.tts_provider || 'edge'
+  adaptUpScore.value = data.drill_adapt_up_score ?? 80
+  adaptDownScore.value = data.drill_adapt_down_score ?? 50
+  adaptStreak.value = data.drill_adapt_streak ?? 2
+  adaptMaxShift.value = data.drill_adapt_max_shift ?? 2
   for (const p of promptFields) prompts[p.key] = data[p.key] || ''
   Object.assign(promptDefaults, data.prompt_defaults || {})
   loadStorage()
   loadUsage()
   loadAsr()
+  loadZipvoice()
   loadExtToken()
   // 从问答页「前往配置模型」跳入（/settings?add=1）：直接打开添加模型弹窗
   if (route.query.add) openModelEditor(null)
@@ -931,6 +1069,11 @@ async function save(successMsg = '保存成功', skipGuide = false) {
       clean_garbled: cleanSwitches.garbled,
       clean_dedup: cleanSwitches.dedup,
       auto_extract_entities: autoExtractEntities.value,
+      // 陪练 · 难度自适应（后端 adapt_params() 会兜底 + 钳制，这里原样提交）
+      drill_adapt_up_score: adaptUpScore.value,
+      drill_adapt_down_score: adaptDownScore.value,
+      drill_adapt_streak: adaptStreak.value,
+      drill_adapt_max_shift: adaptMaxShift.value,
     })
     Object.assign(form, data)
     models.value = data.llm_models || []
@@ -1185,4 +1328,8 @@ async function rebuildAll() {
   margin: 4px 0 0; padding-top: 12px; border-top: 1px solid var(--asc-border);
   font-size: 12px; color: var(--asc-text-3);
 }
+/* ===== 陪练 · 难度自适应（优化 7） ===== */
+.drill-form { margin-top: 14px; }
+.drill-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.drill-hint { font-size: 12.5px; color: var(--asc-text-2); }
 </style>

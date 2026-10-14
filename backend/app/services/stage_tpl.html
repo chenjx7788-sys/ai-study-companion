@@ -1,0 +1,1113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<style>
+/* =========================================================================
+   舞台页模板（阶段 2）—— 由 services/stage.py 注入数据后交给渲染器抓帧。
+   ⚠️ 换行保持 LF；CSS / 渲染逻辑与原型 `_video_proto_v6_20261004/index.html` 同源，
+      改了原型要同步这里（原型本身零改动，它是交互演示页，这里是成片舞台）。
+   ⚠️ 取景严格 1920×1080：`.screen` 写死像素（不用 width:100%），
+      配合无头浏览器 --force-device-scale-factor=1，才能与输出分辨率一一对应。
+   ========================================================================= */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: #0e0f14; overflow: hidden; }
+.screen {
+  position: relative; width: 1920px; height: 1080px;
+  background: #0e0f14; overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+/* ---------- SVG 场景（结构图皮肤） ---------- */
+.scene { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; transition: opacity .5s ease; }
+.scene.on { opacity: 1; }
+.el { opacity: 0; transform: translateY(9px); transition: opacity .5s ease, transform .5s ease; }
+.el.on { opacity: 1; transform: translateY(0); }
+/* 镜内分屏：一屏一个版式，按毫秒**整屏**切换（换屏 = 幻灯片翻页）。
+   ⚠️ 只切一层 opacity、不做位移：位移会让同屏卡片看起来「又长了一次」，
+      而这一层的语义是「换了一页」，不是「新增了一个元素」。 */
+.sub { opacity: 0; transition: opacity .42s ease; }
+.sub.on { opacity: 1; }
+
+text { font-family: inherit; }
+.ttl { font-size: 34px; fill: #f2f2f6; font-weight: 500; }
+.stl { font-size: 18px; fill: #9c9cab; }
+.nd  { font-size: 20px; fill: #eaeaef; font-weight: 500; }
+.ns  { font-size: 16px; fill: #cfcfda; }
+.sm  { font-size: 16px; fill: #9c9cab; }
+.dim { font-size: 15px; fill: #9c9cab; }
+.code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 14px; fill: #8fd4a8; }
+.num { font-size: 22px; fill: #6f7285; font-weight: 500; }
+.warn { fill: #fb923c; }
+.ok   { fill: #6ee7a8; }
+.acc  { fill: #a78bfa; }
+.bignum { font-size: 15px; fill: #8f93a8; }
+.ndbox { fill: #171923; stroke: #2c3040; stroke-width: 1; }
+.ndbox.hi { stroke: #a78bfa; stroke-width: 1.6; }
+.ndbox.wa { stroke: #fb923c; stroke-width: 1.3; }
+.chip { fill: #1b1e29; stroke: #2c3040; stroke-width: 1; }
+.chip.hi { stroke: #7c5cfc; stroke-width: 1.4; }
+.chip.on2 { fill: #2a2233; stroke: #a78bfa; stroke-width: 1.4; }
+.chip.wa { stroke: #fb923c; stroke-width: 1.4; }
+.sandbox { fill: none; stroke: #fb923c; stroke-width: 1.5; stroke-dasharray: 7 6; }
+.flow { stroke: #575b6e; stroke-width: 1.6; fill: none; }
+.flow.a { stroke: #a78bfa; }
+.arw { fill: #575b6e; }
+.arw.a { fill: #a78bfa; }
+/* 程序化结构图卡片（原型是手绘 SVG，这里由 stage.py 按 points 与版式布局） */
+.gcard { fill: #171923; stroke: #2c3040; stroke-width: 1.2; }
+.gcard.k-good { stroke: #34d399; }
+.gcard.k-cost { stroke: #fb923c; }
+.gcard.k-concept { stroke: #a78bfa; }
+.gmark { fill: #4a4d5e; }
+.gmark.k-good { fill: #34d399; }
+.gmark.k-cost { fill: #fb923c; }
+.gmark.k-concept { fill: #a78bfa; }
+.gtx { fill: #dfe0ea; }
+.gtx.k-good { fill: #e6fff4; }
+.gtx.k-cost { fill: #ffeedd; }
+.gtx.k-concept { fill: #efe8ff; }
+/* 序号徽标 */
+.gnum-bg { fill: #232739; }
+.gnum { font-size: 13px; fill: #b9bccb; font-weight: 500; }
+/* 版式连接件（flow 箭头 / hub 曲线 / compare 中缝） */
+.gflow { fill: none; stroke: #575b6e; stroke-width: 1.6; }
+.gdiv { stroke: #2c3040; stroke-width: 1.4; stroke-dasharray: 6 6; }
+.gvs { fill: #1b1e29; stroke: #a78bfa; stroke-width: 1.4; }
+.gvstx { font-size: 14px; fill: #a78bfa; font-weight: 500; }
+/* 当前点亮的那张卡：加亮描边，让「画面正在讲哪里」一眼可辨 */
+.el.on .gcard { stroke-width: 2; }
+.el.on .gcard.k-concept { stroke: #b9a5ff; }
+.el.on .gcard.k-good { stroke: #4ee0ab; }
+.el.on .gcard.k-cost { stroke: #ffa963; }
+
+/* ---------- 右侧知识点栏 ---------- */
+.kpanel {
+  position: absolute; left: 70.4%; top: 5.6%; width: 27.6%;
+  background: rgba(255,255,255,.055); border: .5px solid rgba(255,255,255,.10);
+  border-radius: 12px; padding: 13px 14px 14px;
+}
+.kpanel .kh {
+  font-size: 12.5px; color: #a78bfa; letter-spacing: .5px;
+  padding-bottom: 9px; margin-bottom: 9px; border-bottom: .5px solid rgba(255,255,255,.09);
+}
+/* 未讲到的条目不要用 opacity 压暗 —— 透明会把对比度一起压下去。
+   改用字色分级：未点亮 6.2:1 · 已点亮 15.1:1 · 警示未点亮 5.5:1。 */
+.pt { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 9px; }
+.pt .dt { flex: none; width: 6px; height: 6px; border-radius: 50%; background: #4a4d5e; margin-top: 6px; transition: background .45s ease; }
+.pt.on .dt { background: #a78bfa; }
+.pt .tx { font-size: 15px; line-height: 1.5; color: #9a9aa8; transition: color .45s ease; }
+.pt.on .tx { color: #f0f0f5; }
+.pt.wa .dt { background: #6b4522; }
+.pt.wa .tx { color: #b08a6a; }
+.pt.wa.on .dt { background: #fb923c; }
+.pt.wa.on .tx { color: #ffd2ab; }
+.pt.k-good .dt { background: #1f5c45; }
+.pt.k-good.on .dt { background: #34d399; }
+.pt.k-cost .dt { background: #6b4522; }
+.pt.k-cost.on .dt { background: #fb923c; }
+/* 结构图皮肤的右栏 = 章节进度（不重复大卡片上的文字，只指示「讲到哪一段」） */
+.kch { display: flex; gap: 9px; align-items: flex-start; margin-bottom: 10px; }
+.kch .no { flex: none; width: 20px; height: 20px; border-radius: 6px; background: #232739;
+           color: #9a9aa8; font-size: 12px; display: flex; align-items: center;
+           justify-content: center; transition: background .45s ease, color .45s ease; }
+.kch.on .no { background: #6b4fd8; color: #fff; }
+.kch .tx { font-size: 14px; line-height: 1.5; color: #9a9aa8; transition: color .45s ease; }
+.kch.on .tx { color: #f0f0f5; }
+
+/* ---------- 画面内标签 ---------- */
+.scenetag { position: absolute; left: 16px; top: 14px; font-size: 12px; color: #a78bfa; letter-spacing: .3px; }
+.badge {
+  position: absolute; right: 31.6%; top: 14px; font-size: 12px; color: #9c9cab;
+  background: rgba(255,255,255,.06); padding: 4px 10px; border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+}
+.progress { position: absolute; left: 16px; right: 16px; top: 0; height: 2px; background: rgba(255,255,255,.07); }
+.progress i { display: block; height: 100%; width: 0; background: #7c5cfc; }
+.dots { position: absolute; left: 50%; top: 16px; transform: translateX(-50%); display: flex; gap: 6px; }
+.dots span { width: 7px; height: 7px; border-radius: 50%; background: rgba(255,255,255,.16); transition: .3s; }
+.dots span.on { background: #a78bfa; }
+/* ⚠️ 字号 19 → 26px（2026-10-14 产品反馈「字幕偏小」）。取 26 的依据是**实测**：
+   ① 真实库 8 份作品里，主模板（结构图系/原件/口播）最长句 **79 字**；26px 下 1920 宽
+      每行约 71 字 → 最坏 2 行，与 19px 时的 1～2 行同量级；
+   ② 底部渐变的**视觉实底**在 34% 处 —— 26px 两行时实底顶边 ≈1035px，而结构图内容
+      最高只到 954px → **不遮挡内容**（subbar 几何顶边的透明 padding 会压到 954，
+      但那一段是 `rgba(...,0)` 全透明，无视觉影响）；
+   ③ 三档音频皮肤（radio/night/ambient）本来就是 37/38px，本档此前 19px 属**全应用
+      不一致**，26px 是向既有尺度的靠拢（那三档是纯文字场景，仍比本档大）。
+   ⚠️ 不要再往下调回 19：这是 1920 基准下约屏宽 1% 的「小字」，用户已明确反馈过。 */
+.subbar {
+  position: absolute; left: 0; right: 0; bottom: 0; padding: 34px 30px 16px;
+  background: linear-gradient(to top, rgba(5,6,10,.94) 34%, rgba(5,6,10,0));
+  color: #fff; font-size: 26px; line-height: 1.55; text-align: center;
+}
+/* 口播皮肤：字幕 karaoke 高亮（已说 / 未说）。
+   ⚠️ 未说色 rgba(255,255,255,.55) 叠在 #05060a 底上 ≈ #8e8e8e，对比度约 6.4:1。
+   ⚠️ 只在 talking_head 生效 —— 其它皮肤仍走 textContent，保证零回归。 */
+.screen[data-skin="talking_head"] .subbar .said { color: #fff; }
+.screen[data-skin="talking_head"] .subbar .todo { color: rgba(255,255,255,.55); }
+
+/* ---------- 皮肤切换 ---------- */
+.skin { position: absolute; inset: 0; }
+#skinSource { display: none; }
+#skinGraph { display: block; }
+.screen[data-skin="source"] #skinGraph { display: none; }
+.screen[data-skin="source"] #skinSource { display: block; }
+/* 口播（talking_head）：内层由 data-inner 决定，形象占一侧 */
+.screen[data-skin="talking_head"] #skinSource,
+.screen[data-skin="talking_head"] #skinGraph { display: none; }
+.screen[data-skin="talking_head"][data-inner="source"] #skinSource { display: block; }
+.screen[data-skin="talking_head"][data-inner="graph"] #skinGraph { display: block; }
+
+/* ---------- 原件皮肤：真实材料页 ---------- */
+/* ⚠️ 右侧【知识点菜单】已按产品要求整体移除（2026-10-12）：source 系组合不再渲染
+   右栏，srcarea 占满全宽，把空间还给原件画面。结构图皮肤的「章节进度」右栏
+   亦已于 2026-10-14 一并移除（四方案统一，见下方「结构图系四方案」段）。 */
+.srcarea {
+  position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+  display: flex; align-items: center; justify-content: center;
+}
+/* ⚠️ aspect-ratio 由 JS 按真实图宽高比设（stage.py 注入 SRC.aspect）。
+   不能靠 img 固有尺寸推 —— 那样 pagewrap 的显示矩形与图片显示区会不等，
+   聚光灯的百分比坐标（以 pagewrap 为基准）就再也对不上了。 */
+.pagewrap { position: relative; height: 100%; overflow: hidden; background: #fff; box-shadow: 0 0 0 1px rgba(255,255,255,.10); }
+.pagewrap img { width: 100%; height: 100%; display: block; }
+.pagewrap img.swap { animation: fadein .3s ease; }
+@keyframes fadein { from { opacity: .35 } to { opacity: 1 } }
+/* 聚光灯：聚焦只靠橙色描边框 + 呼吸环。
+   ⚠️ 框外压暗蒙版（box-shadow 0 0 0 9999px rgba(9,11,18,.62)）已按产品要求移除
+   （2026-10-12）：讲解时整页被盖一层暗纱、看不到上下文，体验差。自此与原型
+   `_video_proto_v6_20261004/index.html` 在 source 皮肤上**有意分叉**，勿同步回去。 */
+.spot { position: absolute; border: 3px solid #ff9f43; border-radius: 5px;
+        pointer-events: none; }
+.spot::after { content: ''; position: absolute; inset: -6px; border-radius: 9px;
+               border: 2px solid rgba(255,159,67,.45); animation: bre 1.9s ease-in-out infinite; }
+@keyframes bre { 0%,100% { opacity: .18 } 50% { opacity: .8 } }
+/* 注：右侧「放大镜」浮层已按产品要求整体移除（2026-10-10）；素材层与聚光灯保留。
+   注：右侧「知识点菜单」与聚光灯的框外压暗蒙版亦已按产品要求移除（2026-10-12）。 */
+.hittag { position: absolute; left: 16px; bottom: 12px; right: 31.6%;
+          font-size: 12px; color: #ffd9b8; background: rgba(90,42,6,.86);
+          padding: 5px 11px; border-radius: 7px;
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: none; }
+.screen[data-skin="source"] .hittag,
+.screen[data-skin="talking_head"][data-inner="source"] .hittag { display: block; }
+
+/* ---------- 口播皮肤（talking_head · C1 轻量） ---------- */
+.th { display: none; position: absolute; inset: 0; }
+.screen[data-skin="talking_head"] .th { display: block; }
+.th-fig { position: absolute; top: 0; height: 100%; width: 33.6%;
+          display: flex; align-items: center; justify-content: center; }
+.th-pos-right .th-fig { right: 0; }
+.th-pos-left  .th-fig { left: 0; }
+.th-pos-pip   .th-fig { right: 32px; top: 132px; height: auto; }
+/* ⚠️ 选择器必须同时覆盖 `video`：动作视频与静态照片占的是**同一个版面槽位**，
+   漏掉 video 的话它会按固有尺寸铺满、把整块版面撑歪。 */
+.th-fig img, .th-fig video { max-width: 100%; max-height: 92%; object-fit: contain;
+              filter: drop-shadow(0 10px 34px rgba(0,0,0,.55)); }
+/* 形象照片（矩形原图，背景抠不掉）：四周羽化融进舞台 —— 否则浅色的照片底会与深色
+   舞台形成一条硬边矩形（2026-10-11 四方案实测的结论）。
+   **预置真人照与用户上传走的是同一套**（2026-10-12 起预置也是图片）。
+   ⚠️ 用 mask 而不是 blur：mask 不额外吃性能，也不会把 drop-shadow 轮廓糊掉。 */
+.th-photo {
+  -webkit-mask-image: radial-gradient(ellipse 86% 80% at 50% 38%,
+      #000 56%, rgba(0,0,0,.45) 78%, transparent 100%);
+          mask-image: radial-gradient(ellipse 86% 80% at 50% 38%,
+      #000 56%, rgba(0,0,0,.45) 78%, transparent 100%);
+}
+/* 动作视频形象（2026-10-13 起 preset_01.webm 为离线 MODNet 抠像版，自带 VP9 alpha）：
+   人物已从原背景里分离，**再叠 radial-gradient mask 会把发丝细节又削掉一层** →
+   视频免 mask、照片保留。`<video>` 与 `<img>` 的分野由 stage.py::_th_dom 天然保证。 */
+video.th-photo {
+  -webkit-mask-image: none;
+          mask-image: none;
+}
+/* 透明 PNG 形象（2026-10-13 起预置形象走 `{aid}_alpha.png`，自带 alpha 通道）：
+   与视频同理 —— 人物已从原背景分离，再叠 radial-gradient mask 会把发丝又削掉一层。
+   ⚠️ 只对带 th-alpha 的 <img> 生效：上传形象（.img 原始字节，带背景）仍保留 mask。 */
+img.th-photo.th-alpha {
+  -webkit-mask-image: none;
+          mask-image: none;
+}
+/* 口腔浮现层（双层嘴部 v2，2026-10-13）：.th-fig 直接子元素，left/top/width 由
+   thLayoutInner() 按主图 getBoundingClientRect 换算 px（object-fit:contain 的真实
+   显示矩形只有 JS 拿得到）；thPaint 按 thJawOpen 驱动 scaleY（origin 顶边=唇缝）
+   + opacity 从唇缝向下展开浮现。主图完全不动 → 从机制上杜绝 v1 jaw 平移的错位缝。
+   ⚠️ 必须覆盖 .th-fig img 的 max-width/max-height/object-fit；inner 自带 alpha 免 mask。 */
+.th-inner { position: absolute; pointer-events: none; z-index: 2; display: block;
+            max-width: none; max-height: none; object-fit: fill; opacity: 0;
+            transform-origin: top center;
+            -webkit-mask-image: none; mask-image: none; }
+/* 兜底占位：只有「预置图也拿不到」时才会出现（正常路径见 stage.py::_th_dom）。
+   注意它**没有** .th-photo → 不创建说话光环、不点头不微摆（见 initThLayer）。 */
+.th-avatar-ph {
+  width: 300px; height: 400px; border-radius: 18px; border: 1.5px dashed rgba(255,255,255,.24);
+  background: linear-gradient(160deg, #1b1e29, #242838);
+  display: flex; align-items: center; justify-content: center;
+  color: #9c9cab; font-size: 14px; text-align: center; line-height: 1.6; padding: 18px;
+}
+/* 说话状态指示（示意性呼吸，不是唇形同步）
+   ⚠️ 高度**不再用 @keyframes 驱动**：改由 render(ms)→thPaint() 写 transform: scaleY()。
+      理由：本项目契约要求动效可 seek 复现（同 stage_tpl_radio.html 的纪律），
+      @keyframes 在 seek(ms) 下取不到确定画面（技术债，2026-10-10 修）。
+   ⚠️ 用 scaleY 而非 height：前者是合成器属性，不触发 layout；渲染走 CDP screencast
+      逐帧抓取，每帧触发布局会拖慢整条出片链路。 */
+.th-pulse { position: absolute; left: 50%; bottom: 92px; transform: translateX(-50%);
+            display: flex; align-items: flex-end; gap: 4px; height: 26px; }
+.th-pulse i { width: 5px; height: 26px; border-radius: 3px; background: #a78bfa;
+              transform-origin: 50% 100%; transform: scaleY(.3); }
+.th-pulse i:nth-child(2) { background: #8b7cf6; }
+.th-pulse i:nth-child(4) { background: #8b7cf6; }
+/* 形象背景柔光斑：radial-gradient 直接画，**不用 filter: blur**
+   （大范围 blur 在 Chromium 抓帧下逐帧重算，显著拖慢渲染）。颜色由 stage.py 内联注入。 */
+.th-glow { position: absolute; top: 0; height: 100%; width: 33.6%; pointer-events: none; }
+.th-pos-right .th-glow { right: 0; }
+.th-pos-left  .th-glow { left: 0; }
+.th-pos-pip   .th-glow { right: 32px; top: 132px; height: 62%; }
+/* 形象的「说话光环」：照片**不做面部变形**（违和 + 逼近「暗示唇形同步」的合规风险），
+   改用形象外圈光环表达「正在说话」。由 thPaint() 驱动 scale / opacity。 */
+.th-aura { position: absolute; left: 50%; margin-left: -23%; bottom: 4%;
+           width: 46%; aspect-ratio: 1; border-radius: 50%;
+           border: 2px solid rgba(167,139,250,.65); pointer-events: none; opacity: .1;
+           /* ⚠️ 必须显式抬层：<img class="th-photo"> 虽非定位元素，却因 filter 创建了
+              层叠上下文，按 DOM 顺序画在 z-index:auto 的绝对定位元素之上 ——
+              实测 elementFromPoint(光环中心) 命中的是 IMG.th-photo，光环等于白做。 */
+           z-index: 3; }
+/* 第二层「声波扩散」虚线环：比主环更大更淡、节奏错开 —— 让「正在说话」有层次。
+   ⚠️ 作为 .th-aura 的**子元素**创建：探针 B6 的判据是「移除 .th-aura 前后像素必须变」，
+      若并列创建，移除主环后它会残留、干扰那条判据的分辨力。子元素随主环一起被移除。 */
+.th-aura2 { position: absolute; left: -13%; top: -13%; width: 126%; height: 126%;
+           border-radius: 50%; border: 1.5px dashed rgba(167,139,250,.42);
+           pointer-events: none; opacity: .3; }
+/* 合规标识：深度合成显著标识，成片必须烧录，位置固定右上、不遮字幕 */
+.th-mark { position: absolute; left: 14px; top: 46px; z-index: 30;
+           font-size: 12.5px; letter-spacing: .6px; color: #ffd7a8;
+           background: rgba(90,42,6,.86); border: .5px solid rgba(255,159,67,.5);
+           padding: 4px 11px; border-radius: 7px; }
+.th-tip { position: absolute; left: 50%; bottom: 42px; transform: translateX(-50%); z-index: 30;
+          font-size: 11.5px; color: #9c9cab; background: rgba(10,12,20,.72);
+          padding: 3px 10px; border-radius: 999px; }
+/* 口播时内层让出形象一侧的宽度（知识点栏移除后 52%→66.4%，空间还给原件） */
+.screen[data-skin="talking_head"][data-inner="source"] .srcarea { width: 66.4%; }
+/* 形象居左时材料区整体右移避让（pos 类挂在 #thLayer 上，用 :has 关联；渲染器是 Chromium，支持）。
+   ⚠️ 这也顺带修掉了「形象居左 + 内容层原件」时形象压在材料左侧的存量重叠。 */
+.screen[data-skin="talking_head"][data-inner="source"]:has(.th-pos-left) .srcarea { left: 33.6%; }
+/* 知识点菜单已移除（2026-10-12）：source 系组合不显示右栏 */
+.screen[data-skin="source"] .kpanel,
+.screen[data-skin="talking_head"][data-inner="source"] .kpanel { display: none; }
+.screen[data-skin="source"] .badge { right: 16px; }
+.screen[data-skin="source"] .hittag { right: 16px; }
+/* 口播·结构图的右栏定位（2026-10-14 起该栏已随结构图系一并隐藏，此规则保留以便回退） */
+.screen[data-skin="talking_head"][data-inner="graph"] .kpanel { left: 70.4%; width: 27.6%; }
+.screen[data-skin="talking_head"] .badge { right: 31.6%; }
+
+/* =========================================================================
+   结构图系四方案：移除「左上角镜头标签」与「右侧章节导航栏」（2026-10-14）
+   ⚠️ 四方案 = 结构图 / 结构图·纸感 / 结构图·清透（三个 graph* 皮肤）+ 数字人口播·结构图
+      （`data-skin="talking_head"` + `data-inner="graph"`）—— 与 JS 里 scenetag 的判定集
+      （`render()` 中 `skin in (graph*) || INNER === 'graph'`）**逐项对齐**，不要只改一处。
+   为什么移：这两处是「制作态」信息（镜头序号 / 全片章节），出现在给学生看的教学成片里
+      既冗余又抢注意力；口播方案里章节栏还会压在数字人形象上（2026-10-14 截图实证）。
+   ⚠️ 只改**显示**、不动 DOM 与 JS：`#scenetag` / `#kpanel` 的元素与更新逻辑原样保留，
+      日后要回退只需删掉下面这段选择器。source 系组合的标签与栏位**不受影响**。
+   ⚠️ 右栏腾出的空间（画布右侧约 1/3）**本次不动**：三个非口播皮肤是否要把结构图铺满
+      仍是待定项（口播那档右侧本来就是形象，天然不需要铺）。见 `_BX1` 的注释。
+   ========================================================================= */
+.screen[data-skin="graph"] .scenetag,
+.screen[data-skin="graph_paper"] .scenetag,
+.screen[data-skin="graph_clean"] .scenetag,
+.screen[data-skin="talking_head"][data-inner="graph"] .scenetag,
+.screen[data-skin="graph"] .kpanel,
+.screen[data-skin="graph_paper"] .kpanel,
+.screen[data-skin="graph_clean"] .kpanel,
+.screen[data-skin="talking_head"][data-inner="graph"] .kpanel { display: none; }
+
+/* =========================================================================
+   结构图 · 纸感主题（graph_paper）——《结构图纸感皮肤改造方案 V0.1》
+   ⚠️ 色值**全部显式写死**：本项目「颜色类」（c-teal 之类）未实现，写类名会掉成黑色。
+   ⚠️ 文字色与装饰色**分开**：青绿装饰 #4B9B8B 在纸底只有 **3.00:1** → 只配画线/描边；
+      正文用 #2F7A6B（纸底 4.64:1）/ #5E6865（卡片底 5.66:1）。
+   ⚠️ `.ptitle` / `.pbody` **不在这里写 font-size**：它们由 stage.py 按条目高度逐条内联
+      （CSS 会盖掉内联属性 → 一律写死会让所有条目同字号，空间小的屏直接溢出）。
+   ========================================================================= */
+.screen[data-skin="graph_paper"] { background: #F7F4EC; }
+.screen[data-skin="graph_paper"] .scenetag { color: #2F7A6B; }
+.screen[data-skin="graph_paper"] .badge { color: #5E6865; background: rgba(38,50,56,.07); }
+.screen[data-skin="graph_paper"] .progress { background: rgba(38,50,56,.08); }
+.screen[data-skin="graph_paper"] .progress i { background: #4B9B8B; }
+.screen[data-skin="graph_paper"] .dots span { background: rgba(38,50,56,.16); }
+.screen[data-skin="graph_paper"] .dots span.on { background: #2F7A6B; }
+.screen[data-skin="graph_paper"] .subbar {
+  background: linear-gradient(to top, rgba(247,244,236,.97) 36%, rgba(247,244,236,0));
+  color: #263238;
+}
+/* 右栏（章节进度）：深色信息面板 → 纸卡。位置不动（与 SVG 的 _BX1 对齐，改位置要同步改坐标）。 */
+.screen[data-skin="graph_paper"] .kpanel {
+  background: #FFFDF7; border: 1px solid #E8E1D0;
+  box-shadow: 0 2px 12px rgba(66,56,39,.07);
+}
+.screen[data-skin="graph_paper"] .kpanel .kh {
+  color: #2F7A6B; border-bottom: 1px solid #E8E1D0; letter-spacing: .6px;
+}
+.screen[data-skin="graph_paper"] .kch .no { background: #EFEAD9; color: #5E6865; }
+.screen[data-skin="graph_paper"] .kch.on .no { background: #2F7A6B; color: #FFFDF7; }
+.screen[data-skin="graph_paper"] .kch .tx { color: #5E6865; }
+.screen[data-skin="graph_paper"] .kch.on .tx { color: #263238; }
+
+/* ---- 纸感 SVG 图元 ---- */
+.screen[data-skin="graph_paper"] .pchap { font-size: 15px; fill: #2F7A6B; font-weight: 600; letter-spacing: 3px; }
+.screen[data-skin="graph_paper"] .pttl { font-size: 36px; fill: #263238; font-weight: 600; }
+.screen[data-skin="graph_paper"] .pul { fill: none; stroke: #4B9B8B; stroke-width: 3.4; stroke-linecap: round; }
+.screen[data-skin="graph_paper"] .pitem { fill: #FFFDF7; stroke: #E8E1D0; stroke-width: 1.2; }
+.screen[data-skin="graph_paper"] .ptile { fill: #EDF4F1; }
+.screen[data-skin="graph_paper"] .pnum {
+  font-size: 15px; fill: #2F7A6B; font-weight: 600;
+  font-variant-numeric: tabular-nums; letter-spacing: .5px;
+}
+.screen[data-skin="graph_paper"] .ptitle { fill: #263238; font-weight: 600; }
+.screen[data-skin="graph_paper"] .pbody { fill: #5E6865; }
+.screen[data-skin="graph_paper"] .phl { fill: #F4D35E; opacity: .62; }
+.screen[data-skin="graph_paper"] .pflow { fill: none; stroke: #4B9B8B; stroke-width: 1.8; stroke-linecap: round; }
+.screen[data-skin="graph_paper"] .pdiv {
+  fill: none; stroke: #4B9B8B; stroke-width: 1.6; stroke-dasharray: 5 7; opacity: .85;
+}
+.screen[data-skin="graph_paper"] .pvstx { font-size: 15px; fill: #2F7A6B; font-weight: 600; letter-spacing: 3px; }
+/* ⚠️ 位移只发生在**内层**：外层（.pwrap）与内层若都吃到 .el 的 9px 位移，
+      两级叠加成 18px，条目看起来是「跳」上来而不是「滑」上来。 */
+.screen[data-skin="graph_paper"] .pwrap,
+.screen[data-skin="graph_paper"] .p-hl-static,
+.screen[data-skin="graph_paper"] .pfigwrap { transform: none; }
+.screen[data-skin="graph_paper"] .el { transition: opacity .46s ease, transform .46s ease; }
+
+/* =========================================================================
+   结构图 · 清透主题（graph_clean）—— 参照知识类课件信息图（2026-10-13）
+   ⚠️ 与纸感段同一纪律：色值全部显式写死；文字色与装饰色分开
+      （正文 #1B1B2A 白底 14.8:1 · 次要 #6E6E86 白底 5.2:1 ≥ 项目下限 #6e6e6e）。
+   ⚠️ `.ctitle` / `.csub` 不写 font-size：由 stage.py 按条目高度逐条内联。
+   ========================================================================= */
+.screen[data-skin="graph_clean"] { background: #F5F6FA; }
+.screen[data-skin="graph_clean"] .scenetag { color: #5747C9; }
+.screen[data-skin="graph_clean"] .badge { color: #6E6E86; background: rgba(27,27,42,.06); }
+.screen[data-skin="graph_clean"] .progress { background: rgba(27,27,42,.08); }
+.screen[data-skin="graph_clean"] .progress i { background: #6B5CE7; }
+.screen[data-skin="graph_clean"] .dots span { background: rgba(27,27,42,.16); }
+.screen[data-skin="graph_clean"] .dots span.on { background: #5747C9; }
+.screen[data-skin="graph_clean"] .subbar {
+  background: linear-gradient(to top, rgba(245,246,250,.97) 36%, rgba(245,246,250,0));
+  color: #1B1B2A;
+}
+/* 右栏（章节进度）：白卡 + 紫强调。位置不动（与 SVG 的 _BX1 对齐）。 */
+.screen[data-skin="graph_clean"] .kpanel {
+  background: #FFFFFF; border: 1px solid #E6E6F2;
+  box-shadow: 0 2px 12px rgba(64,56,140,.07);
+}
+.screen[data-skin="graph_clean"] .kpanel .kh {
+  color: #5747C9; border-bottom: 1px solid #E6E6F2; letter-spacing: .6px;
+}
+.screen[data-skin="graph_clean"] .kch .no { background: #EFEDFC; color: #5747C9; }
+.screen[data-skin="graph_clean"] .kch.on .no { background: #6B5CE7; color: #FFFFFF; }
+.screen[data-skin="graph_clean"] .kch .tx { color: #6E6E86; }
+.screen[data-skin="graph_clean"] .kch.on .tx { color: #1B1B2A; }
+
+/* ---- 清透 SVG 图元 ---- */
+.screen[data-skin="graph_clean"] .ckick { font-size: 22px; fill: #6B5CE7; font-weight: 700;
+  font-variant-numeric: tabular-nums; }
+.screen[data-skin="graph_clean"] .ckick2 { font-size: 15px; fill: #6E6E86; }
+.screen[data-skin="graph_clean"] .cttl2 { font-size: 34px; fill: #1B1B2A; font-weight: 700; }
+.screen[data-skin="graph_clean"] .cbar { fill: #6B5CE7; }
+.screen[data-skin="graph_clean"] .citem { fill: #FFFFFF; stroke: #E6E6F2; stroke-width: 1.2; }
+.screen[data-skin="graph_clean"] .ctitle { fill: #1B1B2A; font-weight: 600; }
+.screen[data-skin="graph_clean"] .csub { fill: #6E6E86; }
+.screen[data-skin="graph_clean"] .croot { fill: #6B5CE7; }
+.screen[data-skin="graph_clean"] .croott { fill: #FFFFFF; font-weight: 600; }
+.screen[data-skin="graph_clean"] .croots { fill: rgba(255,255,255,.82); }
+.screen[data-skin="graph_clean"] .clink { fill: none; stroke: #C8C3EF; stroke-width: 2;
+  stroke-linecap: round; }
+.screen[data-skin="graph_clean"] .cstep { fill: #6B5CE7; }
+.screen[data-skin="graph_clean"] .cstepn { font-size: 13px; fill: #FFFFFF; font-weight: 600; }
+.screen[data-skin="graph_clean"] .ctab { fill: #6B5CE7; }
+.screen[data-skin="graph_clean"] .ctabt { fill: #FFFFFF; font-weight: 600; }
+.screen[data-skin="graph_clean"] .crows { fill: #FFFFFF; stroke: #E6E6F2; stroke-width: 1.2; }
+.screen[data-skin="graph_clean"] .csep { fill: none; stroke: #ECECF4; stroke-width: 1; }
+.screen[data-skin="graph_clean"] .cvs { fill: #FFFFFF; stroke: #6B5CE7; stroke-width: 1.6; }
+.screen[data-skin="graph_clean"] .cvst { font-size: 14px; fill: #6B5CE7; font-weight: 600; }
+/* ⚠️ 位移只发生在**内层**（与纸感 .pwrap 同一原因：两级叠加会让卡片「跳」上来）。 */
+.screen[data-skin="graph_clean"] .cwrap { transform: none; }
+.screen[data-skin="graph_clean"] .el { transition: opacity .46s ease, transform .46s ease; }
+</style>
+</head>
+<body>
+<div class="screen" id="screen" data-skin="__SKIN__" data-inner="__INNER__">
+  <div class="progress"><i id="progFill"></i></div>
+  <div class="dots" id="dots"></div>
+  <div class="scenetag" id="scenetag"></div>
+  <div class="badge" id="badge"></div>
+  <div class="kpanel" id="kpanel"></div>
+
+  <div class="skin" id="skinGraph">__GRAPH_SVG__</div>
+
+  <div class="skin" id="skinSource">
+    <div class="srcarea" id="srcarea">
+      <div class="pagewrap" id="pagewrap">
+        <img id="pageImg" alt="材料原件">
+        <div class="spot" id="spot"></div>
+      </div>
+    </div>
+  </div>
+  <div class="hittag" id="hitTag"></div>
+
+  <div class="th th-pos-__AVATAR_POS__" id="thLayer">__TH_DOM__</div>
+
+  <div class="subbar"><span id="subTxt"></span></div>
+</div>
+
+<script>
+/* =========================================================================
+   数据（stage.py 注入）。结构与原型 v6 完全同构，便于两处对照。
+   SEGS      [{s,t,a,b}]          讲稿句（毫秒绝对时间）
+   SCENE_OF  [..]                 句 → 场景号
+   SHOTS     [{n,l,a,b}]          分镜
+   POINTS    [[{t,k,at}]]         右侧要点栏，按场景分组
+   SRC       {aspect,count,steps} 材料原件步点（x/y/w/h 为页面百分比）
+   ========================================================================= */
+const SEGS = __SEGS__;
+const SCENE_OF = __SCENE_OF__;
+const SHOTS = __SHOTS__;
+const POINTS = __POINTS__;
+const SRC = __SRC__;
+const TOTAL = __TOTAL__;
+/* 真实人声 RMS 包络（逐帧 0..1）+ 帧率：A+C（2026-10-13）让「说话活跃度 / 动作视频推进」
+   跟着**真实声音**走。空数组 = 非口播 / 音轨不可用 → 回落「合成开合」（2026-10-12 之前的行为）。
+   ⚠️ 与 radio/night 同源（waveform.audio_levels）：同一音轨、同一 fps，口径一致。 */
+const LEVELS = __LEVELS__;
+const FPS = __FPS__;
+/* D（2026-10-14）句级调速常量：句内恒 RATE_TALK、句间停顿降到 RATE_IDLE；
+   坡长随空隙长度自适应（≤ RATE_RAMP），**降速深度**也随空隙缩放（空隙越短降得越浅，
+   否则 288ms 的空隙里单帧速度变化会大到看得见）。说明见 thVideoRateAt()。
+   ⚠️ 放在顶层常量区（不是 TH 块）：TH 块在 render() 之前，此处更早，免疫 TDZ。 */
+const RATE_TALK = 1.00, RATE_IDLE = 0.45, RATE_RAMP = 320, RATE_GAP_FULL = 500;
+const SKIN = "__SKIN__";
+const INNER = "__INNER__";
+const SRC_PAGES = __SRC_PAGES__;
+
+const $ = (id) => document.getElementById(id);
+const sceneEls = [...document.querySelectorAll('.scene')];
+const els = [...document.querySelectorAll('.el')];
+const screenEl = $('screen');
+const pageImg = $('pageImg'), spot = $('spot'), pagewrap = $('pagewrap'),
+      srcarea = $('srcarea');
+
+let curScene = -1, curPage = -1, skin = SKIN;
+
+/* ⚠️ AT 必须声明在任何可能「注册即执行」的东西之前：
+   本项目踩过 TDZ 导致整页白屏（setup 里 watch/computed 注册即同步跑一次）。
+   这里虽是普通函数（调用才求值），但提前声明零成本、免疫后人误改。 */
+const AT = [];
+SEGS.forEach((s, i) => { const si = SCENE_OF[i]; if (AT[si] === undefined) AT[si] = s.a; });
+/* AT 可能因首句不在场景 0 而缺项 —— 补齐，保证 sceneAt 单调 */
+for (let i = 1; i < AT.length; i++) if (AT[i] === undefined) AT[i] = AT[i - 1];
+
+const pad = (n) => String(n).padStart(2, '0');
+const fmt = (ms) => {
+  const t = Math.max(0, Math.floor(ms / 1000));
+  return pad(Math.floor(t / 60)) + ':' + pad(t % 60);
+};
+const idxAt = (ms) => {
+  let last = -1;
+  for (let i = 0; i < SEGS.length; i++) {
+    if (ms >= SEGS[i].b) { last = i; continue; }
+    if (ms >= SEGS[i].a) return i;
+    break;
+  }
+  return last < 0 ? 0 : last;
+};
+const sceneAt = (ms) => {
+  let k = 0;
+  for (let i = 0; i < AT.length; i++) if (ms >= AT[i]) k = i;
+  return k;
+};
+/* 原件层也按毫秒取步，而不是「一句一个框」 */
+const srcAt = (ms) => {
+  let k = 0;
+  for (let i = 0; i < SRC.steps.length; i++) if (ms >= SRC.steps[i].at) k = i;
+  return k;
+};
+
+
+/* ---------- 右侧栏（皮肤共用容器，内容按皮肤构建） ----------
+   ⚠️ 结构图皮肤右栏 = **章节进度**：大卡片已经写着要点文字，右栏再列一遍同样的字
+      就是同一屏出现两份重复信息（实测海报上就是如此）。
+   ⚠️ 原件（source）系组合的「本镜要点」右栏已按产品要求移除（2026-10-12），
+      此处直接return、不建任何节点（CSS 侧同位置有 display:none 双保险）。
+   ⚠️ 结构图系（graph / graph_paper / graph_clean / 口播内层 graph）的「章节进度」
+      右栏也已于 2026-10-14 移除 —— 这里**照旧构建**，由 CSS 的 display:none 关掉：
+      保留 DOM 是为了日后回退（删一条 CSS 即可复原），代价只是几个不渲染的节点。
+   ⚠️ setSkin 之后必须重建（容器内容与皮肤绑定）。 */
+function buildKpanel() {
+  const host = $('kpanel');
+  host.innerHTML = '';
+  /* ⚠️ graph_paper（纸感结构图）/ graph_clean（清透结构图）与 graph 同族：
+       右栏同为**章节进度**，只是配色不同（见 CSS）。漏了它们右栏会掉进「本镜要点」分支 ——
+       那种分支要 POINTS 有内容，而结构图皮肤的卡片已经写着同样的字 → 同屏两份重复信息。 */
+  if (skin === 'graph' || skin === 'graph_paper' || skin === 'graph_clean' || INNER === 'graph') {
+    let h = '<div class="kh">章节 · 共 ' + SHOTS.length + ' 段</div>';
+    SHOTS.forEach((sh, si) => {
+      h += '<div class="kch" data-scene="' + si + '"><span class="no">' + (si + 1) +
+           '</span><span class="tx">' + (sh.l || '') + '</span></div>';
+    });
+    host.innerHTML = h;
+    return;
+  }
+  /* source 系组合：知识点菜单已移除，不建要点列表（容器由 CSS display:none） */
+  if (skin === 'source' || INNER === 'source') return;
+  POINTS.forEach((group, si) => {
+    const box = document.createElement('div');
+    box.className = 'kbox';
+    box.dataset.scene = si;
+    box.style.display = 'none';
+    const shot = SHOTS[si] || { l: '' };
+    let h = '<div class="kh">知识点 · ' + shot.l + '</div>';
+    group.forEach((p) => {
+      const cls = 'pt' + (p.wa ? ' wa' : '') + (p.k ? (' k-' + p.k) : '');
+      h += '<div class="' + cls + '" data-at="' + p.at + '">' +
+           '<span class="dt"></span><span class="tx">' + p.t + '</span></div>';
+    });
+    box.innerHTML = h;
+    host.appendChild(box);
+  });
+}
+
+/* =========================================================================
+   口播层（talking_head）· ms → 状态
+   ⚠️ 全部是**纯函数**：同一 ms 必须永远算出同一状态（seek 与截图同果）。
+      绝不用 Math.random() / Date.now() / performance.now()。
+   ⚠️ TH 必须在任何调用 render() 的语句之前声明 —— 本页 render(0) 在初始化段，
+      若 TH 声明在其后，会 TDZ 整页白屏（本项目在 App.vue 踩过同类事故）。
+   ========================================================================= */
+const TH = { fig: null, pulse: [], aura: null, aura2: null,
+       isPhoto: false, side: 1, capKey: '',
+       /* 动作视频（有则形象自己会动）。⚠️ videoDur 要等元数据到了才有效，初见为 0，
+          所以 thSyncVideo 必须自己判 `dur > 0.05` 而不是假设一定有值。 */
+       video: null, videoDur: 0,
+       /* 句级调速时钟的前缀和（initThLayer 建）+ 上次写的 playbackRate（量化防抖） */
+       rateCum: null, lastRate: 1 };
+
+/* 当前句的「开口量」∈ [0,1]；句间空隙 = 0。
+   ⚠️ 名字沿用历史的 MouthOpen，但自 2026-10-12 矢量形象下线后，它**不再驱动任何嘴部图形**：
+      现在它只是「说话活跃度」，喂给 呼吸幅度 / 头部微摆 / 说话光环亮度 / 呼吸条。 */
+function thMouthOpen(ms) {
+  const seg = SEGS[idxAt(ms)];
+  if (!seg || ms < seg.a || ms >= seg.b) return 0;
+  const dur = Math.max(1, seg.b - seg.a);
+  const p = (ms - seg.a) / dur;
+  const cps = Math.max(1, seg.t.length) / (dur / 1000);   /* 每秒字数 ≈ 语速 */
+  const f = Math.min(7.5, Math.max(2.2, cps * 0.62));     /* 开合频率（Hz） */
+  /* 双频叠加：单一正弦看起来像节拍器，不像说话 */
+  const s = 0.55 + 0.45 * Math.sin((ms / 1000) * f * 6.2832)
+                 + 0.18 * Math.sin((ms / 1000) * f * 3.7 * 6.2832 + 1.1);
+  /* 软起软落：句首 / 句尾做包络，避免「瞬间张嘴 / 闭嘴」 */
+  const env = Math.min(1, p / 0.08) * Math.min(1, (1 - p) / 0.10);
+  const shape = Math.max(0, Math.min(1, s)) * env;
+  /* A（2026-10-13）：活跃度 × **真实响度**（说话才晃、安静收敛、重音更亮）。
+     合成正弦仍是「节奏载体」，真实包络是「振幅」—— 两者相乘才像人声。
+     ⚠️ 下限 0.22：句内轻音不至于完全静止（完全不动反而像「卡住」）。
+     无包络（LEVELS 空）时回落原行为。 */
+  if (!LEVELS.length) return shape;
+  const loud = Math.min(1, thEnv(ms) * 1.6);
+  return shape * (0.22 + 0.78 * loud);
+}
+
+/* 呼吸 ∈ [-1,1]，周期 4200ms。 */
+function thBreath(ms) { return Math.sin((ms / 1000) * 6.2832 / 4.2); }
+
+/* jaw 专用平滑 open（2026-10-13）：thMouthOpen 的 2.2~7.5Hz 双频对光环/呼吸条合适，
+   对下巴位移是抽搐（实测轨迹 0↔12px / 150ms 跳变）。
+   ±80ms 五点滑动平均 ≈ 160ms 低通窗口，频率上限自然压到 ~3Hz（真人下巴开合节奏）。
+   ⚠️ 必须是纯函数（渲染器 seek(ms) 逐帧同果的前提）——不能用运行时累积状态。 */
+function thJawOpen(ms) {
+  let s = 0, n = 0;
+  for (let d = -80; d <= 80; d += 40) { s += thMouthOpen(ms + d); n++; }
+  return s / n;
+}
+
+/* 当前帧的真实响度 ∈[0,1]（±2 帧滑动平均压毛刺：RMS 逐帧抖，直接驱动光环会闪）。
+   ⚠️ 纯函数（只依赖 ms 与 LEVELS）—— 渲染器 seekTo(ms) 逐帧同果的前提。 */
+function thEnv(ms) {
+  if (!LEVELS.length) return 0;
+  const k = Math.min(LEVELS.length - 1, Math.max(0, Math.floor(ms / 1000 * FPS)));
+  let s = 0, n = 0;
+  for (let j = k - 2; j <= k + 2; j++) { if (j >= 0 && j < LEVELS.length) { s += LEVELS[j]; n++; } }
+  return n ? s / n : 0;
+}
+
+/* 说话时头部微摆（度，峰值 ±0.65°）：低频双频叠加避免节拍器感；open=0 时平滑回正
+   （open 自带句首/句尾软包络，不会跳变）。只用于照片 —— 矢量形象已有眼/嘴动画，
+   再叠加头部摆动会显得乱。 */
+function thHeadSway(ms, open) {
+  const t = ms / 1000;
+  return open * (0.45 * Math.sin(t * 2.0) + 0.20 * Math.sin(t * 4.7 + 1.3));
+}
+
+/* 句首点头（px）：每句开头 260ms 内一个 sin 脉冲（下压 4px 再回），句间与其余时刻为 0。
+   把「开口说话」从纯听觉事件变成可见的肢体语言 —— 照片没有可寻址五官，
+   这是不动面部、不逼近「唇形同步」合规线的前提下最强的生命感信号。 */
+function thNodAt(ms) {
+  const seg = SEGS[idxAt(ms)];
+  if (!seg || ms < seg.a || ms >= seg.b) return 0;
+  const q = (ms - seg.a) / 260;
+  if (q >= 1) return 0;
+  return Math.sin(q * Math.PI) * 4.0;
+}
+
+/* 片头入场：0 → 900ms，smoothstep。只在**片头**做一次 —— 口播镜头平均 10–20 秒一切，
+   每镜都滑一次会显得画面在抖，反而丢掉「讲述者一直在场」的感觉。 */
+function thIntro(ms) {
+  const t = Math.min(1, ms / 900);
+  return t * t * (3 - 2 * t);
+}
+
+/* 缓慢推近（Ken Burns），单镜内 1.000 → 1.035。
+   ⚠️ 只作用于**形象**：整画面缩放会把内层材料图 / 结构图卡片一并放大，
+      文字锐度下降，且与聚光灯的百分比坐标冲突。 */
+function thZoomAt(ms) {
+  const sh = SHOTS[sceneAt(ms)] || { a: 0, b: TOTAL };
+  const p = Math.max(0, Math.min(1, (ms - (sh.a || 0)) / Math.max(1, (sh.b || 0) - (sh.a || 0))));
+  return 1 + 0.035 * p;
+}
+
+function thFigTransform(ms, br, open) {
+  const e = thIntro(ms);
+  const dx = TH.side * 14 * (1 - e);          /* 从画面外侧滑入 */
+  TH.fig.style.opacity = e;
+  /* 图片形象的肢体语言：句首点头叠加在呼吸位移上 + 说话微摆。
+     占位框（TH.isPhoto=false）不加这两项。 */
+  /* ⚠️ 有动作视频时**收敛**容器的程序化动作：视频里的人自己就在点头/微动，
+     再叠加一层整图点头 + 微摆会变成双倍的晃动（看着晕）。此处只保留轻微呼吸位移，
+     以及片头入场与缓慢推近（那是镜头语言，不是人物动作）。 */
+  const motion = !!TH.video;
+  const dy = br * (motion ? 1.1 : 3.0) + ((TH.isPhoto && !motion) ? thNodAt(ms) : 0);
+  let t = 'translate(' + dx.toFixed(2) + 'px,' + dy.toFixed(2) + 'px)';
+  if (TH.isPhoto && !motion) t += ' rotate(' + thHeadSway(ms, open).toFixed(3) + 'deg)';
+  return t + ' scale(' + thZoomAt(ms).toFixed(4) + ')';
+}
+
+function thEscHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/* 当前句高亮：字时刻按**句内线性插值**近似 —— 本项目的 TTS 时间戳只到句级
+   （tts.py 的 timings 是逐句 start_ms / end_ms）。句内语速基本均匀，误差在字幕尺度不可见。
+   ⚠️ 输出必须与 stage.py::_sub_html 逐字同果（探针做真值比对）。
+   ⚠️ capKey 缓存：每帧重建 innerHTML 会白白触发布局。 */
+function thCaption(ms) {
+  const host = $('subTxt'); if (!host) return;
+  const i = idxAt(ms), seg = SEGS[i];
+  const text = seg ? seg.t : '';
+  const p = seg ? Math.max(0, Math.min(1, (ms - seg.a) / Math.max(1, seg.b - seg.a))) : 0;
+  const k = Math.floor(p * text.length);
+  const key = i + '|' + k;
+  if (key === TH.capKey) return;
+  TH.capKey = key;
+  host.innerHTML = '<span class="said">' + thEscHtml(text.slice(0, k)) + '</span>'
+                 + '<span class="todo">' + thEscHtml(text.slice(k)) + '</span>';
+}
+
+/* ---------- D（2026-10-14）：句级调速 ----------
+   ⚠️ 为什么换掉 C：C 版 rate = 0.12 + 0.88·clamp(env/0.4) 随**响度**调速。用户实测
+      「数字人卡 + 口型对不上」。三场景浏览器对照（同一段真实口播 + 真实舞台页）：
+        真实舞台页：playbackRate 每秒改写 13.7 次（峰值 21 次/秒）、值域 0.123~1.000，
+                    10 秒墙钟只推进 6.05 秒内容（有效 14.5fps），另有 1 次 0.306s 硬回跳；
+        锁 1.0× + 禁 seek / 裸播：零掉帧、零回跳。
+      且该调制已被**烘焙进成片像素**（成片里高响度帧运动量 = 低响度帧的 2.02×）——
+      近景取景（脸 212→348px）只是把它暴露出来。
+   D：**句内恒定 RATE_TALK**（嘴动速度 = 真实时间，口型才对得上），只在**句间停顿**降到
+      RATE_IDLE；边界用余弦坡 → rate 连续（C1）、无加速度折角。
+   ⚠️ 三个自适应（2026-10-14 补，都是被门禁逐条咬出来的，记录在此防复踩）：
+      ① 坡长 R = min(RATE_RAMP, gap/2) —— 写死坡长在短空隙里放不下（30fps 下 140ms 只有
+         4.2 帧，余弦中点斜率必然陡）；
+      ② **降速深度随空隙缩放** k = min(1, gap/RATE_GAP_FULL) —— 单帧速率变化 ≈
+         0.55·k·π/(2R)·(1000/FPS)，不缩放的话短空隙里每帧要变 21% 速度（= 看得见的一顿）；
+      ③ **整段凹陷必须完整落在空隙里**（句内恒 1）。第一版把爬升放进下一句的句首，
+         而空隙末尾已升回 1 → 句首又从 (1-k) 起 → 每句边界一个 k 的阶跃（实测 0.538）。
+         末句之后没有「下一句」→ 用**片尾余量** (TOTAL - seg.b) 当空隙，否则末尾从 1 直跳到 0。
+   ⚠️ 时钟与 LEVELS（响度包络）**解耦**：只认讲稿句边界（SEGS），无包络的口播也有稳定速率。
+   ⚠️ 必须是 ms 的**纯函数**（渲染器 seek(ms) 逐帧同果）→ 前缀和在 initThLayer 建，
+      不在播放循环里累加状态。 */
+function thSpeakAt(ms) {
+  const i = idxAt(ms), seg = SEGS[i];
+  if (!seg) return 0;
+  if (ms >= seg.a && ms < seg.b) return 1;          /* 句内：恒满速，不做任何坡 */
+  const nxt = SEGS[i + 1];
+  const gap = nxt ? Math.max(0, nxt.a - seg.b) : Math.max(0, TOTAL - seg.b);
+  const R = Math.min(RATE_RAMP, gap / 2);
+  const k = Math.min(1, gap / RATE_GAP_FULL);        /* 空隙越短降得越浅 */
+  const d = ms - seg.b;
+  if (d < 0) return 1;                               /* 首句之前 */
+  if (R <= 0 || d >= gap) return 1 - k;
+  if (d < R) return 1 - k * (0.5 - 0.5 * Math.cos((d / R) * Math.PI));
+  if (d > gap - R) return 1 - k * (0.5 + 0.5 * Math.cos(((d - (gap - R)) / R) * Math.PI));
+  return 1 - k;
+}
+
+function thVideoRateAt(ms) {
+  return RATE_IDLE + (RATE_TALK - RATE_IDLE) * thSpeakAt(ms);
+}
+
+/* 动作视频的**句级调速时钟** = ∫ rate(t) dt（initThLayer 建的前缀和，每帧 O(1)）。
+   取代 C 的包络积分 —— 包络积分在安静时几乎不走，本身就是错位的来源之一。 */
+function thVideoClock(ms) {
+  if (!TH.rateCum) return ms / 1000;
+  const k = Math.min(TH.rateCum.length - 1, Math.max(0, Math.floor(ms / 1000 * FPS)));
+  return TH.rateCum[k] || 0;
+}
+
+/* 动作视频与页钟对表（时钟 = thVideoClock 的**句级调速积分**，不是匀速页钟）。
+   ⚠️⚠️ **只在句间空隙里才允许 seek**：句中 seek 会让嘴部硬跳 —— 那正是「口型对不上」
+      的直接来源（旧版实测发生过 1 次 / 0.306s 的硬回跳）。
+   ⚠️ 阈值 1.0s（旧 0.30s 约等于半句话，纠偏本身就成了可见错位）。
+   ⚠️ 句级调速后视频与时钟**同速率推进**，漂移只来自起播初值 → 正常情况永不触发。
+   ⚠️ 循环回绕必须取**最短环距**：否则 `want=0.02 / got=7.98` 会被算成漂了 7.96s，
+      每次循环都白 seek 一次。 */
+function thSyncVideo(ms) {
+  const v = TH.video;
+  if (!v) return;
+  const dur = TH.videoDur;
+  if (!(dur > 0.05)) return;
+  const seg = SEGS[idxAt(ms)];
+  if (seg && ms >= seg.a && ms < seg.b) return;      /* 句中：绝不 seek */
+  const want = thVideoClock(ms) % dur;
+  let d = v.currentTime - want;
+  if (d > dur / 2) d -= dur;
+  if (d < -dur / 2) d += dur;
+  if (Math.abs(d) > 1.0) {
+    try { v.currentTime = want; } catch (e) { /* seek 失败不影响出片，下一帧再试 */ }
+  }
+}
+
+function thPaint(ms) {
+  if (skin !== 'talking_head') return;   /* 严格限定作用域：其它皮肤零回归 */
+
+  /* D（2026-10-14）：动作视频的**实时**推进 = thVideoRateAt(ms)（句级调速）。
+     ⚠️ 必须与 thVideoClock 用**同一个**速率函数，否则视频与时钟不同速 → 句间空隙里
+        每 1s 触发一次纠偏 seek。量化到 0.05 才写（斜坡内约 13 次，其余时间零写入）。 */
+  if (TH.video) {
+    const rate = thVideoRateAt(ms);
+    if (Math.abs(rate - (TH.lastRate || 1)) > 0.05) {
+      try { TH.video.playbackRate = rate; TH.lastRate = rate; } catch (e) {}
+    }
+  }
+  thSyncVideo(ms);                       /* 视频对表：纯校正，不做任何动效 */
+
+  const open = thMouthOpen(ms);
+  /* 口腔浮现层（双层嘴部 v2，2026-10-13）：open 驱动口腔层从唇缝向下展开浮现
+     （scaleY 0.06→1.0 + opacity 快速淡入），主图不动 → 零接缝。
+     驱动信号 thJawOpen 已做 ±80ms 低通（压掉 7.5Hz 抽搐）。 */
+  if (TH.inner) {
+    const jo = thJawOpen(ms);
+    const sy = 0.06 + 0.94 * jo;
+    const op = jo < 0.03 ? 0 : Math.min(1, jo * 2.5);
+    const t = 'scaleY(' + (Math.round(sy * 100) / 100).toFixed(2) + ')';
+    if (t !== TH.innerT) {
+      TH.inner.style.transform = t;
+      TH.inner.style.opacity = op.toFixed(2);
+      TH.innerT = t;
+    }
+  }
+  /* 呼吸幅度：形象**没有可变形的五官**，说话时加深呼吸做补偿 —— 否则「越说话越静」。
+     占位框（TH.isPhoto=false）不进这条路。 */
+  const br = thBreath(ms) * (TH.isPhoto ? (1 + 0.30 * open) : 1);
+
+  /* 形象整体：呼吸位移 + 片头入场 + 缓慢推近 + 句首点头 + 说话微摆 */
+  if (TH.fig) TH.fig.style.transform = thFigTransform(ms, br, open);
+
+  /* 说话光环（图片形象专用；占位框没有 .th-photo → TH.aura 为 null） */
+  if (TH.aura) {
+    TH.aura.style.transform = 'scale(' + (0.93 + 0.20 * open).toFixed(3) + ')';
+    TH.aura.style.opacity = (0.12 + 0.73 * open).toFixed(3);
+  }
+  /* 扩散虚线环：节奏与主环错开（更大更慢），opacity 受主环乘算 —— 静默时一并隐没 */
+  if (TH.aura2) {
+    TH.aura2.style.transform = 'scale(' + (1.00 + 0.26 * open).toFixed(3) + ')';
+    TH.aura2.style.opacity = (0.30 + 0.55 * open).toFixed(3);
+  }
+
+  /* 呼吸条：由 open 决定活跃度（替代原 @keyframes） */
+  const lv = 0.26 + 0.74 * open;
+  for (let k = 0; k < TH.pulse.length; k++) {
+    const ph = 0.5 + 0.5 * Math.sin(k * 0.63 + (ms / 1000) * 6.2);
+    TH.pulse[k].style.transform = 'scaleY(' + (0.18 + lv * (0.30 + 0.70 * ph)).toFixed(3) + ')';
+  }
+
+  thCaption(ms);
+}
+
+/* ---------- 渲染 ---------- */
+function render(ms) {
+  const i = idxAt(ms);
+  const si = sceneAt(ms);
+  if (si !== curScene) {
+    sceneEls.forEach((s, k) => s.classList.toggle('on', k === si));
+    /* 原件皮肤的要点栏已移除（2026-10-12）；此循环对结构图以外皮肤为空操作 */
+    document.querySelectorAll('.kbox').forEach((b) =>
+      b.style.display = (+b.dataset.scene === si) ? '' : 'none');
+    /* 结构图皮肤的章节进度：点亮「当前及之前」，已讲过的段保持高亮 */
+    document.querySelectorAll('.kch').forEach((c) =>
+      c.classList.toggle('on', +c.dataset.scene <= si));
+    document.querySelectorAll('.dots span').forEach((d, k) => d.classList.toggle('on', k === si));
+    curScene = si;
+  }
+  els.forEach((e) => e.classList.toggle('on', ms >= +e.dataset.at));
+  document.querySelectorAll('.pt').forEach((p) => p.classList.toggle('on', ms >= +p.dataset.at));
+
+  /* 结构图皮肤：镜内分屏。屏区间连续覆盖镜头 → 「起点已过的最后一屏」恰好是当前屏。
+     ⚠️ 不能写成「ms >= a 就亮」：那会让之前的所有屏都保持点亮（前后两屏叠在一起）。
+     ⚠️ 取不到任何一屏（毫秒落在镜头之前）时全部关闭，不要 retain 上一帧的屏。 */
+  const curSceneEl = document.querySelector('.scene.on');
+  if (curSceneEl) {
+    const subs = curSceneEl.querySelectorAll('.sub');
+    let curSub = -1;
+    for (let i = 0; i < subs.length; i++) if (ms >= +subs[i].dataset.a) curSub = i;
+    for (let i = 0; i < subs.length; i++) subs[i].classList.toggle('on', i === curSub);
+  }
+
+  const hasSrc = (SRC.steps && SRC.steps.length > 0);
+  const s = hasSrc ? SRC.steps[srcAt(ms)] : null;
+  if (s) {
+    const samePage = (s.p === curPage);
+    if (!samePage) {
+      pageImg.src = SRC_PAGES[s.p - 1];
+      pageImg.classList.remove('swap'); void pageImg.offsetWidth; pageImg.classList.add('swap');
+      curPage = s.p;
+    }
+    const tr = 'left .42s cubic-bezier(.4,0,.2,1), top .42s cubic-bezier(.4,0,.2,1),'
+             + ' width .42s cubic-bezier(.4,0,.2,1), height .42s cubic-bezier(.4,0,.2,1)';
+    spot.style.transition = samePage ? tr : 'none';
+    spot.style.left = s.x + '%'; spot.style.top = s.y + '%';
+    spot.style.width = s.w + '%'; spot.style.height = s.h + '%';
+    $('hitTag').textContent = '原文：' + s.hit;
+  }
+
+  if (skin === 'graph' || skin === 'graph_paper' || skin === 'graph_clean' || INNER === 'graph') {
+    const sh = SHOTS[si] || { n: '', l: '' };
+    $('scenetag').textContent = '镜头 ' + sh.n + ' · ' + sh.l;
+  } else if (s) {
+    $('scenetag').textContent = '材料原件 · 第 ' + s.p + ' 张 / 共 ' + SRC.count + ' 张';
+  }
+  $('badge').textContent = pad(i + 1) + ' / ' + SEGS.length;
+  /* ⚠️ 口播皮肤的字幕由 thPaint()→thCaption() 以 innerHTML 分片写（karaoke 高亮）；
+     这里保留 textContent 路径给其它皮肤 —— 两条路径互斥，避免每帧重建 innerHTML。 */
+  if (skin !== 'talking_head') $('subTxt').textContent = SEGS[i] ? SEGS[i].t : '';
+
+  /* 口播层（talking_head）：ms → 状态。函数首行有 skin 判定，其它皮肤立即返回。 */
+  thPaint(ms);
+}
+
+/* pagewrap 的显示矩形必须 == 图片显示区（聚光灯百分比坐标以它为准）。
+   ⚠️ 用**显式像素**而不是 aspect-ratio + flex 推断：flex item 宽度超限会被 shrink，
+      高度不变 → aspect-ratio 被打破 → pagewrap rect ≠ 图片显示区 → 聚光灯错位。
+   ⚠️ aspect 的口径是 **w/h**（原型 SRC.aspect=0.75 对应 1080×1440 的竖版图）。 */
+function syncPagewrap() {
+  if (!pagewrap || !srcarea) return;
+  const a = SRC.aspect || (pageImg.naturalWidth && pageImg.naturalHeight
+        ? pageImg.naturalWidth / pageImg.naturalHeight : 0.75);
+  if (!(a > 0)) return;
+  const boxH = srcarea.clientHeight, boxW = srcarea.clientWidth;
+  let w, h;
+  if (boxH * a <= boxW) { h = boxH; w = boxH * a; } else { w = boxW; h = boxW / a; }
+  pagewrap.style.width = Math.round(w) + 'px';
+  pagewrap.style.height = Math.round(h) + 'px';
+}
+
+function paint(ms) {
+  const p = Math.min(1, Math.max(0, ms / TOTAL));
+  $('progFill').style.width = (p * 100) + '%';
+}
+
+/* ---------- 皮肤切换（探针用；渲染时固定） ---------- */
+function setSkin(k, inner) {
+  skin = k;
+  screenEl.dataset.skin = k;
+  if (inner) screenEl.dataset.inner = inner;
+  if (pagewrap) pagewrap.style.removeProperty('aspect-ratio');
+  syncPagewrap();
+  /* ⚠️ 右栏内容与皮肤绑定（结构图=章节 / 原件=要点），换肤后必须重建；
+     否则探针换肤截图会看到「结构图配着要点栏」的错位组合。 */
+  buildKpanel();
+  curScene = -1;
+  /* ⚠️ 换肤后字幕写法可能切换（textContent ↔ innerHTML 分片）→ 必须清 capKey，
+     否则 key 未变会让 thCaption 跳过重绘，字幕停在旧写法上。 */
+  TH.capKey = '';
+  render(window.__stage ? window.__stage.ms : 0);
+}
+
+/* ---------- 初始化 ---------- */
+/* 口播层引用缓存。⚠️ 必须在 render(0)（下方）之前完成，否则 thPaint 读到 null。 */
+(function initThLayer() {
+  TH.fig = document.querySelector('.th-fig');
+  TH.pulse = [...document.querySelectorAll('.th-pulse i')];
+  const layer = document.getElementById('thLayer');
+  TH.side = (layer && layer.classList.contains('th-pos-left')) ? -1 : 1;
+  TH.aura = null;
+  TH.aura2 = null;
+  TH.video = null;
+  TH.videoDur = 0;
+  /* 口型 jaw 层（双层嘴部）：无 jaw 层时为 null，thPaint 分支自然跳过 */
+  /* 口腔浮现层（双层嘴部 v2）：无 inner 层时为 null，thPaint 分支自然跳过 */
+  TH.figImg = document.querySelector('#thFig');
+  TH.inner = document.querySelector('.th-inner');
+  TH.innerT = '';   /* 上次写入的 transform（量化去抖） */
+  /* inner 定位：按主图实际显示矩形换算（data-l/t/w 是相对主图的比例）。
+     主图 object-fit:contain 的真实矩形随容器尺寸定 → 加载完成/resize 后各算一次。 */
+  function thLayoutInner() {
+    if (!TH.inner || !TH.figImg || !TH.fig) return;
+    const ir = TH.figImg.getBoundingClientRect();
+    const fr = TH.fig.getBoundingClientRect();
+    if (ir.width < 2) return;   /* 主图未就绪，等 load 后再算 */
+    const L = parseFloat(TH.inner.dataset.l), T = parseFloat(TH.inner.dataset.t),
+          W = parseFloat(TH.inner.dataset.w);
+    TH.inner.style.left = (ir.left - fr.left + ir.width * L).toFixed(1) + 'px';
+    TH.inner.style.top = (ir.top - fr.top + ir.height * T).toFixed(1) + 'px';
+    TH.inner.style.width = (ir.width * W).toFixed(1) + 'px';
+  }
+  if (TH.inner) {
+    thLayoutInner();
+    if (TH.figImg && !TH.figImg.complete) TH.figImg.addEventListener('load', thLayoutInner);
+    window.addEventListener('resize', thLayoutInner);
+  }
+  TH.isPhoto = !!(TH.fig && document.querySelector('.th-photo'));
+  /* 动作视频：形象自己有表情与姿态，不必再靠整体缩放去伪装「活着」 */
+  if (TH.fig) TH.video = TH.fig.querySelector('video.th-photo');
+  if (TH.video) {
+    const setDur = function () {
+      const d = TH.video ? TH.video.duration : 0;
+      if (isFinite(d) && d > 0.05) TH.videoDur = d;
+    };
+    setDur();
+    TH.video.addEventListener('loadedmetadata', setDur);
+    TH.video.addEventListener('durationchange', setDur);
+  }
+  /* 句级调速时钟前缀和：thVideoClock 每帧 O(1)。
+     ⚠️ 分辨率 = 帧率栅格（渲染器逐帧取样恰好落在栅格上，栅格值即精确值）。
+     ⚠️ 中点法则积分：cum[i] = ∫₀^(i/FPS) rate dt，比「先加后存」少半个采样周期的系统偏差。
+     ⚠️ 只依赖 SEGS（与 LEVELS 无关）→ 无响度包络的口播也有稳定速率。
+     ⚠️ 只在**有动作视频**时建：静态图 / 其它皮肤零开销。 */
+  if (TH.video) {
+    const n = Math.ceil(TOTAL / 1000 * FPS) + 2;
+    const cum = new Float64Array(n);
+    let acc = 0;
+    for (let i = 0; i < n; i++) {
+      cum[i] = acc;
+      acc += thVideoRateAt((i + 0.5) / FPS * 1000) / FPS;
+    }
+    TH.rateCum = cum;
+  }
+  /* 说话光环已移除（2026-10-13 用户实测：数字人底部的光环圆环观感多余）。
+     TH.aura/TH.aura2 保持 null，thPaint 里的 if (TH.aura) 分支自然跳过；
+     CSS .th-aura/.th-aura2 保留（不再被创建，零渲染成本）。「正在说话」的表达
+     由呼吸加深 + 头部微摆 + 呼吸条承担。 */
+})();
+buildKpanel();
+(function buildDots() {
+  const dots = $('dots');
+  SHOTS.forEach(() => { const s = document.createElement('span'); dots.appendChild(s); });
+})();
+if (pageImg) pageImg.addEventListener('load', syncPagewrap);
+window.addEventListener('resize', syncPagewrap);
+syncPagewrap();
+render(0); paint(0);
+
+/* =========================================================================
+   渲染接口（由 renderer.py 通过 page.evaluate 调用）
+   ⚠️ 自驱动时钟用 performance.now() + rAF，**不依赖页面自身的 audio**：
+      音轨是渲染器独立解码再合流的，页面出声只会有害（缓冲抖动）。
+   ⚠️ 不改任何视觉逻辑 —— 只是把 render(ms) 按真实时间喂进去，
+      CSS 过渡（.42s 缓动等）由合成器按真实时间推进，这正是 screencast 的前提。
+   ========================================================================= */
+window.__stage = {
+  total: TOTAL,
+  skin: SKIN,
+  inner: INNER,
+  ms: 0,
+  t0: 0,
+  done: false,
+  running: false,
+  /* 只读数据引用：渲染器与验收探针要靠它算「某时刻应该是什么画面」，
+     不必重新解析 HTML。舞台页只被无头渲染器加载，不对外暴露。 */
+  data: { segs: SEGS, sceneOf: SCENE_OF, shots: SHOTS, points: POINTS,
+          at: AT, src: SRC, pages: SRC_PAGES },
+  /* 资源就绪：图片解码完 + 字体就绪，否则第一帧抓到的可能是白屏 */
+  ready: function () {
+    if (document.fonts && document.fonts.status !== 'loaded') return false;
+    if (skin === 'source' || INNER === 'source') {
+      if (!pageImg.complete || !pageImg.naturalWidth) return false;
+    }
+    /* 动作视频要等到**能出画面**（readyState ≥ 2）才认就绪：否则第一帧抓到的
+       是 poster 或黑块，而锚点恰好落在那一帧上 —— 整片开头一瞬会是静态照片。 */
+    if (TH.video && TH.video.readyState < 2) return false;
+    return true;
+  },
+  /* 独立 seek（探针逐帧验证用；不挂在播放循环上）
+     ⚠️⚠️ 有动作视频时，`seek(ms)` **不再单独构成**「同一 ms 同一画面」的保证：
+         视频 seek 是**异步**的（要等解码器定位），同步截图会拿到旧帧。
+         所以这里做两件事：① 明确把视频定位到该时刻并暂停；② 提供 `videoSeeked()`
+         让调用方等这一帧真正就绪。无视频时（静态图 / 其它皮肤）语义与从前完全一致。 */
+  seek: function (ms) {
+    render(ms); paint(ms); window.__stage.ms = ms;
+    const v = TH.video;
+    if (v) {
+      const dur = TH.videoDur;
+      /* ⚠️ 必须与 thSyncVideo **同一个**时钟函数（**句级调速时钟**，见 thVideoClock），
+         否则探针 seek 的画面
+         与生产渲染（start()）不在同一条时间轴上 —— 探针绿 ≠ 成片对。 */
+      const want = (dur > 0.05) ? (thVideoClock(ms) % dur) : 0;
+      try { v.pause(); v.currentTime = want; } catch (e) {}
+    }
+  },
+  /* 视频 seek 就绪信号（无视频时立即完成）。探针 seek 之后必须等它再截图。 */
+  videoSeeked: function () {
+    const v = TH.video;
+    if (!v) return Promise.resolve(false);
+    if (!v.seeking) return Promise.resolve(true);
+    return new Promise(function (res) {
+      let done = false;
+      const fin = function () { if (!done) { done = true; res(true); } };
+      v.addEventListener('seeked', fin, { once: true });
+      setTimeout(fin, 2500);           /* 兜底：seek 卡住也不能把调用方吊死 */
+    });
+  },
+  setSkin: function (k, inner) { setSkin(k, inner); },
+  /* 启动自驱动时钟 */
+  start: function () {
+    const self = window.__stage;
+    /* ⚠️ 动作视频必须与页钟**同时**归零起播：两者都跟挂钟走，同一起点才不累积错位。
+       第一帧本来就对应 ms=0，所以这里归零是安全的。 */
+    if (TH.video) {
+      try { TH.video.currentTime = 0; } catch (e) {}
+      const pr = TH.video.play();
+      if (pr && pr.catch) pr.catch(function () {});
+    }
+    self.t0 = performance.now();
+    self.ms = 0; self.done = false; self.running = true;
+    function tick() {
+      if (!self.running) return;
+      const ms = Math.min(TOTAL, performance.now() - self.t0);
+      self.ms = ms;
+      render(ms); paint(ms);
+      if (ms >= TOTAL) { self.done = true; self.running = false; return; }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  },
+  stop: function () { window.__stage.running = false; },
+  state: function () {
+    const self = window.__stage;
+    return { ms: self.ms, t0: self.t0, done: self.done, running: self.running,
+             clock: performance.now() - self.t0 };
+  }
+};
+/* 探针/渲染器就绪信号（CSP/时序无关：脚本执行完即置位） */
+window.__stage_ready = true;
+</script>
+</body>
+</html>

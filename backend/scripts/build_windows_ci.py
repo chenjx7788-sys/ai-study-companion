@@ -686,6 +686,19 @@ def assert_package(zip_path: Path, fe_count: int, model_path: Path) -> None:
     need(base + "dist/index.html", "前端入口 dist/index.html")
     need(base + "extension/manifest.json", "浏览器扩展随包")
 
+    # ⚠️ 舞台模板 + 预置形象素材：`collect_all()` 收不到的**数据文件**，只在打包版暴露
+    #    （源码态读工作树里的真文件 → 缺了也一切正常，本项目已两次栽在这类「只漏打包版」）。
+    #    2026-10-12 实测：spec 的 datas 只补了 `app/services/assets`，把 `stage_tpl*.html`
+    #    漏了 → 打包版 AI 视频**全部皮肤**渲染即 `FileNotFoundError`。
+    #    加这几条守卫的用意：漏收时**在这里红**（CI 直接失败），而不是等用户装上才发现。
+    #    ⚠️ 新增皮肤模板时要同步往这份名单里加，否则守卫反而会漏掉新皮肤。
+    for _tpl in ("stage_tpl.html", "stage_tpl_radio.html",
+                 "stage_tpl_night.html", "stage_tpl_ambient.html"):
+        need(base + "app/services/" + _tpl, "舞台模板随包 %s" % _tpl)
+    need(base + "app/services/assets/avatars/preset_01.jpg", "预置形象素材随包")
+    # ⚠️ 必须用**具体文件**（zip 的 infolist 里通常没有纯目录条目 → 拿目录名当 key 会假红）
+    need(base + "app/services/assets/night/night_dusk.png", "深色电台插画随包")
+
     model_key = base + "data/models/bge-small-zh-v1.5/model.onnx"
     if model_key in infos:
         got = infos[model_key].file_size

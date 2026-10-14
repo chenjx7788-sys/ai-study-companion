@@ -29,13 +29,48 @@ datas += [('../frontend/dist', 'dist')]
 # 浏览器扩展源码（设置页「下载扩展」现场打包 zip 用，ext.py 里 _MEIPASS/extension 定位）
 datas += [('../extension', 'extension')]
 
+# ⚠️⚠️ 应用自带的**静态资源**必须显式收集（`collect_all()` 只收模块与二进制，**不收数据文件**）：
+#   · app/services/assets/night/          深色电台的背景插画（缺失时 stage.py 直接报错）
+#   · app/services/assets/skin_previews/  视觉方案示例图的随包兜底
+#   · app/services/assets/avatars/        **预置数字人形象**（2026-10-12 起为真人照片）
+#   漏收的后果**只在打包版暴露**（源码态一切正常）：预置形象集体 404、night 渲染报错。
+#   ⚠️ 此前这三类**都漏收**（night / skin_previews 是既有缺口），本次一并补上。
+#   ⚠️ `asc_pack_trim` 只裁 `babel/locale-data/`，不会把它们当垃圾删掉。
+datas += [('app/services/assets', 'app/services/assets')]
+
+# ⚠️⚠️ **舞台模板**（`stage_tpl*.html`）同样是 `collect_all()` 收不到的**数据文件**，
+#    而且漏收的后果比上一条更致命：`stage.py` 用
+#    `Path(__file__).with_name("stage_tpl*.html")` 读它们 ——
+#    缺任一文件就是**打包版 AI 视频全部皮肤**每次渲染 `FileNotFoundError`，
+#    而源码态永远看不见（读的是工作树里的真文件）。
+#    2026-10-12 核实：本 spec 的 datas、`backend/scripts/build_windows_ci.py`、
+#    `.github/workflows/build-*.yml` 里**都没有**任何收集它的机制
+#    （当天补了 `assets/`，把 `*.html` 漏了）→ 本次一并补上。
+#    ⚠️ 用 glob 而不是写死文件名：视频侧的既定约定是「新增皮肤 = +1 个
+#    `stage_tpl_*.html`」，写死的话下次加皮肤会**静默漏收**。
+#    ⚠️ 不能裸写 `glob.glob('app/services/...')`：spec 执行时的 cwd 不保证在这个目录，
+#    必须锚到 `SPECPATH`（PyInstaller 注入的「spec 所在目录」—— datas 里的相对路径
+#    也正是按它解析的）。
+#    ⚠️ 命中 0 个文件时**直接报错**：路径锚错就静默出一个没有模板的坏包，
+#    与本项目「不许静默失效」的纪律相悖。
+import glob as _glob_tpl
+import os as _os_tpl
+_TPL_DIR = _os_tpl.path.join(globals().get('SPECPATH') or _os_tpl.getcwd(),
+                             'app', 'services')
+_TPL_FILES = sorted(_glob_tpl.glob(_os_tpl.path.join(_TPL_DIR, 'stage_tpl*.html')))
+if not _TPL_FILES:
+    raise SystemExit("[spec] 未找到舞台模板：%s —— 路径锚错，打包会缺模板" % _TPL_DIR)
+datas += [(_p, 'app/services') for _p in _TPL_FILES]
+
 # 收集依赖（动态库 + 数据文件 + 隐藏导入）
 for pkg in ['faster_whisper', 'ctranslate2', 'onnxruntime', 'tokenizers',
             'chromadb', 'uvicorn', 'openai', 'pypdf', 'docx', 'pptx', 'webview',
             'lxml',   # EPUB 章节 XHTML 解析：此前靠依赖链偶然带入，显式收集保证两个平台都齐
             'rapidocr_onnxruntime', 'cv2', 'fitz', 'pymupdf', 'shapely', 'pyclipper', 'PIL',
             # AI 播客 TTS：edge-tts（免费音色）+ aiohttp（WebSocket 客户端，含 C 扩展，需显式收集）
-            'edge_tts', 'aiohttp', 'certifi']:
+            'edge_tts', 'aiohttp', 'certifi',
+            # 本地 TTS 运行时（provider=zipvoice）：sherpa-onnx（C++ 扩展 + Python 绑定）
+            'sherpa_onnx']:
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
@@ -75,6 +110,24 @@ if _sys.platform == 'darwin':
 
 # BGE 向量模型随包（启动器首次启动时预置到用户目录）
 datas += [('data/models/bge-small-zh-v1.5', 'data/models/bge-small-zh-v1.5')]
+
+# ⚠️⚠️ sherpa-onnx 的 C++ 运行时 .dll 必须**单独显式收集**（2026-10-13 新增 zipvoice provider）：
+#   `collect_all('sherpa_onnx')` 收得到 `lib/_sherpa_onnx.cpXY-*.pyd`（扩展模块 → 二进制），
+#   但**收不到同目录下的 onnxruntime.dll / sherpa-onnx-c-api.dll**（它们既非扩展模块、
+#   也非 collect_data_files 默认口径内的数据文件）→ 漏收后果与历史 Qt 坑一模一样：
+#   源码态一切正常、**打包版 import 直接崩**（Windows: WinError 126 找不到
+#   sherpa-onnx-c-api.dll；功能表现为「本地合成不可用」）。
+#   故显式把 `sherpa_onnx/lib/*.dll|*.pyd` 收进同名目录 —— .pyd 的依赖 DLL 搜索
+#   优先看它自己所在目录，放同目录最稳。
+try:
+    from pathlib import Path as _Path
+    import sherpa_onnx as _so_pkg
+    _so_lib = _Path(_so_pkg.__file__).resolve().parent / 'lib'
+    for _pat in ('*.dll', '*.pyd'):
+        for _f in _so_lib.glob(_pat):
+            binaries.append((str(_f), 'sherpa_onnx/lib'))
+except Exception:
+    pass   # 未安装 sherpa-onnx 时（例如只需 edge-tts 的构建）不阻断打包
 
 # ⚠️⚠️ 数据文件必须单独收（2026-09-23 实测，R6 时抓到）：
 #   `collect_all()` **只收模块与二进制，不收数据文件** —— 上面那些 `collect_all('webview')`

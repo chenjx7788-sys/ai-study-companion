@@ -775,10 +775,16 @@ def reset_whisper_cache():
 
 
 
-def _load_whisper_slot(slot: int):
+def _load_whisper_slot(slot: int, allow_download: bool = True):
     """为指定槽加载模型实例（懒加载，每路独立实例、独占 cpu_count//路数 线程）。
     按 asr.preferred_size() 选择版本（用户配置优先，否则 small→base）；
-    以 model.bin 体积>20MB 判定已安装，避免半截残留文件被误加载。"""
+    以 model.bin 体积>20MB 判定已安装，避免半截残留文件被误加载。
+
+    ⚠️ `allow_download=False` 时**绝不**走「无模型就下载 base」兜底，直接抛
+        `RuntimeError("[NEED_ASR]...")`。口述作答（transcribe_short）必须走这条路：
+        用户正等着填答案，静默拉 145MB 既无进度也不可控。
+        路由层的 `installed_size()` 预判存在 TOCTOU 窗口（判完到真正加载之间模型被删），
+        这里才是**机制上**的最后一道闸。"""
     from . import asr as asr_svc
     from ..core.config import settings
     import os
@@ -806,6 +812,8 @@ def _load_whisper_slot(slot: int):
             break
 
     if model is None:
+        if not allow_download:
+            raise RuntimeError("[NEED_ASR]语音模型尚未下载")
         os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
         print("[asr] 本地无模型，从镜像下载 whisper base...")
         model = WhisperModel("base", device="cpu", compute_type="int8",
@@ -817,9 +825,13 @@ def _load_whisper_slot(slot: int):
     return model
 
 
-def _acquire_whisper():
+def _acquire_whisper(allow_download: bool = True):
     """借一个转写槽（信号量已保证同时借出 ≤ 并发路数）。返回 (slot, model)；
-    用完必须 _release_whisper(slot)。首次借某槽时懒加载该路模型。"""
+    用完必须 _release_whisper(slot)。首次借某槽时懒加载该路模型。
+
+    ⚠️ 加载失败必须**先把槽还回去**再抛：槽位是「忙/闲」两态标记，泄漏一次就少一路并发，
+        反复失败会把 _TRANSCRIBE_CONCURRENCY 路全占死 → 之后所有转写都报「无可用转写槽」。
+    """
     slot = -1
     with _whisper_slots_lock:
         for i in range(_TRANSCRIBE_CONCURRENCY):
@@ -830,7 +842,11 @@ def _acquire_whisper():
     if slot < 0:   # 理论上不会发生（信号量限流），防御
         raise RuntimeError("无可用转写槽")
     if _whisper_slots[slot] is None:
-        _load_whisper_slot(slot)
+        try:
+            _load_whisper_slot(slot, allow_download=allow_download)
+        except BaseException:
+            _release_whisper(slot)
+            raise
     return slot, _whisper_slots[slot]
 
 
@@ -880,6 +896,30 @@ def parse_media(path: str, on_progress=None) -> list[dict]:
         finally:
             _release_whisper(slot)
     return chunks
+
+
+def transcribe_short(path: str) -> str:
+    """短音频 → 文本（语音作答用）。返回纯文本，**不做分钟分块**。
+
+    ⚠️ 与 parse_media 的分工：parse_media 面向「材料导入」，按 ~1 分钟切块并给 page_no
+        供检索与定位；这里只要用户刚口述的那一句话 → 直接拼接全部分段。
+    ⚠️ 复用**同一套** whisper 槽位与同一个信号量（_transcribe_sem）→ 与材料转写共用
+        并发闸，不会在批量导入音频时又压上第二个模型实例把 CPU 抢死。
+    ⚠️ 本函数**从机制上**禁止「模型没装就自动下载」（allow_download=False）：那是
+        parse_media 材料导入路径的兜底。语音作答要求模型已就绪（路由层先判
+        asr.installed_size()），避免用户等答案时被静默拖走 145MB 流量。
+        ⚠️ 只靠路由层那一次判断不够：判完到真正加载之间有 TOCTOU 窗口（模型被删/换盘）。
+    """
+    with _transcribe_sem:
+        slot, model = _acquire_whisper(allow_download=False)
+        try:
+            segments, _info = model.transcribe(
+                path, language="zh", vad_filter=True, beam_size=1,
+                initial_prompt="以下是简体中文普通话的语音内容，请用简体中文转写，注意标点。",
+            )
+            return "".join(seg.text.strip() for seg in segments).strip()
+        finally:
+            _release_whisper(slot)
 
 
 PARSERS = {"pdf": parse_pdf, "docx": parse_docx, "doc": parse_docx, "pptx": parse_pptx, "ppt": parse_pptx,

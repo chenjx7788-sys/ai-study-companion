@@ -31,9 +31,14 @@ function guideSetup(message) {
 }
 
 // onProgress：分批任务（如长文档摘要的两段式）的进度回调，payload = {done, total}
+// onStage：**阶段**进度回调，payload = {stage, detail}（AI 视频的生成流用它）。
+//   ⚠️ 与 onProgress 分开，是因为两者载荷语义不同（阶段名+明细 vs 计数）：
+//      合用一个回调会逼调用方靠猜字段名区分。
+//   ⚠️ 不加这个分支时 `event: stage` 会被 `else` 链**静默丢弃** ——
+//      表现为「点了生成、进度条一直不动」的假死（后端其实在跑）。
 // signal：可选的 AbortSignal（WP17 侧栏订阅要在卸载时断开长连接）。
 //   ⚠️ 长连接（SSE）**必须**能断开：否则每次订阅都在后端留一条不死连接 + 一个订阅者队列。
-export async function streamSSE(url, body, onToken, onDone, onError, onMeta, onProgress, signal) {
+export async function streamSSE(url, body, onToken, onDone, onError, onMeta, onProgress, signal, onStage) {
   const headers = { 'Content-Type': 'application/json' }
   let resp
   try {
@@ -85,6 +90,7 @@ export async function streamSSE(url, body, onToken, onDone, onError, onMeta, onP
       }
       else if (ev === 'meta') onMeta?.(payload)
       else if (ev === 'progress') onProgress?.(payload)
+      else if (ev === 'stage') onStage?.(payload)
     }
   }
 }

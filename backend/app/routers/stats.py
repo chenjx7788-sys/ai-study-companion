@@ -28,19 +28,25 @@ CN = timedelta(hours=8)
 # ---------- 埋点 ----------
 
 class TrackReq(BaseModel):
-    type: str          # duration / note_view
-    ref_id: int = 0    # material_id（duration）或 note_id（note_view）
+    type: str          # duration / note_view / video_create / video_render / video_finish / video_play / video_export / video_to_note
+    ref_id: int = 0    # material_id（duration）或 note_id（note_view）或 video_id（video_*）
     duration_seconds: int = 0
+    detail: str = ""   # 行为明细 JSON 小对象（≤255 字符；绝不装讲稿正文/来源内容 —— PRD 4.2 埋点边界）
 
 
 @router.post("/track")
 def track(req: TrackReq, db: Session = Depends(get_db)):
     """行为埋点：学习时长（学习页心跳）/ 笔记回看"""
-    if req.type not in ("duration", "note_view"):
-        raise HTTPException(400, "type 须为 duration / note_view")
+    if req.type not in ("duration", "note_view", "video_create", "video_render",
+                        "video_finish", "video_play", "video_export", "video_to_note"):
+        raise HTTPException(400, "type 须为 duration / note_view / video_*（PRD 4.2）")
     if req.type == "duration" and (req.duration_seconds <= 0 or req.duration_seconds > 3600):
         raise HTTPException(400, "duration_seconds 须在 1-3600 之间")
-    db.add(ActivityLog(type=req.type, ref_id=req.ref_id, duration_seconds=req.duration_seconds))
+    if len(req.detail or "") > 255:
+        raise HTTPException(400, "detail 过长（埋点只装行为量，不装正文 —— PRD 4.2）")
+    db.add(ActivityLog(type=req.type, ref_id=req.ref_id,
+                       duration_seconds=req.duration_seconds,
+                       detail=(req.detail or "")[:255]))
     db.commit()
     return {"ok": True}
 

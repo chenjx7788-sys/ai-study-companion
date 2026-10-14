@@ -158,6 +158,10 @@ def _run_learn_job(mid: int, title: str, quiz_count: int, job: _LearnJob) -> Non
         job.stage = "prepare"
         job.broadcast("progress", {"status": "running", "stage": "prepare"})
         chunks = _load_chunks(db, mid)
+        # 材料内容性质（P0 工艺分流）：决定讲义走哪套工艺。
+        # 空串 = auto（未判定 / 老数据 / 图片·音视频之外未判定）→ 走改造前的通用工艺。
+        _m = db.get(Material, mid)
+        doc_kind = (_m.doc_kind if _m else "") or "auto"
         if not chunks:
             job.status = "failed"
             job.error = "材料没有可学习的内容，请先完成解析"
@@ -170,7 +174,7 @@ def _run_learn_job(mid: int, title: str, quiz_count: int, job: _LearnJob) -> Non
         # 逐 token 广播：前端据此实时渲染「正在打字」的讲义，不必等全文生成完。
         # 全文累积到 content，落库口径与旧非流式版本一致（截断提示块已由生成器垫在最前）。
         content_parts: list[str] = []
-        for piece in llm.generate_learn_note_stream(chunks, title=title):
+        for piece in llm.generate_learn_note_stream(chunks, title=title, doc_kind=doc_kind):
             content_parts.append(piece)
             job.note_buf.append(piece)
             job.broadcast("token", {"t": piece})

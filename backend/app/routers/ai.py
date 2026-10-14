@@ -131,7 +131,10 @@ def create_section_summary(req: SectionSummaryReq, db: Session = Depends(get_db)
     if not rows:
         raise HTTPException(404, "该章节没有可总结的文本内容")
     chunks = [{"content": r.content, "page_no": r.page_no, "section_path": r.section_path} for r in rows]
-    content = llm.generate_summary(chunks, f"只总结「{req.section_path}」这一章，不要扩展到其他章节",
+    # P1 · 分章摘要省略边界：prompt_summary 第 5 条约定“分章只输出章节大纲、不输出适用边界”，
+    # 这里用 scope_hint 触发该分支（全文摘要/流式摘要不拼此 hint，仍输出边界）。
+    content = llm.generate_summary(chunks, f"只总结「{req.section_path}」这一章，不要扩展到其他章节"
+                                   "【scope_hint=section_only：这是分章摘要，只输出章节大纲，不要输出 `## 适用边界`】",
                                    kind="section_summary")
 
     a = AIAsset(material_id=req.material_id, type="section_summary", content=content,

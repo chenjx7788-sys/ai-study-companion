@@ -96,6 +96,8 @@ def material_to_dict(m: Material, db: Session) -> dict:
         "parse_error": m.parse_error,
         "page_count": m.page_count,
         "tags": m.tags or [],
+        # 内容性质（P0 工艺分流）：空串 = auto（未判定/老数据），前端据此显示"内容类型"选择器。
+        "doc_kind": m.doc_kind or "",
         "last_read_page": m.last_read_page or 0,
         "note_count": note_count,
         "has_ai": has_ai,
@@ -104,6 +106,26 @@ def material_to_dict(m: Material, db: Session) -> dict:
 
 
 # ---------- 解析任务（后台线程） ----------
+
+# 图片 OCR 块的独占前缀（后端 parser 的约定，与前端 isImgOcr 同口径）
+IMG_OCR_PREFIX = "[图片]"
+
+
+def _chunk_kind(content: str, m) -> str:
+    """单个解析块的性质：`img_ocr`（图片里的文字）或 `body`（正文）。
+
+    ⚠️ **只对网页剪藏材料生效**（`origin_meta.saved_from == 'clip'`）。
+       判据用 `saved_from` 而**不是** `origin`：早期小红书笔记的 origin 记的是 `'upload'`
+       （实测 #40/#43/#45 都是小红书、origin 却 = upload），按 origin 枚举判会漏掉最大的那几篇。
+    ⚠️ 这类块**照常分块、照常入向量库与全文检索**，只是学习页默认不显示（有折叠入口）。
+       所以这里只打标记，**绝不去动 content** —— content 是 extract_sig 指纹的输入，
+       改动会误触发重新抽实体、白烧 token。
+    """
+    if not (content or "").startswith(IMG_OCR_PREFIX):
+        return "body"
+    meta = m.origin_meta if isinstance(m.origin_meta, dict) else {}
+    return "img_ocr" if meta.get("saved_from") == "clip" else "body"
+
 
 def _parse_material(material_id: int):
     """后台解析：提取文本块 → 写入 MaterialChunk → 更新状态。
@@ -178,6 +200,7 @@ def _parse_material(material_id: int):
                 content=c["content"],
                 page_no=c["page_no"],
                 section_path=c.get("section_path", ""),
+                kind=_chunk_kind(c["content"], m),
             ))
         m.page_count = max(c["page_no"] for c in chunks)
         db.commit()   # 先落 chunks，供索引查询
@@ -216,6 +239,17 @@ def _parse_material(material_id: int):
                     daemon=True).start()
             except BaseException:
                 pass   # 抽取任务派发失败不影响主流程
+
+        # 材料内容性质判定（P0 工艺分流）：与实体抽取同款后台异步 + 失败静默。
+        # 图片/音视频直接判 fragment（不调 LLM）；文本类才调一次 LLM（取前 4000 字样本）。
+        # ⚠️ 放在"标记成功"之后、绝不同步等待 —— 判定慢/失败都不该拖住解析状态。
+        try:
+            _mid_ck = m.id
+            threading.Thread(
+                target=_classify_doc_kind_task, args=(_mid_ck,),
+                daemon=True).start()
+        except BaseException:
+            pass   # 判定任务派发失败不影响主流程
     finally:
         db.close()
 
@@ -239,6 +273,41 @@ def _extract_entities_task(material_id: int):
             print(f"[entity] 材料 {material_id} 实体抽取完成：{n} 个实体")
     except BaseException:
         # ⚠️ BaseException：safe-delete shim / LLM 异常等都不该让后台线程带出异常
+        pass
+    finally:
+        db.close()
+
+
+def _classify_doc_kind_task(material_id: int):
+    """后台判定材料内容性质（P0 工艺分流）：独立会话 + 失败静默。
+
+    ⚠️ 与 _extract_entities_task 同理：必须用**自己的 SessionLocal** 重新查 chunk，
+    绝不能复用调用方传入的 ORM 对象（_parse_material 的 db 已在 finally 里 close）。
+    ⚠️ 失败静默：判定是增强项 —— 未配 Key / 超时 / 解析异常都不该影响材料的成功状态，
+    此时 doc_kind 保持空 = auto，讲义走改造前的通用工艺。
+    """
+    from ..services import llm as llm_svc
+    db = SessionLocal()
+    try:
+        m = db.get(Material, material_id)
+        if not m:
+            return
+        chunks = (db.query(MaterialChunk)
+                  .filter(MaterialChunk.material_id == material_id)
+                  .order_by(MaterialChunk.page_no, MaterialChunk.id).all())
+        if not chunks:
+            return
+        dicts = [{"content": c.content, "page_no": c.page_no,
+                  "section_path": c.section_path or ""} for c in chunks]
+        kind = llm_svc.classify_doc_kind(dicts, m.format)
+        m = db.get(Material, material_id)   # 判定期间材料可能已被删除
+        if m is None:
+            return
+        m.doc_kind = kind
+        db.commit()
+        print(f"[doc_kind] 材料 {material_id} 内容性质判定为 {kind}")
+    except BaseException:
+        # ⚠️ BaseException：safe-delete shim / LLM 异常都不该让后台线程带出异常
         pass
     finally:
         db.close()
@@ -764,7 +833,12 @@ def get_material(material_id: int, db: Session = Depends(get_db)):
 
 @router.get("/{material_id}/chunks")
 def get_chunks(material_id: int, db: Session = Depends(get_db)):
-    """B1 阅读器文本视图数据：按页码/顺序返回解析块"""
+    """B1 阅读器文本视图数据：按页码/顺序返回解析块
+
+    返回 `kind`（body / img_ocr）供前端决定是否显示：img_ocr = 网页材料里图片的 OCR 文字，
+    学习页默认不渲染（可折叠展开），但**块本身仍然返回** —— 向量化、全文检索、AI 上下文
+    都读这张表，任何一层都不能因为"不显示"而把它删掉。
+    """
     m = db.get(Material, material_id)
     if not m:
         raise HTTPException(404, "材料不存在")
@@ -772,7 +846,7 @@ def get_chunks(material_id: int, db: Session = Depends(get_db)):
             .filter(MaterialChunk.material_id == material_id)
             .order_by(MaterialChunk.page_no, MaterialChunk.id).all())
     return [{"id": r.id, "content": r.content, "page_no": r.page_no,
-             "section_path": r.section_path} for r in rows]
+             "section_path": r.section_path, "kind": r.kind or "body"} for r in rows]
 
 
 class ChunkUpdateReq(BaseModel):
@@ -1048,6 +1122,14 @@ def update_material(material_id: int, payload: dict, db: Session = Depends(get_d
     m = db.get(Material, material_id)
     if not m:
         raise HTTPException(404, "材料不存在")
+    if "doc_kind" in payload:
+        from ..services.llm import DOC_KIND_VALUES
+        k = str(payload["doc_kind"] or "").strip().lower()
+        if k not in DOC_KIND_VALUES:
+            raise HTTPException(400, f"内容类型取值非法：{k}")
+        m.doc_kind = k
+        # ⚠️ 不自动删已生成的讲义/题目：题目与「测一测」共用 source="quiz" 删除口径，
+        #    自动删会静默清空用户的复习进度（项目铁律）。前端提示"重新生成讲义后生效"即可。
     if "tags" in payload and isinstance(payload["tags"], list):
         m.tags = [str(t)[:20] for t in payload["tags"]][:10]
     if "last_read_page" in payload:

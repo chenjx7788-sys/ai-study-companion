@@ -184,6 +184,18 @@
 
             <div class="field">
               <label>音色<span class="hint-inline">点 ▶ 可试听每个音色</span></label>
+              <!-- ⚠️ 本地合成引擎但模型未下载时，音色列表必然为空 —— 直接给空下拉是死路，
+                   必须给出「去哪解决」的明确指引（与后端可执行错误文案同口径） -->
+              <el-alert v-if="!options.voices.length" type="warning" :closable="false"
+                class="voice-empty-tip">
+                <template #title>
+                  当前合成引擎是「本地（ZipVoice）」，但语音模型还没下载 —— 音色列表因此为空。
+                </template>
+                <template #default>
+                  <span>到「管理中心 → 语音合成模型（本地合成）」点「立即下载」，或把合成引擎切回「在线（edge-tts）」。</span>
+                  <el-button size="small" type="primary" link @click="goSettings">去下载</el-button>
+                </template>
+              </el-alert>
               <div class="voice-row">
                 <span class="voice-role">{{ isVerbatim ? '朗读' : '主持人' }}</span>
                 <el-select v-model="form.voice_map.host" size="small" style="flex:1">
@@ -377,10 +389,6 @@
                   <svg class="ac-op-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
                   <span class="ac-op-text">打开位置</span>
                 </el-button>
-                <el-button size="small" text title="复制路径" @click="copyPath">
-                  <svg class="ac-op-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                  <span class="ac-op-text">复制路径</span>
-                </el-button>
                 <el-button size="small" text title="导出文稿" @click="exportScript">
                   <svg class="ac-op-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
                   <span class="ac-op-text">导出文稿</span>
@@ -546,6 +554,7 @@
 
 <script setup>
 import { ref, computed, reactive, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import MarkdownIt from 'markdown-it'
 import mascot from '../assets/mascot.png'
@@ -676,6 +685,9 @@ const sourceTypes = [
 ]
 
 const voiceStatus = ref({ ok: true, label: '语音服务', text: '点击检测语音服务' })
+// 本地合成模型未下载时的引导：跳到管理中心下载（与 SettingsView 的下载卡片同页）
+const router = useRouter()
+function goSettings() { router.push('/settings') }
 
 // 当前风格的说明（用户不必点开才知道「单人精讲」是什么）
 const styleDesc = computed(() => {
@@ -1944,6 +1956,8 @@ onMounted(async () => {
 }
 
 /* ---------- 音色试听 ---------- */
+/* 本地合成模型未下载时的引导条：给空音色列表一个出口，不做成死路 */
+.voice-empty-tip { margin-bottom: 10px; }
 .voice-row {
   display: grid; grid-template-columns: 42px minmax(0, 1fr) 30px;
   align-items: center; gap: 8px; margin-bottom: 8px;

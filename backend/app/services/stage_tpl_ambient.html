@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<style>
+/* =========================================================================
+   舞台页 · ambient 深色氛围（解压型皮肤 · 保留档）。
+   inner=none：纯氛围光晕；inner=source：氛围底 + 材料原件**柔化浮现**。
+   与 source 皮肤的区别：原件微压暗 + 大圆角 + 柔投影「浮」在氛围上；聚光从
+   「3px 硬边框」改成**柔光晕**（radial-gradient 无硬边）；无放大镜、无要点栏。
+   ⚠️ 所有动效（含柔光晕的移动）是 `ms → 状态` JS 纯函数插值，不用 CSS transition —
+      这样 seekTo(ms) 与成片同果（可逐帧验收）。
+   ⚠️ 光晕用 radial-gradient 连续渐变，**不用多层同心圆叠加**（实测出靶心硬边环）。
+   ========================================================================= */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: #0e0f14; overflow: hidden; }
+.screen {
+  position: relative; width: 1920px; height: 1080px; background: #0e0f14; overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+/* ---------- 自定义背景（可选；用户上传） ----------
+   ⚠️ 遮罩 0.35 是实测值（`_bg_alpha_dense_20261012/`）：ambient 自带 `.subbar` 的
+      94% 渐变底衬**已经把字幕兜住**，这里只需把背景压到「不干扰光晕、不抢原件」的亮度。
+      加强到 0.75 会把用户图彻底洗掉（氛围皮肤的意义正是那张图的空气感）。 */
+.bgphoto {
+  position: absolute; inset: 0; background-size: cover; background-position: center;
+  background-repeat: no-repeat;
+}
+.screen[data-bg="user"] .bgphoto::after {
+  content: ''; position: absolute; inset: 0; background: rgba(14,15,20,.35);
+}
+
+/* ---------- 用户背景时的进度条 ----------
+   ⚠️⚠️ 探针实测（`_bg_probe_run1.txt`）：紫色填充 `#7c5cfc` 的**相对亮度只有 0.19**，
+      压在浅色照片的遮罩上仅 **1.91:1**（灰色照片 1.62:1）—— 全表最差项。
+      亮度是算出来的，不是风格问题：紫色对任何中等亮度的底都不够，只有纯黑底才行。
+   ⚠️ 修法是**换填充色 + 加深色轨道**，而不是调遮罩 —— 调遮罩会连用户照片一起洗掉。
+      实测（黑白灰三种极端底图）：深轨 + `#f2f0ff` 浅填充 → 4.7 ~ 16.8:1。
+   ⚠️ 只作用于 `[data-bg="user"]`：纯氛围（无背景）时紫条压纯色底本来就有 4.37:1，别动。
+   ⚠️⚠️ 这两条**靠权重生效**（`.screen[data-bg="user"] .progress` = 0,3,0，压过 `.progress` 的
+      0,1,0），**与书写先后无关** —— 曾误把「位置在通用规则之前」当失效原因去调顺序，
+      实测数字一格没动（`_bg_probe_run2.txt`）。真因在 body：`.bgphoto` 写在 `.progress`
+      之后把它盖住了，照片够暗时还会让对比度看起来是达标的。 */
+.screen[data-bg="user"] .progress { background: rgba(0, 0, 0, .60); }
+.screen[data-bg="user"] .progress i { background: #f2f0ff; }
+.progress { position: absolute; left: 0; right: 0; top: 0; height: 3px; background: rgba(255,255,255,.07); }
+.progress i { display: block; height: 100%; width: 0; background: #7c5cfc; }
+.glow { position: absolute; left: 0; top: 0; will-change: transform; }
+.doctag {
+  position: absolute; left: 50%; top: 30px; transform: translateX(-50%);
+  font-size: 16px; color: #9c9cab; letter-spacing: 3px;
+}
+.docwrap { position: absolute; left: 50%; top: 45%; transform: translate(-50%, -50%); }
+.docfloat {
+  position: relative; width: 100%; height: 100%; border-radius: 16px; overflow: hidden;
+  box-shadow: 0 26px 80px rgba(0,0,0,.62), 0 0 0 1px rgba(255,255,255,.07);
+}
+.docfloat img { display: block; width: 100%; height: 100%; }
+.softspot {
+  position: absolute; pointer-events: none; border-radius: 14px;
+  background: radial-gradient(ellipse at center,
+    rgba(255,214,150,.36) 0%, rgba(255,214,150,.17) 52%, rgba(255,214,150,0) 100%);
+}
+.subbar {
+  position: absolute; left: 0; right: 0; bottom: 0; padding: 56px 120px 42px;
+  background: linear-gradient(to top, rgba(5,6,10,.94) 36%, rgba(5,6,10,0));
+  color: #fff; font-size: 38px; line-height: 1.6; text-align: center;
+}
+/* inner=none：隐藏原件层 */
+.screen[data-inner="none"] .docwrap,
+.screen[data-inner="none"] .doctag { display: none; }
+</style>
+</head>
+<body>
+<div class="screen" id="screen" data-inner="__INNER__" data-bg="__BG_KIND__">
+  <!-- ⚠️⚠️ 背景层必须在 **.progress 之前**：两者都是 position:absolute 且都没有 z-index
+       → DOM 顺序就是层叠顺序，后写的 .bgphoto 会把进度条（轨道 + 填充）整条盖住。
+       无背景时 .bgphoto 没有图（透明），所以这个错**只在「上传了背景」时才暴露**。
+       ⚠️ 它同时仍必须在 #glowHost **之前**：光晕是氛围的主体，要压在背景之上。 -->
+  <div class="bgphoto" id="bgphoto"></div>
+  <div class="progress"><i id="progFill"></i></div>
+  <div id="glowHost"></div>
+  <div class="doctag" id="doctag"></div>
+  <div class="docwrap" id="docwrap">
+    <div class="docfloat" id="docfloat">
+      <img id="docImg" alt="材料原件">
+      <div class="softspot" id="spot"></div>
+    </div>
+  </div>
+  <div class="subbar"><span id="subTxt"></span></div>
+</div>
+<script>
+/* SEGS=[{s,t,a,b}] · GLOW=光晕参数 · SRC={aspect,count,steps[{at,p,x,y,w,h}]} · SRC_PAGES=[页图] */
+const SEGS = __SEGS__;
+const GLOW = __GLOW_CFG__;
+const SRC = __SRC__;
+const SRC_PAGES = __SRC_PAGES__;
+const INNER = "__INNER__";
+const DOC_TAG = "__DOC_TAG__";
+const TOTAL = __TOTAL__;
+
+const W = 1920, H = 1080, TAU = Math.PI * 2;
+const $ = (id) => document.getElementById(id);
+
+/* ---------- 自定义背景（可选） ----------
+   ⚠️ 必须等图片解码完再让 ready() 通过：渲染器在第一帧就截图，
+      漏掉 onload 会把「空白背景」烧进成片开头。 */
+const BG_URL = "__BG_URL__";
+let bgReady = true;
+if (BG_URL) {
+  bgReady = false;
+  $('bgphoto').style.backgroundImage = 'url("' + BG_URL + '")';
+  const bgIm = new Image();
+  bgIm.onload = function () { bgReady = true; };
+  bgIm.onerror = function () { bgReady = true; };   // 加载失败也要放行（不留死等）
+  bgIm.src = BG_URL;
+}
+
+/* ---------- 光晕 ---------- */
+const host = $('glowHost');
+function stopsCss(g) {
+  return g.stops.map(function (s) {
+    return 'rgba(' + g.color + ',' + s[1] + ') ' + (s[0] * 100).toFixed(2) + '%';
+  }).join(',');
+}
+const glowEls = GLOW.map(function (g) {
+  const el = document.createElement('div');
+  el.className = 'glow';
+  el.style.width = (2 * g.r0) + 'px';
+  el.style.height = (2 * g.r0) + 'px';
+  el.style.background = 'radial-gradient(circle closest-side at 50% 50%,' + stopsCss(g) + ')';
+  host.appendChild(el);
+  return el;
+});
+function glowState(g, ms) {
+  const t = ms / 1000;
+  return {
+    cx: W * (g.x0 + g.ax * Math.sin(TAU * t / g.tx + g.px)),
+    cy: H * (g.y0 + g.ay * Math.sin(TAU * t / g.ty + g.py)),
+    br: 1 + g.ab * Math.sin(TAU * t / g.tb + g.pb)
+  };
+}
+
+/* ---------- 原件层（inner=source） ---------- */
+const docwrap = $('docwrap'), docfloat = $('docfloat'), spot = $('spot'), docImg = $('docImg');
+const HAS_DOC = (INNER === 'source') && SRC_PAGES.length > 0;
+let docReady = false, curPage = -1;
+function syncDoc() {
+  if (!HAS_DOC) return;
+  const a = SRC.aspect || 1.6;
+  let w = 1080, h = w / a;
+  if (h > 640) { h = 640; w = h * a; }
+  docwrap.style.width = Math.round(w) + 'px';
+  docwrap.style.height = Math.round(h) + 'px';
+}
+if (HAS_DOC) {
+  docImg.onload = function () { docReady = true; };
+  docImg.onerror = function () { docReady = true; };
+  docImg.src = SRC_PAGES[0];
+  $('doctag').textContent = DOC_TAG;
+  syncDoc();
+}
+/* 柔光晕步点（纯函数插值；换页时直接跳、不平滑） */
+function spotState(ms) {
+  const steps = SRC.steps || [];
+  if (!steps.length) return null;
+  let k = 0;
+  for (let i = 0; i < steps.length; i++) if (ms >= steps[i].at) k = i;
+  const cur = steps[k], prev = k > 0 ? steps[k - 1] : cur;
+  const samePage = cur.p === prev.p;
+  const t = samePage ? Math.min(1, Math.max(0, (ms - cur.at) / 600)) : 1;
+  const e = 1 - Math.pow(1 - t, 3);
+  return { p: cur.p, x: prev.x + (cur.x - prev.x) * e, y: prev.y + (cur.y - prev.y) * e,
+           w: prev.w + (cur.w - prev.w) * e, h: prev.h + (cur.h - prev.h) * e };
+}
+function idxAt(ms) {
+  let last = 0;
+  for (let i = 0; i < SEGS.length; i++) { if (ms >= SEGS[i].a) last = i; else break; }
+  return last;
+}
+
+let curSub = -1;
+function render(ms) {
+  for (let i = 0; i < GLOW.length; i++) {
+    const g = GLOW[i], s = glowState(g, ms);
+    glowEls[i].style.transform =
+      'translate(' + (s.cx - g.r0) + 'px,' + (s.cy - g.r0) + 'px) scale(' + s.br + ')';
+  }
+  if (HAS_DOC) {
+    /* 开场浮现（0–1.6s easeOutCubic，上浮 + 淡入） */
+    const t = Math.min(1, ms / 1600), e = 1 - Math.pow(1 - t, 3);
+    docfloat.style.opacity = (0.97 * e).toFixed(3);
+    docfloat.style.transform = 'translateY(' + ((1 - e) * 36).toFixed(1) + 'px)';
+    const s = spotState(ms);
+    if (s) {
+      if (s.p !== curPage) { docImg.src = SRC_PAGES[s.p - 1]; curPage = s.p; }
+      const cxp = s.x + s.w / 2, cyp = s.y + s.h / 2;
+      const lw = s.w * 1.7, lh = s.h * 2.4;
+      spot.style.left = (cxp - lw / 2) + '%';
+      spot.style.top = (cyp - lh / 2) + '%';
+      spot.style.width = lw + '%';
+      spot.style.height = lh + '%';
+      spot.style.opacity = 1;
+    }
+  }
+  const si = idxAt(ms);
+  if (si !== curSub) { $('subTxt').textContent = SEGS[si] ? SEGS[si].t : ''; curSub = si; }
+}
+function paint(ms) {
+  const p = Math.min(1, Math.max(0, ms / TOTAL));
+  $('progFill').style.width = (p * 100) + '%';
+}
+
+window.__stage = {
+  total: TOTAL, ms: 0, t0: 0, done: false, running: false,
+  data: { segs: SEGS, inner: INNER, hasDoc: HAS_DOC, src: SRC },
+  ready: function () {
+    if (document.fonts && document.fonts.status !== 'loaded') return false;
+    if (HAS_DOC && !docReady) return false;
+    if (!bgReady) return false;
+    return true;
+  },
+  seek: function (ms) { render(ms); paint(ms); window.__stage.ms = ms; },
+  start: function () {
+    const self = window.__stage;
+    self.t0 = performance.now();
+    self.ms = 0; self.done = false; self.running = true;
+    function tick() {
+      if (!self.running) return;
+      const ms = Math.min(TOTAL, performance.now() - self.t0);
+      self.ms = ms;
+      render(ms); paint(ms);
+      if (ms >= TOTAL) { self.done = true; self.running = false; return; }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  },
+  stop: function () { window.__stage.running = false; },
+  state: function () {
+    const self = window.__stage;
+    return { ms: self.ms, t0: self.t0, done: self.done, running: self.running,
+             clock: performance.now() - self.t0 };
+  }
+};
+render(0); paint(0);
+window.__stage_ready = true;
+</script>
+</body>
+</html>

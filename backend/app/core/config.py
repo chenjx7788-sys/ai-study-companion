@@ -51,6 +51,15 @@ class Settings(BaseSettings):
     # （若改用其他 embedding 模型需重新校准）
     kb_hit_threshold: float = 0.15
     review_daily_limit: int = 30   # 每日复习上限，防积压
+    # 陪练·难度自适应（管理中心「陪练」页可调；出题时读取，改动即时生效）
+    drill_adapt_up_score: int = 80      # 「答得好」判定线
+    drill_adapt_down_score: int = 50    # 「答得差」判定线
+    drill_adapt_streak: int = 2         # 连续 N 题同向 → 调一档
+    drill_adapt_max_shift: int = 2      # 相对基准档最多调几档
+    # AI 视频 · 启动时回收孤儿作品的超时窗口（分钟）
+    # ⚠️ 必须 ≥ 单条视频渲染超时上限（PRD 4.3：视频时长 × 3 + 5 分钟），
+    #    否则正在渲染的作品会在下次启动时被误判为「服务重启中断」。
+    video_orphan_minutes: int = 30
 
     class Config:
         env_prefix = "ASC_"

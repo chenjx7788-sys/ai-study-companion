@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from app_version import __version__ as APP_VERSION
 from .core.config import settings
 from .database import Base, engine
-from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats, podcasts, ephemeral, imgproxy, ext, simple_learn
+from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats, podcasts, ephemeral, imgproxy, ext, simple_learn, drill, videos, zipvoice
 
 Base.metadata.create_all(bind=engine)
 
@@ -49,6 +49,17 @@ def _migrate_columns():
             if "extract_sig" not in cols:
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE materials ADD COLUMN extract_sig VARCHAR(32) DEFAULT ''"))
+            # 材料内容性质（P0 工艺分流）：常量默认值 —— 老行自动 ""，行为与改造前一致。
+            if "doc_kind" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE materials ADD COLUMN doc_kind VARCHAR(16) DEFAULT ''"))
+        # 原文块性质（body / img_ocr）：老行全部视为 body → 存量行为完全不变。
+        # img_ocr 由回填脚本按 saved_from=='clip' AND content LIKE '[图片]%' 单独打。
+        if "material_chunks" in insp.get_table_names():
+            cols = {c["name"] for c in insp.get_columns("material_chunks")}
+            if "kind" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE material_chunks ADD COLUMN kind VARCHAR(16) DEFAULT 'body'"))
         if "podcasts" in insp.get_table_names():
             cols = {c["name"] for c in insp.get_columns("podcasts")}
             if "audio_sig" not in cols:
@@ -76,6 +87,82 @@ def _migrate_columns():
             if "gen_mode" not in cols:
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE podcasts ADD COLUMN gen_mode VARCHAR(16) DEFAULT ''"))
+        if "videos" in insp.get_table_names():
+            cols = {c["name"] for c in insp.get_columns("videos")}
+            # 渲染耗时（阶段 2 补列）。旧的视频作品留 0 → 界面按「未记录」处理，
+            # 不会凭空显示一个假的耗时。
+            if "render_seconds" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE videos ADD COLUMN render_seconds FLOAT DEFAULT 0"))
+            # 跳过闸门（PRD 3.9.7）：连续失败计数 + 当前成片的跳过标注。
+            # 旧行默认 0/False → 行为与改造前完全一致（不允许跳过、无标注）。
+            if "gate_fail_count" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE videos ADD COLUMN gate_fail_count INTEGER DEFAULT 0"))
+            if "gate_skipped" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE videos ADD COLUMN gate_skipped BOOLEAN DEFAULT 0"))
+            # 本片音色（作品级，与 podcasts.voice_map 同构）。老行填 '{}' → 与改造前
+            # 行为一致（跟随设置页的语音设置），不会凭空冒出一个音色。
+            if "voice_map" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE videos ADD COLUMN voice_map JSON DEFAULT '{}'"))
+            # 自定义背景图（解压型皮肤）。老行默认 '' → 渲染走皮肤自带画面，
+            # 与改造前逐帧一致（不会凭空出现一张背景）。
+            if "bg_id" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE videos ADD COLUMN bg_id VARCHAR(64) DEFAULT ''"))
+            # 背景音乐（默认关闭，仅「本片单独生成」音轨生效）。旧记录 bgm_id 为空串 →
+            # 指纹口径不变，不会被误判过期（与 podcasts 同款三列；视频无历史 BGM，无需回填 label）。
+            if "bgm_id" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE videos ADD COLUMN bgm_id VARCHAR(64) DEFAULT ''"))
+            if "bgm_volume" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE videos ADD COLUMN bgm_volume INTEGER DEFAULT -20"))
+            if "bgm_label" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE videos ADD COLUMN bgm_label VARCHAR(64) DEFAULT ''"))
+            # 皮肤预设变体（电台浅色/深色各 3 套）。旧行默认 '' = 默认套 →
+            # 渲染画面与升级前逐像素一致，不会凭空换配色。
+            if "skin_variant" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE videos ADD COLUMN skin_variant VARCHAR(16) DEFAULT ''"))
+            # 画面署名（电台浅色/深色画面底部那行字）。旧行默认 '' = 回落作品标题。
+            # ⚠️ 这条迁移会让**存量电台作品的画面真的变**（底部那行字从内置装饰字
+            #    「且 听」/「夜 曲」变成作品标题），所以 visual_sig 会跟着变、界面
+            #    如实报「视觉方案已更换」—— 那是**真实变化，不是误报**，提示重新生成
+            #    正是我们要的（不删除旧成片，只标注 + 允许一键重建）。
+            if "brand_text" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE videos ADD COLUMN brand_text VARCHAR(32) DEFAULT ''"))
+            # 存量**死状态**自愈：口播层选了、内容层却是空（或非法值）。
+            # 旧口径的 `_norm_skin` 允许写入空串，而生成路径会直接拒绝 → 这份作品
+            # 永远生成不出来（报「未知的视觉方案：talking_head」）。结构与渲染路径
+            # 一直按 graph 兜底，这里把存量行对齐到同一口径。
+            # ⚠️ 幂等：修完之后再无行命中，重启不会反复改写（也不动别的字段）。
+            with engine.begin() as conn:
+                fixed = conn.execute(text(
+                    "UPDATE videos SET inner_skin = 'graph' "
+                    "WHERE skin = 'talking_head' "
+                    "AND (inner_skin IS NULL OR TRIM(inner_skin) = '' "
+                    "     OR LOWER(TRIM(inner_skin)) NOT IN ('source', 'graph'))"
+                )).rowcount
+            if fixed:
+                print(f"[migrate] 修复 {fixed} 部作品的空内容层（数字人口播 → 结构图）")
+        if "activity_logs" in insp.get_table_names():
+            cols = {c["name"] for c in insp.get_columns("activity_logs")}
+            # 视频埋点明细（PRD 4.2）：stage / completed 等小对象 JSON。旧行默认 ''。
+            if "detail" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE activity_logs ADD COLUMN detail VARCHAR(255) DEFAULT ''"))
+        if "drill_turns" in insp.get_table_names():
+            cols = {c["name"] for c in insp.get_columns("drill_turns")}
+            # 难度自适应（C 档）：记录本题**实际使用**的难度。
+            # 旧数据留空 → 前端按「未记录」处理，不会凭空多出「已调整难度」标注。
+            if "difficulty" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE drill_turns ADD COLUMN difficulty VARCHAR(8)"))
     except Exception:
         pass
 
@@ -174,11 +261,54 @@ def _migrate_source_folder_to_folder():
         db.close()
 
 
+def _backfill_chunk_kind():
+    """给存量「网页剪藏材料里的图片 OCR 块」打 img_ocr 标记（幂等，每次启动都跑）。
+
+    ⚠️ 判据是 `origin_meta.saved_from == 'clip'` 而**不是** `origin`：早期小红书笔记的
+       origin 记的是 `'upload'`（实测 #40/#43/#45 都是小红书），按 origin 枚举判会漏掉
+       最大的那几篇。`origin_meta` 在 SQLite 里是 TEXT，故按 dict / str 两种形态都认。
+    ⚠️ 只改 `kind`、**绝不改 content** —— content 是 extract_sig 指纹的输入，
+       动它会误触发重新抽实体、白烧 token；向量与全文检索读的都是 content，不受影响。
+    """
+    import json
+    from sqlalchemy import or_
+    from .database import SessionLocal
+    from .models import Material, MaterialChunk
+    db = SessionLocal()
+    try:
+        clip_ids = []
+        for mid, raw_meta in db.query(Material.id, Material.origin_meta).all():
+            meta = raw_meta
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            if isinstance(meta, dict) and meta.get("saved_from") == "clip":
+                clip_ids.append(mid)
+        if not clip_ids:
+            return
+        n = (db.query(MaterialChunk)
+             .filter(MaterialChunk.material_id.in_(clip_ids),
+                     or_(MaterialChunk.kind == "body", MaterialChunk.kind.is_(None)),
+                     MaterialChunk.content.like("[图片]%"))
+             .update({"kind": "img_ocr"}, synchronize_session=False))
+        db.commit()
+        if n:
+            print(f"[migrate] 回填 {n} 个图片 OCR 块为 img_ocr（来自 {len(clip_ids)} 篇网页材料）")
+    except Exception as e:
+        db.rollback()
+        print(f"[migrate] 回填 chunk kind 失败（不阻塞启动）: {e}")
+    finally:
+        db.close()
+
+
 _migrate_columns()
 _backfill_material_origin()
 _migrate_source_folder_to_folder()
+_backfill_chunk_kind()
 
-app = FastAPI(title="知萤 - AI知识中枢", version="0.1.5")
+app = FastAPI(title="知萤 - AI知识中枢", version="0.1.6")
 
 # 自动定时备份（启动后延迟 30s 首备，此后每日一次，保留最近 7 份）
 from .services import auto_backup
@@ -273,6 +403,61 @@ def _auto_weekly_report():
 
 _auto_weekly_report()
 
+# 陪练会话：启动时回收孤儿（PRD 2.2.6）。
+# ⚠️ 会话生命周期的唯一权威是 DB：进程重启后内存任务清零，若不回收，
+#    status ∈ {outlining,running} 的会话会永远停在「进行中」且点不开（僵尸卡片），
+#    并永久占用并发槽位（updated_at 不再刷新 → 槽位只进不出）。
+# ⚠️ 打印一律用 ASCII：CI 的 Windows runner 控制台是 cp1252，中文 print 会直接崩。
+def _recover_drill_orphans():
+    def _run():
+        try:
+            from .database import SessionLocal
+            from .services import drill as drill_svc
+            db = SessionLocal()
+            try:
+                n = drill_svc.recover_orphans(db)
+                if n:
+                    print(f"[startup] recovered {n} orphan drill session(s) -> failed")
+            finally:
+                db.close()
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
+_recover_drill_orphans()
+
+
+# AI 视频：启动时回收孤儿作品（PRD 2.2.6）。
+# ⚠️ 与陪练同理：进程重启后内存任务清零，若不回收，status ∈ {scripting,queued,rendering}
+#    的作品会永远停在「渲染中」且点不开，并永久占住并发槽（updated_at 不再刷新）。
+def _recover_video_orphans():
+    def _run():
+        try:
+            from .database import SessionLocal
+            from .services import video as video_svc
+            db = SessionLocal()
+            try:
+                n = video_svc.recover_orphans(db)
+                if n:
+                    print(f"[startup] recovered {n} orphan video(s) -> failed")
+                # ⚠️ 回收之后还要**把队列接回来**：内存里的渲染队列随进程消失，
+                #    但 DB 里 status=queued 的作品还在。不重排的话它们没有执行者，
+                #    而回收窗口（默认 30 分钟，必须 ≥ 单条渲染超时）又不会立刻清它 ——
+                #    表现是「排队中」卡半小时，然后突然变「服务重启中断」。
+                from .routers import videos as videos_router
+                m = videos_router.resume_queued_renders()
+                if m:
+                    print(f"[startup] re-queued {m} video(s) for rendering")
+            finally:
+                db.close()
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
+_recover_video_orphans()
+
 # CORS：本地单机应用，放宽到 * 让 pywebview 内联 loading 页（origin=null）也能轮询 /api/health
 app.add_middleware(
     CORSMiddleware,
@@ -289,10 +474,19 @@ app.include_router(chat.router, prefix="/api")
 app.include_router(review.router, prefix="/api")
 app.include_router(settings_router.router, prefix="/api")
 app.include_router(asr.router, prefix="/api")
+# 语音合成模型（routers/zipvoice.py）：/api/zipvoice/*（状态 / 按需下载 / 进度 / 音色）
+# 与 asr（Whisper 转写模型）同构 —— 前端复用同一套「下载卡片 + 轮询」交互。
+app.include_router(zipvoice.router, prefix="/api")
 app.include_router(folders.router, prefix="/api")
 app.include_router(stats.router, prefix="/api")
 app.include_router(podcasts.router, prefix="/api")
 app.include_router(simple_learn.router, prefix="/api")
+# AI 陪练（模块 J）：/api/drill/*（会话 CRUD / 范围摘要 / start·answer 两条 SSE / finish）
+# ⚠️ 必须与其它 router 一样注册在下方 SPA catch-all **之前**。
+app.include_router(drill.router, prefix="/api")
+# AI 视频（模块 K）：/api/videos/*（作品 CRUD / options / plan·render 两条 SSE / 产物）
+# ⚠️ 必须注册在下方 SPA catch-all **之前**，否则接口会被它吞成 404。
+app.include_router(videos.router, prefix="/api")
 # 「仅本次阅读」+「最近阅读」内存快照（P0-5）。prefix 自带 /ai/ephemeral，
 # 与 ai.router（/ai）并列而不冲突（FastAPI 按更具体的路径优先匹配）。
 app.include_router(ephemeral.router, prefix="/api")

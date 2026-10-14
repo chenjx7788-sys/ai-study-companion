@@ -162,7 +162,9 @@ const navItems = [
   { path: '/', label: '材料库', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="2" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="2" y="9" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="9" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/></svg>' },
   { path: '/knowledge', label: '知识库', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2.5c-1.2-.9-3-1.2-5-.8v10.6c2-.4 3.8-.1 5 .8 1.2-.9 3-1.2 5-.8V1.7c-2-.4-3.8-.1-5 .8z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 2.5v10.6" stroke="currentColor" stroke-width="1.3"/></svg>' },
   { path: '/chat', label: 'AI 问答', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v6a1.5 1.5 0 0 1-1.5 1.5H8l-3.5 3v-3h-1A1.5 1.5 0 0 1 2 9.5v-6z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>' },
+  { path: '/drill', label: 'AI 陪练', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.6" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="2.6" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r=".9" fill="currentColor"/></svg>' },
   { path: '/podcast', label: 'AI 播客', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.6 9.4V8a5.4 5.4 0 0 1 10.8 0v1.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><rect x="1.7" y="8.7" width="3.1" height="4.5" rx="1.55" stroke="currentColor" stroke-width="1.3"/><rect x="11.2" y="8.7" width="3.1" height="4.5" rx="1.55" stroke="currentColor" stroke-width="1.3"/></svg>' },
+  { path: '/video', label: 'AI 视频', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.8" y="3.1" width="12.4" height="9.8" rx="2" stroke="currentColor" stroke-width="1.3"/><path d="M6.7 6.2l3.6 2.1-3.6 2.1V6.2z" fill="currentColor"/></svg>' },
   { path: '/review', label: '复习巩固', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M13.5 1.8v2.6h-2.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>' },
   { path: '/stats', label: '数据统计', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 13h2V8H3v5zM7 13h2V3H7v10zM11 13h2V6h-2v7z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>' },
   { path: '/settings', label: '管理中心', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.3"/><path d="M8 1.8v1.7M8 12.5v1.7M1.8 8h1.7M12.5 8h1.7M3.6 3.6l1.2 1.2M11.2 11.2l1.2 1.2M12.4 3.6l-1.2 1.2M4.8 11.2l-1.2 1.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>' },
@@ -196,12 +198,15 @@ function toggleSidebar() {
   sidebarCollapsed.value = !sidebarCollapsed.value
   localStorage.setItem('asc_sidebar_collapsed', sidebarCollapsed.value ? '1' : '0')
 }
-// 进入材料详情页 / AI 播客默认折叠菜单（给内容区腾空间），离开后恢复 localStorage 记忆状态
+// 进入材料详情页默认折叠菜单（给内容区腾空间），离开后恢复 localStorage 记忆状态
 // （离开时不直接展开而是读回用户偏好：用户手动折叠过的，不被动展开）
+// ⚠️ AI 播客（/podcast, 2026-10-14）与 AI 视频（/video, 2026-10-12）都不在名单里：
+//    菜单不默认收起，只认用户手动点「折叠」（localStorage 记忆逻辑不变）——
+//    换个页面就把菜单收走，等于抹掉用户自己的选择。
 // 离开学习页时错开一帧再展开：先让当前帧完成 StudyView 卸载（PDF canvas / Word 原文 DOM）与目标页挂载，
 // 再触发侧边栏 width 过渡，避免主线程争抢导致「菜单展开卡顿」
 watch(() => route.path, (path) => {
-  if (path.startsWith('/study') || path.startsWith('/podcast')) {
+  if (path.startsWith('/study')) {
     sidebarCollapsed.value = true
   } else {
     requestAnimationFrame(() => {
@@ -228,7 +233,8 @@ watch(() => route.path, (path) => {
 .app-aside.collapsed .nav-item,
 .app-aside.collapsed .nav-help { justify-content: center; padding-left: 0; padding-right: 0; }
 .app-aside.collapsed .nav-item { position: relative; }
-.app-aside.collapsed .due-badge { position: absolute; right: 8px; top: 4px; min-width: 16px; height: 16px; font-size: 10px; }
+.app-aside.collapsed .due-badge,
+.app-aside.collapsed .new-badge { position: absolute; right: 8px; top: 4px; min-width: 16px; height: 16px; font-size: 10px; }
 .app-aside.collapsed .collapse-btn { justify-content: center; }
 .collapse-btn {
   display: flex; align-items: center; gap: 6px;
@@ -266,6 +272,13 @@ watch(() => route.path, (path) => {
   margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px;
   background: var(--asc-primary); color: #fff;
   border-radius: 9px; font-size: 11px; font-weight: 600;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+/* 新功能角标（AI 陪练）：与待复习数徽标同几何、暖色 —— 区分「计数」与「新品」 */
+.new-badge {
+  margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px;
+  background: #b45309; color: #fff;
+  border-radius: 9px; font-size: 10px; font-weight: 600;
   display: inline-flex; align-items: center; justify-content: center;
 }
 .nav-item.active {

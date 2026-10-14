@@ -43,6 +43,7 @@ def _guard_mask_fallback(request: Request, model_id: str, has_key: bool):
 def get_settings():
     """返回当前配置；Key 类字段脱敏。提示词字段返回自定义值（空=用默认），另附默认模板供前端展示"""
     from ..services import llm as llm_svc
+    from ..services import drill as drill_svc
     conf = settings_store.load()
     # 模型列表：api_key 脱敏
     models = [
@@ -63,6 +64,8 @@ def get_settings():
         "embedding_api_key": MASK if conf.get("embedding_api_key") else "",
         # 语音模型默认转写版本：空 = 自动（small 优先）；small / base = 强制指定
         "asr_model_size": conf.get("asr_model_size") or "",
+        # AI 播客 · 语音合成引擎：edge = 在线（音色丰富、依赖网络）/ zipvoice = 本地离线
+        "tts_provider": conf.get("tts_provider") or "edge",
         # 知识库切分与去噪（修改后对「新解析/重建索引」的材料生效）
         "chunk_size": conf.get("chunk_size") or 700,
         "chunk_overlap": conf.get("chunk_overlap") if conf.get("chunk_overlap") is not None else 100,
@@ -78,6 +81,12 @@ def get_settings():
         # 遍历 FIELDS 中所有 prompt_ 字段，确保新增提示词无需改此处
         **{k: conf.get(k, "") for k in settings_store.FIELDS if k.startswith("prompt_")},
         "kb_hit_threshold": conf.get("kb_hit_threshold", 0.15),
+        # 陪练 · 难度自适应参数：**直接复用出题时的读取口径**（adapt_params 带默认回退
+        # 与范围钳制）—— 否则设置页显示的值可能和出题实际用的值不一致。
+        **{k: v for k, v in zip(
+            ("drill_adapt_up_score", "drill_adapt_down_score",
+             "drill_adapt_streak", "drill_adapt_max_shift"),
+            drill_svc.adapt_params())},
         # 预设标签库（材料库可先建标签，再打给材料）
         "preset_tags": conf.get("preset_tags") or [],
         "prompt_defaults": llm_svc.DEFAULT_PROMPTS,
@@ -115,6 +124,15 @@ def update_settings(payload: dict):
         for m in payload["llm_models"]:
             if m.get("api_key") == MASK and m.get("id") in cur_models:
                 m["api_key"] = cur_models[m["id"]].get("api_key", "")
+    # TTS provider 白名单：非法值直接 400。
+    # ⚠️ 不校验会静默落库成未知 provider → 合成时抛 TTSPermanent，用户在设置页
+    #    看不出是自己选错了（只会看到「暂不支持的 TTS 提供方」）。
+    _tp = payload.get("tts_provider")
+    if _tp is not None:
+        from ..services import tts as tts_svc
+        if _tp not in tts_svc.SUPPORTED_PROVIDERS:
+            raise HTTPException(
+                400, "语音合成引擎取值非法，须为 " + " 或 ".join(tts_svc.SUPPORTED_PROVIDERS))
     settings_store.save(payload)
     return get_settings()
 

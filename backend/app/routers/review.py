@@ -297,8 +297,12 @@ def list_cards(material_id: int | None = None, tag: str | None = None,
 
 
 def _apply_filters(q, material_id: int | None, tag: str | None, type_: str | None, db: Session):
-    """按资料 / 材料标签 / 题型筛选复习卡"""
-    if material_id:
+    """按资料 / 材料标签 / 题型筛选复习卡
+
+    ⚠️ 判空必须用 `is not None` 而不是真值判断：`0`（AI 问答）与 `-1`（AI 陪练）
+    都是**有效筛选值**，旧写法 `if material_id:` 把它们当 falsy → 点筛选返回全部卡。
+    """
+    if material_id is not None:
         q = q.filter(ReviewCard.material_id == material_id)
     if tag:
         mids = [m.id for m in db.query(Material).all() if tag in (m.tags or [])]
@@ -318,6 +322,10 @@ def review_filters(db: Session = Depends(get_db)):
     # 问答笔记（material_id=0）生成的复习卡：补一个「AI 问答」筛选项，否则这类卡在材料下拉里永远选不到
     if any(r[0] == 0 for r in mid_rows):
         materials.append({"id": 0, "title": "AI 问答"})
+    # AI 陪练（material_id=-1 哨兵）：同理补一个「AI 陪练」筛选项。
+    # ⚠️ 必须与 _apply_filters 的 `is not None` 修正同批，否则点该筛选会返回全部卡。
+    if any(r[0] == -1 for r in mid_rows):
+        materials.append({"id": -1, "title": "AI 陪练"})
     tags = sorted({t for m in mats for t in (m.tags or [])})
     return {"materials": materials, "tags": tags}
 

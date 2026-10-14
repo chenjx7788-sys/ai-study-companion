@@ -63,3 +63,37 @@ def recognize(img) -> list[tuple[str, float]]:
 def ocr_image_to_text(img) -> str:
     """识别并拼接为文本（逐行换行）；空白/模糊图片返回空串"""
     return "\n".join(t for t, _ in recognize(img) if t.strip())
+
+
+def recognize_boxes(img) -> list[dict]:
+    """识别图片并返回**带框坐标**的结果，按阅读顺序（行中心 y → 行中心 x）排序。
+
+    每项：{"t": 文本, "sc": 置信度, "x0","y0","x1","y1": 框的极值坐标（像素）}
+
+    ⚠️ 框坐标取四点的 **min/max**，**绝不用四点均值** —— 车牌/斜排文字这类
+    四边形用均值会明显偏离实际位置（本项目在视觉定位时踩过，见 PRD 3.5.6）。
+    ⚠️ 坐标是**输入图像素**，调用方负责换算成页面百分比（分母必须与输入同尺度）。
+    """
+    engine = _get_engine()
+    result, _ = engine(img)
+    if not result:
+        return []
+    items = []
+    for box, text, score in result:
+        try:
+            s = float(score)
+        except (TypeError, ValueError):
+            s = 0.0
+        xs = [float(p[0]) for p in box]
+        ys = [float(p[1]) for p in box]
+        items.append({
+            "t": str(text),
+            "sc": s,
+            "x0": min(xs), "y0": min(ys), "x1": max(xs), "y1": max(ys),
+            "cy": sum(ys) / len(ys), "cx": sum(xs) / len(xs),
+        })
+    items.sort(key=lambda it: (it["cy"], it["cx"]))
+    for it in items:
+        it.pop("cy", None)
+        it.pop("cx", None)
+    return items

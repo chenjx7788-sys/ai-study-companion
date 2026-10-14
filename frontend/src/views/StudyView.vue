@@ -96,7 +96,7 @@
         <!-- Markdown：整篇渲染成连续文档，不分页（md 编辑统一走 EditorView，此分支无编辑态） -->
         <template v-if="isMd">
           <div class="md-body">
-            <div v-for="c in chunks" :key="c.id" :id="'page-' + c.page_no" :data-page="c.page_no" class="md-seg"
+            <div v-for="c in visibleChunks" :key="c.id" :id="'page-' + c.page_no" :data-page="c.page_no" class="md-seg"
               :class="{ 'md-seg-flash': flashLocate && flashLocate.page === c.page_no }"
               v-html="renderMd(c.content)"></div>
           </div>
@@ -124,6 +124,18 @@
           </template>
           <el-empty v-if="pagedChunks.length === 0" :description="isMedia ? '未识别到语音内容' : (isImage ? '未识别到文字，可在原文视图查看图片' : '无文本内容（扫描件请切换原文视图）')" />
         </template>
+        <!-- 图片 OCR 文字折叠条：这些块默认不进正文（仍照常入向量库与全文检索），
+             留一个可展开入口 —— 没有入口的「隐藏」等于说不清是 bug 还是设计。 -->
+        <div v-if="hiddenImgOcrChunks.length" class="imgocr-fold">
+          <button type="button" class="imgocr-fold-bar" @click="imgocrExpanded = !imgocrExpanded">
+            <span>本文含 {{ hiddenImgOcrChunks.length }} 段图片中的文字（{{ imgocrCharCount }} 字），未在正文显示</span>
+            <span class="imgocr-fold-arrow">{{ imgocrExpanded ? '收起' : '展开查看' }}</span>
+          </button>
+          <div v-if="imgocrExpanded" class="imgocr-fold-body">
+            <component :is="isRichMd ? 'div' : 'p'" v-for="c in hiddenImgOcrChunks" :key="c.id"
+              class="chunk" :class="{ 'rich': isRichMd }" v-html="renderChunk(c)"></component>
+          </div>
+        </div>
         <div v-if="transcriptEditing" class="transcript-save">
           <el-button type="primary" :loading="transcriptSaving" @click="saveTranscript">保存修改</el-button>
           <el-button v-if="isRichMd" text type="primary" class="edit-preview-btn" @click="editPreview = !editPreview">{{ editPreview ? '继续编辑' : '预览排版' }}</el-button>
@@ -845,10 +857,37 @@ function onFsChange() { isFullscreen.value = !!document.fullscreenElement }
 
 const noteDialog = reactive({ show: false, id: null, title: '', content: '', anchor: null, sourceType: 'manual' })
 
+// ---------- 图片 OCR 块的显示策略（后端 kind 标记，见 materials._chunk_kind） ----------
+// 网页剪藏材料里由「内嵌图 OCR」产出的块：**不进正文显示**，但仍照常分块、入向量库与
+// 全文检索（后端 _parse_material 只打 kind、绝不动 content）→ 这里只做展示层过滤。
+// ⚠️ 所有面向用户的派生（正文渲染 / 目录 / 下载文本）一律走 visibleChunks，
+//    不许有人直接读 chunks —— 否则会退回「屏幕上看不到、导出的 md 里有」。
+// ⚠️ 判据只用 kind，**不用 content 前缀**：用户编辑过一次块，前缀就失效了。
+const isImgOcrChunk = (c) => (c?.kind || 'body') === 'img_ocr'
+const IMG_OCR_PREFIX_RE = /^\[图片\]\s*/
+
+const visibleChunks = computed(() => chunks.value.filter(c => !isImgOcrChunk(c)))
+const hiddenImgOcrChunks = computed(() => chunks.value.filter(isImgOcrChunk))
+const imgocrExpanded = ref(false)
+const imgocrCharCount = computed(() =>
+  hiddenImgOcrChunks.value.reduce((n, c) => n + (c.content || '').replace(IMG_OCR_PREFIX_RE, '').length, 0))
+
+// 定位目标落在被隐藏的块上时给一条说明：滚动照常（同页正文块仍带 #page-N 锚点），
+// 但文本高亮无从匹配 —— 不说一声，用户会以为「来源定位」失灵了。
+function hiddenChunkHint(page, text) {
+  if (!text) return
+  const key = String(text).trim().slice(0, 12)
+  if (key.length < 4) return          // 太短易误判，宁可不提示
+  if (hiddenImgOcrChunks.value.some(c => c.page_no === page && (c.content || '').includes(key))) {
+    ElMessage.info({ message: '该内容来自图片中的文字，已从正文隐藏（可在文末展开查看）',
+                     duration: 3000, grouping: true })
+  }
+}
+
 // 按页分组
 const pagedChunks = computed(() => {
   const map = new Map()
-  for (const c of chunks.value) {
+  for (const c of visibleChunks.value) {
     if (!map.has(c.page_no)) map.set(c.page_no, [])
     map.get(c.page_no).push(c)
   }
@@ -866,7 +905,7 @@ const visiblePageChips = computed(() =>
 const normPath = (t) => (t || '').replace(/\s+/g, ' ').trim()
 const sections = computed(() => {
   const seen = new Map()
-  for (const c of chunks.value) {
+  for (const c of visibleChunks.value) {
     if (c.section_path && !seen.has(c.section_path)) seen.set(c.section_path, c.page_no)
   }
   return [...seen.entries()].map(([path, page]) => ({ path, page, key: normPath(path) }))
@@ -961,7 +1000,9 @@ function downloadFile() {
     document.body.removeChild(a)
   } else {
     // 文本视图：下载文本内容（统一导出 .md）
-    const text = chunks.value.map(c => c.content || '').join('\n\n')
+    // ⚠️ 走 visibleChunks 而不是 chunks：图片 OCR 文字不显示也不导出，
+    //    保持「屏幕 / 导出」同一份内容（避免两个入口给出不同产物）。
+    const text = visibleChunks.value.map(c => c.content || '').join('\n\n')
     const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -1098,6 +1139,7 @@ const flashLocate = ref(null)
 let flashLocateTimer = null
 function locateAndFlash(page, text) {
   scrollToPage(page)
+  hiddenChunkHint(page, text)          // 目标是图片 OCR 文字（默认隐藏）时说明一声
   flashLocate.value = { page, text: text || null }
   if (flashLocateTimer) clearTimeout(flashLocateTimer)
   flashLocateTimer = setTimeout(() => { flashLocate.value = null }, 3000)
@@ -1174,6 +1216,9 @@ watch(flashHl, (fl) => {
     delete q.hl
     router.replace({ query: q })
   }, 3000)
+  // 跨页来源跳转命中图片 OCR 文字（默认隐藏）→ 文本高亮无从匹配，说明一声。
+  // 放在 nextTick：路由参数落地时 chunks 可能还没加载完。
+  nextTick(() => hiddenChunkHint(fl.page, fl.text))
 })
 
 // 按页聚合高亮：chain=已 AI 解读（紫）/ note=已转笔记（琥珀）
@@ -2874,6 +2919,22 @@ onUnmounted(() => {
   content: "🖼"; flex: none; margin-top: 1px;
   font-size: 15px; line-height: 1.6;
 }
+
+/* 图片 OCR 文字折叠条：这些块默认不进正文（后端仍照常分块、入向量库与全文检索），
+   留一条可展开入口 —— 没有入口的「隐藏」等于一个说不清是 bug 还是设计的点。
+   本元素是普通模板标记（带 scoped data-v），不需要 :deep()。 */
+.imgocr-fold { margin: 28px 0 8px; }
+.imgocr-fold-bar {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 10px 14px; box-sizing: border-box;
+  border: 1px dashed var(--asc-border, #e5e5e8); border-radius: 8px;
+  background: var(--asc-surface-2, #f5f5f7);
+  color: var(--asc-text-2, #6e6e6e);   /* 次要文字下限 #6e6e6e（按自身底色算对比度） */
+  font-size: 13px; line-height: 1.6; text-align: left; cursor: pointer;
+}
+.imgocr-fold-bar:hover { border-color: var(--asc-primary, #7c5cfc); color: var(--asc-primary, #7c5cfc); }
+.imgocr-fold-arrow { flex: none; margin-left: auto; font-size: 12px; }
+.imgocr-fold-body { margin-top: 14px; }
 
 /* ---- 表格 / 标题：Word/PPT 解析产物由 v-html 注入，**不带 scoped 的 data-v 属性**，
        所以不能以 .md-table / .chunk-h 自身当锚点（那样选择器永不匹配、表格会没有边框），

@@ -64,3 +64,16 @@ _restart*.txt
 _rst*.txt
 _port*.txt
 _proc*.txt
+
+# 开发期临时产物（2026-10-14 补，v0.1.6 发布前清账）
+# ⚠️ _bak_* 是改前备份、_apply_*/_probe_*/_write_* 是一次性补丁与验证脚本、
+#    _fetch_probe/ 是抓取探针、_brand_*.txt 是扫描输出 —— 全部不进仓库。
+_bak_*/
+_apply_*
+_probe_*
+_hide_*
+_fetch_probe/
+_brand_*.txt
+_write_*_memory_*.py
+frontend/_sfc_check_*
+frontend/dist__fixed_tmp/

@@ -57,7 +57,8 @@ defineProps({
 .page-head-sub {
   margin: 0;
   font-size: 12.5px;
-  color: var(--asc-text-3);
+  /* ⚠️ --asc-text-3(#a0a0a0) 在页底 #f5f5f6 上仅 2.40:1 未过 AA → 次要文字下限 --asc-text-2(4.68:1) */
+  color: var(--asc-text-2);
   line-height: 1.5;
 }
 .page-head-actions {

@@ -251,7 +251,8 @@ DEFAULT_PROMPTS = {
 1. 按文档原有章节结构组织，输出层级大纲（Markdown：## 章节，- 要点，子要点缩进两个空格）；
 2. 每条要点末尾用 (P页码) 标注出处，页码取自原文中的 [P数字] 标记；
 3. 要点是对内容的提炼压缩，不是照抄原文；
-4. 精炼优先，不照抄原文；篇幅以用户消息中给出的字数上限为准（未给上限时不超过原文的 10%）。""",
+4. 精炼优先，不照抄原文；篇幅以用户消息中给出的字数上限为准（未给上限时不超过原文的 10%）。
+5. 全文摘要末尾追加 `## 适用边界`（4 行：✅适用场景 / ❌不适用场景 / ⚠️前提条件 / 🔍已知局限），边界内容单独配额、不挤占正文篇幅；材料没有给出就写“材料未给出”，绝不编造。""",
     "prompt_keywords": """你是一名学习助手。请从文档中提炼核心知识点，严格输出 JSON 数组，不要输出其他任何内容：
 [{"concept": "概念名", "explanation": "一句话解释（≤60字）", "page_no": 页码数字}]
 要求：
@@ -278,6 +279,31 @@ DEFAULT_PROMPTS = {
     "prompt_recall": """你是一名学习教练，擅长用费曼学习法帮人巩固知识。根据用户的学习笔记生成一道「复述题」，严格输出 JSON（不要输出其他内容）：
 {"question": "复述指令（如「请用自己的话解释：XXX」，考察能否讲清核心概念）", "answer": "参考答案要点（≤120字，列出应涵盖的关键点，供用户对照）"}
 要求：聚焦一个核心概念，引导用户主动组织语言复述，而非简单回忆定义。""",
+    # ---- AI 陪练（模块 J）----
+    "prompt_drill_examiner": """你是一名资深考官，围绕给定的学习素材出题。所有输出都必须是严格 JSON，不要输出任何其他内容（不要 Markdown 代码块）。
+
+按用户消息指定的模式输出：
+
+【模式一 · 出题纲】用户要求生成考点时，输出 JSON 数组：
+[{"point": "考点描述（15-40字，指向素材里的具体知识点，不要泛泛而问）", "difficulty": "easy|medium|hard", "hint": "提问角度提示（可选，≤20字）", "source": "该考点来自哪份材料的标题（不确定则填空串）"}]
+要求：1. 考点之间互不重复，合起来覆盖素材主要知识点；2. 优先考察「能不能讲出来」的理解与应用，不是死记硬背；3. 难度递进，先易后难；4. 只依据素材出题，绝不编造素材里没有的知识点。
+
+【模式二 · 出题 + 期望要点】用户指定某个考点时，输出 JSON 对象：
+{"question": "面向学习者的开放式问题（口语化、明确，不要「请论述」这类空话）", "expected_points": ["要点1", "要点2"], "source": "来源材料标题（不确定则空串）"}
+要求：1. expected_points 列 2-5 条该题必须覆盖的关键点，供评分比对；2. 问题应能用一个自然段回答完，不需长篇大论；3. 仍严格依据素材。
+
+【模式三 · 追问】用户给出原问题、期望要点与作答并明确要求追问时，输出 JSON 对象：
+{"question": "针对作答中未讲透之处的一层深挖问题（一句话，不要重复原问题）", "expected_points": ["..."]}
+要求：追问必须建立在素材事实上，不引入素材之外的新知识。""",
+    "prompt_drill_judge": """你是一名严谨而友善的评分官。请根据「问题 + 期望要点 + 学习者作答」给出结构化评分，严格输出 JSON 对象，不要输出任何其他内容（不要 Markdown 代码块）：
+{"score": 0-100 的整数, "verdict": "correct|partial|wrong", "dimensions": {"正确性": 0-100, "完整度": 0-100, "表达": 0-100}, "comment": "点评（≤120字，先肯定对的部分，再指出问题）", "missing_points": ["未覆盖的期望要点"], "followup": {"question": "需要追问时给出一个针对未讲透之处的追问；不需要则留空字符串", "expected_points": ["..."]}}
+
+评分标准：
+1. **正确性**：结论是否准确、有无事实性错误（最重要的一维）；
+2. **完整度**：期望要点的覆盖比例；
+3. **表达**：逻辑是否清晰、是否讲得让人听懂。
+verdict 判定：score >= 80 且无关键错误 → correct；40-79 或漏掉主要要点 → partial；< 40 或方向性错误 → wrong。
+要求：1. 严格对照期望要点，不要因措辞不同就判错（意思对即算覆盖）；2. missing_points 只列**期望要点中未被覆盖**的，不新增素材之外的要点；3. 不编造材料中没有的评价标准；4. followup.question 只在「作答明显没讲透、值得再挖一层」时给出，否则留空串。""",
     "prompt_learn_note": """你是一名顶尖学习教练。你的任务不是"总结"，而是把给定材料【转译】成一份结构化的学习笔记：让一个非本专业的初学者，不看原文也能在最短时间内抓住知识骨架、理解核心概念、并记住要点。
 
 ## 输出结构（必须严格照此，缺一不可）
@@ -297,6 +323,8 @@ DEFAULT_PROMPTS = {
      - `### C{n} 小节`：转译正文
      - `### 本节小结`：固定 ◆ 三条，每条一句话
 
+5. 全篇末尾追加 `## 适用边界`（固定 4 行：✅适用场景 / ❌不适用场景 / ⚠️前提条件 / 🔍已知局限），材料没有明确给出就写“材料未给出”，绝不编造；逐章展开里不重复写边界。
+
 ## 转译规则（决定"看得懂"）
 
 - 否定式纠偏：能破除刻板印象的，用「不是 X，而是 Y」句式。
@@ -315,6 +343,142 @@ DEFAULT_PROMPTS = {
 - 术语首次出现必须给一句通俗解释。
 - 用页码标注出处（页码取自原文 [P数字] 标记），正文要点末尾标 (P页码)。
 - 输出纯 Markdown，每章结构一致、可复现。""",
+    "prompt_learn_note_conceptual": """你是一名顶尖学习教练。你的任务不是"总结"，而是把给定材料【转译】成一份结构化的学习笔记：让一个非本专业的初学者，不看原文也能在最短时间内抓住知识骨架、理解核心概念、并记住要点。
+
+## 输出结构（必须严格照此）
+
+1. 标题用 `# {材料名} · 学习笔记`
+
+2. `## 必记要点 Top N`（3~5 条）
+   —— 全篇最该记住的要点，编号列出，每条一句话点透。
+
+3. `## 核心问题`
+   —— 作者试图回答的根本问题是什么（1~2 句点透，不要展开）。
+
+4. `## 底层假设`
+   —— 作者默认成立的前提（2~4 条）。⚠️ 只写材料中**明确或可合理推知**的假设，推不出的宁可不写，不要替作者搭建他没说的前提。
+
+5. 主体：**按材料结构自适应，二选一**（先判断材料有没有清晰章节）
+
+   ⓐ **材料有清晰章节时** → 沿用章回体骨架：
+      - `## B{n} 章节标题`
+        - `### 引入`：本章核心问题（一句话）+ 逻辑链条（C1..Cn 清单）
+        - `### C{n} 小节`：转译正文
+        - `### 本节小结`：固定 ◆ 三条，每条一句话
+
+   ⓑ **材料无明显章节时**（随笔式、主题式、条目式）→ 用框架结构：
+      - `## F{n} 框架名`
+        - 这一层在解决什么（一句话）
+        - 推理链条：C1 → C2 → C3（用箭头串，写明因果）
+        - 结论与主张
+
+   ⚠️ 判断依据是**材料自身的行文结构**，不是你的偏好。**有章节就必须用 ⓐ**，不要为了省事退化成 ⓑ；反之**没有章节时绝不硬编章节**。
+
+6. `## 适用边界`
+   - ✅ 适合用来分析：…
+   - ❌ 不能用来解释：…
+   - ⚠️ 前提条件：…
+   - 🔍 已知局限（含作者未提及的隐藏前提）：…
+
+## 转译规则（决定"看得懂"）
+- 否定式纠偏：能破除刻板印象的，用「不是 X，而是 Y」句式。
+- 表格降维：凡线性罗列的概念，能压成 Markdown 表格就压成表格。
+- 每次只讲一次：一个概念首次出现给完整解释，后文一律用指代，严禁重复展开。
+- ⚠️ 不要用"统一的场景比喻串成 N 幕"来串讲（那是叙事类的做法）——认知类靠"问题 → 假设 → 推理链"建立心智模型，比喻点到为止即可。
+- ⚠️ 走 ⓐ 时，每章的小结必须与正文换角度概括，不得原句复述。
+
+## 记忆钩子（决定"记得住"）
+- 把抽象概念压成一句可复述的口诀。
+
+## 硬约束（绝不违犯）
+- 绝不编造原文没有的内容；不确定的信息宁可不写。
+- 术语首次出现必须给一句通俗解释。
+- 用页码标注出处（页码取自原文 [P数字] 标记），正文要点末尾标 (P页码)。
+- 输出纯 Markdown，结构一致、可复现。""",
+    "prompt_learn_note_practical": """你是一名顶尖学习教练。你的任务不是"总结"，而是把给定材料【转译】成一份结构化的学习笔记：让一个非本专业的初学者，不看原文也能在最短时间内抓住知识骨架、理解核心概念、并记住要点。
+
+## 输出结构（必须严格照此）
+
+1. 标题用 `# {材料名} · 学习笔记`
+
+2. `## 必记要点 Top N`（3~5 条）
+   —— 全篇最该记住的要点，编号列出，每条一句话点透。
+
+3. `## 它解决什么问题`
+   —— 这份材料针对什么场景/痛点（1~2 句点透）。
+
+4. `## 操作流程`（按材料实际步骤逐条展开）
+   - `### S{n} 步骤名`
+     - 怎么做：具体动作（能照做，不写"需要注意"这类空话）
+     - 做完得到什么：这一步的产出/判定标志
+     - 关键参数/取值（材料里有就给，没有就写"材料未提供"）
+
+5. `## 判断标准`（材料没有则省略本节）
+   —— 怎么判断做对了 / 什么情况下该走哪条分支。
+
+6. `## 禁忌与坑点`（材料没有则省略本节）
+   —— 材料明确提到的"不要做""常见错误"。材料没提到就不要编，宁缺勿滥。
+
+7. `## 适用边界`
+   - ✅ 适用场景：…
+   - ❌ 不适用场景：…
+   - ⚠️ 前提条件：…
+   - 🔍 已知局限：…
+
+## 转译规则（决定"看得懂"）
+- 表格降维：参数/选项/对比，能压成 Markdown 表格就压成表格。
+- 每次只讲一次：一个概念首次出现给完整解释，后文一律用指代，严禁重复展开。
+- ⚠️ 不要用"场景比喻/第 N 幕"来串讲——工具类材料要的是准确，比喻会稀释信息。
+- ⚠️ 材料里**没有**的步骤，绝不替它补充（这是工具书最容易出现的幻觉）。
+
+## 记忆钩子（决定"记得住"）
+- 把关键规则压成一句可复述的口诀。
+
+## 硬约束（绝不违犯）
+- 绝不编造原文没有的内容；不确定的信息宁可不写。
+- 术语首次出现必须给一句通俗解释。
+- 用页码标注出处（页码取自原文 [P数字] 标记），正文要点末尾标 (P页码)。
+- 输出纯 Markdown，结构一致、可复现。""",
+    "prompt_learn_note_fragment": """你是一名学习助手。下面的材料来自图片 OCR 或音视频转写，它**没有章节结构**，可能只是零散的笔记、板书、课件页或口语流水。请把它整理成一份**信息点清单**，让读者快速看清"这堆内容里到底讲了什么"。
+
+## 输出结构（必须严格照此）
+
+1. 标题用 `# {材料名} · 要点清单`
+
+2. `## 内容概览`（1~2 句）
+   —— 这份材料整体在讲什么（不要拔高、不要编造背景）。
+
+3. `## 信息点`（按材料出现顺序，逐条列出）
+   - 每条格式：`- **要点标题**：具体内容（标出处：图片→(P1)；音视频→(第N分钟)）`
+   - 只整理材料里**真实出现**的信息，不做归类拔高。
+
+4. `## 可深挖的线索`（可选，0~3 条）
+   —— 材料里提到但**没展开**的概念/术语，列出以便用户另行查证。
+   ⚠️ 只列"材料提到了什么"，**不要替它解释**。
+
+## 铁律（这一套的重点）
+
+- ⚠️ **禁止编造章节**：材料没有"第一章/第二章"，就不要写「第 N 章」。
+- ⚠️ **禁止编造隐喻与"探索历程"**：碎片材料串不成故事，硬串就是编。
+- ⚠️ **禁止补全**：OCR 可能识别出错字、转写可能有口误，看不懂的地方**如实标注「（此处文字不确定）」**，绝不猜测补全。
+- ⚠️ **禁止拔高**：不要总结出材料里没有的"深层含义"。
+- 材料过短（只有一两句）时，**如实给一两条信息点即可**，不要为凑结构而注水。
+
+## 硬约束（绝不违犯）
+- 用页码/时间标注出处（图片用 (P1)；音视频用 (第N分钟)）。
+- 输出纯 Markdown，简洁为主。""",
+    "prompt_doc_kind": """你是一名材料分类助手。请判断下面这段材料正文属于哪一类，只输出一个 JSON 对象，不要输出其他内容：
+{"kind": "practical|conceptual|narrative", "reason": "一句话理由（≤30字）"}
+
+判定标准：
+- **practical**（工具实用类）：核心是"怎么做"——操作步骤、判断标准、参数、使用规范、禁忌坑点。典型：技术手册、API 文档、操作指南、制度流程、菜谱、教程。
+- **conceptual**（认知思维类）：核心是"怎么想"——思考框架、底层假设、推理链条、判断维度。典型：心理学、商业分析、思维方法、理论教材、哲学社科。
+- **narrative**（叙事类）：核心是"讲了什么故事/经历"——人物、事件、时间线、情节。典型：小说、传记、历史纪实、随笔散文。
+
+注意：
+1. 判断依据是**内容性质**，不是文件格式。
+2. 介于两类之间时，选**主导**特征；实在无法判断，选 conceptual。
+3. 只输出 JSON，不要解释、不要 Markdown 代码块。""",
     "prompt_material_ask": """你是一名伴学助手。请基于给定的材料内容回答用户的问题。要求：1. 回答严格依据材料，不编造材料中没有的信息；2. 可适当总结、解释，帮助用户理解；3. 回答简洁聚焦，直接回应问题。""",
     "prompt_note_rewrite": """你是一名文字加工助手。请把下面这段文字改写得更通顺、更专业、更简洁，保持原意、事实和关键数字不变，不增删信息。直接输出改写后的文字，不要加任何前后缀或解释。""",
     "prompt_note_expand": """你是一名文字加工助手。请在保持原意和事实不变的前提下，对下面这段文字进行扩写：补充必要的背景、细节、例子或解释，让内容更充实、更容易理解；不得编造原文中没有的事实。直接输出扩写后的文字，不要加任何前后缀。""",
@@ -350,11 +514,12 @@ DEFAULT_PROMPTS = {
 2. 舍弃次要细节，保住信息量最大的判断
 3. 不编造素材中没有的数据或事实
 4. 全文总字数控制在 {brief_chars} 字以内（硬约束）""",
-    "prompt_podcast_script": """你是一名播客编剧。请把「知识简报」改写成一段双人对话播客脚本。
+        "prompt_podcast_script": """你是一名播客编剧。请把「知识简报」改写成一段双人对话播客脚本。
 
 两个角色：
 - host（主持人）：代表听众提问，负责推进节奏、追问、适时小结
 - expert（专家）：负责解答，讲清原理、举具体例子、给出结论
+- 注意：「向听众提问」不是 host 的专属，host 和 expert 都可以直接问听众
 
 严格输出 JSON 数组，不要输出其他任何内容（不要 Markdown 代码块）：
 [{"speaker": "host", "text": "..."}, {"speaker": "expert", "text": "..."}]
@@ -363,19 +528,40 @@ DEFAULT_PROMPTS = {
 1. 开场用具体问题或反常识切入，禁止「大家好，欢迎收听」这类套话
 2. 主持人提问要像真人：短、具体、有追问感；禁止「能不能详细讲讲」这类空问题
 3. 专家回答要口语化：多用短句、比喻和具体例子，避免书面语和超长并列句
-4. 自然穿插举例、反问、阶段性小结；中段至少有一次「举个例子」式的展开
-5. 结尾由主持人用一句话收束，不要「下期再见」式客套
+4. 自然穿插举例、反问、阶段性小结（举例的具体要求见第 11 条）
+5. 结尾不要「下期再见」式客套（结尾怎么写见第 14 条）
 6. 每句 20-80 字，适合朗读；不要出现 Markdown 符号、括号注释、表情符号
 7. 【最重要的约束】全文总字数必须控制在 {script_chars} 字左右，且不得超过 {max_chars} 字；
    共 {seg_count} 句，每句平均约 {avg_chars} 字。
    写超和写少都视为不合格 —— 落笔前先规划好每句承载多少信息，宁可少讲一个点，
    也不要为了显得完整而堆句子。
-8. 只讲知识简报里的内容，不额外发挥""",
-    "prompt_podcast_script_direct": """你是一名播客编剧。请把下面的学习素材直接改写成一段双人对话播客脚本。
+8. 只讲知识简报里的内容，不额外发挥
+
+【教学质量要求 —— 每条都要能逐句核对，缺一项即视为不合格】
+9. 【学习目标】开场必须明确告诉听众「看完能得到什么」，例如「看完你会拿到一张选择表」。
+10. 【问听众】全文至少 3 次要「直接问听众」（句子里要出现「你」，host 和 expert 都可以问），
+    而且要「分散在不同概念之间」，不要都堆在开场。
+    其中至少 1 次要让听众先想一下再继续（例如「你手上有没有…？想三秒钟」）。
+11. 【例子】每个核心概念都要配一个「具体例子」（用「比如…」引出）。例子必须来自素材；
+    素材给了场景就具体化，没给就换素材里另一个真实场景，「绝不编造」。
+    【篇幅分级】本次全文约 {script_chars} 字 —— 若这个篇幅装不下「每个概念都配例子」，
+    至少保证 2 个核心概念有例子，不要为了凑数把句子写超。
+12. 【代价】每个核心概念都要讲「它自己的代价」（成本 / 延迟 / 复杂度 / 门槛 / 风险）。
+    如果素材里这个概念只写了优点，必须明说「这份材料只写了优点」，再从素材给出的
+    结构或流程推出代价 —— 「绝不允许编造一个素材里没有的缺点」。
+    篇幅不足时（同第 11 条的篇幅分级）至少覆盖 2 个核心概念的代价。
+13. 【复现】核心概念名全文至少出现 2 次（首次讲解 + 后文复述），不要讲完就丢。
+14. 【收尾动作】结尾必须给听众一个「可执行动作」（让他去做什么），不要用总结句收尾。
+15. 【归属】讲某个概念的代价或例子时，「那句话里必须直接写出这个概念的名字」，
+    不许用「它」「这个模式」之类指代 —— 否则听众对不上是在说哪个。
+16. 【记忆锚点】中后段要给听众一句「能带走的说法」（口诀 / 一句话总结 /
+    「三步」「两条」这类结构化表述），让他关掉之后还记得住。""",
+        "prompt_podcast_script_direct": """你是一名播客编剧。请把下面的学习素材直接改写成一段双人对话播客脚本。
 
 两个角色：
 - host（主持人）：代表听众提问，负责推进节奏、追问、适时小结
 - expert（专家）：负责解答，讲清原理、举具体例子、给出结论
+- 注意：「向听众提问」不是 host 的专属，host 和 expert 都可以直接问听众
 
 严格输出 JSON 数组，不要输出其他任何内容（不要 Markdown 代码块）：
 [{"speaker": "host", "text": "..."}, {"speaker": "expert", "text": "..."}]
@@ -383,12 +569,32 @@ DEFAULT_PROMPTS = {
 要求：
 1. 先在心里提炼素材的核心观点与关键论据，再改写成对话；不要逐段复述原文
 2. 开场用具体问题或反常识切入，禁止「大家好，欢迎收听」这类套话
-3. 主持人提问要短、具体、有追问感；专家回答要口语化，多举例
+3. 主持人提问要短、具体、有追问感；专家回答要口语化，多举例（具体要求见第 9 条）
 4. 【最重要的约束】全文总字数必须控制在 {script_chars} 字左右，且不得超过 {max_chars} 字；
    共 {seg_count} 句，每句平均约 {avg_chars} 字。写超和写少都视为不合格。
 5. 每句 20-80 字，适合朗读；不要出现 Markdown 符号、括号注释、表情符号
-6. 不编造素材中没有的事实和数据""",
-    "prompt_podcast_script_solo": """你是一名播客主播。请把「知识简报」改写成一段**单人精讲**口播稿。
+6. 不编造素材中没有的事实和数据
+
+【教学质量要求 —— 每条都要能逐句核对，缺一项即视为不合格】
+7. 【学习目标】开场必须明确告诉听众「看完能得到什么」，例如「看完你会拿到一张选择表」。
+8. 【问听众】全文至少 3 次要「直接问听众」（句子里要出现「你」，host 和 expert 都可以问），
+    而且要「分散在不同概念之间」，不要都堆在开场。
+    其中至少 1 次要让听众先想一下再继续（例如「你手上有没有…？想三秒钟」）。
+9. 【例子】每个核心概念都要配一个「具体例子」（用「比如…」引出）。例子必须来自素材；
+    素材给了场景就具体化，没给就换素材里另一个真实场景，「绝不编造」。
+    【篇幅分级】本次全文约 {script_chars} 字 —— 若这个篇幅装不下「每个概念都配例子」，
+    至少保证 2 个核心概念有例子，不要为了凑数把句子写超。
+10. 【代价】每个核心概念都要讲「它自己的代价」（成本 / 延迟 / 复杂度 / 门槛 / 风险）。
+    如果素材里这个概念只写了优点，必须明说「这份材料只写了优点」，再从素材给出的
+    结构或流程推出代价 —— 「绝不允许编造一个素材里没有的缺点」。
+    篇幅不足时（同第 9 条的篇幅分级）至少覆盖 2 个核心概念的代价。
+11. 【复现】核心概念名全文至少出现 2 次（首次讲解 + 后文复述），不要讲完就丢。
+12. 【收尾动作】结尾必须给听众一个「可执行动作」（让他去做什么），不要用总结句收尾。
+13. 【归属】讲某个概念的代价或例子时，「那句话里必须直接写出这个概念的名字」，
+    不许用「它」「这个模式」之类指代 —— 否则听众对不上是在说哪个。
+14. 【记忆锚点】中后段要给听众一句「能带走的说法」（口诀 / 一句话总结 /
+    「三步」「两条」这类结构化表述），让他关掉之后还记得住。""",
+        "prompt_podcast_script_solo": """你是一名播客主播。请把「知识简报」改写成一段**单人精讲**口播稿。
 
 只有一个说话人：speaker 恒为 "host"，全文不要出现第二个人，也不要自问自答式的角色切换。
 
@@ -400,14 +606,34 @@ DEFAULT_PROMPTS = {
 2. 全程第一人称讲解，像在给一个朋友把这件事讲透：先给结论，再讲为什么
 3. 语言口语化：多用短句、比喻和具体例子，避免书面语和超长并列句
 4. 每个要点讲完用一句话收束，再自然过渡到下一个要点；禁止小标题式罗列
-5. 结尾用一句话收束，不要「下期再见」式客套
+5. 结尾不要「下期再见」式客套（结尾怎么写见第 14 条）
 6. 每句 20-120 字，适合朗读；不要出现 Markdown 符号、括号注释、表情符号
 7. 【最重要的约束】全文总字数必须控制在 {script_chars} 字左右，且不得超过 {max_chars} 字；
    共 {seg_count} 句，每句平均约 {avg_chars} 字。
    写超和写少都视为不合格 —— 落笔前先规划好每句承载多少信息，宁可少讲一个点，
    也不要为了显得完整而堆句子。
-8. 只讲知识简报里的内容，不额外发挥""",
-    "prompt_podcast_script_solo_direct": """你是一名播客主播。请把下面的学习素材直接改写成一段**单人精讲**口播稿。
+8. 只讲知识简报里的内容，不额外发挥
+
+【教学质量要求 —— 每条都要能逐句核对，缺一项即视为不合格】
+9. 【学习目标】开场必须明确告诉听众「看完能得到什么」，例如「看完你会拿到一张选择表」。
+10. 【问听众】全文至少 3 次要「直接问听众」（句子里要出现「你」），
+    而且要「分散在不同概念之间」，不要都堆在开场。
+    其中至少 1 次要让听众先想一下再继续（例如「你手上有没有…？想三秒钟」）。
+11. 【例子】每个核心概念都要配一个「具体例子」（用「比如…」引出）。例子必须来自素材；
+    素材给了场景就具体化，没给就换素材里另一个真实场景，「绝不编造」。
+    【篇幅分级】本次全文约 {script_chars} 字 —— 若这个篇幅装不下「每个概念都配例子」，
+    至少保证 2 个核心概念有例子，不要为了凑数把句子写超。
+12. 【代价】每个核心概念都要讲「它自己的代价」（成本 / 延迟 / 复杂度 / 门槛 / 风险）。
+    如果素材里这个概念只写了优点，必须明说「这份材料只写了优点」，再从素材给出的
+    结构或流程推出代价 —— 「绝不允许编造一个素材里没有的缺点」。
+    篇幅不足时（同第 11 条的篇幅分级）至少覆盖 2 个核心概念的代价。
+13. 【复现】核心概念名全文至少出现 2 次（首次讲解 + 后文复述），不要讲完就丢。
+14. 【收尾动作】结尾必须给听众一个「可执行动作」（让他去做什么），不要用总结句收尾。
+15. 【归属】讲某个概念的代价或例子时，「那句话里必须直接写出这个概念的名字」，
+    不许用「它」「这个模式」之类指代 —— 否则听众对不上是在说哪个。
+16. 【记忆锚点】中后段要给听众一句「能带走的说法」（口诀 / 一句话总结 /
+    「三步」「两条」这类结构化表述），让他关掉之后还记得住。""",
+        "prompt_podcast_script_solo_direct": """你是一名播客主播。请把下面的学习素材直接改写成一段**单人精讲**口播稿。
 
 只有一个说话人：speaker 恒为 "host"，全文不要出现第二个人。
 
@@ -421,7 +647,116 @@ DEFAULT_PROMPTS = {
 4. 【最重要的约束】全文总字数必须控制在 {script_chars} 字左右，且不得超过 {max_chars} 字；
    共 {seg_count} 句，每句平均约 {avg_chars} 字。写超和写少都视为不合格。
 5. 每句 20-120 字，适合朗读；不要出现 Markdown 符号、括号注释、表情符号
-6. 不编造素材中没有的事实和数据""",
+6. 不编造素材中没有的事实和数据
+
+【教学质量要求 —— 每条都要能逐句核对，缺一项即视为不合格】
+7. 【学习目标】开场必须明确告诉听众「看完能得到什么」，例如「看完你会拿到一张选择表」。
+8. 【问听众】全文至少 3 次要「直接问听众」（句子里要出现「你」），
+    而且要「分散在不同概念之间」，不要都堆在开场。
+    其中至少 1 次要让听众先想一下再继续（例如「你手上有没有…？想三秒钟」）。
+9. 【例子】每个核心概念都要配一个「具体例子」（用「比如…」引出）。例子必须来自素材；
+    素材给了场景就具体化，没给就换素材里另一个真实场景，「绝不编造」。
+    【篇幅分级】本次全文约 {script_chars} 字 —— 若这个篇幅装不下「每个概念都配例子」，
+    至少保证 2 个核心概念有例子，不要为了凑数把句子写超。
+10. 【代价】每个核心概念都要讲「它自己的代价」（成本 / 延迟 / 复杂度 / 门槛 / 风险）。
+    如果素材里这个概念只写了优点，必须明说「这份材料只写了优点」，再从素材给出的
+    结构或流程推出代价 —— 「绝不允许编造一个素材里没有的缺点」。
+    篇幅不足时（同第 9 条的篇幅分级）至少覆盖 2 个核心概念的代价。
+11. 【复现】核心概念名全文至少出现 2 次（首次讲解 + 后文复述），不要讲完就丢。
+12. 【收尾动作】结尾必须给听众一个「可执行动作」（让他去做什么），不要用总结句收尾。
+13. 【归属】讲某个概念的代价或例子时，「那句话里必须直接写出这个概念的名字」，
+    不许用「它」「这个模式」之类指代 —— 否则听众对不上是在说哪个。
+14. 【记忆锚点】中后段要给听众一句「能带走的说法」（口诀 / 一句话总结 /
+    「三步」「两条」这类结构化表述），让他关掉之后还记得住。""",
+    "prompt_video_script": """你是一名讲解视频的撰稿人。请把下面的学习素材改写成一份「要配画面讲解」的视频讲稿。
+
+严格输出 JSON 数组，不要输出其他任何内容（不要 Markdown 代码块）：
+[{"speaker": "host", "text": "..."}, {"speaker": "host", "text": "..."}]
+
+要求：
+1. 先在心里提炼核心观点与关键论据，再改写成口播；不要逐段复述原文
+2. 开场用具体问题或反常识切入，禁止「大家好，欢迎收看」这类套话
+3. 【最重要的约束】全文总字数必须控制在 {script_chars} 字左右，且不得超过 {max_chars} 字；
+   共 {seg_count} 句，每句平均约 {avg_chars} 字。写超和写少都视为不合格。
+4. 每句 20-120 字，适合朗读；不要出现 Markdown 符号、括号注释、表情符号
+5. 【画面约束，视频特有，必须逐句满足】每句话里都要出现至少一个「在原文里原样存在的
+   多字短语」（4-12 字，绝不能用单字）。系统会拿这个短语去原文里定位，
+   把画面聚焦到讲到的那个位置。例如原文写的是「用户访谈」，
+   讲稿里就必须出现「用户访谈」这四个字，不要改写成「和用户聊了聊」。
+6. 不要写「如图所示」「请看这一页」这类依赖画面的指代 —— 画面由系统自动定位，
+   你只要把内容讲清楚。
+7. 不要用「它」「这个」「上面提到的」开头指代上一句的主语：每一句都要能独立听懂。
+8. 不编造素材中没有的事实和数据""",
+    "prompt_video_points": """你是一名信息图编辑。请依据下面的视频讲稿与分镜表，为每个镜头设计「若干屏」结构图画面。
+
+严格输出一个 JSON 对象，不要输出其他任何内容（不要 Markdown 代码块）：
+{"title": "全片标题（不超过 14 字）",
+ "scenes": [{"shot": 1, "title": "镜头标题（不超过 12 字）",
+             "screens": [{"layout": "grid",
+                          "elements": [{"t": "元素文本（不超过 16 字）", "k": "concept", "seg": 1}]}]}]}
+
+字段说明：
+- shot：镜头编号（必须使用分镜表里给定的编号，每个镜头恰好出现一次）
+- title：这个镜头在讲什么，写成完整通顺的短语（会原样显示在画面顶部，
+  禁止写半截词、禁止以「的/了/和」这类虚字结尾）
+- screens：把这个镜头**按时间先后拆成若干屏**（像一叠幻灯片，每换一屏卡片整屏换掉）。
+  一个 30-60 秒的镜头通常 2-5 屏；内容少时 1 屏也可以，但**每屏 3-6 个元素**。
+- layout：**这一屏**的版式，只能取这五个值之一 ——
+  grid（要点平铺，不确定时的默认）、flow（步骤/流程，元素按先后连成链）、
+  hub（中心辐射：第 1 个元素是中心主题，其余是围绕它的分支）、
+  compare（左右对比：前一半元素是一方，后一半是另一方）、
+  pyramid（分层递进：元素自上而下逐层展开，越往下越具体）
+  按**这一屏**的内容选最贴切的：讲流程用 flow、讲取舍对比用 compare、
+  讲体系组成用 hub、讲层次递进用 pyramid，都不像就用 grid
+- elements：这一屏里逐个点亮的元素；t 短句或短语，一个元素只讲一件事；
+  k 只能取 concept（概念 / 机制）、good（良方 / 做法）、cost（代价 / 边界）
+- seg：该元素应当在第几句讲稿被点亮（必须在所属镜头的句号范围内）
+
+要求：
+1. 【一屏的容量】每屏 3-6 个元素，grid 最多 {max_group} 个 —— 这是**硬上限**：
+   一屏塞进十几个元素会糊成一团、谁也看不清。内容多就**多拆几屏**，不要往一屏里堆。
+2. 【全片总量】元素总数**不得少于 {point_count} 个**（这是**密度下限**，不是参考值）：
+   画面上「长出来」的次数直接决定最长静止，数量不够会被质量闸门拦下、
+   **整条片子不允许渲染**。请按讲稿顺序铺开，平均每句约 {per_seg} 个；
+   长句（超过 30 字）给 2-4 个，短句至少 1 个。
+   ⚠️ 总量靠「更多屏」达成，**不是**靠「每屏更多元素」。
+3. 分布必须**铺满整条视频**，不许在开头一口气给完 ——
+   视频最后 20% 的时间里必须仍有元素待点亮
+4. 屏的时间顺序必须与讲稿一致：同一镜头里，后面那屏的 seg 只能更大，不许倒回去
+5. 每个镜头都要有元素，不许留空镜头
+6. 元素文本用讲稿里出现过的说法，不要自创新词
+7. concept / good / cost 三类都要在全片出现；「代价 / 边界 / 风险」要单独成元素，不要混进良方
+8. 不要编造讲稿里没有的内容""",
+    "prompt_video_anchor": """你是一名信息检索助手。下面是一份视频讲稿（每行一句，行首是序号）。
+请为每一句挑出 1-4 个「定位关键词（anchor）」，用来在原始资料里找到这一句讲的是哪一处。
+
+严格输出 JSON 数组，不要输出其他任何内容（不要 Markdown 代码块）：
+[{"i": 1, "anchors": ["用户访谈", "访谈"]}]
+
+硬规则（违反则定位必然失败）：
+1. anchor 必须是**多字词**（4-12 字），绝不能用单字 ——
+   单字（如「术」）会在同一页命中「技术 / 优术 / 术」多处，定位毫无意义。
+2. anchor 必须是**原文里原样出现过的短语**，含标点要一致
+   （原文用的是全角逗号「，」就不能写成半角逗号）。
+   用户消息里给了「原文片段」时，**只允许从那一段里逐字原样摘取**：不得改写、不得拼接、
+   不得摘半截词。整个片段里都找不到合适的短语 → 给空数组 []（下游会回退到句内切分，
+   给一个错的锚点比给空数组更糟）。
+3. 数量按句子长度给，但**下限是 2 个**（只要句中找得出两个互不重叠的多字词）：
+   短句（不超过 30 字）给 2 个；中等（31-80 字）给 2-3 个；
+   长句（超过 80 字）给 3-4 个，且按句子从前到后的顺序给出。
+   ⚠️ 为什么下限是 2：下游是「逐个试定位、命中任何一个就算这句定位成功」，
+   只给 1 个等于把整句的成败押在一个短语上 —— 它只要不在原文里，这句就直接算未定位。
+   实测（内容同源的真实剪藏材料）：短句只给 1 个 anchor 时命中率卡在 89.5%，
+   够不到 95% 的口径。两个 anchor 要落在句中**不同且不重叠**的位置；
+   确实找不出两个就给 1 个，**不要为了凑数给一个不在原文里的词**。
+4. 同一句的多个 anchor 要落在句子里**不同的位置**，不要给互为子串的词
+   （不要同时给「用户访谈」和「访谈」这种会命中同一处的组合）。
+5. 纯过渡句（如「我们先看第一部分」）给空数组 []。
+6. 同一句内的 anchor 不得重复。
+7. 拿到「原文片段」时，优先摘**片段中连续、完整的多字词**（如「需求管理」「用户访谈记录」），
+   不要摘跨标点的拼接，也不要用片段里没出现过的同义词。
+
+讲稿共 {seg_count} 句。只输出 JSON，不要输出其他任何内容。""",
 }
 
 
@@ -530,6 +865,65 @@ LEARN_NOTE_MAX_CHARS = 24000
 LEARN_TRUNC_MARK = "覆盖范围提示"
 
 
+# 碎片类材料（图片 / 音视频）：解析产物**无章节结构**（图片=单块 page_no=1、
+# 音视频=「第 N 分钟」），强制套章回体会让模型凭空编造章节 → 固定走 fragment 工艺，不调 LLM。
+# ⚠️ 与 parser.py 的 IMAGE_FORMATS / MEDIA_FORMATS 保持一致（那边是解析口径，这里是工艺口径）。
+FRAGMENT_FORMATS = {"jpg", "jpeg", "png", "webp", "bmp", "mp3", "wav", "m4a", "mp4"}
+
+# doc_kind → 讲义提示词键。⚠️ narrative 与 auto 都映射到现有 prompt_learn_note ——
+# 保证「判定失败 / 未判定 / 老数据」时行为与改造前**完全一致**（零回退风险）。
+LEARN_NOTE_PROMPT_BY_KIND = {
+    "narrative": "prompt_learn_note",
+    "auto": "prompt_learn_note",
+    "conceptual": "prompt_learn_note_conceptual",
+    "practical": "prompt_learn_note_practical",
+    "fragment": "prompt_learn_note_fragment",
+}
+
+
+def learn_note_prompt_key(doc_kind: str | None) -> str:
+    """按 doc_kind 选讲义提示词键（未知值回落现有工艺）。"""
+    return LEARN_NOTE_PROMPT_BY_KIND.get((doc_kind or "auto").strip().lower(), "prompt_learn_note")
+
+
+DOC_KIND_VALUES = ("narrative", "conceptual", "practical", "fragment", "auto")
+# 供 LLM 判定的三类（fragment 是「形态」决定、不由 LLM 判；auto 是失败兜底）
+DOC_KIND_LLM_VALUES = ("practical", "conceptual", "narrative")
+DOC_KIND_SAMPLE_CHARS = 4000   # 分类只需看开头一段，不必全文（省 token）
+
+
+def classify_doc_kind(chunks: list[dict], fmt: str | None = None) -> str:
+    """判定材料的内容性质，返回 narrative / conceptual / practical / fragment / auto。
+
+    两级判定（先看形态、再看性质）：
+    1. **确定性**：fmt ∈ FRAGMENT_FORMATS（图片 / 音视频）→ 直接 fragment，**不调 LLM**
+       （这类材料解析出来就没有章节，不存在"认知类图片"的可能）。
+    2. **LLM 判定**：其余文本类材料取正文开头一段调一次 summary_chat，判 practical/conceptual/narrative。
+       ⚠️ 未配 Key / 调用失败 / 返回非法值 → 一律回落 "auto"（走现有通用工艺，**不阻塞、不报错**）。
+
+    kind 归口为 "learn_note"：判定是讲义链路的内部环节，不单列统计口径
+    （`prompt_doc_kind` 亦不暴露到设置页 —— 见 P0 送审稿决议 #4）。
+    """
+    if (fmt or "").strip().lower() in FRAGMENT_FORMATS:
+        return "fragment"
+    text = format_chunks(chunks)
+    if not text.strip():
+        return "auto"
+    try:
+        raw = summary_chat([
+            {"role": "system", "content": get_prompt("prompt_doc_kind")},
+            {"role": "user", "content": text[:DOC_KIND_SAMPLE_CHARS]},
+        ], kind="learn_note")
+        start, end = raw.find("{"), raw.rfind("}")
+        if start < 0 or end <= start:
+            return "auto"
+        data = json.loads(raw[start:end + 1])
+        kind = str(data.get("kind") or "").strip().lower()
+        return kind if kind in DOC_KIND_LLM_VALUES else "auto"
+    except Exception:
+        return "auto"   # 判定是增强项：失败绝不拖垮讲义生成
+
+
 def learn_note_coverage(chunks: list[dict]) -> dict:
     """讲义覆盖度（纯字符串长度计算，不调 LLM）。
 
@@ -546,7 +940,8 @@ def learn_note_coverage(chunks: list[dict]) -> dict:
     }
 
 
-def _learn_note_inputs(chunks: list[dict], title: str | None = None) -> tuple[list[dict], dict, str]:
+def _learn_note_inputs(chunks: list[dict], title: str | None = None,
+                       doc_kind: str = "auto") -> tuple[list[dict], dict, str]:
     """组装讲义生成的 messages / 覆盖度 / 截断后的前置提示（供一次性与流式共用）。"""
     text = format_chunks(chunks)
     cov = learn_note_coverage(chunks)
@@ -557,7 +952,7 @@ def _learn_note_inputs(chunks: list[dict], title: str | None = None) -> tuple[li
         head += ("⚠️ 本次只提供了材料的前一部分（材料过长已被截断）："
                  "请在讲义第 1 行之前如实写出覆盖范围，不要声称已覆盖全文。\n")
     messages = [
-        {"role": "system", "content": get_prompt("prompt_learn_note")},
+        {"role": "system", "content": get_prompt(learn_note_prompt_key(doc_kind))},
         {"role": "user", "content": f"{head}以下是材料原文（含页码标记）：\n\n{text}"},
     ]
     warn = ""
@@ -569,7 +964,8 @@ def _learn_note_inputs(chunks: list[dict], title: str | None = None) -> tuple[li
     return messages, cov, warn
 
 
-def generate_learn_note(chunks: list[dict], title: str | None = None) -> str:
+def generate_learn_note(chunks: list[dict], title: str | None = None,
+                        doc_kind: str = "auto") -> str:
     """把材料转译成结构化学习笔记（简单学习核心产物）。
 
     输入 chunks 与摘要/知识点一致（含 page_no）；返回 Markdown 结构化笔记。
@@ -579,21 +975,22 @@ def generate_learn_note(chunks: list[dict], title: str | None = None) -> str:
     ① prompt 里明确告知模型「只看了一部分」，避免它声称覆盖全文；
     ② 正文开头插入「覆盖范围提示」块——它随讲义一起落库、转笔记，任何入口都看得见。
     """
-    messages, cov, warn = _learn_note_inputs(chunks, title)
+    messages, cov, warn = _learn_note_inputs(chunks, title, doc_kind)
     body_txt = summary_chat(messages, kind="learn_note")
     if not cov["truncated"]:
         return body_txt
     return warn + body_txt.lstrip()
 
 
-def generate_learn_note_stream(chunks: list[dict], title: str | None = None):
+def generate_learn_note_stream(chunks: list[dict], title: str | None = None,
+                               doc_kind: str = "auto"):
     """流式版学习笔记：逐 token yield 字符串（供 SSE 逐字推给前端）。
 
     与 generate_learn_note 完全同构（同一 messages、同一覆盖度处理），
     只是把 summary_chat 换成 summary_chat_stream，并把截断提示块放在
     首个 token 之前 yield（保证「覆盖范围提示」出现在讲义最前头，任何入口都看得见）。
     """
-    messages, cov, warn = _learn_note_inputs(chunks, title)
+    messages, cov, warn = _learn_note_inputs(chunks, title, doc_kind)
     if warn:
         yield warn
     first = True
@@ -896,3 +1293,774 @@ def generate_podcast_script_direct(source_title: str, source_text: str,
         {"role": "user", "content": f"素材标题：{source_title}\n\n素材内容：\n{source_text}{extra}"},
     ], kind="podcast_script")
     return _parse_podcast_script(raw)
+
+
+# ---------- AI 视频（模块 K · V1.0） ----------
+# 视频不重造链路：讲稿与结构图内容都走 summary_chat（与播客 / 陪练同模型）。
+# 记账 kind：video_script（讲稿 + 定位锚点）、video_points（结构图元素与要点）。
+# ⚠️ 埋点边界（PRD 4.2）：埋点不含讲稿正文与来源内容，只上报行为量与长度。
+
+VIDEO_KINDS = ("concept", "good", "cost")
+
+# 单个镜头的元素上限（PRD 3.6.6 #4）：9 个元素叠在一起会糊。
+VIDEO_MAX_GROUP = 8
+# 结构图要点的**单批**预算。⚠️⚠️ 为什么必须分批：服务商默认 max_tokens = 8192，
+#     实测 240 个元素的输出会在 char ~15963 处被**截断** → JSON 非法 → 解析失败
+#     → 整条生成链路报「结构图内容生成失败」（2026-10-09 实测：33 分钟 / 104 句的
+#     播客 100% 复现）。60 是实测安全上界（59 个元素一次成功、240 个必挂）。
+POINT_CHUNK_EVENT_BUDGET = 60
+# 单批句数预算：句很短时「60 个事件」也可能撑爆输出（每句都要至少 1 个元素）。
+POINT_CHUNK_SEG_BUDGET = 30
+
+
+def generate_video_script(source_title: str, source_text: str, script_chars: int = 850,
+                          seg_count: int = 16, instruction: str = "",
+                          style: str = "solo") -> list[dict]:
+    """演绎层：素材 → 视频讲稿（逐句，含画面可定位的 anchor 短语）。
+
+    ⚠️ 与播客脚本共用 JSON 形状与解析器（纯函数复用），但用**独立的提示词**：
+    视频讲稿多一条硬约束 —— 每句必须含一个「原文里原样存在的多字短语」，
+    否则视觉定位无锚可用（这是视频与播客在讲稿层唯一的实质差别）。
+    """
+    avg = max(20, round(script_chars / max(1, seg_count)))
+    prompt = (get_prompt("prompt_video_script")
+              .replace("{script_chars}", str(script_chars))
+              .replace("{max_chars}", str(round(script_chars * 1.1)))
+              .replace("{seg_count}", str(seg_count))
+              .replace("{avg_chars}", str(avg)))
+    extra = f"\n\n用户额外要求：{instruction}" if instruction else ""
+    if style == "dialogue":
+        extra += ("\n\n【本期为双人对谈】请用 host（主持人提问）与 expert（专家解答）交替；"
+                  "同一角色不要连续超过 3 句。")
+    raw = summary_chat([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": f"素材标题：{source_title}\n\n素材内容：\n{source_text}{extra}"},
+    ], kind="video_script")
+    return _parse_podcast_script(raw)
+
+
+def generate_video_points(script_text: str, seg_count: int,
+                          point_count: int | None = None,
+                          shots: list | None = None) -> dict:
+    """结构图内容：讲稿 → {title, elements:[{t,k,seg,group,sc}],
+                       scenes:[{shot,title,screens:[{layout,s,e}]}]}。
+
+    ⚠️ 只让模型给「第几句」（seg），**绝对毫秒由后端按该句的 start_ms 算**：
+    让模型写毫秒是必错的（它不知道 TTS 后的真实时间轴）。
+    ⚠️ `point_count` 必须由调用方按**时长**算好（`video.needed_events`）——
+       这里的默认值只按句数兜底。实测证明「一句一个元素」在真实音轨上会让最长静止到
+       **42 秒**（19 句 / 200 秒），闸门直接不放行。
+    ⚠️ `shots` 是分镜边界 [{n, a, b}]（a/b 为 1 基句号，调用方按 build_shots +
+       讲稿时间轴算出）。传入后提示词附带分镜表，模型为每个镜头出 title/layout；
+       不传（或校验不过）则退回旧扁平格式（全部 grid 版式，镜头标题沿用原截取逻辑）。
+    ⚠️ 模型**经常少给**（实测：要 19 个只给 9 个 = 47%）。事件数直接决定闸门能否放行，
+       而用户能做的只有「再点一次生成」→ 数量严重不足时**内部重试一次**，
+       并把「上一次差多少」明确告诉模型（PRD 3.6.8 的「重试 1 次」策略，
+       从"生成失败"扩展到"数量不足"；这里只重试、**不编造**任何元素）。
+    """
+    n = max(8, int(point_count or seg_count))
+    segs = _split_point_lines(script_text, seg_count)
+    shots = _valid_point_shots(shots, seg_count)
+
+    if shots:
+        # ---- 有分镜表：按镜头边界分批（绝不劈开镜头），模型按镜头出 title/layout ----
+        batches = _point_batches(segs, shots)
+        if len(batches) <= 1:
+            return _gen_points_single(script_text, seg_count, n, shots_table=shots)
+        merged: list = []
+        scenes_all: list = []
+        title = ""
+        seg_cursor = 0                     # 本批第一句的**全局**序号（0 基）
+        for b_shots in batches:
+            take = sum(sh["b"] - sh["a"] + 1 for sh in b_shots)
+            part = segs[seg_cursor:seg_cursor + take]
+            text = "\n".join(f"{j}. {t}" for j, t in enumerate(part, 1))
+            # 批内分镜表：镜头号与句号都按批内重编（模型只见批内编号，防串号）
+            local_table = [{"n": i, "a": sh["a"] - seg_cursor, "b": sh["b"] - seg_cursor}
+                           for i, sh in enumerate(b_shots, 1)]
+            sub = _gen_points_single(text, take, max(8, -(-n * take // len(segs))),
+                                     want_title=(not title), shots_table=local_table)
+            title = title or str(sub.get("title") or "")
+            for e in sub.get("elements") or []:
+                try:
+                    local = int(e.get("seg") or 1)
+                except (TypeError, ValueError):
+                    local = 1
+                # 批内序号 → **全局句号**（后面按 seg 算绝对毫秒，错一位整段错位）
+                e["seg"] = max(1, min(seg_cursor + local, seg_count))
+                merged.append(e)
+            for sc in sub.get("scenes") or []:
+                try:
+                    local_shot = int(sc.get("shot") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if not (1 <= local_shot <= len(b_shots)):
+                    continue
+                # ⚠️ 屏的 s/e 是**批内句号**，必须加 seg_cursor 换算成全局句号 ——
+                #    与元素 seg 同一处纪律，错一位整段屏切换错位。
+                screens = []
+                for s2 in sc.get("screens") or []:
+                    if not isinstance(s2, dict):
+                        continue
+                    try:
+                        lo = int(s2.get("s") or 1) + seg_cursor
+                        hi = int(s2.get("e") or 1) + seg_cursor
+                    except (TypeError, ValueError):
+                        continue
+                    lay = str(s2.get("layout") or "grid").strip().lower()
+                    screens.append({"layout": lay,
+                                    "s": max(1, min(lo, seg_count)),
+                                    "e": max(1, min(hi, seg_count))})
+                scenes_all.append({"shot": b_shots[local_shot - 1]["n"],
+                                   "title": str(sc.get("title") or ""),
+                                   "screens": screens})
+            seg_cursor += take
+        if not merged:
+            raise HTTPException(500, "结构图内容生成失败：模型未返回可用元素，请重试")
+        if len(merged) < max(8, int(n * 0.6)):
+            raise HTTPException(
+                500, f"结构图内容生成失败：分批只得到 {len(merged)} 个元素（目标 {n}），请重试")
+        # 元素 group 由后端按 seg 归属镜头** authoritative 重算**（不信模型的场景归属，
+        # 模型只管内容；渲染层按时间归属，两者殊途同归到同一镜头）
+        _assign_group_by_shots(merged, shots)
+        # 屏归属同样由后端按 seg 权威重算（信模型编号会出现「后一屏的点先亮」）
+        _assign_sc_by_screens(merged, scenes_all)
+        return {"title": title[:20] or "内容结构", "elements": merged, "scenes": scenes_all}
+
+    # ---- 无分镜表（旧路径）：纯句数/事件预算分批，扁平 elements，全 grid ----
+    k = 1
+    if segs:
+        k = max(1,
+                -(-n // POINT_CHUNK_EVENT_BUDGET),
+                -(-len(segs) // POINT_CHUNK_SEG_BUDGET))
+    if k <= 1:
+        return _gen_points_single(script_text, seg_count, n)
+
+    # ⚠️ 分句失败（格式不符）时 `segs` 为 None → k 保持 1 → 走上面的单批路径，
+    #    绝不因为「分不开」把原本能生成的情况弄坏。
+    base, rem = divmod(len(segs), k)
+    merged = []
+    title = ""
+    cursor = 0                     # 本批第一句的**全局**序号（0 基）
+    for b in range(k):
+        take = base + (1 if b < rem else 0)
+        if take <= 0:
+            continue
+        part = segs[cursor:cursor + take]
+        cursor += take
+        text = "\n".join(f"{j}. {t}" for j, t in enumerate(part, 1))
+        sub = _gen_points_single(text, len(part), max(8, -(-n // k)),
+                                 want_title=(not title))
+        title = title or str(sub.get("title") or "")
+        for e in sub.get("elements") or []:
+            try:
+                local = int(e.get("seg") or 1)
+            except (TypeError, ValueError):
+                local = 1
+            # 批内序号 → **全局句号**（后面按 seg 算绝对毫秒，错一位整段错位）
+            e["seg"] = max(1, min(cursor - take + local, max(1, seg_count)))
+            merged.append(e)
+    if not merged:
+        raise HTTPException(500, "结构图内容生成失败：模型未返回可用元素，请重试")
+    if len(merged) < max(8, int(n * 0.6)):
+        raise HTTPException(
+            500, f"结构图内容生成失败：分批只得到 {len(merged)} 个元素（目标 {n}），请重试")
+    return {"title": title[:20] or "内容结构", "elements": _reassign_groups(merged),
+            "scenes": []}
+
+
+def _valid_point_shots(shots: list | None, seg_count: int) -> list | None:
+    """分镜表校验：从 1 连续编号、不重叠、恰好覆盖 [1, seg_count]。任何一条不符返回 None。
+
+    ⚠️ 宁可整表作废（退回无分镜旧路径），也不拿一张「缺句/重叠」的表去约束模型 ——
+       表错了，每个镜头的 title/layout 都会贴错位置。
+    """
+    if not shots or seg_count < 1:
+        return None
+    out = []
+    try:
+        for i, sh in enumerate(shots, 1):
+            out.append({"n": int(sh.get("n") or i),
+                        "a": int(sh.get("a") or 0), "b": int(sh.get("b") or 0)})
+    except (TypeError, ValueError, AttributeError):
+        return None
+    for i, sh in enumerate(out, 1):
+        if sh["n"] != i or not (1 <= sh["a"] <= sh["b"] <= seg_count):
+            return None
+    if out[0]["a"] != 1 or out[-1]["b"] != seg_count:
+        return None
+    for i in range(1, len(out)):
+        if out[i]["a"] != out[i - 1]["b"] + 1:
+            return None
+    return out
+
+
+def _point_batches(segs: list, shots: list) -> list:
+    """把分镜表按句数预算切成若干批（**绝不劈开镜头**）。返回 [[shot...], ...]。
+
+    ⚠️ 分批的动机是输出 token 上限（见 POINT_CHUNK_EVENT_BUDGET 注释）：
+       单批输出过长必被截断。按镜头切批保证模型的场景编号不需要跨批对齐。
+    """
+    batches, cur, cur_segs = [], [], 0
+    for sh in shots:
+        scount = sh["b"] - sh["a"] + 1
+        if cur and cur_segs + scount > POINT_CHUNK_SEG_BUDGET:
+            batches.append(cur)
+            cur, cur_segs = [], 0
+        cur.append(sh)
+        cur_segs += scount
+    if cur:
+        batches.append(cur)
+    # 批数还需受事件预算约束（要 200+ 元素时，单批 30 句也可能撑爆输出）
+    need_k = max(1, -(-len(segs) // POINT_CHUNK_SEG_BUDGET))
+    while len(batches) < need_k and len(batches) < len(shots):
+        # 把最大的批从中间劈开（按镜头边界）
+        bi = max(range(len(batches)),
+                 key=lambda i: sum(s["b"] - s["a"] + 1 for s in batches[i]))
+        big = batches[bi]
+        if len(big) < 2:
+            break
+        half = len(big) // 2
+        batches[bi:bi + 1] = [big[:half], big[half:]]
+    return batches
+
+
+def _assign_group_by_shots(elements: list, shots: list) -> None:
+    """按 seg 把元素的 group 归到**覆盖它的镜头号**（后端权威口径，不信模型的场景归属）。"""
+    for e in elements:
+        seg = int(e.get("seg") or 1)
+        g = shots[-1]["n"]
+        for sh in shots:
+            if sh["a"] <= seg <= sh["b"]:
+                g = sh["n"]
+                break
+        e["group"] = g
+
+
+def _split_point_lines(script_text: str, seg_count: int) -> list | None:
+    """把 `1. xxx\n2. yyy` 切成**纯文本**分句；任何一行不符就返回 None（回退单批）。
+
+    ⚠️ 严格按 `^<序号>[.、] ` 逐行匹配：宁可回退单批，也不要「切歪了」导致
+       句号错位 —— seg 是后面算绝对毫秒的唯一依据，错一位整段画面错位。
+    """
+    lines = [l for l in (script_text or "").split("\n") if l.strip()]
+    if not lines or len(lines) != max(1, int(seg_count or 0)):
+        return None
+    out = []
+    for i, l in enumerate(lines, 1):
+        m = re.match(r"^\s*%d[.、]\s*" % i, l)
+        if not m:
+            return None
+        out.append(l[m.end():])
+    return out
+
+
+def _gen_points_single(script_text: str, seg_count: int, need: int,
+                       want_title: bool = True, shots_table: list | None = None) -> dict:
+    """**单批**结构图要点：讲稿 → {title, elements, scenes}。
+
+    `generate_video_points` 分批后每一批都走这里，接口与旧实现等价。
+    ⚠️ 只让模型给「第几句」（seg），**绝对毫秒由后端按该句的 start_ms 算**：
+       让模型写毫秒是必错的（它不知道 TTS 之后的真实时间轴）。
+    ⚠️ `shots_table` 是批内分镜表 [{n,a,b}]（句号也是批内编号）；给了它，
+       模型才按镜头输出 title/screens（每个镜头若干屏、每屏一个版式），
+       否则退回扁平 elements。
+    ⚠️ 模型**经常少给**（实测：要 19 个只给 9 个 = 47%）。事件数直接决定闸门能否放行，
+       而用户能做的只有「再点一次生成」→ 数量严重不足时**内部重试一次**，
+       并把「上一次差多少」明确告诉模型（PRD 3.6.8 的「重试 1 次」策略，
+       从"生成失败"扩展到"数量不足"；这里只重试、**不编造**任何元素）。
+    """
+    n = max(8, int(need or seg_count))
+    per_seg = max(1, round(n / max(1, seg_count)))
+    prompt = (get_prompt("prompt_video_points")
+              .replace("{seg_count}", str(seg_count))
+              .replace("{point_count}", str(n))
+              .replace("{per_seg}", str(per_seg))
+              .replace("{max_group}", str(VIDEO_MAX_GROUP)))
+    table = ""
+    if shots_table:
+        rows = "\n".join(f"镜头 {sh['n']}（第 {sh['a']}-{sh['b']} 句）"
+                         for sh in shots_table)
+        table = ("\n\n分镜表（句号指上面讲稿的行号；每个镜头的 screens 与各元素的 seg "
+                 "都必须落在该镜头的句号范围内）：\n" + rows)
+    user = f"视频讲稿（共 {seg_count} 句）：\n{script_text}{table}"
+    raw = summary_chat([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": user},
+    ], kind="video_points")
+    obj = _parse_video_points(raw, seg_count, shots_table)
+    got = len(obj.get("elements") or [])
+    if got >= max(8, int(n * 0.6)):
+        return obj
+    # 数量严重不足（< 目标的 60%）→ 重试一次，把差距直说
+    try:
+        raw2 = summary_chat([
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": (
+                f"{user}\n\n"
+                f"⚠️ 上一次只给出了 {got} 个元素，**数量不足**。"
+                f"本次必须给出不少于 {n} 个元素（平均每句约 {per_seg} 个），"
+                f"否则视频会出现长时间画面静止、无法通过质量闸门。")},
+        ], kind="video_points")
+        obj2 = _parse_video_points(raw2, seg_count, shots_table)
+        if len(obj2.get("elements") or []) > got:
+            return obj2
+    except BaseException:
+        pass
+    return obj
+
+
+def generate_video_anchors(script_lines: list[str], source_text: str = "") -> list[dict]:
+    """定位锚点：逐句产 1-4 个 anchor 短语（长句给更多，按句中先后给）。
+
+    返回 [{"i": 1, "anchors": [...]}]。空 anchors 是**合法**结果（过渡句）——
+    调用方对该句回退到「本句文本切分」的兜底定位，所以这里不抛错。
+
+    `source_text`：**视觉来源材料的原文片段**（不给则退回「猜」，见下）。
+
+    ⚠️ 不传原文是本链路曾经的**根本缺陷**：提示词第 2 条硬性要求
+       「anchor 必须是原文里原样出现过的短语」，而模型手里只有讲稿 ——
+       讲稿是 LLM 改写过的，措辞与原文不同，模型只能**猜**哪个短语在原文里存在。
+       实测（`_fetch_probe/_diag_avideo_locator_20261008.py`）：讲稿与材料同源的剪藏材料上，
+       讲稿 4-gram 在页面文本里的命中率只有 18.2% → 闸门判据 4（≥95%）永远过不去
+       → 「材料原件（source）」皮肤等于不可用。
+       原文片段由 `locate.source_excerpt()` 从材料页面抽取，经用户消息交给模型。
+    """
+    numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(script_lines, 1))
+    prompt = get_prompt("prompt_video_anchor").replace("{seg_count}", str(len(script_lines)))
+    user = f"讲稿：\n{numbered}"
+    src = (source_text or "").strip()
+    if src:
+        # ⚠️ 刻意挂在**用户消息**上，而不是提示词里的 `{source_excerpt}` 占位符：
+        #    用户可能在设置页改过这段提示词，改过的版本不会有占位符 ——
+        #    靠占位符注入会**静默失效**（模型又回到「猜」的状态，且毫无报错）。
+        user += ("\n\n原文片段（锚点只能从下面这段原文里**逐字原样摘取**；"
+                 "整段都摘不到就给 []）：\n" + src)
+    raw = summary_chat([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": user},
+    ], kind="video_script")
+    return _parse_video_anchors(raw, len(script_lines))
+
+
+def retry_video_call(fn, tries: int = 2):
+    """视频链路的 LLM 重试（PRD 3.4.7：JSON 非法 → 自动重试 1 次）。
+
+    复用与陪练同一套重试节奏（首败 sleep 1.5s 再试），保持全项目一致。
+    """
+    last: Exception | None = None
+    for attempt in range(max(1, tries)):
+        try:
+            return fn()
+        except Exception as e:      # HTTPException 也在此列（已是可读文案）
+            last = e
+            if attempt < tries - 1:
+                time.sleep(1.5)
+    raise last  # type: ignore[misc]
+
+
+def _clamp_point(it, seg_count: int) -> dict | None:
+    """单个元素的边界钳制（类别白名单 / seg 范围）；不合法返回 None。"""
+    if not isinstance(it, dict):
+        return None
+    t = str(it.get("t") or "").strip()
+    if not t:
+        return None
+    k = str(it.get("k") or "").strip().lower()
+    if k not in VIDEO_KINDS:
+        k = "concept"
+    try:
+        seg = int(it.get("seg") or 1)
+    except (TypeError, ValueError):
+        seg = 1
+    seg = max(1, min(seg, max(1, seg_count)))
+    return {"t": t[:24], "k": k, "seg": seg, "group": 1}
+
+
+def _split_screen_units(els: list, layout: str, limits: dict) -> list:
+    """一屏的元素按版式上限切成若干「屏」；不足下限的块降级 grid。
+
+    ⚠️⚠️ **超上限必须切开、不能降级** —— 这是这次改造的核心：
+       闸门密度下限把每镜逼到 15-21 个元素（151s/4 镜需 63 个事件），
+       若按「越界即降级 grid」处理，flow/hub/compare/pyramid 的上限（6-7）
+       永远被突破 → 版式**永远退化成 grid**（实测作品 5：四镜全 grid，结构化等于没生效）。
+       正确做法：保持版式、把这一屏切成多屏 —— 密度与结构才能同时成立。
+    ⚠️ 尾块可能小于下限（如 7 个元素、flow 上限 6 → 切 6+1）：不足下限的块单独降级 grid，
+       绝不留一块「孤零零 1 张卡的 flow」（元素太少撑不起流程，观感比 grid 更糟）。
+    返回 [(元素块, 该块版式), ...]（顺序即时间顺序）。
+    """
+    lo, hi = limits.get(layout, (1, 10))
+    if len(els) <= hi:
+        return [(els, layout if (layout == "grid" or len(els) >= lo) else "grid")]
+    n_parts = -(-len(els) // max(1, hi))
+    base, rem = divmod(len(els), n_parts)
+    out, cursor = [], 0
+    for i in range(n_parts):
+        take = base + (1 if i < rem else 0)
+        chunk = els[cursor:cursor + take]
+        cursor += take
+        if not chunk:
+            continue
+        out.append((chunk, layout if (layout == "grid" or len(chunk) >= lo) else "grid"))
+    return out
+
+
+def _assign_sc_by_screens(elements: list, scenes: list) -> None:
+    """按 seg 把元素的 `sc` 归到**覆盖它的那一屏**（后端权威口径，不信模型的屏归属）。
+
+    ⚠️ 与 `_assign_group_by_shots` 同一纪律：模型只管内容，归属一律后端重算 ——
+       否则「屏的时间顺序」会被模型的随手编号破坏，出现「后一屏的点先亮」。
+    ⚠️ 屏的 s/e 必须是**全局句号**（分批路径在合并时已换算过）。
+    """
+    for e in elements:
+        try:
+            seg = int(e.get("seg") or 1)
+            shot = int(e.get("group") or 1)
+        except (TypeError, ValueError):
+            e["sc"] = 0
+            continue
+        screens = []
+        for s in scenes or []:
+            try:
+                if int(s.get("shot") or 0) == shot:
+                    screens = s.get("screens") or []
+                    break
+            except (TypeError, ValueError):
+                continue
+        idx = 0
+        for j, scr in enumerate(screens):
+            try:
+                if int(scr.get("e") or 0) >= seg:
+                    idx = j
+                    break
+            except (TypeError, ValueError):
+                continue
+        else:
+            idx = max(0, len(screens) - 1)
+        e["sc"] = idx
+
+
+def _parse_video_points(raw: str, seg_count: int,
+                        shots_table: list | None = None) -> dict:
+    """解析结构图 JSON 对象：**新格式（scenes → screens 两层）优先，旧格式逐级兜底**。
+
+    ⚠️ 三种格式都必须能吃（用户可能在设置页改过提示词，只认新格式 = 让自定义用户必挂）：
+       ① {title, scenes:[{shot,title,screens:[{layout,elements}]}]}   当前格式
+       ② {title, scenes:[{shot,title,layout,elements}]}              上一版（视为单屏）
+       ③ {title, elements:[{t,k,seg,group}]}                         最初扁平格式
+    ⚠️ 钳制必须在这里做完：模型给出的 seg 越界、k 非法、版式乱写都是常态，
+       放任下去会在渲染期变成「元素永远不亮」或「一屏 15 个元素」这类静默故障。
+    ⚠️ 每屏元素数**超上限时切开、低于下限才降级**（见 `_split_screen_units`）。
+    返回的元素带 `sc`（屏序号、镜头内 0 基）；scenes 里每屏给 `s`/`e`（首末句号，全局）。
+    """
+    from .video import GRAPH_LAYOUTS, GRAPH_LAYOUT_LIMITS
+    txt = _strip_code_fence(raw)
+    start, end = txt.find("{"), txt.rfind("}")
+    try:
+        obj = json.loads(txt[start:end + 1])
+        assert isinstance(obj, dict)
+    except Exception:
+        raise HTTPException(500, "结构图内容生成失败，请重试")
+    title = str(obj.get("title") or "").strip()[:20] or "内容结构"
+
+    scs = obj.get("scenes")
+    if isinstance(scs, list) and scs:
+        seg_range = {}
+        if shots_table:
+            for sh in shots_table:
+                seg_range[int(sh["n"])] = (int(sh["a"]), int(sh["b"]))
+        scenes_out, elements_out = [], []
+        seen_shot = set()
+        for sc in scs:
+            if not isinstance(sc, dict):
+                continue
+            try:
+                shot = int(sc.get("shot") or 0)
+            except (TypeError, ValueError):
+                continue
+            if shot in seen_shot:
+                continue
+            if seg_range and shot not in seg_range:
+                continue
+            seen_shot.add(shot)
+            stitle = str(sc.get("title") or "").strip()[:16]
+            raw_screens = sc.get("screens")
+            if not (isinstance(raw_screens, list) and raw_screens):
+                # ② 上一版：镜头级单个 layout + elements → 视为「一镜一屏」
+                raw_screens = [{"layout": sc.get("layout"),
+                                "elements": sc.get("elements")}]
+            screens_out = []
+            for raw_scr in raw_screens:
+                if not isinstance(raw_scr, dict):
+                    continue
+                layout = str(raw_scr.get("layout") or "").strip().lower()
+                if layout not in GRAPH_LAYOUTS:
+                    layout = "grid"
+                els = []
+                for it in raw_scr.get("elements") or []:
+                    e = _clamp_point(it, seg_count)
+                    if e is None:
+                        continue
+                    if seg_range:
+                        lo_s, hi_s = seg_range[shot]
+                        e["seg"] = max(lo_s, min(e["seg"], hi_s))
+                    e["group"] = shot
+                    els.append(e)
+                if not els:
+                    continue
+                for chunk, lay in _split_screen_units(els, layout, GRAPH_LAYOUT_LIMITS):
+                    sc_idx = len(screens_out)
+                    for e in chunk:
+                        e["sc"] = sc_idx
+                    elements_out.extend(chunk)
+                    screens_out.append({"layout": lay,
+                                        "s": min(e["seg"] for e in chunk),
+                                        "e": max(e["seg"] for e in chunk)})
+            if screens_out:
+                scenes_out.append({"shot": shot, "title": stitle,
+                                   "screens": screens_out})
+        if elements_out:
+            elements_out.sort(key=lambda e: (e["seg"], e["group"], e["sc"]))
+            return {"title": title, "elements": elements_out, "scenes": scenes_out}
+        # scenes 结构在、但里面一个可用元素都没有 → 不静默，落去旧格式再试一次
+    els = []
+    for it in obj.get("elements") or []:
+        e = _clamp_point(it, seg_count)
+        if e is None:
+            continue
+        try:
+            grp = int(it.get("group") or 1)
+        except (TypeError, ValueError):
+            grp = 1
+        e["group"] = max(1, grp)
+        e["sc"] = 0
+        els.append(e)
+    if not els:
+        raise HTTPException(500, "结构图内容生成失败：模型未返回可用元素，请重试")
+    return {"title": title, "elements": _reassign_groups(els), "scenes": []}
+
+
+
+def _reassign_groups(els: list) -> list:
+    """把 group 重排为连续序号，并强制「每镜头 ≤ VIDEO_MAX_GROUP」。
+
+    ⚠️ 抽成独立函数是因为**分批生成**也要用它：分批各自重排会让镜头号重复/跳号
+       （第 1 批与第 2 批都从 group=1 开始），渲染时会出现「同一屏塞进 15 个元素」。
+       ⚠️ 绝不复制一份另写 —— 两处漂移 = 分批与非分批的镜头切分不一致。
+    ⚠️ 模型经常把 15 个元素塞进 group=1。按出现顺序切块即可，元素顺序不受影响
+       （每个元素仍带有自己的 seg）。
+    """
+    ordered = sorted(els, key=lambda e: (e["group"], e["seg"]))
+    fixed, gid, used = [], 1, 0
+    for e in ordered:
+        if used >= VIDEO_MAX_GROUP:
+            gid += 1
+            used = 0
+        e["group"] = gid
+        used += 1
+        fixed.append(e)
+    # 还原成「按 seg 排序」的元素顺序（渲染时按 seg 升序点亮），但 group 已归并
+    fixed.sort(key=lambda e: (e["seg"], e["group"]))
+    return fixed
+
+
+def _parse_video_anchors(raw: str, seg_count: int) -> list[dict]:
+    """解析 anchor JSON 数组；**允许空数组**（全为过渡句），但不允许整体解析失败。"""
+    txt = _strip_code_fence(raw)
+    start, end = txt.find("["), txt.rfind("]")
+    if start < 0 or end <= start:
+        raise HTTPException(500, "定位锚点生成失败，请重试")
+    try:
+        items = json.loads(txt[start:end + 1])
+    except Exception:
+        raise HTTPException(500, "定位锚点生成失败，请重试")
+    out = []
+    seen = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            i = int(it.get("i") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not (1 <= i <= seg_count) or i in seen:
+            continue
+        seen.add(i)
+        words = []
+        for w in (it.get("anchors") or []):
+            w = str(w or "").strip()
+            # 单字 anchor 一律丢弃（PRD 3.5.6 硬规则 1）；同时丢弃句内重复
+            if len(w) >= 2 and w not in words:
+                words.append(w)
+        out.append({"i": i, "anchors": words[:4]})
+    return out
+
+
+# ---------- AI 陪练（模块 J） ----------
+# 题型：题纲 / 出题（含期望要点） / 评分，全部走 summary_chat（与「测一测」同模型）。
+# 记账 kind：出题链路 drill / 评分链路 drill_judge（统计页据此分账）。
+
+def _parse_drill_json_object(raw: str, keys: tuple,
+                             err_msg: str = "陪练生成失败，请重试") -> dict:
+    """解析 LLM 返回的 JSON 对象（容错代码块包裹 / 前后杂质）。
+
+    err_msg 用于**按阶段分流文案**（PRD 3.4.7）：评分阶段失败必须说「评分失败」，
+    不能笼统说「生成失败」——那会让用户误以为出题炸了、跑去重开一场。
+    """
+    txt = _strip_code_fence(raw)
+    start, end = txt.find("{"), txt.rfind("}")
+    try:
+        obj = json.loads(txt[start:end + 1])
+        assert isinstance(obj, dict) and all(k in obj for k in keys)
+        return obj
+    except Exception:
+        raise HTTPException(500, err_msg)
+
+
+def _parse_drill_json_list(raw: str, keys: tuple,
+                           err_msg: str = "陪练生成失败，请重试") -> list[dict]:
+    """解析 LLM 返回的 JSON 数组；**绝不返回空数组**（否则调用方会静默把题纲写空）。"""
+    txt = _strip_code_fence(raw)
+    start, end = txt.find("["), txt.rfind("]")
+    try:
+        items = json.loads(txt[start:end + 1])
+    except Exception:
+        raise HTTPException(500, err_msg)
+    out = [i for i in items if isinstance(i, dict) and all(k in i for k in keys)]
+    if not out:
+        raise HTTPException(500, "陪练生成失败：模型未返回可用考点，请重试")
+    return out
+
+
+def _retry_drill_call(fn, tries: int = 2):
+    """陪练链路的 LLM 调用重试（PRD 3.3.7 / 3.4.6 / 3.5：JSON 非法 → 重试 1 次）。
+
+    ⚠️ 只对**异常**重试（JSON 解析失败 / 网络抖动 / 429），不对生成质量做判断。
+    ⚠️ 全部失败后抛**最后一次**异常：调用方按阶段降级 ——
+       出题失败 → 该考点跳过；评分失败 → 该题标未评分且不阻断后续（PRD 3.4.7）。
+    与 map_group_safe 同构（首败 sleep 1.5s 再试），保持全项目一致的重试节奏。
+    """
+    last: Exception | None = None
+    for attempt in range(max(1, tries)):
+        try:
+            return fn()
+        except Exception as e:      # HTTPException 也在此列（已是可读文案）
+            last = e
+            if attempt < tries - 1:
+                time.sleep(1.5)
+    raise last  # type: ignore[misc]
+
+
+def generate_drill_outline(context: str, count: int, scope_label: str = "") -> list[dict]:
+    """生成考点题纲（模式一）。返回 [{point, difficulty, hint, source}]，最多 count 条。"""
+    def _once() -> list[dict]:
+        raw = summary_chat([
+            {"role": "system", "content": get_prompt("prompt_drill_examiner").replace("{count}", str(count))},
+            {"role": "user", "content": f"【陪练范围】{scope_label}\n\n【素材内容】\n{context}\n\n"
+                                        f"请按「模式一 · 出题纲」输出，生成 {count} 个互不重复的考点。"},
+        ], kind="drill")
+        return _parse_drill_json_list(raw, ("point",))[:count]
+
+    return _retry_drill_call(_once)
+
+
+def generate_drill_question(context: str, point: str, hint: str = "",
+                            difficulty: str = "medium") -> dict:
+    """为单个考点生成「开放式问题 + 期望要点」（模式二）。
+
+    ⚠️ 问题与期望要点**必须同批产出**（PRD 3.4.5）：否则评分阶段无对照标准。
+    """
+    extra = f"\n难度：{difficulty}"
+    if hint:
+        extra += f"\n提问角度提示：{hint}"
+
+    def _once() -> dict:
+        raw = summary_chat([
+            {"role": "system", "content": get_prompt("prompt_drill_examiner")},
+            {"role": "user", "content": f"【素材内容】\n{context}\n\n【本次要考察的考点】{point}{extra}\n\n"
+                                        f"请按「模式二 · 出题 + 期望要点」输出。"},
+        ], kind="drill")
+        obj = _parse_drill_json_object(raw, ("question", "expected_points"))
+        obj["expected_points"] = [str(p).strip() for p in (obj.get("expected_points") or []) if str(p).strip()]
+        if not obj["expected_points"]:
+            raise HTTPException(500, "陪练生成失败：未产出期望要点，请重试")
+        return obj
+
+    return _retry_drill_call(_once)
+
+
+def generate_drill_followup(context: str, question: str, expected_points: list,
+                            user_answer: str) -> dict | None:
+    """为同一考点生成一层追问（模式三）。失败返回 None（调用方静默降级到下一考点）。"""
+    def _once() -> dict | None:
+        raw = summary_chat([
+            {"role": "system", "content": get_prompt("prompt_drill_examiner")},
+            {"role": "user", "content": f"【素材内容】\n{context}\n\n【原问题】{question}\n\n"
+                                        f"【期望要点】\n" + "\n".join(f"- {p}" for p in expected_points)
+                                        + f"\n\n【学习者作答】\n{user_answer}\n\n请按「模式三 · 追问」输出。"},
+        ], kind="drill")
+        obj = _parse_drill_json_object(raw, ("question",))
+        q = str(obj.get("question") or "").strip()
+        if not q or q == question:
+            return None
+        pts = [str(p).strip() for p in (obj.get("expected_points") or []) if str(p).strip()]
+        return {"question": q, "expected_points": pts or list(expected_points)}
+
+    try:
+        return _retry_drill_call(_once)
+    except Exception:
+        return None
+
+
+def judge_drill_answer(question: str, expected_points: list, user_answer: str) -> dict:
+    """评分（结构化 JSON）。⚠️ 必须把**期望要点**一并喂入，否则模型只能凭感觉给分（PRD 3.5）。
+
+    返回 {score, verdict, dimensions, comment, missing_points, followup}，已做边界钳制与兜底。
+    ⚠️ 文案分流（A3）：评分阶段失败说「本题评分失败」，不复用题纲/出题阶段的「生成失败」。
+    """
+    pts = "\n".join(f"- {p}" for p in (expected_points or [])) or "（未提供）"
+
+    def _once() -> dict:
+        raw = summary_chat([
+            {"role": "system", "content": get_prompt("prompt_drill_judge")},
+            {"role": "user", "content": f"【问题】{question}\n\n【期望要点】\n{pts}\n\n"
+                                        f"【学习者作答】\n{user_answer}"},
+        ], kind="drill_judge")
+        obj = _parse_drill_json_object(raw, ("score", "verdict", "comment"),
+                                       err_msg="本题评分失败，可稍后重试")
+        return _normalize_judgement(obj)
+
+    return _retry_drill_call(_once)
+
+
+def _normalize_judgement(obj: dict) -> dict:
+    """评分结果规范化：分数钳到 0-100、verdict 兜底、维度缺失用总分回填（PRD 3.5.7）。"""
+    try:
+        score = int(round(float(obj.get("score", 0))))
+    except Exception:
+        score = 0
+    score = max(0, min(100, score))
+    verdict = str(obj.get("verdict") or "").strip().lower()
+    if verdict not in ("correct", "partial", "wrong"):
+        verdict = "correct" if score >= 80 else ("partial" if score >= 40 else "wrong")
+    dims = obj.get("dimensions")
+    if not isinstance(dims, dict) or not dims:
+        dims = {"正确性": score, "完整度": score, "表达": score}
+    else:
+        clean = {}
+        for k in ("正确性", "完整度", "表达"):
+            try:
+                clean[k] = max(0, min(100, int(round(float(dims.get(k, score))))))
+            except Exception:
+                clean[k] = score
+        dims = clean
+    missing = [str(x).strip() for x in (obj.get("missing_points") or []) if str(x).strip()]
+    fu = obj.get("followup") if isinstance(obj.get("followup"), dict) else {}
+    fu_q = str(fu.get("question") or "").strip()
+    fu_pts = [str(x).strip() for x in (fu.get("expected_points") or []) if str(x).strip()]
+    return {
+        "score": score, "verdict": verdict, "dimensions": dims,
+        "comment": str(obj.get("comment") or "").strip()[:500],
+        "missing_points": missing,
+        "followup": ({"question": fu_q, "expected_points": fu_pts} if fu_q else None),
+    }

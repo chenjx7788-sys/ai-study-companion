@@ -33,6 +33,13 @@ pywebview>=6.2.1
 # AI 播客 · 语音合成：edge-tts 免费、无需 API Key，输出 MPEG-2 Layer III / 24kHz / 48kbps / mono
 # 注意：依赖 aiohttp（自动带入）。聚合音频采用 MP3 帧字节拼接，无需 ffmpeg。
 edge-tts>=7.2
+# AI 播客 · 本地语音合成（可选 provider=zipvoice）：ZipVoice 蒸馏 INT8（sherpa-onnx 版）。
+# ⚠️ 模型本体约 195MB **不随包**（按需下载到 data/models/zipvoice-distill-int8/），
+#    这里只装运行时；推理纯本地 CPU、零网络依赖 → 解决 edge-tts 无 SLA 的稳定性问题。
+# ⚠️ 1.13+ 为**拆分架构**：sherpa-onnx（Python 层 ~2.3MB）+ sherpa-onnx-core（C++ 运行时
+#    ~44MB 解压，**自带 onnxruntime.dll**）→ 与本文件里的 Python onnxruntime 包（rapidocr 用）
+#    互不干扰（实测 core 的 METADATA 未声明 onnxruntime 依赖，无版本冲突）。
+sherpa-onnx>=1.13
 # 网页剪藏：专业级正文抽取。⚠️ 安装体积 +39.8MB（其中 babel/locale-data 独占 28.5MB），
 # 打包时剔除 babel/locale-data 后降到 +11.3MB —— 实测中文抽取不依赖它（见 _fetch_probe/probe4_babel_trim.py）。
 # ⚠️ 打包后必须实测：静态抓取 + SPA 判定 + 公众号抓取三态都正常。

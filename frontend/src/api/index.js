@@ -151,6 +151,15 @@ export const asrApi = {
   downloadStatus: () => http.get('/asr/download/status')
 }
 
+// 语音合成模型（本地 ZipVoice：状态 / 下载 / 进度 / 音色）
+// 与 asrApi 同构 —— 前端复用同一套「下载卡片 + 轮询」交互
+export const zipvoiceApi = {
+  models: () => http.get('/zipvoice/models'),
+  download: () => http.post('/zipvoice/download'),
+  downloadStatus: () => http.get('/zipvoice/download/status'),
+  voices: () => http.get('/zipvoice/voices')
+}
+
 // 设置（PRD 模块 F）
 export const settingsApi = {
   get: () => http.get('/settings'),
@@ -205,4 +214,84 @@ export const podcastApi = {
   removeBgm: (bgmId) => http.delete(`/podcasts/bgm/${encodeURIComponent(bgmId)}`),
   setBgm: (id, payload) => http.put(`/podcasts/${id}`, payload),
   testVoice: () => http.post('/podcasts/test-voice', {}, { timeout: 120000 })
+}
+
+// AI 陪练（模块 J · V1.0）：选题纲 → 逐题作答（AI 评分）→ 成绩单 + 错题回写复习
+// ⚠️ 两条 SSE 流用**完整路径**：streamSSE / 自定义 fetch 不走 axios 的 /api 前缀协商
+export const drillApi = {
+  // 范围内容量估算（纯 DB 统计，不触发检索）→ 用于判断「开始陪练」是否可点
+  scopePreview: (payload) => http.post('/drill/scope/preview', payload),
+  create: (payload) => http.post('/drill/sessions', payload),
+  list: (params) => http.get('/drill/sessions', { params }),
+  detail: (sid) => http.get(`/drill/sessions/${sid}`),
+  remove: (sid) => http.delete(`/drill/sessions/${sid}`),
+  // 跨场次趋势（优化 3）：服务端聚合已落库的漏点，看短板是否在收敛
+  trend: (limit) => http.get('/drill/trend', { params: { limit } }),
+  startStreamUrl: (sid) => `/api/drill/sessions/${sid}/start/stream`,
+  answerStreamUrl: (sid) => `/api/drill/sessions/${sid}/answer/stream`,
+  finish: (sid, reason) => http.post(`/drill/sessions/${sid}/finish`, { reason }),
+  // 语音（C 档）：念题返回 mp3 字节流；口述作答返回 { text }
+  // ⚠️ 念题的 responseType 必须是 blob —— 走默认的 json 解析会把音频当成坏 JSON 报错
+  tts: (text, voice) => http.post('/drill/tts', { text, voice }, { responseType: 'blob', timeout: 120000 }),
+  asr: (blob, filename) => {
+    const fd = new FormData()
+    fd.append('file', blob, filename || 'answer.webm')
+    return http.post('/drill/asr', fd, { timeout: 180000 })
+  },
+}
+
+// AI 视频（PRD V1.0.1）：讲稿与分镜编排 → 视觉步点 → 质量闸门 → 渲染 → 播放 / 导出。
+// 与播客的关系：**独立作品类型 + 独立入口**；音轨「复用播客（绝不重新合成）」或本片单独生成。
+// ⚠️ 两条约束贯穿前端：
+//   ① 生成是「启动或附着」的长任务 —— SSE 只是进度订阅者，用户离开页面不会中断生成，
+//      回来时用 planStatus 问一句「还在跑吗」再决定是否重新订阅；
+//   ② 产物 URL 带上字节数（`?v=`）做 cache-buster：重新生成后 <audio>/<video> 才会丢掉旧缓冲。
+//      （后端对这三个端点用的是 `Cache-Control: private, no-cache`，不解析这个参数，纯前端用。）
+export const videoApi = {
+  options: () => http.get('/videos/options'),
+  list: () => http.get('/videos'),
+  detail: (id) => http.get(`/videos/${id}`),
+  create: (payload) => http.post('/videos', payload),
+  update: (id, payload) => http.put(`/videos/${id}`, payload),
+  remove: (id) => http.delete(`/videos/${id}`),
+  // 讲稿保存在**已有音轨**的前提下进行：改一句丢一句时间戳（时间轴唯一来源是音轨）
+  saveScript: (id, script) => http.put(`/videos/${id}/script`, { script }),
+  // 兼容性预检（硬规则）：某份材料做不了「材料原件」时，UI 据此置灰并说明原因
+  precheck: (id) => http.get(`/videos/${id}/precheck`),
+  // SSE 流式生成（启动或附着）。streamSSE 走 fetch，不走 axios 的 /api 前缀协商
+  planStreamUrl: (id) => `/api/videos/${id}/plan/stream`,
+  planStatus: (id) => http.get(`/videos/${id}/plan/status`),
+  // 重跑质量闸门（改讲稿后调用；不重新生成讲稿与锚点）
+  gate: (id) => http.post(`/videos/${id}/gate`),
+  // 一键补步（PRD 3.9.6）：只重跑定位/步点生成 + 闸门，不动讲稿与音轨（含 LLM 调用，超时放宽）
+  refillSteps: (id) => http.post(`/videos/${id}/steps/refill`, {}, { timeout: 300000 }),
+  // 手动指定未命中句的原文位置（PRD 3.9.5 判据 4 修复入口）
+  manualStep: (id, seg, anchor) => http.post(`/videos/${id}/steps/manual`, { seg, anchor }),
+  // 渲染（阶段 2）：闸门通过才会入队；**并发上限 1**，超限不是失败而是排队并展示位次。
+  // ⚠️ render 是幂等的：已在队列/正在渲染时返回同一个任务的位次，不会重复入队。
+  // skipGate：连续 3 次未通过自检时才允许（PRD 3.9.7），其余情况后端照拦
+  render: (id, skipGate = false) => http.post(`/videos/${id}/render`, skipGate ? { skip_gate: true } : {}),
+  renderStreamUrl: (id) => `/api/videos/${id}/render/stream`,
+  renderStatus: (id) => http.get(`/videos/${id}/render/status`),
+  audioUrl: (id, v) => `/api/videos/${id}/audio${v ? `?v=${v}` : ''}`,
+  srtUrl: (id) => `/api/videos/${id}/srt`,
+  // 播放器内字幕轨（<track> 只认 WebVTT；与 SRT 同一条时间轴）
+  vttUrl: (id, v) => `/api/videos/${id}/vtt${v ? `?v=${v}` : ''}`,
+  fileUrl: (id, v) => `/api/videos/${id}/file${v ? `?v=${v}` : ''}`,
+  posterUrl: (id, v) => `/api/videos/${id}/poster${v ? `?v=${v}` : ''}`,
+  reveal: (id) => http.post(`/videos/${id}/reveal`),
+  exportUrl: (id) => `/api/videos/${id}/export`,
+  // 转笔记：幂等键 = video:{id}:{讲稿指纹}，anchor.kind = video_script（不与摘要抢认领）
+  toNote: (id) => http.post(`/videos/${id}/to-note`),
+  // 数字人形象上传（竖版 ≥3:4 且短边 ≥512px）
+  uploadAvatar: (formData) => http.post('/videos/avatar/upload', formData, { timeout: 120000 }),
+  // 删除一个用户上传的形象（预置形象后端会拒）。返回带 used_by：
+  // 「有几个作品正在用它」，前端据此在确认框里如实提示后果。
+  deleteAvatar: (id) => http.delete(`/videos/avatar/${id}`),
+  // 自定义背景图（解压型皮肤 radio / night / ambient 共用一份**全局背景库**）。
+  // ⚠️ 与形象同构：作品只存库里的 id，不存路径 —— 删作品不删素材。
+  uploadBackground: (formData) => http.post('/videos/background/upload', formData, { timeout: 120000 }),
+  // 删除一张上传的背景（内置背景不是文件、后端会拒）。返回带 used_by：
+  // 「有几个作品正在用它」，前端据此在确认框里如实说明后果（与 deleteAvatar 同一口径）。
+  deleteBackground: (id) => http.delete(`/videos/background/${id}`),
 }

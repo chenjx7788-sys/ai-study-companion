@@ -1,0 +1,30 @@
+{
+ "note": "设计版示例图血缘清单，由 _gen_skin_previews_design_20261012.py 与 _gen_skin_preview_clean_20261013.py 自动维护。探针据此断言 assets 里的图确实是设计版；手动塞真渲染帧 -> md5 不匹配即 FAIL。",
+ "items": {
+  "source": {
+   "md5": "ed3d813335e92cddfc096b07cb75ab03",
+   "bytes": 83913,
+   "script": "_gen_skin_previews_design_20261012.py"
+  },
+  "graph": {
+   "md5": "cbe362e8b9e6ecf80a999ba20da40a4a",
+   "bytes": 81075,
+   "script": "_gen_skin_previews_design_20261012.py"
+  },
+  "graph_paper": {
+   "md5": "e5cdd795fa37d69e47846b8c90de2d46",
+   "bytes": 85050,
+   "script": "_gen_skin_previews_design_20261012.py"
+  },
+  "talking_head": {
+   "md5": "13270ef886c314b1c8a8bc7fb5eb11b6",
+   "bytes": 72084,
+   "script": "_gen_skin_previews_design_20261012.py"
+  },
+  "graph_clean": {
+   "md5": "daf38ef34d1cc063841c081e7d0fdde3",
+   "bytes": 82845,
+   "script": "_gen_skin_preview_clean_20261013.py"
+  }
+ }
+}

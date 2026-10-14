@@ -198,7 +198,8 @@ def podcast_to_dict(p: Podcast, db: Session | None = None, *,
         "source_missing": _source_missing(p, alive),
         # 音频是否为「上一版脚本」的产物：为真时界面须显式标注，避免用户以为
         # 听到的就是当前文案（音频与脚本是两份数据，改脚本后必然分叉）
-        "audio_stale": svc.audio_is_stale(p, rate=conf["rate"], gap_ms=conf["gap_ms"]),
+        "audio_stale": svc.audio_is_stale(p, rate=conf["rate"], gap_ms=conf["gap_ms"],
+                                          provider=conf["provider"]),
         "script_chars": svc.script_chars(script),
         "estimate_sec": svc.estimate_seconds(script),
         "segment_count": len(script),
@@ -246,12 +247,18 @@ def _tts_conf() -> dict:
 
 
 def _normalize_voice_map(vm: dict | None) -> dict:
-    """把前端传来的音色映射归一到 {host, expert}，非法值回退默认"""
+    """把前端传来的音色映射归一到 {host, expert}，非法值回退默认
+
+    ⚠️ 必须带 provider：zipvoice 音色（zv:xxx）与 edge 音色（zh-CN-XxxNeural）是两套
+      命名空间。漏传时，切到本地合成后仍会拿 edge 音色 id 去合成 → 报「音色无效」。
+    """
     conf = _tts_conf()
     vm = vm or {}
     return {
-        "host": tts.resolve_voice(vm.get("host") or conf["host"], "host"),
-        "expert": tts.resolve_voice(vm.get("expert") or conf["expert"], "expert"),
+        "host": tts.resolve_voice(vm.get("host") or conf["host"], "host",
+                                  provider=conf["provider"]),
+        "expert": tts.resolve_voice(vm.get("expert") or conf["expert"], "expert",
+                                    provider=conf["provider"]),
     }
 
 
@@ -333,7 +340,7 @@ def options(db: Session = Depends(get_db)):
                    "updated_at": n.updated_at.isoformat() if n.updated_at else None} for n in notes],
         "highlight_materials": highlight_mats,
         "review_due": due,
-        "voices": tts.list_voices(),
+        "voices": tts.list_voices(conf["provider"]),
         "styles": [{"id": k, **v} for k, v in svc.STYLE_PRESETS.items()],
         "lengths": [{"minutes": k, **v} for k, v in svc.LENGTH_PRESETS.items()],
         # 单句字数上限随 options 下发：前端不必再手抄一份 400（两处常量迟早漂移）
@@ -344,13 +351,24 @@ def options(db: Session = Depends(get_db)):
                      "provider": conf["provider"]},
         "highlight_semantics": svc.HIGHLIGHT_SEMANTICS,
         "supported_providers": list(tts.SUPPORTED_PROVIDERS),
+        # 本地合成模型是否就绪：前端据此在「音色列表为空」时给出「去下载模型」的引导
+        "zipvoice_installed": _zipvoice_installed(),
     }
+
+
+def _zipvoice_installed() -> bool:
+    try:
+        from ..services import zipvoice as zv
+        return zv.is_installed()
+    except Exception:
+        return False
 
 
 @router.post("/test-voice")
 def test_voice():
-    """语音服务连通性自检"""
-    return tts.probe()
+    """语音服务连通性自检（按当前配置的 provider 探测）"""
+    conf = _tts_conf()
+    return tts.probe(provider=conf["provider"])
 
 
 # ⚠️ 必须注册在 /{pid} 之前：否则 "/voices/..." 会先匹配到 /{pid} 并因 int 转换失败而 422
@@ -862,10 +880,15 @@ def _resolve_synth_conf(p: Podcast, req: SynthReq) -> dict:
 
 
 def _finalize_audio(db: Session, p: Podcast, audio: bytes, script: list[dict],
-                    timings: list[dict], voice_map: dict) -> None:
+                    timings: list[dict], voice_map: dict,
+                    conf: dict | None = None) -> None:
     """合成结果落库：时间戳回填 → BGM 混音 → 写音频 → 记指纹 → 提交。
 
     同步接口与 SSE 流式接口共用这一份，避免两条路径各写一遍导致口径漂移。
+
+    ⚠️ conf 必须传「本次合成实际用的参数」（rate/gap_ms/provider）：指纹写入与
+       `audio_is_stale` 的比对必须同口径 —— 写的时候漏传、比对的时候传了，
+       结果是「刚合成完就永久显示音频过期」（假过期，且用户无法消除）。
     """
     merged = [{**seg, "start_ms": t["start_ms"], "end_ms": t["end_ms"],
                "voice": t["voice"], "voice_name": t["voice_name"]}
@@ -888,8 +911,13 @@ def _finalize_audio(db: Session, p: Podcast, audio: bytes, script: list[dict],
     p.audio_name = name
     p.audio_bytes = len(audio)
     p.duration_sec = round(tts.duration_ms(audio) / 1000)
-    # 记录音频对应的脚本+音色指纹：此后若再改动脚本或音色，界面即可判定音频已过期
-    p.audio_sig = svc.script_signature(merged, voice_map, p.bgm_id or "", p.bgm_volume)
+    # 记录音频对应的脚本+音色+语速+停顿+合成引擎的指纹：此后若再改动其中任一项，
+    # 界面即可判定音频已过期（⚠️ 必须与 audio_is_stale 的比对口径完全一致）
+    _conf = conf or {}
+    p.audio_sig = svc.script_signature(
+        merged, voice_map, p.bgm_id or "", p.bgm_volume,
+        rate=_conf.get("rate"), gap_ms=_conf.get("gap_ms"),
+        provider=_conf.get("provider"))
     p.status = "done"
     p.error = ""
     db.commit()
@@ -922,6 +950,12 @@ def synthesize(pid: int, req: SynthReq, db: Session = Depends(get_db)):
             audio, timings = tts.synthesize(script, conf["voice_map"], rate=conf["rate"],
                                             gap_ms=conf["gap_ms"], provider=conf["provider"],
                                             cache_dir=svc.parts_dir(p.id))
+        except tts.TTSPermanent as e:
+            # 确定性错误（模型未下载 / 音色非法）：原样透出可执行指引，不伪装成「稍后重试」
+            p.status = "failed"
+            p.error = str(e)[:200]
+            db.commit()
+            raise HTTPException(400, p.error)
         except tts.TTSError as e:
             # 成功句已缓存 → 再次点击只会补失败的部分，不必整段重做
             p.status = "failed"
@@ -934,7 +968,7 @@ def synthesize(pid: int, req: SynthReq, db: Session = Depends(get_db)):
             db.commit()
             raise HTTPException(502, p.error)
 
-        _finalize_audio(db, p, audio, script, timings, conf["voice_map"])
+        _finalize_audio(db, p, audio, script, timings, conf["voice_map"], conf)
     return podcast_to_dict(p, db)
 
 
@@ -1002,8 +1036,13 @@ def _run_synth_job(pid: int, script: list[dict], conf: dict, job: _SynthJob) -> 
                     gap_ms=conf["gap_ms"], provider=conf["provider"],
                     cache_dir=svc.parts_dir(pid), on_progress=on_progress)
             except BaseException as e:      # noqa: BLE001
-                # 成功句已缓存 → 再次点击只会补失败的部分，不必整段重做
-                msg = getattr(e, "friendly", None) or f"语音合成失败：{str(e)[:180]}"
+                # 成功句已缓存 → 再次点击只会补失败的部分，不必整段重做。
+                # ⚠️ TTSPermanent 是**确定性**错误（模型未下载 / 音色非法），必须原样
+                #    透出可执行指引，不能被换成「稍后重试」—— 同 tts.synthesize 的处理。
+                if isinstance(e, tts.TTSPermanent):
+                    msg = str(e)[:200]
+                else:
+                    msg = getattr(e, "friendly", None) or f"语音合成失败：{str(e)[:180]}"
                 p = db.get(Podcast, pid)
                 if p:
                     p.status = "failed"
@@ -1016,7 +1055,7 @@ def _run_synth_job(pid: int, script: list[dict], conf: dict, job: _SynthJob) -> 
 
             p = db.get(Podcast, pid)
             try:
-                _finalize_audio(db, p, audio, script, timings, conf["voice_map"])
+                _finalize_audio(db, p, audio, script, timings, conf["voice_map"], conf)
             except HTTPException as e:      # _apply_bgm 已写过 status/error
                 job.status = "failed"
                 job.error = str(e.detail)

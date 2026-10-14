@@ -224,31 +224,15 @@
         </div>
         <div class="input-inner">
         <div class="input-col">
-          <!-- 检索范围（置于输入框上方，避免挤压底部） -->
-          <div class="scope-row">
-            <el-radio-group v-model="scope" size="small" class="scope-picker">
-              <el-radio-button value="all">整个知识库</el-radio-button>
-              <el-radio-button value="material">资料</el-radio-button>
-              <el-radio-button value="note">笔记</el-radio-button>
-              <el-radio-button value="folder">文件夹</el-radio-button>
-            </el-radio-group>
-            <!-- 指定条目：空 = 全部 -->
-            <el-select v-if="scope === 'material'" v-model="selectedMaterialIds" multiple
-              collapse-tags collapse-tags-tooltip :max-collapse-tags="2"
-              placeholder="全部资料（可点选指定）" size="small" class="scope-select">
-              <el-option v-for="m in materialOptions" :key="m.id" :label="m.title" :value="m.id" />
-            </el-select>
-            <el-select v-if="scope === 'note'" v-model="selectedNoteIds" multiple
-              collapse-tags collapse-tags-tooltip :max-collapse-tags="2"
-              placeholder="全部笔记（可点选指定）" size="small" class="scope-select">
-              <el-option v-for="n in noteOptions" :key="n.id" :label="n.title" :value="n.id" />
-            </el-select>
-            <el-select v-if="scope === 'folder'" v-model="selectedFolderIds" multiple
-              collapse-tags collapse-tags-tooltip :max-collapse-tags="2"
-              placeholder="选择文件夹（含子文件夹）" size="small" class="scope-select">
-              <el-option v-for="f in folderOptions" :key="f.id" :label="f.name" :value="f.id" />
-            </el-select>
-          </div>
+          <!-- 检索范围（置于输入框上方，避免挤压底部）——已抽成组件（F1） -->
+          <ScopePicker
+            v-model:scope="scope"
+            v-model:material-ids="selectedMaterialIds"
+            v-model:note-ids="selectedNoteIds"
+            v-model:folder-ids="selectedFolderIds"
+            :material-options="materialOptions"
+            :note-options="noteOptions"
+            :folder-options="folderOptions" />
           <div class="composer-row">
             <el-input v-model="question" type="textarea" :rows="2" resize="none"
               :placeholder="scopePlaceholder" @keydown.enter.exact.prevent="send" />
@@ -411,7 +395,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted, nextTick, watch, h } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, nextTick, h } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import mascot from '../assets/mascot.png'
 import { ElMessage, ElNotification } from 'element-plus'
@@ -420,6 +404,7 @@ import { chatApi, materialApi, kbApi, settingsApi, foldersApi, noteApi, reviewAp
 import http, { errMsg } from '../api/http'
 // SSE 统一走共享 util（此前内联副本硬编码 127.0.0.1:8000，换端口即静默失效）
 import { streamSSE } from '../utils/sse'
+import ScopePicker from '../components/ScopePicker.vue'
 
 const md = new MarkdownIt({ breaks: true })
 const renderMd = (t) => md.render(t || '')
@@ -530,17 +515,8 @@ const groupedSessions = computed(() => {
   return groups.filter(g => g.items.length)
 })
 
-// 取消所有引用后自动切回「整个知识库」——否则停留在「资料/笔记」范围，
-// 检索会被收窄（资料范围只查原文、笔记范围只查笔记），无法全库回答
-watch(selectedMaterialIds, (v) => {
-  if (scope.value === 'material' && v.length === 0) scope.value = 'all'
-})
-watch(selectedNoteIds, (v) => {
-  if (scope.value === 'note' && v.length === 0) scope.value = 'all'
-})
-watch(selectedFolderIds, (v) => {
-  if (scope.value === 'folder' && v.length === 0) scope.value = 'all'
-})
+// ⚠️「取消所有引用后自动切回整个知识库」的 watch 已随范围选择器一起移入
+//    components/ScopePicker.vue（F1）——问答 / 陪练共用同一份交互规则。
 const materialOptions = ref([])
 const noteOptions = ref([])
 const folderOptions = ref([])
@@ -1351,33 +1327,7 @@ function closeCitePop(e) {
 /* 输入行：textarea + 发送按钮 */
 .composer-row { display: flex; align-items: flex-end; gap: 10px; }
 .composer-row .el-input { flex: 1; }
-/* 范围选择：安静文字 chip（无边框无分割线，弱化层级） */
-.scope-row {
-  display: flex; gap: 8px; align-items: center;
-}
-.scope-picker {
-  display: inline-flex; flex-shrink: 0; gap: 2px;
-}
-.scope-picker :deep(.el-radio-button) { margin: 0; }
-.scope-picker :deep(.el-radio-button__inner) {
-  border: none !important; background: transparent !important; box-shadow: none !important;
-  color: var(--asc-text-3); font-size: 12.5px; padding: 4px 11px;
-  border-radius: 8px; transition: all .18s ease;
-}
-.scope-picker :deep(.el-radio-button__inner:hover) {
-  background: var(--asc-surface-2) !important; color: var(--asc-text-2) !important;
-}
-.scope-picker :deep(.el-radio-button.is-active .el-radio-button__inner) {
-  background: var(--asc-primary-soft) !important; color: var(--asc-primary) !important; font-weight: 600;
-  box-shadow: none;
-}
-.scope-select { flex: 1; }
-/* 选中的资料/笔记文件名标签：主题紫高亮 */
-.scope-select :deep(.el-tag) {
-  color: var(--asc-primary); font-weight: 500;
-  background: var(--asc-primary-soft); border-color: rgba(124, 92, 252, .35);
-}
-.scope-select :deep(.el-tag .el-icon) { color: var(--asc-primary); }
+/* 范围选择器样式已随组件移入 components/ScopePicker.vue（F1） */
 /* 模型工具栏（输入框左下角：推理强度 + 模型切换，靠左，无分割线） */
 .model-toolbar {
   display: flex; align-items: center; justify-content: flex-start; gap: 6px;
@@ -1386,8 +1336,7 @@ function closeCitePop(e) {
 .model-select { flex-shrink: 0; min-width: 130px; max-width: 210px; }
 .reason-select { flex-shrink: 0; min-width: 100px; max-width: 116px; }
 .reason-select :deep(.el-select__wrapper),
-.model-select :deep(.el-select__wrapper),
-.scope-select :deep(.el-select__wrapper) {
+.model-select :deep(.el-select__wrapper) {
   background: transparent;
   border-radius: 9px;
   box-shadow: none;
@@ -1396,21 +1345,18 @@ function closeCitePop(e) {
   transition: background .18s ease, box-shadow .18s ease;
 }
 .reason-select :deep(.el-select__wrapper:hover),
-.model-select :deep(.el-select__wrapper:hover),
-.scope-select :deep(.el-select__wrapper:hover) {
+.model-select :deep(.el-select__wrapper:hover) {
   background: var(--asc-surface-2);
 }
 .reason-select :deep(.el-select__wrapper.is-focused),
-.model-select :deep(.el-select__wrapper.is-focused),
-.scope-select :deep(.el-select__wrapper.is-focused) {
+.model-select :deep(.el-select__wrapper.is-focused) {
   background: var(--asc-surface-2);
   box-shadow: 0 0 0 1.5px rgba(124, 92, 252, .45);
 }
 .reason-select :deep(.el-select__selected-item),
 .model-select :deep(.el-select__selected-item) { font-weight: 500; color: var(--asc-text-2); }
 .reason-select :deep(.el-select__placeholder),
-.model-select :deep(.el-select__placeholder),
-.scope-select :deep(.el-select__placeholder) { color: var(--asc-text-3); }
+.model-select :deep(.el-select__placeholder) { color: var(--asc-text-3); }
 /* 思维链折叠块 */
 .reasoning-box {
   margin-bottom: 12px;

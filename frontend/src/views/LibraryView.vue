@@ -195,6 +195,22 @@
                 {{ statusTag(m).text }}
               </el-tag>
             </div>
+            <!-- 内容类型（P0 工艺分流）：点击可手改，决定「简单学」讲义走哪套工艺。
+                 仅解析成功的材料显示（解析中/失败时无判定意义）。 -->
+            <el-dropdown v-if="m.parsed_status === 'success'" trigger="click"
+              @command="(k) => saveDocKind(m, k)" @click.stop>
+              <span class="doc-kind-chip" :title="docKindHint(m.doc_kind)" @click.stop>
+                {{ docKindLabel(m.doc_kind) }}
+              </span>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item v-for="o in DOC_KIND_OPTIONS" :key="o.value || 'auto'"
+                    :command="o.value">
+                    {{ (m.doc_kind || '') === o.value ? '✓ ' : '' }}{{ o.label }}
+                  </el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
             <!-- 标签块：「+ 标签」默认紧随状态标签，添加标签后自动跟到标签之后 -->
             <div v-if="m.tags?.length" class="card-tags">
               <span v-for="t in m.tags" :key="t" class="mini-tag">{{ t }}</span>
@@ -622,6 +638,34 @@ async function saveTags(m, tags) {
   await materialApi.update(m.id, { tags })
   m.tags = tags
   ElMessage.success('标签已保存')
+}
+
+// 内容类型（P0 工艺分流）：决定「简单学」讲义走哪套工艺。
+// 空串 = 自动（未判定/判定失败/老数据）→ 后端回落默认（叙事类）通用工艺。
+const DOC_KIND_OPTIONS = [
+  { value: '', label: '自动判定' },
+  { value: 'narrative', label: '叙事类（电子书 / 传记 / 小说）' },
+  { value: 'conceptual', label: '认知思维类（心理 / 商业 / 理论）' },
+  { value: 'practical', label: '工具实用类（手册 / 指南 / 规范）' },
+  { value: 'fragment', label: '碎片内容（图片 / 音视频）' },
+]
+const DOC_KIND_LABELS = { narrative: '叙事', conceptual: '认知', practical: '实用', fragment: '碎片', auto: '自动' }
+const docKindLabel = (k) => DOC_KIND_LABELS[k || 'auto'] || '自动'
+const docKindHint = (k) => ({
+  narrative: '叙事类 → 讲义走「探索历程 + 逐章转译」',
+  conceptual: '认知思维类 → 讲义走「核心问题 + 底层假设 + 思维框架」',
+  practical: '工具实用类 → 讲义走「操作流程 + 判断标准 + 禁忌坑点」',
+  fragment: '碎片内容（图片 / 音视频）→ 讲义走「要点清单」，不编造章节与比喻',
+  auto: '自动判定（未判定 / 失败）→ 走默认通用工艺',
+}[k || 'auto'] || '')
+async function saveDocKind(m, k) {
+  const next = (k || '').trim()
+  if ((m.doc_kind || '') === next) return
+  await materialApi.update(m.id, { doc_kind: next })
+  m.doc_kind = next
+  ElMessage.success(next
+    ? `内容类型已设为「${docKindLabel(next)}」，重新生成讲义后生效`
+    : '内容类型已恢复自动判定，重新生成讲义后生效')
 }
 
 const isMediaFmt = (f) => ['mp3', 'wav', 'm4a', 'mp4'].includes(f)
@@ -1136,6 +1180,13 @@ onUnmounted(() => pollTimer && clearInterval(pollTimer))
   transition: color .15s;
 }
 .tag-edit:hover { color: var(--asc-primary); }
+
+/* 内容类型 chip（P0 工艺分流）：无底色 + text-2(#6e6e6e)，卡片白底上对比度达标 */
+.doc-kind-chip {
+  font-size: 11px; color: var(--asc-text-2); cursor: pointer; flex-shrink: 0;
+  transition: color .15s;
+}
+.doc-kind-chip:hover { color: var(--asc-primary); }
 
 .progress-row, .parse-progress { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .progress-track { flex: 1; height: 4px; background: var(--asc-surface-2); border-radius: 2px; overflow: hidden; }

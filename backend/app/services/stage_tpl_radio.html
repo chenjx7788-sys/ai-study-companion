@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<style>
+/* =========================================================================
+   舞台页 · radio 浅色电台（解压型皮肤）—— 由 stage.py 注入数据后交渲染器抓帧。
+   画面：米色底 + 线条插画（确定性轮换）+ 音频响应波形 + 字幕。
+   ⚠️ 所有动效是 `ms → 状态` 纯函数（挂进 render(ms)），不用 CSS @keyframes —
+      渲染链路靠 seekTo(ms) + 逐帧截图验收，CSS 动画不可 seek 会导致不同果。
+   ⚠️ 取景严格 1920×1080（写死像素，配合 --force-device-scale-factor=1）。
+   ========================================================================= */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: #e8dfcd; overflow: hidden; }
+.stage {
+  position: relative; width: 1920px; height: 1080px; background: #e8dfcd; overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+}
+/* ---------- 自定义背景（可选；用户上传） ----------
+   ⚠️⚠️ 遮罩强度 0.75 是**实测值**，不是拍的（`_bg_alpha_dense_20261012/`）：
+      浅色电台的字幕、线稿插画、品牌字、波形条**全部直接压在背景上**，没有任何底衬。
+      α=0 时 9 组「背景 × 元素」里 8 组出现不可读项（字幕最差 2.73）；
+      α=0.55 时亮底背景的字幕仍只有 3.83、固有元素 1.12；
+      只有 0.75 能把字幕与固有元素**一起**兜到 4.5 以上。
+   ⚠️ 代价必须说清：照片会被洗成一层米色雾 —— 这是「浅色电台」这个风格本身的约束，
+      不是靠调参能绕开的（换深色遮罩只会更糟，因为字与底都是深棕）。
+   ⚠️ 遮罩用**皮肤底色**（#e8dfcd）而不是黑色：黑遮罩会把图压成灰色，与米色纸感冲突。 */
+.bgphoto {
+  position: absolute; inset: 0; background-size: cover; background-position: center;
+  background-repeat: no-repeat;
+}
+.stage[data-bg="user"] .bgphoto::after {
+  content: ''; position: absolute; inset: 0; background: rgba(232,223,205,.75);
+}
+.progress { position: absolute; left: 0; right: 0; top: 0; height: 3px; background: rgba(46,42,36,.10); }
+.progress i { display: block; height: 100%; width: 0; background: #2e2a24; }
+.art { position: absolute; left: 50%; top: 262px; transform: translateX(-50%); width: 470px; height: 323px; }
+/* 插画线条色是 currentColor（artworks.py 的 _LINE），由这里按变体上色。
+   默认色 #2e2a24 与改造前写死的 stroke 逐字节同色 → 存量零回归。 */
+.artwork { position: absolute; left: 50%; top: 0; transform: translateX(-50%); opacity: 0; color: #2e2a24; }
+.artwork svg { display: block; width: 470px; height: 323px; }
+.brand {
+  position: absolute; left: 0; right: 0; top: 640px; text-align: center;
+  font-family: KaiTi, "楷体", "STKaiti", serif; font-style: italic;
+  font-size: 58px; letter-spacing: 14px; color: #2e2a24;
+}
+.bars {
+  position: absolute; left: 50%; top: 720px; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 10px; height: 110px;
+}
+.bars i { width: 7px; border-radius: 3.5px; background: #2e2a24; display: block; }
+.subs {
+  position: absolute; left: 0; right: 0; bottom: 118px; text-align: center;
+  font-size: 37px; font-weight: 500; color: #262019; letter-spacing: 1px; padding: 0 120px;
+}
+/* 字幕「影子层」：与 #subTxt 同形同位，只在交叉淡入时显形（上一句淡出）。
+   ⚠️ MOTION=0 时永远空文本 + opacity:0 → 不参与渲染（逐像素零回归）。 */
+.subs.subghost { opacity: 0; }
+/* 插画背后柔光晕（音频响应）：随响度呼吸，MOTION=0 时 display:none。 */
+.artglow {
+  position: absolute; left: 50%; top: 470px; transform: translate(-50%, -50%);
+  width: 980px; height: 700px; display: none; pointer-events: none; opacity: 0;
+  background: radial-gradient(closest-side, rgba(255,244,222,.92), rgba(255,244,222,0) 74%);
+}
+/* ---------- 预设变体（2026-10-12）：雾蓝 mist / 抹茶 matcha ----------
+   ⚠️ 默认套（data-variant="" 或缺省）不命中任何覆盖 → 与改造前逐像素一致（存量零回归）。
+   ⚠️ 遮罩色必须跟随底色一起换：0.75 是浅色电台的实测兜底线（见 .bgphoto::after 注释），
+      换底色不换遮罩 = 用户照片上会泛一层旧米色雾。
+   ⚠️ 插画线条色是 currentColor（artworks.py 的 _LINE），由 .artwork 的 color 上色。 */
+.stage[data-variant="mist"] { background: #dfe7ec; }
+.stage[data-variant="mist"] .progress { background: rgba(36,50,60,.10); }
+.stage[data-variant="mist"] .progress i { background: #24323c; }
+.stage[data-variant="mist"] .artwork { color: #24323c; }
+.stage[data-variant="mist"] .brand { color: #24323c; }
+.stage[data-variant="mist"] .bars i { background: #24323c; }
+.stage[data-variant="mist"] .subs { color: #202d36; }
+.stage[data-variant="mist"][data-bg="user"] .bgphoto::after { background: rgba(223,231,236,.75); }
+.stage[data-variant="matcha"] { background: #d9e2c6; }
+.stage[data-variant="matcha"] .progress { background: rgba(47,58,36,.10); }
+.stage[data-variant="matcha"] .progress i { background: #2f3a24; }
+.stage[data-variant="matcha"] .artwork { color: #2f3a24; }
+.stage[data-variant="matcha"] .brand { color: #2f3a24; }
+.stage[data-variant="matcha"] .bars i { background: #2f3a24; }
+.stage[data-variant="matcha"] .subs { color: #2a331f; }
+.stage[data-variant="matcha"][data-bg="user"] .bgphoto::after { background: rgba(217,226,198,.75); }
+</style>
+</head>
+<body>
+<div class="stage" id="stage" data-bg="__BG_KIND__" data-variant="__VARIANT__">
+  <div class="bgphoto" id="bgphoto"></div>
+  <div class="artglow" id="artglow"></div>
+  <div class="progress"><i id="progFill"></i></div>
+  <div class="art" id="art"></div>
+  <div class="brand" id="brand"></div>
+  <div class="bars" id="bars"></div>
+  <div class="subs" id="subTxt"></div>
+  <div class="subs subghost" id="subGhost"></div>
+</div>
+<script>
+/* SEGS=[{s,t,a,b}] 讲稿句(毫秒) · LEVELS=[0..1] 逐帧响度 · ARTS=[{brand,svg}] 插画序列 */
+const SEGS = __SEGS__;
+const LEVELS = __LEVELS__;
+const ARTS = __ARTS__;
+const TOTAL = __TOTAL__;
+const FPS = 30;
+
+/* ---------- 动效（2026-10-12）----------
+   ⚠️ 唯一时钟是 render(ms) 传进来的 ms —— 绝不用 performance.now() / Math.random()：
+      同一 ms 必须永远同一画面（成片走 CDP 实时抓帧、验收走 seek(ms) 截帧，共用这一条）。
+   ⚠️ MOTION=0（__MOTION__ 注入 0）时全部旁路：不写 inline 样式、新元素 display:none
+      → 页面与改造前逐像素一致（存量零回归判据 X1' 就靠这条）。 */
+/* ⚠️ 用 typeof 守卫而不是直接引用：有几个验收探针**手工拼 HTML**（不走 stage.py）
+   → 会漏注入 __MOTION__ → 直接引用会 ReferenceError 把整段脚本炸掉（__stage 全无、
+   页面空白，实测踩中过）。漏注入仍会被 relax_stage_gen 的「残留占位符」判据抓住。 */
+const MOTION = (typeof __MOTION__ === 'undefined') ? 1 : __MOTION__;
+const SUB_FADE = 260;         // 字幕交叉淡入时长（ms）
+const ART_RISE = 16;          // 插画入场 / 切换的上浮距离（px）
+const ART_FLOAT_AMP = 6;      // 插画呼吸浮动幅度（px）
+const ART_FLOAT_MS = 5200;    // 呼吸周期（ms）
+const BRAND_MS = 700;         // 品牌字淡入时长（ms）
+const clamp01 = (x) => (x < 0 ? 0 : (x > 1 ? 1 : x));
+const easeOut = (t) => 1 - (1 - t) * (1 - t);
+
+/* ---------- 字幕分条：长句拆成多条，每条 ≤ 2 行 ----------
+   ⚠️ 复用播客音轨时讲稿是「播客长句」（实测最长 176 字 = 6 行 · 250px），
+      字幕会一路向上盖住波形。这里只在**显示层**把长句按句读标点拆成多条，
+      时间按字符数比例分配 —— 不改讲稿、不改音轨、不改总时长、不改分镜。
+   ⚠️ CUE_MAX=64 是真机标定值：1920 宽 / 37px 字号下，64 字稳定 2 行（100px）。
+      改这个值必须重跑 _probe_radio_cue_calib_20261010.py 重新标定。
+   ⚠️ 纯函数（同一文本 → 同一结果），逐帧截图与 seekTo 验收仍然一致。 */
+const CUE_MAX = 64;
+const CUE_STOPS = "，。！？；：、,.;:!?";
+function packCues(text, maxChars) {
+  const atoms = []; let cur = "";
+  for (const ch of text) { cur += ch; if (CUE_STOPS.indexOf(ch) >= 0) { atoms.push(cur); cur = ""; } }
+  if (cur) atoms.push(cur);
+  const merged = []; let buf = "";
+  for (const a of atoms) {
+    if (!buf) { buf = a; continue; }
+    if ((buf + a).length <= maxChars) buf += a; else { merged.push(buf); buf = a; }
+  }
+  if (buf) merged.push(buf);
+  const fin = [];
+  for (const p of merged) {
+    if (p.length <= maxChars) { fin.push(p); continue; }
+    for (let i = 0; i < p.length; i += maxChars) fin.push(p.slice(i, i + maxChars));
+  }
+  return fin;
+}
+function buildCues(segs, maxChars) {
+  const out = [];
+  for (const s of segs) {
+    const t = String(s.t || "");
+    if (t.length <= maxChars) { out.push({ t: t, a: s.a, b: s.b }); continue; }
+    const parts = packCues(t, maxChars);
+    let total = 0;
+    for (const p of parts) total += p.length;
+    if (!total) total = 1;
+    const span = s.b - s.a;
+    let cur = s.a;
+    for (const p of parts) {
+      const dur = Math.round(span * p.length / total);
+      out.push({ t: p, a: cur, b: cur + dur });
+      cur += dur;
+    }
+    out[out.length - 1].b = s.b;
+  }
+  return out;
+}
+const CUES = buildCues(SEGS, CUE_MAX);
+
+const $ = (id) => document.getElementById(id);
+
+/* ---------- 署名排印自适应（2026-10-13） ----------
+   署名来自用户（brand_text 或作品标题，≤20 字），而 .brand 的 58px / 14px 字距是按
+   2-3 个字设计的：20 个字原样排出来是 1440px 宽的一整条，不像署名、像一行正文。
+   这里按字数**降档**（字号与字距一起收），让长署名仍保持「一行署名」的观感。
+   ⚠️ 纯函数（同一文本 → 同一档位）：逐帧抓帧与 seek(ms) 验收必须一致。
+   ⚠️ 档位表是实测标定的，不是拍的 —— 改一次就要重跑 `_probe_brand_fit_cmd_20261013.py`
+      （真模板 + Range 量文本渲染宽度）重新标定，并把结果同步回那张探针。
+   ⚠️ 前 5 字保持 58/14 原样：短署名（「且 听」这类 2-3 字）与改造前逐像素一致。 */
+const BRAND_TIERS = [[5, 58, 14], [9, 50, 10], [13, 42, 6], [17, 36, 4], [20, 32, 2]];
+function fitBrand(el, text) {
+  const n = String(text || '').length;
+  let fs = 32, ls = 2;
+  for (let i = 0; i < BRAND_TIERS.length; i++) {
+    if (n <= BRAND_TIERS[i][0]) { fs = BRAND_TIERS[i][1]; ls = BRAND_TIERS[i][2]; break; }
+  }
+  el.style.fontSize = fs + 'px';
+  el.style.letterSpacing = ls + 'px';
+}
+
+/* ---------- 自定义背景（可选） ----------
+   ⚠️ 必须等图片解码完再让 ready() 通过：渲染器在第一帧就截图，
+      漏掉 onload 会把「空白背景 + 米色遮罩」烧进成片开头。 */
+const BG_URL = "__BG_URL__";
+let bgReady = true;
+if (BG_URL) {
+  bgReady = false;
+  $('bgphoto').style.backgroundImage = 'url("' + BG_URL + '")';
+  const bgIm = new Image();
+  bgIm.onload = function () { bgReady = true; };
+  bgIm.onerror = function () { bgReady = true; };   // 加载失败也要放行（不留死等）
+  bgIm.src = BG_URL;
+}
+
+/* 构建插画 DOM（全部插入、opacity 切换显示） */
+/* 作品署名（2026-10-13）：三幅插画下显示的是**同一个署名**（stage.py 注入时统一覆盖
+   ARTS[].brand），所以在这里设一次就够了 —— render 里不再逐帧改文字。
+   ⚠️ 别退回「每换插画重设一次」：那样同一个词会随插画切换反复淡出淡入。 */
+const brandEl = $('brand');
+brandEl.textContent = (ARTS.length ? ARTS[0].brand : '') || '';
+fitBrand(brandEl, brandEl.textContent);
+const artHost = $('art');
+const artworks = ARTS.map(function (a) {
+  const d = document.createElement('div');
+  d.className = 'artwork';
+  d.innerHTML = a.svg;
+  artHost.appendChild(d);
+  return d;
+});
+
+/* 波形条 */
+const N_BARS = 26;
+const barHost = $('bars');
+const bars = [];
+for (let i = 0; i < N_BARS; i++) {
+  const b = document.createElement('i');
+  barHost.appendChild(b);
+  bars.push(b);
+}
+
+function levelAt(ms) {
+  const k = Math.min(LEVELS.length - 1, Math.max(0, Math.floor(ms / 1000 * FPS)));
+  return LEVELS[k] || 0;
+}
+function idxAt(ms) {
+  let last = 0;
+  for (let i = 0; i < CUES.length; i++) { if (ms >= CUES[i].a) last = i; else break; }
+  return last;
+}
+function artAt(ms) {
+  return Math.min(artworks.length - 1, Math.floor(ms / (TOTAL / artworks.length)));
+}
+
+const artglowEl = $('artglow');
+if (MOTION) artglowEl.style.display = 'block';
+const subGhostEl = $('subGhost');
+
+let curSub = -1;
+function render(ms) {
+  const lv = levelAt(ms);
+  for (let i = 0; i < N_BARS; i++) {
+    const ph = 0.5 + 0.5 * Math.sin(i * 0.63 + ms / 1100);
+    bars[i].style.height = (9 + lv * 86 * (0.35 + 0.65 * ph)) + 'px';
+  }
+  const ai = artAt(ms);
+  const span = TOTAL / artworks.length;
+  const local = ms - ai * span;
+  if (MOTION) {
+    /* 插画：入场淡入 + 上浮；换幅时与上一幅交叉淡出；静止时缓慢呼吸浮动 */
+    const p = clamp01(local / 600);
+    const rise = ART_RISE * (1 - easeOut(p));
+    const float = ART_FLOAT_AMP * Math.sin(ms / ART_FLOAT_MS * Math.PI * 2);
+    for (let i = 0; i < artworks.length; i++) {
+      let o = 0;
+      if (i === ai) o = p;
+      else if (i === ai - 1) o = 1 - p;
+      artworks[i].style.opacity = o.toFixed(3);
+      artworks[i].style.transform =
+        'translate(-50%, ' + (rise + (i === ai ? float : 0)).toFixed(2) + 'px)';
+    }
+    /* 署名淡入用**全片时间 ms**、不用当前插画的局部时间 local：三幅插画共用同一个
+       署名，用局部时间会让同一个词每换一幅就重新淡入一次（一闪一闪）。
+       ⚠️ 必须只依赖 ms：seekTo 会任意跳帧，任何「记住上次是几毫秒」的写法都会让
+          同一 ms 渲出不同画面（渲染抓帧与 seek 验收共用这条）。 */
+    $('brand').style.opacity = clamp01(ms / BRAND_MS).toFixed(3);
+    /* 插画背后柔光晕：随响度呼吸（音频响应） */
+    artglowEl.style.opacity = (0.08 + lv * 0.34).toFixed(3);
+    artglowEl.style.transform =
+      'translate(-50%, -50%) scale(' + (0.94 + lv * 0.12).toFixed(3) + ')';
+  } else {
+    const fade = Math.min(1, local / 600);
+    for (let i = 0; i < artworks.length; i++) {
+      artworks[i].style.opacity = (i === ai) ? fade : 0;
+    }
+  }
+  const si = idxAt(ms);
+  if (si !== curSub) { $('subTxt').textContent = CUES[si] ? CUES[si].t : ''; curSub = si; }
+  if (MOTION) {
+    /* 字幕交叉淡入：新句淡入、上一句在影子层淡出（切句不再硬切） */
+    const cue = CUES[si];
+    const q = cue ? clamp01((ms - cue.a) / SUB_FADE) : 1;
+    $('subTxt').style.opacity = q.toFixed(3);
+    if (si > 0) {
+      subGhostEl.textContent = CUES[si - 1].t;
+      subGhostEl.style.opacity = (1 - q).toFixed(3);
+    } else {
+      subGhostEl.textContent = '';
+    }
+  }
+}
+function paint(ms) {
+  const p = Math.min(1, Math.max(0, ms / TOTAL));
+  $('progFill').style.width = (p * 100) + '%';
+}
+
+window.__stage = {
+  total: TOTAL, ms: 0, t0: 0, done: false, running: false,
+  data: { segs: SEGS, cues: CUES.length, levels: LEVELS.length, arts: ARTS.map(a => a.id || '') },
+  ready: function () {
+    if (document.fonts && document.fonts.status !== 'loaded') return false;
+    if (!bgReady) return false;
+    return true;
+  },
+  seek: function (ms) { render(ms); paint(ms); window.__stage.ms = ms; },
+  start: function () {
+    const self = window.__stage;
+    self.t0 = performance.now();
+    self.ms = 0; self.done = false; self.running = true;
+    function tick() {
+      if (!self.running) return;
+      const ms = Math.min(TOTAL, performance.now() - self.t0);
+      self.ms = ms;
+      render(ms); paint(ms);
+      if (ms >= TOTAL) { self.done = true; self.running = false; return; }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  },
+  stop: function () { window.__stage.running = false; },
+  state: function () {
+    const self = window.__stage;
+    return { ms: self.ms, t0: self.t0, done: self.done, running: self.running,
+             clock: performance.now() - self.t0 };
+  }
+};
+render(0); paint(0);
+window.__stage_ready = true;
+</script>
+</body>
+</html>
