@@ -13,7 +13,7 @@
 #   bash backend/scripts/build_windows.sh
 # 可选环境变量：
 #   OUT_ROOT  输出根目录，默认 /d/AIStudyCompanion-build
-#   VERSION   版本号，默认 0.1.5（用于 zip 命名）
+#   VERSION   版本号，默认 0.1.6（用于 zip 命名）
 #   PY        打包用的 Python（需装齐依赖 + PyInstaller）
 # =============================================================================
 set -uo pipefail
