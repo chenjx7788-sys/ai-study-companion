@@ -12,6 +12,7 @@ audio_name / duration_sec / audio_sig / status，视频调用它等于把视频�
 用户离开页面任务照跑、落盘照写；回到页面重新调 `/plan/stream` 即附着到
 正在跑的任务上继续看进度。绝不在 SSE 生成器里做落盘（连接一断，几十秒白烧）。
 """
+import asyncio
 import hashlib
 import json
 import queue
@@ -51,6 +52,11 @@ RENDER_CONCURRENCY = 1
 # 1 秒还拿不到说明确实有长任务在跑 → 直接拒绝比排队语义更清楚。
 LOCK_WAIT_SEC = 1.0
 
+# SSE 等待队列的轮询间隔。⚠️ 生成器必须是 async 且用「get_nowait + await sleep」：
+# 同步生成器会被 Starlette 丢进线程池迭代（iterate_in_threadpool），客户端断开后
+# 既不会被 close()、finally 里的退订也永不执行 → 订阅者永久滞留
+# （2026-10-14 实测：断开 4.3s 后 job.subs 仍为 1；async 对照组立即归零）。
+SSE_POLL_SEC = 0.1
 HEARTBEAT_SEC = 10.0
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -1243,6 +1249,12 @@ def _do_plan(db, v: Video, job: _PlanJob) -> None:
         if not _audio_exists(v):
             job.emit("audio", {"mode": "self", "phase": "source"})
             _make_self_audio(db, v, job)
+        elif svc.audio_stale(v, conf, v.voice_map or {}):
+            # 音轨已过期（改了音色 / BGM / 语速，或用户逐句改过文案）→ 连带重合成。
+            # ⚠️ 2026-10-15 之前这里直接跳过：文件在就沿用旧音轨，于是「改完音色点
+            #    重新生成，音频却不变」——界面上只剩一条没有出口的血汗提示。
+            job.emit("audio", {"mode": "self", "phase": "resynth"})
+            _resynth_self_audio(db, v, job)
         else:
             v.duration_ms = v.duration_ms or svc.duration_ms_from_file(
                 svc.video_abspath(v.id, v.audio_name))
@@ -1402,6 +1414,47 @@ def _make_self_audio(db, v: Video, job: _PlanJob) -> None:
                        duration_ms=tts.duration_ms(audio))
 
 
+def _resynth_self_audio(db, v: Video, job: _PlanJob) -> None:
+    """音轨重合成（2026-10-15）：讲稿**文本保持不变**，只重做 TTS + BGM 混音 + 时间轴。
+
+    触发场景：`svc.audio_stale` 为真 —— 改了音色 / BGM / 语速，或用户逐句改过文案。
+    ⚠️ **绝不重跑 LLM 讲稿生成**：用户改过的文案就是要合成的文案，重新生成等于把
+       他的编辑冲掉（静默改作品级别的错误）。
+    ⚠️ 分句缓存是纯人声：只改 BGM / 音量时 TTS 全命中缓存、只重混一次（快）；
+       改音色 / 改文案才真的重合成对应句。
+    ⚠️ 音轨时长会变 → 本函数只负责音轨；分镜 / 步点 / 闸门由调用方 `_do_plan`
+       继续往下跑（与全新生成同一条尾巴，不另开链路）。
+    """
+    script = [dict(s) for s in (v.script or []) if str((s or {}).get("text") or "").strip()]
+    if not script:
+        raise HTTPException(400, "讲稿为空，无法合成音轨")
+    conf = _tts_conf()
+    job.emit("audio", {"phase": "tts", "segments": len(script)})
+    try:
+        audio, timings = tts.synthesize(
+            script, _voice_map(v, conf), rate=conf["rate"], gap_ms=conf["gap_ms"],
+            provider=conf["provider"], cache_dir=svc.parts_dir(v.id),
+            on_progress=lambda d, t: job.emit("audio", {"phase": "tts", "done": d, "total": t}))
+    except tts.TTSPermanent as e:
+        # 确定性错误：原样透出可执行指引（如「模型未下载 → 去下载」），不包装成稍后重试
+        raise HTTPException(400, str(e)[:200])
+    except tts.TTSError as e:
+        raise HTTPException(502, e.friendly)
+    except BaseException as e:      # noqa: BLE001
+        raise HTTPException(502, f"语音合成失败：{str(e)[:160]}")
+
+    # BGM 与全新生成同法：整轨层面混入（分句缓存保持纯人声）
+    if (getattr(v, "bgm_id", "") or "").strip():
+        audio, timings = _mix_bgm(v, audio, timings)
+
+    merged = [{**seg, "start_ms": t["start_ms"], "end_ms": t["end_ms"],
+               "voice": t["voice"], "voice_name": t["voice_name"]}
+              for seg, t in zip(script, timings)]
+    name = svc.save_audio(v.id, audio)
+    svc.finalize_video(db, v, audio=audio, audio_name=name, script=merged,
+                       duration_ms=tts.duration_ms(audio))
+
+
 def _mix_bgm(v: Video, audio: bytes, timings: list) -> tuple:
     """把背景音乐混进纯人声音轨，并补偿二次编码引入的延迟（与 podcasts._apply_bgm 同法）。
 
@@ -1451,7 +1504,7 @@ def _voice_map(v: Video, conf: dict) -> dict:
 
 
 @router.post("/{vid}/plan/stream")
-def plan_stream(vid: int, db: Session = Depends(get_db)):
+def plan_stream(vid: int):
     """SSE：`stage`×N → `done` | `error`。
 
     「启动或附着」：已有任务在跑就直接附着（重复点击 / 离开页面后回来走的是这条路），
@@ -1459,15 +1512,24 @@ def plan_stream(vid: int, db: Session = Depends(get_db)):
     ⚠️ 前置校验（404）必须在返回响应**之前**做完：一旦进入生成器响应头已发出，
        错误只能作为 error 事件回传，拿不到 HTTP 状态码。
     """
-    v = db.get(Video, vid)
-    if not v:
-        raise HTTPException(404, "视频作品不存在或已删除")
+    # ⚠️ 不用请求级 Depends(get_db)：SSE 流期间该依赖不会释放（等于占着一条 DB
+    #    连接几十秒）。这里只需要一次前置校验 → 用**临时会话**，查完即关
+    #    （与 drill.py 的 SSE 端点同法）。
+    db = SessionLocal()
+    try:
+        if not db.get(Video, vid):
+            raise HTTPException(404, "视频作品不存在或已删除")
+    finally:
+        db.close()
     job = _start_or_attach_plan(vid)
     return StreamingResponse(_plan_events(job), media_type="text/event-stream",
                              headers=SSE_HEADERS)
 
 
-def _plan_events(job: _PlanJob):
+async def _plan_events(job: _PlanJob):
+    """⚠️ 必须 async：CancelledError 只会投递到 await 点，async 生成器在客户端
+    断开时 finally 立即执行 → 订阅者被摘掉（同步版会永久滞留，见 SSE_POLL_SEC）。
+    """
     q: queue.Queue = queue.Queue()
     job.subs.append(q)
     try:
@@ -1482,11 +1544,12 @@ def _plan_events(job: _PlanJob):
         last = time.time()
         while True:
             try:
-                kind, payload = q.get(timeout=0.5)
+                kind, payload = q.get_nowait()
             except queue.Empty:
                 if time.time() - last >= HEARTBEAT_SEC:
                     last = time.time()
                     yield ": ping\n\n"
+                await asyncio.sleep(SSE_POLL_SEC)
                 continue
             last = time.time()
             if kind == "stage":
@@ -1986,21 +2049,27 @@ def start_render(vid: int, req: RenderReq | None = None, db: Session = Depends(g
 
 
 @router.post("/{vid}/render/stream")
-def render_stream(vid: int, db: Session = Depends(get_db)):
+def render_stream(vid: int):
     """SSE：`stage`×N → `done` | `error`（与 `/plan/stream` 同构）。
 
     ⚠️ 前置校验必须在返回响应**之前**做完：一旦进入生成器响应头已发出，
        错误只能作为 error 事件回传，拿不到 HTTP 状态码。
     """
-    v = db.get(Video, vid)
-    if not v:
-        raise HTTPException(404, "视频作品不存在或已删除")
-    job = _render_start(v, db)
+    # ⚠️ 同 /plan/stream：SSE 流期间请求级依赖不释放 → 临时会话做完校验与入队即关。
+    db = SessionLocal()
+    try:
+        v = db.get(Video, vid)
+        if not v:
+            raise HTTPException(404, "视频作品不存在或已删除")
+        job = _render_start(v, db)
+    finally:
+        db.close()
     return StreamingResponse(_render_events(job, vid), media_type="text/event-stream",
                              headers=SSE_HEADERS)
 
 
-def _render_events(job: _RenderJob, vid: int):
+async def _render_events(job: _RenderJob, vid: int):
+    """⚠️ 同 _plan_events：必须 async，否则断开后 finally 不执行、订阅者永久滞留。"""
     q: queue.Queue = queue.Queue()
     job.subs.append(q)
     try:
@@ -2015,11 +2084,12 @@ def _render_events(job: _RenderJob, vid: int):
         last = time.time()
         while True:
             try:
-                kind, payload = q.get(timeout=0.5)
+                kind, payload = q.get_nowait()
             except queue.Empty:
                 if time.time() - last >= HEARTBEAT_SEC:
                     last = time.time()
                     yield ": ping\n\n"
+                await asyncio.sleep(SSE_POLL_SEC)
                 continue
             last = time.time()
             if kind == "stage":
@@ -2211,8 +2281,19 @@ def export_video(vid: int, db: Session = Depends(get_db)):
                                  "Cache-Control": "private, no-cache"})
 
 
+def _video_note_key(v: Video, payload: dict) -> str:
+    """转笔记的**内容指纹键**（`to_note` 与 `note-state` 共用，绝不各写一份）。
+
+    ⚠️ 幂等键必须覆盖笔记的**全部输入**（标题 / 讲稿 / 分镜 / 结构要点）——
+       只用讲稿指纹会在「同一 id 被复用 + 讲稿逐字相同但分镜不同」时张冠李戴。
+    """
+    digest = hashlib.md5(payload["content"].encode("utf-8")).hexdigest()[:12]
+    return f"video:{v.id}:{digest}"
+
+
 @router.post("/{vid}/to-note")
-def to_note(vid: int, db: Session = Depends(get_db)):
+def to_note(vid: int, note_id: int | None = None,
+            db: Session = Depends(get_db)):
     """转笔记：讲稿 + 分镜 + 要点 → 一篇笔记。
 
     ⚠️ 幂等（PRD 验收 #39）：用 `anchor.key` 标记来源，同一作品同一版本只生成一篇。
@@ -2229,7 +2310,21 @@ def to_note(vid: int, db: Session = Depends(get_db)):
     #    逐字相同但分镜/要点不同」时，乙会命中甲留下的旧笔记（返回 created=False
     #    且内容张冠李戴，已实测坐实）。改用**内容指纹**：
     #    同一作品、同一篇内容，只生成一篇。
-    key = f"video:{v.id}:{hashlib.md5(payload['content'].encode('utf-8')).hexdigest()[:12]}"
+    key = _video_note_key(v, payload)
+    # 显式覆盖更新（前端「文稿已更新 · 更新笔记」走这条，与 AI 播客同一业务流程）。
+    # ⚠️ 必须校验这条笔记**确实属于本作品** —— 否则等于开了一个「任意笔记被跨作品覆写」的口子。
+    if note_id is not None:
+        n0 = db.get(Note, note_id)
+        a0 = (n0.anchor or {}) if n0 else {}
+        if (n0 and isinstance(a0, dict) and a0.get("kind") == "video_script"
+                and a0.get("video_id") == v.id):
+            n0.title = payload["title"]
+            n0.content = payload["content"]
+            n0.anchor = {"kind": "video_script", "key": key, "video_id": v.id}
+            db.commit()
+            db.refresh(n0)
+            _track("video_to_note", v.id, 0, {"created": 0, "updated": 1})
+            return {"ok": True, "note_id": n0.id, "created": False, "updated": True}
     # 幂等判据用**指纹**而不是「有没有笔记」：讲稿改了 / 分镜变了就是新的一版，
     # 应该能再沉淀一篇（而不是静默复用旧的那篇）。
     rows = db.query(Note).all()
@@ -2254,6 +2349,31 @@ def to_note(vid: int, db: Session = Depends(get_db)):
     db.refresh(note)
     _track("video_to_note", v.id, 0, {"created": 1})
     return {"ok": True, "note_id": note.id, "created": True}
+
+
+@router.get("/{vid}/note-state")
+def note_state(vid: int, db: Session = Depends(get_db)):
+    """这篇作品的转笔记状态：转过没有 / 是哪一篇 / 文稿是否已变。
+
+    详情页按钮据此三态显示（转笔记 / ✓ 已转笔记 · 查看 / 文稿已更新 · 更新笔记），
+    与 AI 播客页同一套业务流程。
+
+    ⚠️ 「是否已变」只能由后端判：指纹键是 `md5(笔记正文)`，而正文是 `to_note_payload`
+       在服务端拼出来的（讲稿 + 分镜 + 要点）—— 前端复刻一份必然漂移。
+    ⚠️ 「哪一篇」取**最近更新**的那条：同一作品文稿改版会沉淀多篇（PRD 2.1 有意为之）。
+    """
+    v = db.get(Video, vid)
+    if not v:
+        raise HTTPException(404, "视频作品不存在或已删除")
+    key = _video_note_key(v, svc.to_note_payload(v))
+    for n in db.query(Note).order_by(Note.updated_at.desc()).all():
+        a = n.anchor or {}
+        if not isinstance(a, dict) or a.get("kind") != "video_script":
+            continue
+        if a.get("video_id") != v.id:
+            continue
+        return {"exists": True, "note_id": n.id, "stale": a.get("key") != key}
+    return {"exists": False, "note_id": None, "stale": False}
 
 
 # ---------- 形象上传（talking_head 用） ----------

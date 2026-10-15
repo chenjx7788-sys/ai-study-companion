@@ -64,10 +64,12 @@
         </div>
       </div>
 
-      <PdfReader v-if="viewMode === 'origin' && material?.format === 'pdf'" :key="'pdf-' + fileTs" :url="fileUrl(material.id)" :footprints="fpByPage" :highlights="highlights" @mouseup="onSelect" @scroll.passive="onReaderScroll" />
+      <PdfReader v-if="viewMode === 'origin' && material?.format === 'pdf'" :key="'pdf-' + fileTs" :url="fileUrl(material.id)" :footprints="fpByPage" :highlights="highlights" :flash-rect="pdfImgFlash" @mouseup="onSelect" @scroll.passive="onReaderScroll" />
 
-      <!-- Word「原文视图」：docx-preview 高保真还原版面（表格 / 图片 / 样式 / 分页） -->
-      <DocxReader v-else-if="viewMode === 'origin' && isDocx" :key="'docx-' + fileTs" :url="fileUrl(material.id)" />
+      <!-- Word「原文视图」：docx-preview 高保真还原版面（表格 / 图片 / 样式 / 分页）
+           sections 交给 reader 给标题段落打 data-section 锚点；@scroll 驱动左栏目录跟随 -->
+      <DocxReader v-else-if="viewMode === 'origin' && isDocx" :key="'docx-' + fileTs" :url="fileUrl(material.id)"
+        :sections="sectionTitles" @scroll="onReaderScroll" @ready="onDocxReady" />
 
       <!-- EPUB「原文视图」：iframe 直出 zip 内章节，原书排版与插图原样生效 -->
       <EpubReader v-else-if="viewMode === 'origin' && isEpub" ref="epubRef" :chapters="epubChapters"
@@ -120,7 +122,23 @@
                 <div v-if="editPreviewOn" class="edit-preview md-body" v-html="renderMd(transcriptDraft[c.id] || '')"></div>
               </div>
             </template>
-            <component :is="isRichMd ? 'div' : 'p'" v-else v-for="c in group.items" :key="c.id" class="chunk" :class="{ 'chunk-image': isImage, 'rich': isRichMd }" :data-page="group.page" :data-chunk="c.id" :data-section="c.section_path || ''" v-html="renderChunk(c)"></component>
+            <template v-else v-for="c in group.items" :key="c.id">
+              <!-- 内嵌图 OCR 块（书籍类）：默认收成一行折叠条 —— OCR 产物多为图表标签/目录
+                   碎片（非线性正文），整段平铺会截断阅读流；点击原地展开为卡片。 -->
+              <div v-if="isInlineImgOcr(c)" class="imgocr-inline" :data-page="group.page" :data-chunk="c.id">
+                <button type="button" class="imgocr-inline-bar" @click="toggleImgOcr(c.id)">
+                  <span>🖼 图片中的文字 · {{ blockUnitText(group.page) }} · {{ imgocrTextLen(c) }} 字</span>
+                  <span class="imgocr-inline-act">{{ imgocrOpen[c.id] ? '收起' : '展开' }}</span>
+                </button>
+                <div v-if="imgocrOpen[c.id]" class="imgocr-inline-body">
+                  <div v-if="canOriginLocate" class="imgocr-inline-tools">
+                    <button type="button" class="imgocr-origin-link" @click.stop="viewImgOcrOrigin(group.page, parseImgRect(c))">在原文中查看</button>
+                  </div>
+                  <div class="chunk imgocr-inline-content" v-html="renderChunk(c)"></div>
+                </div>
+              </div>
+              <component v-else :is="isRichMd ? 'div' : 'p'" class="chunk" :class="{ 'chunk-image': isImage, 'rich': isRichMd }" :data-page="group.page" :data-chunk="c.id" :data-section="c.section_path || ''" v-html="renderChunk(c)"></component>
+            </template>
           </template>
           <el-empty v-if="pagedChunks.length === 0" :description="isMedia ? '未识别到语音内容' : (isImage ? '未识别到文字，可在原文视图查看图片' : '无文本内容（扫描件请切换原文视图）')" />
         </template>
@@ -559,6 +577,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown } from '@element-plus/icons-vue'
 import { createMd } from '../utils/md'
+import { normPath, sectionKeyForPage } from '../utils/toc'
 import { materialApi, aiApi, noteApi, reviewApi, kbApi, statsApi, simpleLearnApi } from '../api'
 import { errMsg } from '../api/http'
 import PdfReader from '../components/PdfReader.vue'
@@ -688,6 +707,7 @@ const isMd = computed(() => ['md', 'markdown'].includes(material.value?.format))
 const isRichMd = computed(() => ['docx', 'doc', 'epub', 'pptx', 'ppt'].includes(material.value?.format))
 // Word「原文视图」仅支持 OOXML（.docx）；旧版 .doc 无法在浏览器端还原版面
 const isDocx = computed(() => material.value?.format === 'docx')
+const isPdf = computed(() => material.value?.format === 'pdf')
 // EPUB「原文视图」：章节清单按 spine 解析，index 与 chunk.page_no 一一对应
 const isEpub = computed(() => material.value?.format === 'epub')
 const epubChapters = ref([])
@@ -872,6 +892,30 @@ const imgocrExpanded = ref(false)
 const imgocrCharCount = computed(() =>
   hiddenImgOcrChunks.value.reduce((n, c) => n + (c.content || '').replace(IMG_OCR_PREFIX_RE, '').length, 0))
 
+// ---------- 书籍类材料的内嵌图 OCR 块：就地折叠条 ----------
+// 这类块 kind='body'（只有剪藏才标 img_ocr 隐藏），此前整段平铺成大卡片 —— OCR 产物
+// 多为图表标签/目录碎片（非线性正文），平铺会截断阅读流。改为默认一行折叠条、原地展开。
+// ⚠️ 只动展示层：content（extract_sig 指纹输入）/ kind / 导出 / 检索 全部不变。
+const imgocrOpen = ref({})
+// 书籍类内嵌图块 = content 带 [图片] 前缀（isImgOcr）且未被标成剪藏隐藏块（kind='body'）
+const isInlineImgOcr = (c) => isImgOcr(c) && !isImgOcrChunk(c)
+const imgocrTextLen = (c) => (c.content || '').replace(IMG_OCR_PREFIX_RE, '').length
+function toggleImgOcr(id) { imgocrOpen.value[id] = !imgocrOpen.value[id] }
+// 「在原文中查看」：仅 PDF/EPUB 有页级定位（docx 原文视图无页锚，不提供入口）
+const canOriginLocate = computed(() => ['pdf', 'epub'].includes(material.value?.format))
+// chunk 上的页内位置（PDF 内嵌图，后端 img_rect）："x0,y0,x1,y1" → 数组；无数据/非法 → null
+const parseImgRect = (c) => {
+  const v = String(c?.img_rect || '').split(',').map(Number)
+  return v.length === 4 && v.every(n => Number.isFinite(n)) ? v : null
+}
+const pdfImgFlash = ref(null)   // { page, rect } —— 传给 PdfReader 的图级闪烁目标
+function viewImgOcrOrigin(page, rect) {
+  // 有 rect → PdfReader 在图的位置画闪烁框（图级定位）；无 → 降级为页级跳转
+  pdfImgFlash.value = rect ? { page, rect } : null
+  activePage.value = page   // watch(viewMode) 会按 activePage 恢复位置 → 正好落到目标页
+  viewMode.value = 'origin'
+}
+
 // 定位目标落在被隐藏的块上时给一条说明：滚动照常（同页正文块仍带 #page-N 锚点），
 // 但文本高亮无从匹配 —— 不说一声，用户会以为「来源定位」失灵了。
 function hiddenChunkHint(page, text) {
@@ -902,7 +946,8 @@ const visiblePageChips = computed(() =>
 )
 
 // 目录：章节首现页（key 为归一化标题，用于当前章节「定位选择」高亮）
-const normPath = (t) => (t || '').replace(/\s+/g, ' ').trim()
+// ⚠️ normPath 与「页(章) → 目录条目」的换算统一在 utils/toc.js：
+//    文本视图（DOM 锚点）/ PDF（当前页）/ EPUB（当前章）三条路径必须共用同一口径。
 const sections = computed(() => {
   const seen = new Map()
   for (const c of visibleChunks.value) {
@@ -910,6 +955,8 @@ const sections = computed(() => {
   }
   return [...seen.entries()].map(([path, page]) => ({ path, page, key: normPath(path) }))
 })
+// 目录条目原文（给 Word 原文视图匹配段落锚点：用原文，由 reader 自行归一化）
+const sectionTitles = computed(() => sections.value.map(s => s.path))
 const activeSection = ref('')
 
 const shortTime = (iso) => iso ? iso.slice(5, 16).replace('T', ' ') : ''
@@ -940,10 +987,20 @@ function currentPageOf(scroller) {
   }
   return current
 }
+// 目录高亮：按当前页(章)号反查目录条目（原文视图没有 DOM 章节锚点时用）
+function markSectionByPage(page) {
+  activeSection.value = sectionKeyForPage(sections.value, page)
+}
+
 function onReaderScroll(e) {
   const scroller = e.target
-  updateActiveSection(scroller)   // 即时更新目录「定位选择」高亮
   const current = currentPageOf(scroller)
+  if (viewMode.value === 'origin' && isPdf.value) {
+    // PDF「原文视图」：正文是 canvas，没有可查询的章节锚点 → 只能按「当前页」反查目录
+    if (current) markSectionByPage(current)
+  } else {
+    updateActiveSection(scroller)   // 文本视图 / Word 原文视图：按 DOM 章节锚点
+  }
   if (!current) return            // 该视图没有页锚点，不参与进度记录
   activePage.value = current
   if (progressTimer) clearTimeout(progressTimer)
@@ -955,26 +1012,35 @@ function onReaderScroll(e) {
   }, 1500)
 }
 
-// 滚动时计算当前所在章节（md 按标题定位，其余按 chunk 的 section 定位）
+// 滚动时按 **DOM 章节锚点** 计算当前所在章节（文本视图 / Word 原文视图）：
+// md 按标题元素定位，其余按正文块上的 data-section 定位。
+// ⚠️ PDF「原文视图」没有这些锚点（画布），其高亮走 markSectionByPage 按页反查；
+//    EPUB「原文视图」正文在 iframe 里（滚动不跨文档冒泡），按「当前章」反查。
 function updateActiveSection(scroller) {
   const scrollerTop = scroller.getBoundingClientRect().top
   let current = ''
+  let first = ''   // 第一个锚点：全部锚点都还没越过定位线时用它兜底
   if (isMd.value) {
     const headings = scroller.querySelectorAll('.md-body h1, .md-body h2, .md-body h3, .md-body h4, .md-body h5, .md-body h6')
+    if (headings.length) first = normPath(headings[0].textContent)
     for (const h of headings) {
       if (h.getBoundingClientRect().top - scrollerTop < 120) {
         current = normPath(h.textContent)
       } else break
     }
   } else {
-    for (const el of scroller.querySelectorAll('[data-section]')) {
+    const els = scroller.querySelectorAll('[data-section]')
+    if (els.length) first = normPath(els[0].getAttribute('data-section'))
+    for (const el of els) {
       if (el.getBoundingClientRect().top - scrollerTop < 120) {
         const sec = el.getAttribute('data-section')
         if (sec) current = normPath(sec)
       } else break
     }
   }
-  activeSection.value = current
+  // 兜底：首个锚点距顶 > 120px（Word 纸张外边距把标题压到定位线之下）时，
+  // 读者显然还在「第一章」范围内 —— 不兜底则刚进视图 / 滚回顶部时目录不亮。
+  activeSection.value = current || first
 }
 
 // C6 导出笔记
@@ -1097,6 +1163,7 @@ function scrollToPage(page) {
 function onEpubChapterChange(page) {
   const n = Number(page) || 1
   activePage.value = n
+  markSectionByPage(n)   // EPUB 原文视图一次只显示一章：章号即目录定位（iframe 滚动不跨文档上报）
   if (material.value && n !== material.value.last_read_page) {
     material.value.last_read_page = n
     materialApi.update(materialId, { last_read_page: n })
@@ -1132,13 +1199,53 @@ async function restoreReadingPosition(view, page) {
   anchor?.scrollIntoView({ behavior: 'auto', block: 'start' })
 }
 
-watch(viewMode, (to) => { restoreReadingPosition(to, activePage.value) })
+watch(viewMode, (to) => {
+  // 回文本视图时清掉图级闪烁目标：PdfReader 重挂载会立即消费 prop，
+  // 不清则每次切回原文视图都会把上一次的目标重新闪一遍（陈旧闪烁）
+  if (to === 'text') pdfImgFlash.value = null
+  restoreReadingPosition(to, activePage.value)
+})
+
+// Word 原文视图渲染完（锚点已打好）先点亮一次目录：否则进视图后要滚一下才亮
+function onDocxReady() {
+  const host = document.querySelector('.docx-origin')
+  if (host) updateActiveSection(host)
+}
+
+// 进入原文视图 / 恢复阅读位置时补一次高亮：PDF 要滚动才有事件、EPUB 在 iframe 内，
+// 两者都推不到滚动回调，不补则切进原文视图时目录是空的。
+watch([viewMode, activePage], ([v, p]) => {
+  if (v !== 'origin' || !p) return
+  if (isPdf.value || isEpub.value) markSectionByPage(p)
+})
+
+// 目录跟随的后半段：长目录（如 249 页的书）里高亮项会落在左栏可视区之外，只改高亮等于没跟随。
+// 仅在「高亮项完全不可见」时滚一次，避免与用户手动翻目录抢滚动。
+watch(activeSection, (k) => {
+  if (!k) return
+  nextTick(() => {
+    const item = document.querySelector('.toc .toc-item.active')
+    const box = document.querySelector('.col-left')
+    if (!item || !box) return
+    const ir = item.getBoundingClientRect()
+    const br = box.getBoundingClientRect()
+    if (ir.top >= br.top && ir.bottom <= br.bottom) return   // 已可见 → 不动
+    item.scrollIntoView({ block: 'nearest' })
+  })
+})
 
 // 跳转 + 目标文本临时高亮 3 秒（text 为空则整段高亮）
 const flashLocate = ref(null)
 let flashLocateTimer = null
 function locateAndFlash(page, text) {
   scrollToPage(page)
+  // 目标落在「就地折叠」的图片 OCR 块上：自动展开 —— 折叠体未渲染时文本高亮无从匹配，
+  // 用户会以为来源定位失灵（折叠条占位仍在原页，滚动位置不受影响）
+  const imgKey = (text || '').trim().slice(0, 12)
+  if (imgKey.length >= 4) {
+    const hit = visibleChunks.value.find(c => isInlineImgOcr(c) && c.page_no === page && (c.content || '').includes(imgKey))
+    if (hit) imgocrOpen.value[hit.id] = true
+  }
   hiddenChunkHint(page, text)          // 目标是图片 OCR 文字（默认隐藏）时说明一声
   flashLocate.value = { page, text: text || null }
   if (flashLocateTimer) clearTimeout(flashLocateTimer)
@@ -1148,6 +1255,16 @@ function locateAndFlash(page, text) {
 // md 整篇渲染无分页锚点，目录跳转需滚动到对应章节标题
 function scrollToSection(s) {
   activeSection.value = s.key
+  // Word「原文视图」：DocxReader 已把标题段落标成 data-section → 与 md 同一套文本匹配跳转。
+  // ⚠️ 绝不能落到下面的 scrollToPage：docx 的 page_no 是 ~700 字/页的估算值（且实测常整篇为 1），
+  //    而 scrollToPage 还会把视图切回文本视图 —— 在原文视图点目录反被踢出视图。
+  if (viewMode.value === 'origin' && isDocx.value) {
+    const host = document.querySelector('.docx-origin')
+    const anchors = host ? [...host.querySelectorAll('[data-section]')] : []
+    const hit = anchors.find(el => normPath(el.getAttribute('data-section')) === s.key)
+    if (hit) { hit.scrollIntoView({ behavior: 'smooth', block: 'start' }); return }
+    if (anchors.length) return   // 锚点在但没匹配上：留在当前视图，不回退成切视图
+  }
   if (isMd.value) {
     const body = document.querySelector('.md-body')
     if (body) {
@@ -2935,6 +3052,30 @@ onUnmounted(() => {
 .imgocr-fold-bar:hover { border-color: var(--asc-primary, #7c5cfc); color: var(--asc-primary, #7c5cfc); }
 .imgocr-fold-arrow { flex: none; margin-left: auto; font-size: 12px; }
 .imgocr-fold-body { margin-top: 14px; }
+
+/* 书籍类材料的内嵌图 OCR 折叠条：默认一行占位、原地展开（与剪藏文末折叠条同一交互语言） */
+.imgocr-inline { margin: 4px 0 16px; }
+.imgocr-inline-bar {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 6px 12px; box-sizing: border-box;
+  border: 1px dashed var(--asc-border, #e5e5e8); border-radius: 8px;
+  background: var(--asc-surface-2, #f5f5f7);
+  color: var(--asc-text-2, #6e6e6e);   /* 次要文字下限 #6e6e6e（按自身底色算对比度） */
+  font-size: 12px; line-height: 1.6; text-align: left; cursor: pointer;
+}
+.imgocr-inline-bar:hover { border-color: var(--asc-primary, #7c5cfc); color: var(--asc-primary, #7c5cfc); }
+.imgocr-inline-act { flex: none; margin-left: auto; color: var(--asc-primary, #7c5cfc); }
+.imgocr-inline-body { margin-top: 8px; }
+.imgocr-inline-tools { display: flex; justify-content: flex-end; margin: 0 0 4px; }
+.imgocr-origin-link {
+  background: none; border: none; padding: 2px 4px; cursor: pointer;
+  font-size: 12px; color: var(--asc-primary, #7c5cfc);
+}
+.imgocr-origin-link:hover { text-decoration: underline; }
+.imgocr-inline-content { margin: 0; }   /* 盖掉 .chunk 的 margin-bottom，间距由 .imgocr-inline 统一管 */
+/* 展开态限高内滚：长 OCR 碎片（目录/图表标签）不再撑爆正文流。
+   v-html 注入的 .imgocr-card 不带 scoped data-v，必须 :deep() 穿透（同上方卡片样式注释） */
+.imgocr-inline-content :deep(.imgocr-card) { max-height: 240px; overflow-y: auto; margin: 0; }
 
 /* ---- 表格 / 标题：Word/PPT 解析产物由 v-html 注入，**不带 scoped 的 data-v 属性**，
        所以不能以 .md-table / .chunk-h 自身当锚点（那样选择器永不匹配、表格会没有边框），

@@ -60,6 +60,10 @@ def _migrate_columns():
             if "kind" not in cols:
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE material_chunks ADD COLUMN kind VARCHAR(16) DEFAULT 'body'"))
+            # 内嵌图 OCR 块的页内位置（PDF 图级定位）：老行空串 → 前端降级页级跳转
+            if "img_rect" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE material_chunks ADD COLUMN img_rect VARCHAR(64) DEFAULT ''"))
         if "podcasts" in insp.get_table_names():
             cols = {c["name"] for c in insp.get_columns("podcasts")}
             if "audio_sig" not in cols:

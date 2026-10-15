@@ -7,6 +7,7 @@
 
 「生成脚本」与「合成音频」是两个独立按钮，中间天然形成确认节点。
 """
+import asyncio
 import json
 import os
 import queue
@@ -57,6 +58,10 @@ LOCK_WAIT_SEC = 1.0
 # 流式任务的心跳间隔：LLM 单次调用 20-60s，期间若不发任何字节，连接会「看起来死了」
 # （也更容易被中间层掐断）。心跳是 SSE 注释行（`: ping`），前端解析时会直接忽略。
 HEARTBEAT_SEC = 10.0
+# SSE 等待队列的轮询间隔（同 videos.py）。⚠️ 生成器必须 async：同步生成器被
+# Starlette 丢进线程池迭代，客户端断开后 finally 永不执行 → 订阅者 / pid 锁
+# 双双滞留（下一次生成会被误判成「正在执行另一项操作」）。
+SSE_POLL_SEC = 0.1
 
 
 def _podcast_lock(pid: int) -> threading.Lock:
@@ -686,13 +691,60 @@ def regenerate_stream(pid: int, req: GenerateReq, db: Session = Depends(get_db))
         media_type="text/event-stream", headers=SSE_HEADERS)
 
 
-def _generation_stream(db: Session, p: Podcast, req: GenerateReq, pid: int,
-                       title: str, source_text: str, style: str, fresh: bool):
+def _drop_fresh_podcast(db: Session, p: Podcast, pid: int) -> None:
+    """新建即失败：把刚建的记录与目录一起清掉（不留半成品）。
+
+    ⚠️ 抽成独立函数是为了能用 asyncio.to_thread 丢出事件循环（同步 SQLAlchemy）。
+    """
+    db.rollback()
+    db.delete(p)
+    db.commit()
+    svc.remove_podcast_files(pid)
+
+
+def _mark_podcast_failed(db: Session, p: Podcast, msg: str) -> None:
+    """保存失败：把作品标成 failed 并把原因落库（与同步 /generate 口径一致）。"""
+    p.status = "failed"
+    p.error = msg
+    db.commit()
+
+
+def _reap_generation(pool: ThreadPoolExecutor, lock: threading.Lock) -> None:
+    """后台收尾：等 worker 跑完 → 关线程池 → 放 pid 锁。
+
+    ⚠️ 必须放独立线程：生成器被取消时 `finally` 里**不能再 await**（取消会立刻
+       打断收尾 —— 这正是同步版泄漏的成因），而同步的 pool.shutdown(wait=True)
+       又不能直接跑在事件循环上（会卡住整个服务）。
+    ⚠️ lock 是 threading.Lock（非 RLock），允许跨线程 release。
+    """
+
+    def _run():
+        try:
+            pool.shutdown(wait=True, cancel_futures=True)
+        except BaseException:      # noqa: BLE001
+            pass
+        finally:
+            try:
+                lock.release()
+            except BaseException:  # noqa: BLE001
+                pass
+
+    threading.Thread(target=_run, name="podcast-gen-reap", daemon=True).start()
+
+
+async def _generation_stream(db: Session, p: Podcast, req: GenerateReq, pid: int,
+                             title: str, source_text: str, style: str, fresh: bool):
     """生成脚本的 SSE 流。
 
     fresh=True 表示这次是「新建」：失败要把刚建的记录与目录一起清掉（不留半成品）。
     LLM 计算放 worker 线程（纯计算、不碰库），写库与落盘都在生成器线程完成 ——
     与 /synthesize/stream 同一套结构。
+
+    ⚠️ 必须 async（原因见 SSE_POLL_SEC 注释）：同步生成器在客户端断开后 finally
+       永不执行 → pid 锁与线程池双双滞留，下一次生成/合成会被误判成「该作品正在
+       执行另一项操作」。
+    ⚠️ 生成器体内的写库一律 `await asyncio.to_thread(...)`：本协程跑在事件循环上，
+       直接调同步 SQLAlchemy 会卡住整个服务。
     """
     total = _GEN_TOTAL.get(req.mode) or 3
     yield _sse("meta", {"podcast_id": pid, "mode": req.mode, "style": style,
@@ -718,12 +770,17 @@ def _generation_stream(db: Session, p: Podcast, req: GenerateReq, pid: int,
                 q.put(("err", e))
 
         pool.submit(worker)
+        last = time.monotonic()
         while True:
             try:
-                kind, payload = q.get(timeout=HEARTBEAT_SEC)
+                kind, payload = q.get_nowait()
             except queue.Empty:
-                yield ": ping\n\n"          # 心跳：LLM 单次 20-60s，见 HEARTBEAT_SEC
+                if time.monotonic() - last >= HEARTBEAT_SEC:
+                    last = time.monotonic()
+                    yield ": ping\n\n"          # 心跳：LLM 单次 20-60s，见 HEARTBEAT_SEC
+                await asyncio.sleep(SSE_POLL_SEC)
                 continue
+            last = time.monotonic()
             if kind == "stage":
                 key, detail = payload
                 yield _sse("progress", _gen_progress(key, detail, req.mode))
@@ -733,30 +790,26 @@ def _generation_stream(db: Session, p: Podcast, req: GenerateReq, pid: int,
                 msg = str(getattr(err, "detail", None) or err)[:200]
                 if fresh:
                     # 新建即失败 → 不留半成品（与同步 /generate 口径一致）
-                    db.rollback()
-                    db.delete(p)
-                    db.commit()
-                    svc.remove_podcast_files(pid)
+                    await asyncio.to_thread(_drop_fresh_podcast, db, p, pid)
                 # 重新生成失败：**不动记录**，原脚本与音频都还在（见接口 docstring）
                 yield _sse("error", {"message": msg})
                 return
             brief, script = payload
             try:
-                _commit_generation(db, p, brief, script)
+                await asyncio.to_thread(_commit_generation, db, p, brief, script)
             except Exception as e:
                 msg = f"脚本保存失败：{str(e)[:160]}"
-                p.status = "failed"
-                p.error = msg
-                db.commit()
+                await asyncio.to_thread(_mark_podcast_failed, db, p, msg)
                 yield _sse("error", {"message": msg})
                 return
-            yield _sse("done", {"podcast": podcast_to_dict(p, db)})
+            yield _sse("done", {"podcast": await asyncio.to_thread(podcast_to_dict, p, db)})
             return
     finally:
         # wait=True：客户端中途断开时 worker 可能还在跑 LLM，等它收尾再放锁，
-        # 否则紧接着的第二次生成会与它抢同一个作品
-        pool.shutdown(wait=True, cancel_futures=True)
-        lock.release()
+        # 否则紧接着的第二次生成会与它抢同一个作品。
+        # ⚠️ 收尾不能在 finally 里 await（取消已投递，await 会立刻被打断而跳过收尾），
+        #    也不能同步等（会卡住事件循环）→ 交给后台线程，本协程立即退出。
+        _reap_generation(pool, lock)
 
 
 # ---------- 脚本编辑（确认环节） ----------
@@ -1099,7 +1152,7 @@ def _start_or_attach_synth(pid: int, script: list[dict], conf: dict) -> _SynthJo
 
 
 @router.post("/{pid}/synthesize/stream")
-def synthesize_stream(pid: int, req: SynthReq, db: Session = Depends(get_db)):
+def synthesize_stream(pid: int, req: SynthReq):
     """SSE 流式合成：`meta`（预检）→ `progress`×N → `done` | `error`
 
     逐句合成十几句要 30–60s（10 分钟档更久）。本接口是「启动或附着」：
@@ -1109,19 +1162,26 @@ def synthesize_stream(pid: int, req: SynthReq, db: Session = Depends(get_db)):
     ⚠️ 前置校验（404 / 400）必须在返回响应之前做完：一旦进入生成器，响应头已发出，
     错误只能作为 error 事件回传，拿不到 HTTP 状态码。
     """
-    p = db.get(Podcast, pid)
-    if not p:
-        raise HTTPException(404, "播客不存在")
-    precheck = _precheck_script(p.script or [])
-    script = _normalize_script(p.script or [])
-    if not script:
-        raise HTTPException(400, "还没有脚本，请先生成或编写脚本")
-    conf = _resolve_synth_conf(p, req)
-    # 配置先落库：BGM / 音量属于「这条作品」的选择，即使合成失败也不该丢
-    db.commit()
+    # ⚠️ 不用请求级 Depends(get_db)：SSE 流期间依赖不会释放（占着 DB 连接几十秒）。
+    #    前置校验与「配置落库」用**临时会话**做完即关（与 drill.py 的 SSE 端点同法）；
+    #    生成器里只读 job 的内存状态，不碰 db。
+    db = SessionLocal()
+    try:
+        p = db.get(Podcast, pid)
+        if not p:
+            raise HTTPException(404, "播客不存在")
+        precheck = _precheck_script(p.script or [])
+        script = _normalize_script(p.script or [])
+        if not script:
+            raise HTTPException(400, "还没有脚本，请先生成或编写脚本")
+        conf = _resolve_synth_conf(p, req)
+        # 配置先落库：BGM / 音量属于「这条作品」的选择，即使合成失败也不该丢
+        db.commit()
+    finally:
+        db.close()
     job = _start_or_attach_synth(pid, script, conf)
 
-    def gen():
+    async def gen():
         # 预检走 meta 通道：utils/sse.js 已有 meta 回调（stats 流的元信息也走它），
         # 不必为一个新事件去改公共工具、也不必让所有调用方多传一个占位参数
         yield _sse("meta", precheck)
@@ -1141,12 +1201,17 @@ def synthesize_stream(pid: int, req: SynthReq, db: Session = Depends(get_db)):
                 return
             if job.total:
                 yield _sse("progress", {"done": job.done, "total": job.total})
+            last = time.monotonic()
             while True:
                 try:
-                    kind, payload = q.get(timeout=HEARTBEAT_SEC)
+                    kind, payload = q.get_nowait()
                 except queue.Empty:
-                    yield ": ping\n\n"      # 心跳：防连接「看起来死了」（脚本里 \n 是字面两字符）
+                    if time.monotonic() - last >= HEARTBEAT_SEC:
+                        last = time.monotonic()
+                        yield ": ping\n\n"      # 心跳：防连接「看起来死了」（脚本里 \n 是字面两字符）
+                    await asyncio.sleep(SSE_POLL_SEC)
                     continue
+                last = time.monotonic()
                 if kind == "progress":
                     yield _sse("progress", payload)
                     continue

@@ -282,7 +282,11 @@ export const videoApi = {
   reveal: (id) => http.post(`/videos/${id}/reveal`),
   exportUrl: (id) => `/api/videos/${id}/export`,
   // 转笔记：幂等键 = video:{id}:{讲稿指纹}，anchor.kind = video_script（不与摘要抢认领）
-  toNote: (id) => http.post(`/videos/${id}/to-note`),
+  // noteId 非空 = 显式覆盖更新已有笔记（「文稿已更新 · 更新笔记」，与 AI 播客同口径）
+  toNote: (id, noteId = null) =>
+    http.post(`/videos/${id}/to-note${noteId ? `?note_id=${noteId}` : ''}`),
+  // 转笔记状态 {exists, note_id, stale}：详情页按钮三态的唯一来源（口径在后端算）
+  noteState: (id) => http.get(`/videos/${id}/note-state`),
   // 数字人形象上传（竖版 ≥3:4 且短边 ≥512px）
   uploadAvatar: (formData) => http.post('/videos/avatar/upload', formData, { timeout: 120000 }),
   // 删除一个用户上传的形象（预置形象后端会拒）。返回带 used_by：

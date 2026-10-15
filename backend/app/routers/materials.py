@@ -201,6 +201,7 @@ def _parse_material(material_id: int):
                 page_no=c["page_no"],
                 section_path=c.get("section_path", ""),
                 kind=_chunk_kind(c["content"], m),
+                img_rect=c.get("img_rect", ""),
             ))
         m.page_count = max(c["page_no"] for c in chunks)
         db.commit()   # 先落 chunks，供索引查询
@@ -846,7 +847,8 @@ def get_chunks(material_id: int, db: Session = Depends(get_db)):
             .filter(MaterialChunk.material_id == material_id)
             .order_by(MaterialChunk.page_no, MaterialChunk.id).all())
     return [{"id": r.id, "content": r.content, "page_no": r.page_no,
-             "section_path": r.section_path, "kind": r.kind or "body"} for r in rows]
+             "section_path": r.section_path, "kind": r.kind or "body",
+             "img_rect": r.img_rect or ""} for r in rows]
 
 
 class ChunkUpdateReq(BaseModel):

@@ -77,6 +77,10 @@ class MaterialChunk(Base):
     # ⚠️ 只加列、不改 content：content 是 extract_sig 指纹的输入，改动会误触发重新抽实体。
     kind = Column(String(16), default="body")
     embedding_id = Column(String(64), nullable=True)
+    # 内嵌图 OCR 块的页内位置（仅 PDF 解析时记录）：归一化 "x0,y0,x1,y1"（0~1，相对页宽/高，左上原点）。
+    # 空串 = 无位置数据（存量材料/非 PDF）→ 前端「在原文中查看」降级为页级跳转，重解析才回填。
+    # ⚠️ 与 content 无关、不参与 extract_sig 指纹。
+    img_rect = Column(String(64), default="")
 
     material = relationship("Material", back_populates="chunks")
 

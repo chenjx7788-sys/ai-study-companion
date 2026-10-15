@@ -60,8 +60,13 @@ def is_installed(size: str) -> bool:
     return p.exists() and p.stat().st_size > 20 * 1024 * 1024
 
 
-def installed_size() -> str | None:
-    """返回已安装的最高版本（small 优先），都未装返回 None"""
+def installed_variant() -> str | None:
+    """返回已安装的**版本规格**（"small" / "base"，small 优先），都未装返回 None。
+
+    ⚠️ 曾用名 installed_size：名字读起来像「体积」，实际返回的是版本标识。
+       一旦前端拿它显示「已下载 145MB」就会显示错（值是 "small"）。
+       接口字段同步改名 installed_variant（与 zipvoice 同构）。
+    """
     for size in ("small", "base"):
         if is_installed(size):
             return size
@@ -74,7 +79,7 @@ def preferred_size() -> str | None:
     pref = (settings_store.load().get("asr_model_size") or "").strip()
     if pref in ("small", "base") and is_installed(pref):
         return pref
-    return installed_size()
+    return installed_variant()
 
 
 def get_models_status() -> dict:
@@ -83,8 +88,8 @@ def get_models_status() -> dict:
             {**MODELS[k], "id": k, "installed": is_installed(k)}
             for k in ("small", "base")
         ],
-        "installed": installed_size() is not None,
-        "installed_size": installed_size() or "",
+        "installed": installed_variant() is not None,
+        "installed_variant": installed_variant() or "",
         "downloading": _state["downloading"],
         "downloading_size": _state["size"],
         "download_progress": _state["progress"],

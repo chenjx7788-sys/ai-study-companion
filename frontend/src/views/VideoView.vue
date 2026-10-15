@@ -17,7 +17,18 @@
           <h3>{{ cur ? '作品参数' : '新建作品' }}</h3>
           <span v-if="cur" class="panel-head-note">#{{ cur.id }} · {{ STATUS_LABEL[cur.status] || cur.status }}</span>
         </div>
+        <p v-if="!cur" class="panel-sub">从上到下填完三组，点底部「创建作品」</p>
+        <div class="form-scroll">
 
+        <!-- 分组折叠（V8 美化）：组头常驻显示当前绑定摘要，折叠不丢任何绑定 -->
+        <div class="fgroup">
+          <button type="button" class="fgroup-head" @click="ui.gBasic = !ui.gBasic">
+            <span class="fgroup-num">1</span>
+            <span class="fgroup-title">基本</span>
+            <span v-if="!ui.gBasic" class="fgroup-sum">{{ form.title || '留空自动命名' }}</span>
+            <span class="fgroup-arrow" :class="{ on: ui.gBasic }"></span>
+          </button>
+          <div v-show="ui.gBasic" class="fgroup-body">
         <div class="field">
           <label class="field-label">标题</label>
           <el-input v-model="form.title" maxlength="50" show-word-limit
@@ -38,6 +49,17 @@
           </p>
         </div>
 
+        </div>
+        </div>
+
+        <div class="fgroup">
+          <button type="button" class="fgroup-head" @click="ui.gAudio = !ui.gAudio">
+            <span class="fgroup-num">2</span>
+            <span class="fgroup-title">音轨</span>
+            <span v-if="!ui.gAudio" class="fgroup-sum">{{ audioSummary }}</span>
+            <span class="fgroup-arrow" :class="{ on: ui.gAudio }"></span>
+          </button>
+          <div v-show="ui.gAudio" class="fgroup-body">
         <div class="field">
           <label class="field-label">音轨来源</label>
           <AudioSourcePicker
@@ -213,7 +235,18 @@
           </AudioSourcePicker>
         </div>
 
-        <div class="field field-group-start">
+        </div>
+        </div>
+
+        <div class="fgroup">
+          <button type="button" class="fgroup-head" @click="ui.gVisual = !ui.gVisual">
+            <span class="fgroup-num">3</span>
+            <span class="fgroup-title">画面</span>
+            <span v-if="!ui.gVisual" class="fgroup-sum">{{ visualSummary }}</span>
+            <span class="fgroup-arrow" :class="{ on: ui.gVisual }"></span>
+          </button>
+          <div v-show="ui.gVisual" class="fgroup-body">
+        <div class="field">
           <label class="field-label">视觉方案</label>
           <SkinPicker
             v-model="form.skin"
@@ -308,11 +341,24 @@
           </div>
         </div>
 
+        </div>
+        </div>
+
+        <div class="fgroup">
+          <button type="button" class="fgroup-head" @click="ui.gAdv = !ui.gAdv">
+            <span class="fgroup-num">4</span>
+            <span class="fgroup-title">高级</span>
+            <span v-if="!ui.gAdv" class="fgroup-sum">{{ form.instruction ? '已填附加要求' : '附加要求（可选）' }}</span>
+            <span class="fgroup-arrow" :class="{ on: ui.gAdv }"></span>
+          </button>
+          <div v-show="ui.gAdv" class="fgroup-body">
         <div class="field">
           <label class="field-label">附加要求（可选）</label>
           <el-input v-model="form.instruction" type="textarea" :rows="2"
                     :maxlength="opts.hints.instruction_max || 500" show-word-limit
                     placeholder="例如：面向新同事，术语要解释一下；多举业务里的例子" />
+        </div>
+          </div>
         </div>
 
         <!-- 试听用的唯一 <audio>（音色与 BGM 共用，与播客同一状态机）：@playing 才关加载态。
@@ -321,6 +367,8 @@
         <audio ref="previewAudioEl" @playing="previewBusy = false"
                @ended="stopPreview" @error="onPreviewError"></audio>
 
+        </div>
+        <div class="form-cta">
         <p v-if="!opts.llm_ready" class="notice warn">
           还没有配置可用的大模型，生成讲稿与步点会失败。请先到「管理中心 → 模型配置」完成配置。
         </p>
@@ -345,6 +393,7 @@
         <p v-if="cur && planning" class="stage-line">
           <span class="stage-dot" />{{ stageText }}
         </p>
+        </div>
       </section>
 
       <!-- ============ 右：作品库 / 作品详情 ============ -->
@@ -400,207 +449,245 @@
             <p v-for="(a, i) in alerts" :key="i" class="notice" :class="a.level">{{ a.text }}</p>
           </div>
 
-          <div class="stats-row">
-            <div class="stat"><span class="stat-k">时长</span><span class="stat-v">{{ fmtMs(cur.duration_ms) }}</span></div>
-            <div class="stat"><span class="stat-k">讲稿</span><span class="stat-v">{{ cur.segment_count }} 句</span></div>
-            <div class="stat"><span class="stat-k">分镜</span><span class="stat-v">{{ cur.shot_count }}</span></div>
-            <div class="stat"><span class="stat-k">视觉步点</span><span class="stat-v">{{ cur.step_count }}</span></div>
-            <div class="stat"><span class="stat-k">最长静止</span><span class="stat-v">{{ fmtMs(cur.gate_max_still_ms) }}</span></div>
-            <div class="stat">
-              <span class="stat-k">定位命中率</span>
-              <span class="stat-v">{{ fmtPct(cur.gate_hit_rate) }}</span>
-            </div>
-            <div class="stat"><span class="stat-k">视觉方案</span><span class="stat-v stat-v--text">{{ cur.skin_label }}</span></div>
-            <div class="stat"><span class="stat-k">音轨</span>
-              <span class="stat-v stat-v--text">{{ cur.has_audio ? (cur.audio_source === 'podcast' ? '复用播客' : '本片生成') : '缺失' }}</span>
-            </div>
-            <div v-if="cur.render_seconds > 0" class="stat">
-              <span class="stat-k">上次渲染</span>
-              <span class="stat-v">{{ Number(cur.render_seconds).toFixed(0) }} 秒</span>
-            </div>
-          </div>
-
-          <div class="actions wrap">
-            <el-button :loading="busy" @click="rerunGate">重跑质量自检</el-button>
-            <el-button :disabled="!cur.has_timeline" @click="openSrt">导出字幕</el-button>
-            <el-button :loading="busy" @click="toNote">转笔记</el-button>
-            <el-button v-if="cur.has_video" @click="openExport">导出成片</el-button>
-            <el-button @click="revealInFolder">在文件夹中定位</el-button>
-            <el-button type="danger" plain @click="removeWork">删除作品</el-button>
-          </div>
-          <!-- 渲染（阶段 2）：闸门通过 → 入队 → 单线程串行出片。
-               并发上限 1，超限不是失败而是排队并显示位次（PRD 验收 #34）。 -->
-          <div class="render-box">
-            <div class="actions wrap render-actions">
-              <el-button type="primary" :loading="rendering" :disabled="!canRender"
-                         @click="runRender(cur.id)">
-                {{ rendering ? '渲染中…' : renderBtnText }}
-              </el-button>
-              <span v-if="rendering" class="actions-hint">
-                可离开页面，渲染在后台继续；回来会自动接上进度
-              </span>
-              <span v-else-if="!opts.render_ready" class="actions-hint">{{ opts.render_reason }}</span>
-            </div>
-            <!-- 跳过质量闸门（PRD 3.9.7 / 验收 #33）：连续 3 次未通过才出现；
-                 跳过 = 知情放弃质量保障，成片标注「未通过质量自检」并记录在案 -->
-            <div v-if="canSkipGate" class="actions wrap skip-gate-row">
-              <el-button type="danger" plain :loading="rendering" @click="skipGateRender">
-                跳过质量自检直接渲染
-              </el-button>
-              <span class="actions-hint">
-                已连续 {{ cur.gate_fail_count }} 次未通过；跳过表示知情放弃质量保障，成片将标注「未通过质量自检」
-              </span>
-            </div>
-            <div v-if="rendering" class="render-bar">
-              <el-progress :percentage="renderPct" :stroke-width="8" :show-text="false" />
-              <span class="render-stage">{{ renderStageText }}</span>
-            </div>
-            <p v-if="renderError" class="notice warn">{{ renderError }}</p>
-            <p v-if="showQuality" class="render-quality">
-              上次渲染：{{ renderQualityText }}
-            </p>
-            <p v-else-if="!cur.has_video && !rendering" class="field-hint">
-              还没有成片。质量自检通过后点「{{ renderBtnText }}」即可出片。
-            </p>
-          </div>
-
-          <!-- 质量自检（8 条判据） -->
-          <h4 class="sec-title">质量自检<template v-if="cur.gate_passed === true"> · 全部通过</template></h4>
-          <p v-if="!gateItems.length" class="empty-line">
-            还没有自检结果。点上面的「生成讲稿与分镜」，或在改完讲稿后点「重跑质量自检」。
-          </p>
-          <table v-else class="gate-table">
-            <thead>
-              <tr><th>判据</th><th class="num">实测</th><th class="num">阈值</th><th>结果</th><th>建议</th></tr>
-            </thead>
-            <tbody>
-              <tr v-for="it in gateItems" :key="it.key" :class="{ bad: !it.ok && !it.na }">
-                <td>{{ it.label }}</td>
-                <td class="num">{{ fmtGateValue(it) }}</td>
-                <td class="num">{{ it.na ? '—' : fmtGateValue({ ...it, value: it.threshold }) }}</td>
-                <td>
-                  <span v-if="it.na" class="muted">不适用</span>
-                  <span v-else-if="it.ok" class="ok-text">通过</span>
-                  <span v-else class="bad-text">未通过</span>
-                </td>
-                <td class="fix">
-                  <template v-if="!it.ok && !it.na">
-                    <el-button v-if="it.fix === 'fill_steps'" size="small" type="primary" plain
-                               :loading="refilling" @click="refillSteps">一键补步</el-button>
-                    <el-button v-else-if="it.fix === 'manual_locate' && unlocatedRows.length"
-                               size="small" type="primary" plain
-                               @click="showUnlocated = !showUnlocated">
-                      {{ showUnlocated ? '收起未命中句' : `未命中句（${unlocatedRows.length}）` }}
+<!-- 预览区（V8 美化 20261015）：成片置顶；右栏 = 关键统计 4 项 + 出片台 -->
+          <div class="hero">
+            <div class="hero-media">
+              <template v-if="cur.has_video">
+                <!-- V6：浏览器缺 H.264 解码 → 提示导出后用本地播放器（PRD 3.10.7） -->
+                <p v-if="!canPlayMp4 || videoPlayError" class="notice warn">
+                  当前环境无法内嵌播放（缺少 H.264 解码支持）。请用「导出成片」下载后，换本地播放器观看。
+                </p>
+                <template v-else>
+                  <video ref="videoEl" class="player" :src="videoApi.fileUrl(cur.id, cur.video_bytes)"
+                         :poster="cur.poster_name ? videoApi.posterUrl(cur.id, cur.video_bytes) : ''"
+                         controls @loadedmetadata="applySubMode" @play="onVideoPlay"
+                         @pause="onVideoPause" @ended="onVideoEnded" @error="onVideoError">
+                    <!-- V3：播放器内字幕（WebVTT 轨；与 SRT 导出同一条时间轴，PRD 3.10.5）
+                         ⚠️ 不带 default：默认关闭，由 applySubMode 按 subOn 设 showing/hidden -->
+                    <track v-if="cur.has_timeline" kind="subtitles" srclang="zh" label="中文字幕"
+                           :src="videoApi.vttUrl(cur.id, cur.audio_bytes)" />
+                  </video>
+                  <div class="player-bar">
+                    <el-button v-if="cur.has_timeline" size="small" text @click="toggleSub">
+                      {{ subOn ? '关闭字幕' : '开启字幕' }}
                     </el-button>
-                    <div class="fix-hint">{{ FIX_HINT[it.fix] || '' }}</div>
-                  </template>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-
-          <!-- 未命中句手动定位（判据 4 修复入口，PRD 3.9.5/3.9.6） -->
-          <div v-if="showUnlocated && unlocatedRows.length" class="unlocated-box">
-            <p class="field-hint">
-              下面这些句子没能在材料原件里定位到原文。从材料里挑一段<b>原样存在</b>的连续短语，
-              点「指定」把它钉到该句的时间点上：
-            </p>
-            <div v-for="u in unlocatedRows" :key="u.seg" class="unlocated-row">
-              <span class="unlocated-seg">#{{ u.seg }}</span>
-              <span class="unlocated-text" :title="u.text">{{ u.text }}</span>
-              <el-input v-model="u.anchor" size="small"
-                        placeholder="材料原文中的一段连续短语（≥2 字）" />
-              <el-button size="small" type="primary" plain :loading="u.busy"
-                         @click="manualLocate(u)">指定</el-button>
+                  </div>
+                </template>
+              </template>
+              <div v-else class="hero-empty">
+                <svg width="34" height="34" viewBox="0 0 22 22" fill="none" aria-hidden="true">
+                  <rect x="2.5" y="4.5" width="17" height="13" rx="3" stroke="currentColor" stroke-width="1.4" />
+                  <path d="M9.4 8.6l4.6 2.4-4.6 2.4V8.6z" fill="currentColor" />
+                </svg>
+                <p class="hero-empty-title">还没有成片</p>
+                <p class="hero-empty-sub">质量自检通过后，在右侧点「{{ renderBtnText }}」出片</p>
+                <audio v-if="cur.has_audio" class="hero-audio"
+                       :src="videoApi.audioUrl(cur.id, cur.audio_bytes)" controls />
+              </div>
             </div>
+            <aside class="hero-side">
+              <div class="hero-stats">
+                <div class="stat"><span class="stat-k">时长</span><span class="stat-v">{{ fmtMs(cur.duration_ms) }}</span></div>
+                <div class="stat"><span class="stat-k">讲稿</span><span class="stat-v">{{ cur.segment_count }} 句</span></div>
+                <div class="stat"><span class="stat-k">分镜</span><span class="stat-v">{{ cur.shot_count }}</span></div>
+                <div class="stat"><span class="stat-k">质量自检</span><span class="stat-v stat-v--text">{{ gateSummary }}</span></div>
+              </div>
+              <!-- 渲染（阶段 2）：闸门通过 → 入队 → 单线程串行出片。
+                   并发上限 1，超限不是失败而是排队并显示位次（PRD 验收 #34）。 -->
+              <div class="render-box">
+                <div class="actions wrap render-actions">
+                  <el-button type="primary" :loading="rendering" :disabled="!canRender"
+                             @click="runRender(cur.id)">
+                    {{ rendering ? '渲染中…' : renderBtnText }}
+                  </el-button>
+                  <span v-if="rendering" class="actions-hint">
+                    可离开页面，渲染在后台继续；回来会自动接上进度
+                  </span>
+                  <span v-else-if="!opts.render_ready" class="actions-hint">{{ opts.render_reason }}</span>
+                </div>
+                <!-- 跳过质量闸门（PRD 3.9.7 / 验收 #33）：连续 3 次未通过才出现；
+                     跳过 = 知情放弃质量保障，成片标注「未通过质量自检」并记录在案 -->
+                <div v-if="canSkipGate" class="actions wrap skip-gate-row">
+                  <el-button type="danger" plain :loading="rendering" @click="skipGateRender">
+                    跳过质量自检直接渲染
+                  </el-button>
+                  <span class="actions-hint">
+                    已连续 {{ cur.gate_fail_count }} 次未通过；跳过表示知情放弃质量保障，成片将标注「未通过质量自检」
+                  </span>
+                </div>
+                <div v-if="rendering" class="render-bar">
+                  <el-progress :percentage="renderPct" :stroke-width="8" :show-text="false" />
+                  <span class="render-stage">{{ renderStageText }}</span>
+                </div>
+                <p v-if="renderError" class="notice warn">{{ renderError }}</p>
+                <p v-if="showQuality" class="render-quality">
+                  上次渲染：{{ renderQualityText }}
+                </p>
+                <p v-else-if="!cur.has_video && !rendering" class="field-hint">
+                  还没有成片。质量自检通过后点「{{ renderBtnText }}」即可出片。
+                </p>
+              </div>
+            </aside>
+          </div>
+
+          <!-- 次操作行：主操作（渲染）已上移至出片台；删除隔离到行尾（danger-end） -->
+          <div class="actions wrap">
+            <el-button :loading="busy" @click="rerunGate"><svg class="btn-ic" viewBox="0 0 14 14" fill="none"><path d="M11.9 7A4.9 4.9 0 1 1 10.4 3.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M12 1.6v2.3H9.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>重跑质量自检</el-button>
+            <el-button :disabled="!cur.has_timeline" @click="openSrt"><svg class="btn-ic" viewBox="0 0 14 14" fill="none"><rect x="1.5" y="3" width="11" height="8" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M3.6 6.8h3.4M3.6 9h6.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>导出字幕</el-button>
+            <!-- 转笔记：与 AI 播客同一业务流程 —— 未转 →「转笔记」；
+                 转过 →「✓ 已转笔记 · 查看」（当前页弹窗打开，不跳知识库）；文稿变了 → 再给「更新笔记」出口。 -->
+            <el-button v-if="!videoNoteId" :disabled="noteBusy" @click="toNote"><svg class="btn-ic" viewBox="0 0 14 14" fill="none"><path d="M3.4 1.8h5l3.2 3.2v7.4H3.4z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M8.4 1.8v3.2h3.2" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>转笔记</el-button>
+            <el-button v-else type="success" plain @click="openVideoNote(videoNoteId)"><svg class="btn-ic" viewBox="0 0 14 14" fill="none"><path d="M1.3 7s2.3-3.6 5.7-3.6S12.7 7 12.7 7s-2.3 3.6-5.7 3.6S1.3 7 1.3 7z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><circle cx="7" cy="7" r="1.7" stroke="currentColor" stroke-width="1.4"/></svg>✓ 已转笔记 · 查看</el-button>
+            <el-button v-if="videoNoteStale" type="warning" plain :disabled="noteBusy" @click="toNote"><svg class="btn-ic" viewBox="0 0 14 14" fill="none"><path d="M11.9 7A4.9 4.9 0 1 1 10.4 3.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M12 1.6v2.3H9.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>文稿已更新 · 更新笔记</el-button>
+            <el-button v-if="cur.has_video" @click="openExport"><svg class="btn-ic" viewBox="0 0 14 14" fill="none"><path d="M7 1.8v6.6M4.3 6.1 7 8.8l2.7-2.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M2.2 11.6h9.6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>导出成片</el-button>
+            <el-button @click="revealInFolder"><svg class="btn-ic" viewBox="0 0 14 14" fill="none"><path d="M1.8 3.6h3.3l1.3 1.5h5.8v6.5a.9.9 0 0 1-.9.9H2.7a.9.9 0 0 1-.9-.9z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>在文件夹中定位</el-button>
+            <el-button type="danger" plain class="danger-end" @click="removeWork">删除作品</el-button>
+          </div>
+
+          <!-- 详情分区页签（V8）：⚠️ 用 v-show 不用 v-if —— 讲稿编辑草稿、表格展开态切换后不丢 -->
+          <div class="dtabs">
+            <button v-for="tb in DETAIL_TABS" :key="tb.key" type="button" class="dtab"
+                    :class="{ active: ui.tab === tb.key }" @click="ui.tab = tb.key">{{ tb.label }}</button>
           </div>
 
           <!-- 讲稿（可逐句编辑；改一句丢该句时间戳，不触发重新合成） -->
-          <h4 class="sec-title">
-            讲稿
-            <span class="sec-note">改过 {{ dirtyCount }} 句 · 时间轴来自音轨，改动后请重跑自检</span>
-            <el-button v-if="scriptDirty" size="small" type="primary" :loading="busy" @click="saveScript">
-              保存讲稿
-            </el-button>
-          </h4>
-          <p v-if="!scriptDraft.length" class="empty-line">还没有讲稿。点「生成讲稿与分镜」。</p>
-          <div v-else class="script-list">
-            <div v-for="(s, i) in scriptDraft" :key="i" class="script-row">
-              <span class="script-time">{{ fmtMs(s.start_ms) }}</span>
-              <span class="script-spk">{{ s.speaker === 'expert' ? '专家' : '主讲' }}</span>
-              <el-input v-model="s.text" type="textarea" :autosize="{ minRows: 1, maxRows: 4 }"
-                        @input="scriptDirty = true" />
+          <div v-show="ui.tab === 'script'" class="dtab-panel">
+            <!-- 已成片作品的独立音轨放讲稿旁（听音轨校文案）；无成片时音轨在上方预览区 -->
+            <audio v-if="cur.has_audio && cur.has_video" class="player panel-audio"
+                   :src="videoApi.audioUrl(cur.id, cur.audio_bytes)" controls />
+            <h4 class="sec-title">
+              讲稿
+              <span class="sec-note">改过 {{ dirtyCount }} 句 · 时间轴来自音轨，改动后请重跑自检</span>
+              <el-button v-if="scriptDirty" size="small" type="primary" :loading="busy" @click="saveScript">
+                保存讲稿
+              </el-button>
+            </h4>
+            <p v-if="!scriptDraft.length" class="empty-line">还没有讲稿。点左侧「生成讲稿与分镜」。</p>
+            <div v-else class="script-list">
+              <div v-for="(s, i) in scriptDraft" :key="i" class="script-row">
+                <span class="script-time">{{ fmtMs(s.start_ms) }}</span>
+                <span class="script-spk">{{ s.speaker === 'expert' ? '专家' : '主讲' }}</span>
+                <el-input v-model="s.text" type="textarea" :autosize="{ minRows: 1, maxRows: 4 }"
+                          @input="scriptDirty = true" />
+              </div>
             </div>
           </div>
 
           <!-- 分镜 -->
-          <h4 class="sec-title">分镜<span class="sec-note">按句间留白切分，是节奏单位<template v-if="cur.has_video">；点击行跳到该分镜起点</template></span></h4>
-          <p v-if="!cur.shots || !cur.shots.length" class="empty-line">还没有分镜。</p>
-          <table v-else class="mini-table">
-            <thead><tr><th class="num">#</th><th class="num">起</th><th class="num">止</th><th class="num">句数</th><th>首个高亮框</th></tr></thead>
-            <tbody>
-              <tr v-for="(sh, i) in cur.shots" :key="i"
-                  :class="{ 'shot-clickable': cur.has_video }" @click="seekShot(sh)">
-                <td class="num">{{ i + 1 }}</td>
-                <td class="num">{{ fmtMs(sh.at) }}</td>
-                <td class="num">{{ fmtMs(sh.end) }}</td>
-                <td class="num">{{ sh.count }}</td>
-                <td class="muted">{{ sh.hit || '—' }}</td>
-              </tr>
-            </tbody>
-          </table>
+          <div v-show="ui.tab === 'shots'" class="dtab-panel">
+            <h4 class="sec-title">分镜<span class="sec-note">按句间留白切分，是节奏单位<template v-if="cur.has_video">；点击行跳到该分镜起点</template></span></h4>
+            <p v-if="!cur.shots || !cur.shots.length" class="empty-line">还没有分镜。</p>
+            <table v-else class="mini-table">
+              <thead><tr><th class="num">#</th><th class="num">起</th><th class="num">止</th><th class="num">句数</th><th>首句</th></tr></thead>
+              <tbody>
+                <tr v-for="(sh, i) in cur.shots" :key="i"
+                    :class="{ 'shot-clickable': cur.has_video }" @click="seekShot(sh)">
+                  <td class="num">{{ i + 1 }}</td>
+                  <td class="num">{{ fmtMs0(sh.a) }}</td>
+                  <td class="num">{{ fmtMs(sh.b) }}</td>
+                  <td class="num">{{ shotSegCount(sh) }}</td>
+                  <td class="muted">{{ sh.l || '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
 
           <!-- 视觉步点 -->
-          <h4 class="sec-title">
-            视觉步点
-            <span class="sec-note">{{ cur.step_count }} 个（画面变化的唯一单位）</span>
-            <el-button v-if="cur.step_count > 40" size="small" text @click="showSteps = !showSteps">
-              {{ showSteps ? '只看前 40 条' : `展开全部 ${cur.step_count} 条` }}
-            </el-button>
-          </h4>
-          <p v-if="!cur.steps || !cur.steps.length" class="empty-line">还没有步点。</p>
-          <table v-else class="mini-table">
-            <thead><tr><th class="num">时刻</th><th class="num">页</th><th>锚点</th><th>命中原文</th><th class="num">位置</th></tr></thead>
-            <tbody>
-              <tr v-for="(st, i) in visibleSteps" :key="i">
-                <td class="num">{{ fmtMs(st.at) }}</td>
-                <td class="num">{{ st.page || '—' }}</td>
-                <td class="anchor">{{ st.anchor || st.t || '—' }}</td>
-                <td class="muted">{{ st.hit || (st.group !== undefined ? `元素组 ${st.group}` : '—') }}</td>
-                <td class="num muted">{{ st.x !== undefined ? `${st.x}% / ${st.y}%` : '—' }}</td>
-              </tr>
-            </tbody>
-          </table>
+          <div v-show="ui.tab === 'steps'" class="dtab-panel">
+            <h4 class="sec-title">
+              视觉步点
+              <span class="sec-note">{{ cur.step_count }} 个（画面变化的唯一单位）</span>
+              <el-button v-if="cur.step_count > 40" size="small" text @click="showSteps = !showSteps">
+                {{ showSteps ? '只看前 40 条' : `展开全部 ${cur.step_count} 条` }}
+              </el-button>
+            </h4>
+            <p v-if="!cur.steps || !cur.steps.length" class="empty-line">还没有步点。</p>
+            <table v-else class="mini-table">
+              <thead><tr><th class="num">时刻</th><th class="num">页</th><th>锚点</th><th>命中原文</th><th class="num">位置</th></tr></thead>
+              <tbody>
+                <tr v-for="(st, i) in visibleSteps" :key="i">
+                  <td class="num">{{ fmtMs(st.at) }}</td>
+                  <td class="num">{{ st.page || '—' }}</td>
+                  <td class="anchor">{{ st.anchor || st.t || '—' }}</td>
+                  <td class="muted">{{ st.hit || (st.group !== undefined ? `元素组 ${st.group}` : '—') }}</td>
+                  <td class="num muted">{{ st.x !== undefined ? `${st.x}% / ${st.y}%` : '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
 
-          <!-- 音轨 / 成片 -->
-          <h4 class="sec-title">音轨与成片</h4>
-          <audio v-if="cur.has_audio" class="player" :src="videoApi.audioUrl(cur.id, cur.audio_bytes)" controls />
-          <p v-else class="empty-line">还没有音轨。</p>
-          <template v-if="cur.has_video">
-            <!-- V6：浏览器缺 H.264 解码 → 提示导出后用本地播放器（PRD 3.10.7） -->
-            <p v-if="!canPlayMp4 || videoPlayError" class="notice warn">
-              当前环境无法内嵌播放（缺少 H.264 解码支持）。请用「导出成片」下载后，换本地播放器观看。
-            </p>
-            <template v-else>
-              <video ref="videoEl" class="player" :src="videoApi.fileUrl(cur.id, cur.video_bytes)"
-                     :poster="cur.poster_name ? videoApi.posterUrl(cur.id, cur.video_bytes) : ''"
-                     controls @loadedmetadata="applySubMode" @play="onVideoPlay"
-                     @pause="onVideoPause" @ended="onVideoEnded" @error="onVideoError">
-                <!-- V3：播放器内字幕（WebVTT 轨；与 SRT 导出同一条时间轴，PRD 3.10.5） -->
-                <track v-if="cur.has_timeline" kind="subtitles" srclang="zh" label="中文字幕"
-                       :src="videoApi.vttUrl(cur.id, cur.audio_bytes)" default />
-              </video>
-              <div class="player-bar">
-                <el-button v-if="cur.has_timeline" size="small" text @click="toggleSub">
-                  {{ subOn ? '关闭字幕' : '开启字幕' }}
-                </el-button>
+          <!-- 质量自检（8 条判据） + 降级统计（原 9 项统计中的次要 6 项挪到这里） -->
+          <div v-show="ui.tab === 'gate'" class="dtab-panel">
+            <div class="stats-row stats-row--sub">
+              <div class="stat"><span class="stat-k">最长静止</span><span class="stat-v">{{ fmtMs(cur.gate_max_still_ms) }}</span></div>
+              <div class="stat"><span class="stat-k">定位命中率</span><span class="stat-v">{{ fmtPct(cur.gate_hit_rate) }}</span></div>
+              <div class="stat"><span class="stat-k">视觉步点</span><span class="stat-v">{{ cur.step_count }}</span></div>
+              <div class="stat"><span class="stat-k">视觉方案</span><span class="stat-v stat-v--text">{{ cur.skin_label }}</span></div>
+              <div class="stat"><span class="stat-k">音轨</span>
+                <span class="stat-v stat-v--text">{{ cur.has_audio ? (cur.audio_source === 'podcast' ? '复用播客' : '本片生成') : '缺失' }}</span>
               </div>
-            </template>
-          </template>
+              <div v-if="cur.render_seconds > 0" class="stat">
+                <span class="stat-k">上次渲染</span>
+                <span class="stat-v">{{ Number(cur.render_seconds).toFixed(0) }} 秒</span>
+              </div>
+            </div>
+            <h4 class="sec-title">质量自检<template v-if="cur.gate_passed === true"> · 全部通过</template></h4>
+            <p v-if="!gateItems.length" class="empty-line">
+              还没有自检结果。点左侧「生成讲稿与分镜」，或在改完讲稿后点「重跑质量自检」。
+            </p>
+            <table v-else class="gate-table">
+              <thead>
+                <tr><th>判据</th><th class="num">实测</th><th class="num">阈值</th><th>结果</th><th>建议</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="it in gateItems" :key="it.key" :class="{ bad: !it.ok && !it.na }">
+                  <td>{{ it.label }}</td>
+                  <td class="num">{{ fmtGateValue(it) }}</td>
+                  <td class="num">{{ it.na ? '—' : fmtGateValue({ ...it, value: it.threshold }) }}</td>
+                  <td>
+                    <span v-if="it.na" class="muted">不适用</span>
+                    <span v-else-if="it.ok" class="ok-text">通过</span>
+                    <span v-else class="bad-text">未通过</span>
+                  </td>
+                  <td class="fix">
+                    <template v-if="!it.ok && !it.na">
+                      <el-button v-if="it.fix === 'fill_steps'" size="small" type="primary" plain
+                                 :loading="refilling" @click="refillSteps">一键补步</el-button>
+                      <el-button v-else-if="it.fix === 'manual_locate' && unlocatedRows.length"
+                                 size="small" type="primary" plain
+                                 @click="showUnlocated = !showUnlocated">
+                        {{ showUnlocated ? '收起未命中句' : `未命中句（${unlocatedRows.length}）` }}
+                      </el-button>
+                      <div class="fix-hint">{{ FIX_HINT[it.fix] || '' }}</div>
+                    </template>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <!-- 未命中句手动定位（判据 4 修复入口，PRD 3.9.5/3.9.6） -->
+            <div v-if="showUnlocated && unlocatedRows.length" class="unlocated-box">
+              <p class="field-hint">
+                下面这些句子没能在材料原件里定位到原文。从材料里挑一段<b>原样存在</b>的连续短语，
+                点「指定」把它钉到该句的时间点上：
+              </p>
+              <div v-for="u in unlocatedRows" :key="u.seg" class="unlocated-row">
+                <span class="unlocated-seg">#{{ u.seg }}</span>
+                <span class="unlocated-text" :title="u.text">{{ u.text }}</span>
+                <el-input v-model="u.anchor" size="small"
+                          placeholder="材料原文中的一段连续短语（≥2 字）" />
+                <el-button size="small" type="primary" plain :loading="u.busy"
+                           @click="manualLocate(u)">指定</el-button>
+              </div>
+            </div>
+          </div>
         </template>
       </section>
     </div>
   </div>
+  <!-- 笔记查看弹窗：转笔记后「查看」在当前页打开（与 AI 播客 / 知识库同一份编辑器组件） -->
+  <NoteEditorDialog v-model="videoNoteView.show" :note-id="videoNoteView.id"
+                    @changed="loadNoteState" />
 </template>
 
 <script setup>
@@ -610,6 +697,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import PageHead from '../components/PageHead.vue'
 import SkinPicker from '../components/SkinPicker.vue'
 import AudioSourcePicker from '../components/AudioSourcePicker.vue'
+import NoteEditorDialog from '../components/NoteEditorDialog.vue'
 import { statsApi, videoApi, podcastApi } from '../api'
 import { errMsg } from '../api/http'
 import { streamSSE } from '../utils/sse'
@@ -623,6 +711,13 @@ import { streamSSE } from '../utils/sse'
 const route = useRoute()
 const router = useRouter()
 
+// 详情分区页签（V8 美化）：讲稿 / 分镜 / 视觉步点 / 质量自检
+const DETAIL_TABS = [
+  { key: 'script', label: '讲稿' },
+  { key: 'shots', label: '分镜' },
+  { key: 'steps', label: '视觉步点' },
+  { key: 'gate', label: '质量自检' },
+]
 const STATUS_LABEL = {
   draft: '草稿', scripting: '生成中', gate_check: '待自检通过',
   queued: '排队渲染', rendering: '渲染中', finished: '已完成', failed: '失败',
@@ -631,7 +726,7 @@ const STATUS_LABEL = {
 const FIX_HINT = {
   fill_steps: '只重跑定位与步点生成（不动讲稿与音轨），补完自动重跑自检',
   manual_locate: '从材料原文里挑一段原样存在的短语手动指定；或换一份材料 / 改用结构图方案',
-  resynth_audio: '音轨对应的是上一版文案：复用播客 → 去「AI 播客」页重新合成；本片音轨 → 目前需新建作品重新生成',
+  resynth_audio: '复用播客 → 去「AI 播客」页重新合成那条播客；本片音轨 → 点左侧「重新生成讲稿与分镜」会连带重合成音轨（讲稿文本不变）',
   free_space: '清理磁盘空间后重试',
 }
 const STAGE_LABEL = {
@@ -679,7 +774,7 @@ const showUnlocated = ref(false)
 const unlocatedRows = ref([])   // [{seg, text, anchor, busy}]
 // 播放器（V3 字幕开关 / V4 分镜跳转 / V6 降级 / V2 播放埋点）
 const videoEl = ref(null)
-const subOn = ref(true)
+const subOn = ref(false)   // V8：字幕默认关闭，按需自行打开（2026-10-15 产品决策）
 const canPlayMp4 = ref(true)
 const videoPlayError = ref(false)
 let playStartAt = 0
@@ -701,6 +796,8 @@ const precheck = ref(null)
 /** 讲稿草稿：**独立于 cur.script**，编辑期间不污染详情对象（取消/保存语义清晰） */
 const scriptDraft = ref([])
 const stage = reactive({ key: '', detail: {} })
+// 界面布局状态（V8 美化）：生成台四组折叠 + 详情页签。纯界面态，不进任何请求体。
+const ui = reactive({ gBasic: true, gAudio: true, gVisual: true, gAdv: false, tab: 'script' })
 const avatarInput = ref(null)
 const bgInput = ref(null)
 const uploadingBg = ref(false)
@@ -868,6 +965,31 @@ async function onBgmPicked(e) {
 }
 
 const isPodcastSource = computed(() => form.audio_source === 'podcast')
+// ---- 组头摘要（V8 美化）：折叠时也要看得出当前绑定的是谁（「面板必须显示当前绑定」约定） ----
+const audioSummary = computed(() => {
+  if (isPodcastSource.value) {
+    const p = (opts.value.podcasts || []).find((x) => x.id === form.podcast_id)
+    return p ? `复用播客 · ${p.title}` : '复用播客音轨'
+  }
+  const v = (opts.value.voices || []).find((x) => x.id === form.voice_map.host)
+  return `本片生成 · ${v ? v.name : '跟随设置页音色'}`
+})
+const visualSummary = computed(() => {
+  const s = (opts.value.skins || []).find((x) => x.key === form.skin)
+  let txt = s ? s.label : '未选择'
+  const vt = ((opts.value.skin_variants || {})[form.skin] || []).find((x) => x.key === form.skin_variant)
+  if (vt) txt += ` · ${vt.label}`
+  return txt
+})
+// 预览区统计第 4 项：质量自检的一句话结论（明细在「质量自检」页签）
+const gateSummary = computed(() => {
+  const v = cur.value
+  if (!v) return '—'
+  if (v.gate_skipped) return '已跳过'
+  if (v.gate_passed === true) return '全部通过'
+  if (v.gate_passed === false) return '未通过'
+  return '未自检'
+})
 const precheckSkins = computed(() => (precheck.value?.skins || null))
 const gateItems = computed(() => cur.value?.gate_report?.items || [])
 const hasScript = computed(() => (cur.value?.segment_count || 0) > 0)
@@ -956,7 +1078,7 @@ const alerts = computed(() => {
   const out = []
   if (v.error) out.push({ level: 'warn', text: `质量自检未通过：${v.error}` })
   if (v.gate_skipped && v.has_video) out.push({ level: 'warn', text: '当前成片是「跳过质量自检」渲染的（未通过质量自检）：风险已由你确认承担；自检重新通过并渲染后，这个标注会自动去掉。' })
-  if (v.audio_stale) out.push({ level: 'warn', text: '音轨与当前讲稿不一致（音轨是上一版文案的产物）：改完文案请重新合成或重新选择来源。' })
+  if (v.audio_stale) out.push({ level: 'warn', text: v.audio_source === 'podcast' ? '音轨对应的是来源播客的上一版文案：请先去「AI 播客」页重新合成那条播客的音频，再回这里重新生成。' : '音轨与当前讲稿或配置不一致（音轨是上一版的产物）：点左侧「重新生成讲稿与分镜」即可重合成音轨，讲稿文本保持不变。' })
   for (const label of v.stale_labels || []) out.push({ level: 'info', text: `成片对应的是上一版：${label}（旧成片不会自动删除，可一键重建）` })
   if (v.source_missing) out.push({ level: 'warn', text: '来源材料已被删除或移动，画面定位可能失效。' })
   if (v.has_video && !v.stale_labels?.length) out.push({ level: 'info', text: '成片与当前配置一致。' })
@@ -1019,6 +1141,7 @@ async function loadDetail(id, { quiet = false } = {}) {
   try {
     const { data } = await videoApi.detail(id)
     applyVideo(data)
+    await loadNoteState()
   } catch (e) {
     if (!quiet) ElMessage.error(errMsg(e, '作品详情加载失败'))
     if (route.params.id) router.replace('/video')
@@ -1552,10 +1675,10 @@ function toggleSub() {
   applySubMode()
 }
 
-/** V4：点击分镜跳到起点 */
+/** V4：点击分镜跳到起点（⚠️ 后端 shots 字段是 {n, l, a, b}，a/b 为毫秒） */
 function seekShot(sh) {
   if (!cur.value || !cur.value.has_video || !videoEl.value) return
-  videoEl.value.currentTime = (Number(sh.at) || 0) / 1000
+  videoEl.value.currentTime = (Number(sh.a) || 0) / 1000
   videoEl.value.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
 }
 
@@ -1592,6 +1715,7 @@ async function saveScript() {
       .map((s) => ({ speaker: s.speaker || 'host', text: s.text, start_ms: s.start_ms, end_ms: s.end_ms }))
     const { data } = await videoApi.saveScript(cur.value.id, rows)
     applyVideo(data)
+    await loadNoteState()   // 文案变了 → 已转的笔记要立刻显示「文稿已更新」
     await loadList()
     if (data.text_changed) {
       ElMessage.success('已保存。文案变了 → 需要重新定位并重跑质量自检')
@@ -1605,16 +1729,57 @@ async function saveScript() {
   }
 }
 
-async function toNote() {
-  if (!cur.value) return
-  busy.value = true
+// ---------- 转笔记（与 AI 播客同一业务流程） ----------
+// 三态的唯一来源是后端的 note-state：指纹键 = md5(笔记正文)，而正文由 to_note_payload
+// 在服务端拼（讲稿 + 分镜 + 要点）—— 前端复刻一份必然漂移，所以「是否已变」只问后端。
+const noteState = ref({ exists: false, note_id: null, stale: false })
+const noteBusy = ref(false)
+const videoNoteId = computed(() => (noteState.value.exists ? noteState.value.note_id : null))
+const videoNoteStale = computed(() => !!noteState.value.exists && !!noteState.value.stale)
+// 「查看」= 当前页弹窗打开（不再跳转知识库，与 AI 播客 / 知识库同一份编辑器组件）
+const videoNoteView = reactive({ show: false, id: null })
+
+async function loadNoteState() {
+  const id = cur.value?.id
+  if (!id) {
+    noteState.value = { exists: false, note_id: null, stale: false }
+    return
+  }
   try {
-    const { data } = await videoApi.toNote(cur.value.id)
-    ElMessage.success(data.created ? '已生成笔记' : '这个版本的讲稿已经有一篇笔记了（同一版本只生成一篇）')
+    const { data } = await videoApi.noteState(id)
+    // ⚠️ 切作品期间回来的旧响应必须丢掉，否则会把 A 的状态贴到 B 上（按钮指向别人的笔记）
+    if (cur.value?.id === id) noteState.value = data
+  } catch {
+    // 拿不到状态只影响按钮形态，不影响转笔记本身 → 不打扰用户
+    if (cur.value?.id === id) noteState.value = { exists: false, note_id: null, stale: false }
+  }
+}
+
+function openVideoNote(id) {
+  videoNoteView.id = Number(id)
+  videoNoteView.show = true
+}
+
+async function toNote() {
+  const c = cur.value
+  if (!c) return
+  const existing = videoNoteId.value
+  noteBusy.value = true
+  try {
+    // 已有笔记 → 覆盖更新（先确认，与 AI 播客同口径：不静默冲掉用户编辑过的内容）
+    if (existing) {
+      await ElMessageBox.confirm(
+        '文稿已经改过了。更新后，你在笔记里做过的编辑会被最新文稿覆盖。',
+        '更新笔记', { type: 'warning', confirmButtonText: '覆盖更新', cancelButtonText: '取消' })
+    }
+    const { data } = await videoApi.toNote(c.id, existing)
+    if (data?.updated) ElMessage.success('笔记已更新')
+    else ElMessage.success(data?.created ? '已生成笔记' : '这个版本的讲稿已经有一篇笔记了（同一版本只生成一篇）')
+    await loadNoteState()
   } catch (e) {
-    ElMessage.error(errMsg(e, '转笔记失败'))
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(errMsg(e, '转笔记失败'))
   } finally {
-    busy.value = false
+    noteBusy.value = false
   }
 }
 
@@ -1799,6 +1964,22 @@ function fmtMs(ms) {
   const m = Math.floor(s / 60)
   return m ? `${m}:${String(s % 60).padStart(2, '0')}` : `${s} 秒`
 }
+// 分镜句数：后端 shots 为 {n, l, a, b}（a/b 毫秒），句数按讲稿时间轴实算（start_ms ∈ [a, b)）
+function shotSegCount(sh) {
+  const a = Number(sh.a) || 0
+  const b = Number(sh.b) || 0
+  return (cur.value?.script || []).filter((s) => {
+    const st = Number(s.start_ms) || 0
+    return st >= a && st < b
+  }).length
+}
+// 分镜「起」专用：允许 0（首镜头从 0ms 开始）。fmtMs 把 0 当空值是给「时长未知」等场景用的
+function fmtMs0(ms) {
+  if (ms === undefined || ms === null) return '—'
+  const n = Number(ms)
+  if (Number.isNaN(n) || n < 0) return '—'
+  return n === 0 ? '0 秒' : fmtMs(n)
+}
 function fmtBytes(n) {
   const b = Number(n)
   if (!b || b < 0 || Number.isNaN(b)) return '—'
@@ -1858,10 +2039,11 @@ watch(() => route.params.id, async (id) => {
   rendering.value = false
   renderError.value = ''
   renderQuality.value = null
-  subOn.value = true
+  subOn.value = false      // V8：字幕默认关闭（与初始值同口径）
   videoPlayError.value = false
   showUnlocated.value = false
   unlocatedRows.value = []
+  ui.tab = 'script'          // V8：切作品时详情回到「讲稿」页签
   if (!id) {
     cur.value = null
     // 新建时清掉上一部作品的画面署名：署名的默认语义就是「空 = 跟随作品标题」，
@@ -1870,6 +2052,7 @@ watch(() => route.params.id, async (id) => {
     form.brand_text = ''
     scriptDraft.value = []
     precheck.value = null
+    noteState.value = { exists: false, note_id: null, stale: false }
     stage.key = ''
     stage.detail = {}
     renderStage.value = ''
@@ -1918,7 +2101,26 @@ onBeforeUnmount(() => {
   padding: 16px 18px;
   box-shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 12px 32px -16px rgba(16, 24, 40, .12);
 }
-.form-panel { position: sticky; top: 18px; }
+.form-panel {
+  position: sticky; top: 18px;
+  /* 限高要扣除页头占用：实测面板顶距视口顶 89px（PageHead 71 + 间距 18），底部再留 21px */
+  display: flex; flex-direction: column; max-height: calc(100vh - 110px);
+}
+/* V9 工作台：参数区面板内滚动，主 CTA 常驻底部（主流工作台做法：剪映专业版 / Runway） */
+.panel-sub { margin: -6px 0 12px; font-size: 12px; color: #6e6e6e; }
+.form-scroll { flex: 1; min-height: 0; overflow-y: auto; padding-right: 2px; }
+.form-cta { flex: none; border-top: 1px solid var(--asc-divider); margin-top: 12px; }
+.form-cta .actions { margin-top: 10px; }
+.form-cta .actions .el-button--primary { min-width: 148px; }
+.fgroup-num {
+  flex: none; width: 18px; height: 18px; border-radius: 50%;
+  background: var(--asc-primary-soft); color: #6a48ee;
+  font-size: 11px; font-weight: 600; display: flex; align-items: center; justify-content: center;
+}
+@media (max-width: 1180px) {
+  .form-panel { position: static; max-height: none; }
+  .form-scroll { overflow: visible; }
+}
 .panel-head {
   display: flex; align-items: center; gap: 10px;
   margin-bottom: 14px; flex-wrap: wrap;
@@ -2155,4 +2357,78 @@ onBeforeUnmount(() => {
 .player-bar { display: flex; justify-content: flex-end; margin: -4px 0 10px; }
 /* 跳过闸门（V1 / PRD 3.9.7） */
 .skip-gate-row { margin-top: 6px; }
+
+/* ===== V8 美化 20261015：生成台分组折叠 ===== */
+.fgroup {
+  border: 1px solid var(--asc-divider); border-radius: 10px;
+  margin-bottom: 12px; background: var(--asc-card);
+}
+.fgroup-head {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 10px 12px; border: 0; background: transparent; cursor: pointer;
+  border-radius: 10px; text-align: left; transition: background .15s ease;
+}
+.fgroup-head:hover { background: var(--asc-surface-2); }
+.fgroup-title { flex: none; font-size: 13px; font-weight: 600; color: var(--asc-text); }
+.fgroup-sum {
+  flex: 1; min-width: 0; font-size: 12px; color: #6e6e6e; text-align: right;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.fgroup-arrow {
+  flex: none; width: 0; height: 0;
+  border-left: 5px solid #6e6e6e; border-top: 4px solid transparent; border-bottom: 4px solid transparent;
+  transition: transform .15s ease;
+}
+.fgroup-arrow.on { transform: rotate(90deg); }
+.fgroup-body { padding: 2px 12px 0; }
+.fgroup-body > .field:last-child { margin-bottom: 14px; }
+
+/* ===== V8 美化：详情预览区（成片置顶） ===== */
+.hero {
+  display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(250px, 1fr);
+  gap: 14px; margin: 2px 0 4px; align-items: start;
+}
+@media (max-width: 1180px) { .hero { grid-template-columns: minmax(0, 1fr); } }
+.hero-media { min-width: 0; }
+.hero-media .player { margin-bottom: 0; }
+.hero-media .player-bar { margin: 4px 0 0; }
+.hero-empty {
+  aspect-ratio: 16 / 9; border-radius: 10px; padding: 18px;
+  background: var(--asc-surface-2); border: 1px dashed var(--asc-border);
+  color: var(--asc-text-2); text-align: center;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+}
+.hero-empty-title { margin: 0; font-size: 13.5px; font-weight: 600; color: var(--asc-text); }
+.hero-empty-sub { margin: 0; font-size: 12px; color: #6e6e6e; }
+.hero-audio { width: min(360px, 88%); margin-top: 8px; }
+.hero-side { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+.hero-stats {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px;
+  padding: 12px 14px; background: var(--asc-surface-2); border-radius: 12px;
+}
+.hero-stats .stat { padding: 0; border-left: none; }
+.hero-stats .stat-v { font-size: 17px; }
+.hero-side .render-box { margin: 0; flex: 1; }
+
+/* ===== V8 美化：详情分区页签 ===== */
+.dtabs {
+  display: flex; gap: 2px; flex-wrap: wrap;
+  border-bottom: 1px solid var(--asc-border); margin-top: 16px;
+}
+.dtab {
+  border: 0; border-bottom: 2px solid transparent; background: transparent; cursor: pointer;
+  padding: 8px 14px; font-size: 13px; color: #6e6e6e; transition: color .15s ease;
+}
+.dtab:hover { color: var(--asc-text); }
+.dtab.active { color: #6a48ee; font-weight: 600; border-bottom-color: #6a48ee; }
+.dtab-panel { padding-top: 6px; }
+.dtab-panel .sec-title { margin-top: 12px; }
+.panel-audio { margin: 8px 0 2px; }
+.danger-end { margin-left: auto; }
+/* 质量页签里的次要统计行（原 9 项统计中降级的 6 项） */
+.stats-row--sub { margin: 8px 0 4px; }
+.stats-row--sub .stat-v { font-size: 15px; }
+/* 操作行按钮内图标（V9） */
+.btn-ic { width: 13px; height: 13px; margin-right: 4px; vertical-align: -2px; flex: none; }
+
 </style>

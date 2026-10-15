@@ -92,11 +92,12 @@ def parse_pdf(path: str, on_progress=None) -> list[dict]:
                     img_texts = _ocr_pdf_page_images(path, i, seen_xrefs)
                 except Exception:
                     img_texts = []
-                for t in img_texts:
+                for t, rect in img_texts:
                     chunks.append({
                         "content": f"[图片] {t}",
                         "page_no": i + 1,
                         "section_path": section,
+                        "img_rect": rect,
                     })
         if on_progress:
             on_progress(int((i + 1) / total * 100))
@@ -138,7 +139,10 @@ _IMG_OCR_MAX_PX = 2000        # 大于 2000px 的图多为整页扫描件，整�
 
 
 def _extract_pdf_page_images(pdf_path: str, page_index: int) -> list:
-    """提取 PDF 单页的内嵌图片（去重 + 尺寸过滤），返回 RGB numpy 数组列表。
+    """提取 PDF 单页的内嵌图片（去重 + 尺寸过滤），返回 (xref, RGB numpy 数组, 页内位置) 三元组列表。
+
+    页内位置 = 归一化 "x0,y0,x1,y1"（0~1，相对页宽/高，左上原点），供前端图级定位闪烁框；
+    取不到（图未实际放置等）则为空串 → 前端降级页级跳转。
 
     - 用 PyMuPDF `page.get_images()` 枚举该页引用的图片 xref（含跨页复用的页眉 LOGO）。
     - 按 xref 去重：同一张图在多页复用只 OCR 一次（由调用方维护全局 xref 集合）。
@@ -155,6 +159,10 @@ def _extract_pdf_page_images(pdf_path: str, page_index: int) -> list:
         out = []
         for info in infos:
             xref = info[0]                      # 图片对象 xref
+            try:
+                rects = page.get_image_rects(xref)   # 图在页内的放置位置（左上原点坐标系）
+            except Exception:
+                rects = []
             try:
                 raw = doc.extract_image(xref)
             except Exception:
@@ -176,7 +184,13 @@ def _extract_pdf_page_images(pdf_path: str, page_index: int) -> list:
             h, w = img.shape[:2]
             if min(h, w) < _IMG_OCR_MIN_PX or max(h, w) > _IMG_OCR_MAX_PX:
                 continue
-            out.append((xref, img))
+            if rects:
+                pr = page.rect
+                r = rects[0]                    # 同页多处放置取第一处（罕见）
+                rect = f"{r.x0 / pr.width:.4f},{r.y0 / pr.height:.4f},{r.x1 / pr.width:.4f},{r.y1 / pr.height:.4f}"
+            else:
+                rect = ""                       # 取不到位置 → 前端降级页级跳转
+            out.append((xref, img, rect))
         return out
     finally:
         doc.close()
@@ -207,21 +221,22 @@ def _ocr_image_blob(blob: bytes) -> str:
     return ocr_svc.ocr_image_to_text(img).strip()
 
 
-def _ocr_pdf_page_images(pdf_path: str, page_index: int, seen_xrefs: set) -> list[str]:
-    """OCR 某页的内嵌图片，返回各图识别文本列表（空文本不计入），并登记已处理的 xref。
+def _ocr_pdf_page_images(pdf_path: str, page_index: int, seen_xrefs: set) -> list[tuple]:
+    """OCR 某页的内嵌图片，返回 (识别文本, 页内位置) 对列表（空文本不计入），并登记已处理的 xref。
 
     用于「有文本层」的页——文本层能拿到正文，但页内插图（图表/公式/流程图截图）里的
     文字不会被 `extract_text` 提取，需单独 OCR 补全。
+    页内位置为归一化 "x0,y0,x1,y1" 或空串（取不到时），随块落库为 img_rect。
     """
     from . import ocr as ocr_svc
     texts = []
-    for xref, img in _extract_pdf_page_images(pdf_path, page_index):
+    for xref, img, rect in _extract_pdf_page_images(pdf_path, page_index):
         if xref in seen_xrefs:
             continue
         seen_xrefs.add(xref)
         t = ocr_svc.ocr_image_to_text(img)
         if t.strip():
-            texts.append(t)
+            texts.append((t, rect))
     return texts
 
 
@@ -783,7 +798,7 @@ def _load_whisper_slot(slot: int, allow_download: bool = True):
     ⚠️ `allow_download=False` 时**绝不**走「无模型就下载 base」兜底，直接抛
         `RuntimeError("[NEED_ASR]...")`。口述作答（transcribe_short）必须走这条路：
         用户正等着填答案，静默拉 145MB 既无进度也不可控。
-        路由层的 `installed_size()` 预判存在 TOCTOU 窗口（判完到真正加载之间模型被删），
+        路由层的 `installed_variant()` 预判存在 TOCTOU 窗口（判完到真正加载之间模型被删），
         这里才是**机制上**的最后一道闸。"""
     from . import asr as asr_svc
     from ..core.config import settings
@@ -907,7 +922,7 @@ def transcribe_short(path: str) -> str:
         并发闸，不会在批量导入音频时又压上第二个模型实例把 CPU 抢死。
     ⚠️ 本函数**从机制上**禁止「模型没装就自动下载」（allow_download=False）：那是
         parse_media 材料导入路径的兜底。语音作答要求模型已就绪（路由层先判
-        asr.installed_size()），避免用户等答案时被静默拖走 145MB 流量。
+        asr.installed_variant()），避免用户等答案时被静默拖走 145MB 流量。
         ⚠️ 只靠路由层那一次判断不够：判完到真正加载之间有 TOCTOU 窗口（模型被删/换盘）。
     """
     with _transcribe_sem:

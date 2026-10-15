@@ -134,7 +134,13 @@ def is_installed() -> bool:
         return False
 
 
-def installed_size() -> str:
+def installed_variant() -> str:
+    """已安装时返回**版本规格**（本模型只有一档 → 模型 key），未装返回 ""。
+
+    ⚠️ 曾用名 installed_size：语义是「版本标识」不是「体积」，与
+       asr.installed_variant 保持一致；接口字段同步改名，
+       免得将来 UI 拿它显示「已下载 195MB」（实际值是 "zipvoice"）。
+    """
     return _MODEL_KEY if is_installed() else ""
 
 
@@ -145,7 +151,7 @@ def get_models_status() -> dict:
             for k in (_MODEL_KEY,)
         ],
         "installed": is_installed(),
-        "installed_size": installed_size(),
+        "installed_variant": installed_variant(),
         "downloading": _state["downloading"],
         "downloading_size": _state["size"],
         "download_progress": _state["progress"],

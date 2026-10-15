@@ -176,12 +176,14 @@ const NOTE_TAG = {
   chat: '问答笔记', ai_asset: 'AI 生成',
   weekly_report: 'AI 周报', podcast_script: 'AI 播客脚本',
   podcast_brief: 'AI 播客简报',
+  video_script: 'AI 视频文稿',
 }
 const noteTagLabel = (t) => NOTE_TAG[t] || '手动'
 const noteTagClass = (t) => ({
   'is-ai': t === 'ai_asset', 'is-chat': t === 'chat',
   'is-report': t === 'weekly_report', 'is-podcast': t === 'podcast_script',
   'is-brief': t === 'podcast_brief',
+  'is-video': t === 'video_script',
 })
 
 // ---------- 草稿（localStorage）：30s 定时 + 关闭时落盘 ----------
@@ -572,6 +574,8 @@ function adoptTransform() {
 .nd-src-tag.is-report { background: rgba(217, 119, 6, .12); color: #b45309; }
 .nd-src-tag.is-podcast { background: rgba(74, 114, 212, .12); color: #3f63c4; }
 .nd-src-tag.is-brief { background: rgba(162, 28, 175, .12); color: #a21caf; }
+/* 视频文稿：与播客 / 简报必须能一眼分开 → 用青（白底 4.6:1） */
+.nd-src-tag.is-video { background: rgba(8, 145, 178, .12); color: #0891b2; }
 .ne-save-state {
   display: inline-flex; align-items: center; gap: 6px;
   font-size: 12px; color: var(--asc-text-3); white-space: nowrap;

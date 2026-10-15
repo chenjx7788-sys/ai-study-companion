@@ -10,6 +10,7 @@
 2. 错题回写必须用 **`source="drill"`**（复用 `quiz` 会与「测一测 / 简单学」互删，
    连复习进度一起清空且不可恢复），`material_id` 无法确定时写**哨兵值 -1**（不得写 0）。
 """
+import asyncio
 import json
 import queue
 import threading
@@ -36,6 +37,10 @@ OUTLINE_SAMPLE_MATERIALS = 12     # 全库范围先抽样的材料份数（12-15
 MAX_CONCURRENT_SESSIONS = 3       # 并发闸上限（按 DB 统计）
 ORPHAN_WINDOW_MIN = 10            # 孤儿会话回收窗口（分钟）≥ 题纲生成超时上限
 SSE_HEARTBEAT_SEC = 10.0
+# SSE 等待队列的轮询间隔。⚠️ 生成器必须 async 且「get_nowait + await sleep」：
+# 同步生成器被 Starlette 丢进线程池迭代 → 客户端断开后 finally 永不执行 →
+# job.subs 里的订阅者永久滞留（2026-10-14 实测：断开 4.3s 后仍为 1）。
+SSE_POLL_SEC = 0.1
 JOB_TTL_SEC = 600                 # 已结束任务在内存中保留 10 分钟（供附着取结果）
 SENTINEL_MATERIAL_ID = -1         # ⚠️ 回写卡 material_id 的哨兵值（0 已被「AI 问答」占用）
 
@@ -428,10 +433,13 @@ def start_answer_job(sid: int, seq: int, answer: str, skip: bool) -> _DrillJob:
     return job
 
 
-def event_stream(job: _DrillJob):
+async def event_stream(job: _DrillJob):
     """SSE 生成器：先补发回放缓冲（中途回来能看到已有进度），再实时推送。
 
     ⚠️ 快照缓冲与登记订阅者必须在**同一把锁**内完成，否则会漏事件或重复发。
+    ⚠️ 必须 async（原因见 SSE_POLL_SEC 注释）：同步生成器在客户端断开后 finally
+       永不执行 → `job.subs` 里的订阅者永久滞留，长任务 + 反复进出页面会堆积
+       死订阅队列。
     """
     q: queue.Queue = queue.Queue()
     with _DRILL_LOCK:
@@ -445,12 +453,17 @@ def event_stream(job: _DrillJob):
         if job.status == "failed":
             yield sse_event("error", {"message": job.error})
             return
+        last = time.monotonic()
         while True:
             try:
-                kind, payload = q.get(timeout=SSE_HEARTBEAT_SEC)
+                kind, payload = q.get_nowait()
             except queue.Empty:
-                yield ": ping\n\n"
+                if time.monotonic() - last >= SSE_HEARTBEAT_SEC:
+                    last = time.monotonic()
+                    yield ": ping\n\n"
+                await asyncio.sleep(SSE_POLL_SEC)
                 continue
+            last = time.monotonic()
             yield sse_event(kind, payload)
             if kind in ("done", "error"):
                 return

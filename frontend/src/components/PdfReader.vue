@@ -13,13 +13,15 @@
       <div class="page-inner" :ref="el => { if (el) innerRefs[pageNum] = el }">
         <canvas :ref="el => { if (el) canvasRefs[pageNum] = el }"></canvas>
         <div :ref="el => { if (el) textLayerRefs[pageNum] = el }" class="textLayer"></div>
+        <!-- 图级定位闪烁框（「在原文中查看」带 img_rect 时）：% 定位挂在 page-inner，重排自动跟随 -->
+        <div v-if="flashBox && flashBox.page === pageNum" class="pdf-img-flash" :style="flashBoxStyle(flashBox.rect)"></div>
       </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, shallowRef, onMounted, onUnmounted } from 'vue'
+import { ref, shallowRef, onMounted, onUnmounted, watch } from 'vue'
 import { Loading } from '@element-plus/icons-vue'
 import * as pdfjs from 'pdfjs-dist'
 import { TextLayer } from 'pdfjs-dist'
@@ -33,6 +35,7 @@ const props = defineProps({
   url: { type: String, required: true },
   footprints: { type: Object, default: () => ({}) },   // { pageNo: {chain:n, note:n} }
   highlights: { type: Array, default: () => [] },      // [{page_no, selected_text, color}]
+  flashRect: { type: Object, default: null },          // { page, rect:[x0,y0,x1,y1] } 图级定位闪烁（归一化坐标）
 })
 
 const emit = defineEmits(['mouseup', 'scroll'])
@@ -57,6 +60,31 @@ const pageTasks = {}   // 每页渲染任务串行化：避免懒渲染与重排
 let scale = 1
 
 const fp = (pageNum) => props.footprints?.[pageNum] || null
+
+// ---- 图级定位闪烁框：props.flashRect 变化时，等目标页渲染完（canvas 有 CSS 尺寸）再挂框，
+//      否则 % 定位会按未渲染画布的默认尺寸（300x150）错位；3 秒后自动消失 ----
+const flashBox = ref(null)   // { page, rect }
+let flashTimer = null
+const flashBoxStyle = (r) => ({
+  left: (r[0] * 100) + '%', top: (r[1] * 100) + '%',
+  width: ((r[2] - r[0]) * 100) + '%', height: ((r[3] - r[1]) * 100) + '%',
+})
+function armFlashBox(v) {
+  let tries = 0
+  const tick = () => {
+    const pageEl = wrapRef.value?.querySelector(`.pdf-page[data-page="${v.page}"]`)
+    const canvas = pageEl?.querySelector('canvas')
+    if (canvas && canvas.style.width) {          // 已渲染 → % 定位才有正确基准
+      flashBox.value = { page: v.page, rect: v.rect }
+      clearTimeout(flashTimer)
+      flashTimer = setTimeout(() => { flashBox.value = null }, 3000)
+      return
+    }
+    if (++tries < 40) setTimeout(tick, 150)      // 懒渲染等待上限 6s
+  }
+  tick()
+}
+watch(() => props.flashRect, (v) => { if (v && v.rect) armFlashBox(v) }, { immediate: true })
 
 async function renderPage(pageNum) {
   const page = await doc.getPage(pageNum)
@@ -201,6 +229,7 @@ async function load() {
 
 onMounted(load)
 onUnmounted(() => {
+  clearTimeout(flashTimer)
   clearTimeout(resizeTimer)
   resizeObserver?.disconnect()
   observer?.disconnect()
@@ -218,6 +247,14 @@ onUnmounted(() => {
 .page-inner { position: relative; }
 .pdf-page canvas { display: block; }
 .textLayer { position: absolute; inset: 0; }
+/* 图级定位闪烁框：归一化坐标 % 定位在 page-inner 上；闪烁 3 次（与 3s 自动消失同步） */
+.pdf-img-flash {
+  position: absolute; pointer-events: none; z-index: 5;
+  border: 2px solid var(--asc-primary, #7c5cfc);
+  background: rgba(124, 92, 252, .12); border-radius: 4px;
+  animation: pdfImgFlash 1s ease-in-out 3;
+}
+@keyframes pdfImgFlash { 0%, 100% { opacity: .25 } 50% { opacity: 1 } }
 .pdf-reader ::selection { background: rgba(124, 92, 252, .25); }
 
 /* 足迹标记 */

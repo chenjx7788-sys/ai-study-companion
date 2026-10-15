@@ -338,6 +338,7 @@ const NOTE_TYPE_FILTERS = [
   { key: 'weekly_report', label: '周报' },
   { key: 'podcast_script', label: '播客' },
   { key: 'podcast_brief', label: '简报' },
+  { key: 'video_script', label: '视频' },
   { key: 'manual', label: '手动' },
 ]
 const typeFilter = ref('all')
@@ -345,12 +346,14 @@ const typeFilter = ref('all')
 const visibleTypeFilters = computed(() => NOTE_TYPE_FILTERS.filter(t => typeCount(t.key) > 0))
 
 // 来源徽章：卡片上短标签 / 弹窗里长标签，共用一份映射，避免两处口径漂移
-const SRC_PILL = { chat: '问答', ai_asset: 'AI', weekly_report: '周报', podcast_script: '播客', podcast_brief: '简报' }
+const SRC_PILL = { chat: '问答', ai_asset: 'AI', weekly_report: '周报',
+  podcast_script: '播客', podcast_brief: '简报', video_script: '视频' }
 const srcPillLabel = (t) => SRC_PILL[t] || '手动'
 const srcPillClass = (t) => ({
   ai: t === 'ai_asset', chat: t === 'chat',
   report: t === 'weekly_report', podcast: t === 'podcast_script',
   brief: t === 'podcast_brief',
+  video: t === 'video_script',
 })
 const filteredNotes = computed(() =>
   typeFilter.value === 'all'
@@ -624,6 +627,8 @@ onMounted(async () => {
 .kb-src-pill.podcast { background: rgba(74, 114, 212, .12); color: #3f63c4; }
 /* 简报：与「播客脚本」同属播客产物但必须能一眼分开 → 用品红（白底 5.3:1） */
 .kb-src-pill.brief { background: rgba(162, 28, 175, .12); color: #a21caf; }
+/* 视频文稿：与播客 / 简报必须能一眼分开 → 用青（白底 4.6:1） */
+.kb-src-pill.video { background: rgba(8, 145, 178, .12); color: #0891b2; }
 .kb-note-content {
   flex: 1; font-size: 13px; color: var(--asc-text-2); line-height: 1.7; margin-bottom: 12px;
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;

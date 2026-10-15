@@ -1,5 +1,5 @@
 <template>
-  <div class="docx-origin">
+  <div class="docx-origin" @scroll.passive="e => emit('scroll', e)">
     <div v-if="loading" class="docx-state">
       <el-icon class="is-loading"><Loading /></el-icon>
       <span>正在还原原文版面…</span>
@@ -25,14 +25,18 @@
  * - 采用动态 import，docx-preview + jszip 单独打包成一个 chunk，不拖累首屏
  * - styleContainer 传 undefined → 文档样式注入到宿主容器内，不污染全局样式
  * - 仅支持 OOXML（.docx）；旧版 .doc 无法解析，由父组件控制入口是否出现
- * - 该视图为只读呈现，不参与划线/阅读进度（文本视图才承载这些能力）
+ * - 该视图为只读呈现，不参与划线；阅读进度仍以文本视图为准（本视图没有页锚点）
+ * - 但**参与目录跟随**：渲染后给标题段落打 data-section 锚点，父组件据此高亮 / 跳转（见 tagSections）
  */
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { Loading } from '@element-plus/icons-vue'
 
 const props = defineProps({
   url: { type: String, required: true },
+  sections: { type: Array, default: () => [] },   // 目录条目（章节标题原文），用于打段落锚点
 })
+
+const emit = defineEmits(['scroll', 'ready'])
 
 const host = ref(null)
 const loading = ref(true)
@@ -54,6 +58,33 @@ function fitWidth() {
   wrap.style.zoom = pageWidth > avail ? String(Math.max(avail / pageWidth, 0.3)) : ''
 }
 
+// 章节锚点：给「文本等于目录条目」的标题段落打 data-section，供父组件做目录跟随 / 目录跳转。
+//
+// 为什么不用页号：docx 的 page_no 由后端按 ~700 字/页估算（python-docx 拿不到真实页码），
+//   实测同一份方案书的 23 个章节 page_no 全是 1 → 页级映射不可用。
+// 为什么能按文本匹配：后端解析时 section_path 取的就是标题段落的纯文本（parser.parse_docx），
+//   与这里 textContent 归一化后逐一相等；docx-preview 渲染出的标题**没有语义标签**
+//   （实测是 <p class="docx_1">，类名是 Word 样式 id，中文模板下不可依赖）。
+// 顺序推进：同名正文段落不会被误标 —— 每个标题只认「上一个命中之后的第一个」匹配。
+function norm(s) { return (s || '').replace(/\s+/g, ' ').trim() }
+
+function tagSections() {
+  const titles = (props.sections || []).filter(Boolean)
+  if (!titles.length || !host.value) return
+  const paras = [...host.value.querySelectorAll('p')]
+  let pi = 0
+  for (const title of titles) {
+    const want = norm(title)
+    for (; pi < paras.length; pi++) {
+      if (norm(paras[pi].textContent) === want) {
+        paras[pi].setAttribute('data-section', title)
+        pi++
+        break
+      }
+    }
+  }
+}
+
 async function render() {
   if (!host.value) return
   loading.value = true
@@ -73,7 +104,9 @@ async function render() {
       renderFooters: true,
       renderFootnotes: true,
     })
+    tagSections()
     fitWidth()
+    emit('ready')
   } catch (e) {
     if (!cancelled) error.value = String(e?.message || e)
   } finally {

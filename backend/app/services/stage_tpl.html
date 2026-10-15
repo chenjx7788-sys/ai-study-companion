@@ -323,6 +323,23 @@ img.th-photo.th-alpha {
 .screen[data-skin="talking_head"][data-inner="graph"] .kpanel { display: none; }
 
 /* =========================================================================
+   结构图系三皮肤：再移除「顶部圆点进度」与「页码胶囊」（2026-10-15 产品决策）
+   与上方镜头标签/章节栏同一理由：圆点（到第几段）与页码（01 / 16）都是**制作态**
+   信息，出现在给学生看的教学成片里既冗余又抢注意力。
+   ⚠️ 范围**只有** graph / graph_paper / graph_clean 三皮肤（用户点名）——
+      口播·结构图（talking_head+graph）与 source 系**不在**本次范围。
+   ⚠️ 只改**显示**、不动 DOM 与 JS：#dots / #badge 的元素与更新逻辑原样保留，
+      回退只需删掉下面这段选择器。
+   ⚠️ 顶部 2px 的 .progress 细进度条**保留**（用户未点名，它是唯一的时间进度指示）。
+   ========================================================================= */
+.screen[data-skin="graph"] .dots,
+.screen[data-skin="graph_paper"] .dots,
+.screen[data-skin="graph_clean"] .dots,
+.screen[data-skin="graph"] .badge,
+.screen[data-skin="graph_paper"] .badge,
+.screen[data-skin="graph_clean"] .badge { display: none; }
+
+/* =========================================================================
    结构图 · 纸感主题（graph_paper）——《结构图纸感皮肤改造方案 V0.1》
    ⚠️ 色值**全部显式写死**：本项目「颜色类」（c-teal 之类）未实现，写类名会掉成黑色。
    ⚠️ 文字色与装饰色**分开**：青绿装饰 #4B9B8B 在纸底只有 **3.00:1** → 只配画线/描边；

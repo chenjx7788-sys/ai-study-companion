@@ -252,7 +252,7 @@ async def transcribe(file: UploadFile = File(...)):
     from ..services import asr as asr_svc
     from ..services import parser as parser_svc
 
-    if asr_svc.installed_size() is None:
+    if asr_svc.installed_variant() is None:
         raise HTTPException(400, "[NEED_ASR]语音模型尚未下载，请到「管理中心 → 语音模型」下载后重试")
 
     data = await file.read()

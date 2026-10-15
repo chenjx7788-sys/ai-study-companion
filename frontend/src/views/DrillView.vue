@@ -163,7 +163,7 @@
 
     <!-- ==================== ③ 会话态 / ④ 成绩单（共用逐题区） ==================== -->
     <template v-else>
-      <div class="flow-head">
+      <div class="flow-head" :class="{ 'flow-wide': view === 'session' && outline.length }">
         <span class="flow-back" @click="backToList">← 返回</span>
         <span class="flow-title" :title="(current || {}).title">{{ (current || {}).title }}</span>
         <span class="flow-progress" :class="{ done: view === 'result' }">
@@ -227,9 +227,10 @@
       </div>
 
       <!-- 考点清单 -->
-      <div v-if="view === 'session' && outline.length" class="outline-bar">
+      <div v-if="view === 'result' && outline.length" class="outline-bar in-result">
         <span v-for="(p, i) in outline" :key="i" class="outline-chip"
-          :class="{ active: i === currentOutlineIndex, done: i < currentOutlineIndex }">
+          :class="{ active: i === currentOutlineIndex, done: i < currentOutlineIndex }"
+          @click="jumpToOutline(i)">
           <b>{{ i + 1 }}</b>{{ p.point }}
         </span>
       </div>
@@ -256,61 +257,101 @@
         <el-button size="small" @click="backToList">返回列表</el-button>
       </div>
 
-      <!-- 逐题区 -->
-      <div class="turn-list" ref="bodyRef">
-        <div v-for="t in turns" :key="t.id" class="turn">
-          <!-- 题干 -->
-          <div class="q-block">
-            <span class="q-tag" :class="{ followup: t.is_followup }">
-              {{ t.is_followup ? '追问' : '考点 ' + ((t.outline_index || 0) + 1) }}
-            </span>
-            <span v-if="t.source_title" class="q-src" :title="t.source_title">出处：{{ t.source_title }}</span>
-            <span v-if="diffBadge(t)" class="q-diff" :class="diffBadge(t).cls"
-              :title="diffBadge(t).tip">{{ diffBadge(t).label }}</span>
-            <div class="q-text">{{ t.question }}</div>
+      <!-- 作答态三栏聚焦：左步骤轨 / 中当前题 / 右状态轨；成绩单为单栏（focus-grid 不生效） -->
+      <div class="focus-wrap" :class="{ 'focus-grid': view === 'session' && outline.length }">
+        <aside v-if="view === 'session' && outline.length" class="focus-steps">
+          <div class="fs-title">本局进度</div>
+          <div v-for="(p, i) in outline" :key="i" class="fs-step"
+            :class="{ done: i < currentOutlineIndex, cur: i === displayedOutline, locked: i > currentOutlineIndex }"
+            @click="focusStep(i)">
+            <span class="fs-ico">{{ i < currentOutlineIndex ? '✓' : i + 1 }}</span>
+            <span class="fs-text">{{ p.point }}</span>
+            <span v-if="i === currentOutlineIndex && currentTurn && currentTurn.is_followup" class="fs-follow">· 追问</span>
           </div>
-
-          <!-- 我的作答 -->
-          <div v-if="t.user_answer !== null" class="a-block">
-            <div class="a-label">我的作答</div>
-            <div class="a-text" :class="{ skipped: t.skipped }">
-              {{ t.skipped || t.user_answer === '' ? '（本题已跳过）' : t.user_answer }}
-            </div>
+          <div class="fs-step fs-final" :class="{ cur: phase === 'scoring' || phase === 'finished' }">
+            <span class="fs-ico">◆</span><span class="fs-text">结算</span>
           </div>
-
-          <!-- 评分卡 -->
-          <div v-if="t._pending" class="score-card pending">
-            <span class="stage-spinner"></span>{{ stageText || 'AI 正在评分…' }}
+        </aside>
+        <main class="focus-main">
+          <div v-if="view === 'session' && outline.length" class="focus-heading">
+            考点 {{ displayedOutline + 1 }} · {{ (outline[displayedOutline] || {}).point || '' }}
           </div>
-          <div v-else-if="t.user_answer !== null && t.skipped" class="score-card skipped">
-            <svg class="sc-ico" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6" /><path d="M5 8h6" stroke-linecap="round" /></svg>
-            <span class="sc-verdict-skipped">{{ t.comment || '本题已跳过' }} · 未计入总分</span>
+          <div v-if="peeking" class="peek-bar">
+            正在回看考点 {{ displayedOutline + 1 }} 的作答
+            <el-button size="small" text type="primary" @click="focusOutline = null">回到当前题 →</el-button>
           </div>
-          <div v-else-if="t.user_answer !== null && t.score != null" class="score-card" :class="t.verdict">
-            <div class="score-head">
-              <span class="score-num" :style="{ color: scoreColor(t.score) }">{{ t.score }}</span>
-              <span class="score-verdict" :class="t.verdict">{{ verdictLabel(t.verdict) }}</span>
-              <div class="score-dims">
-                <span v-for="d in dimsOf(t)" :key="d.name" class="dim">
-                  <i>{{ d.name }}</i>
-                  <span class="dim-bar"><span class="dim-fill" :style="{ width: d.value + '%', background: scoreColor(d.value) }"></span></span>
-                  <b>{{ d.value }}</b>
+          <!-- 逐题区（作答态只渲染当前考点这一串；成绩单渲染全部） -->
+          <div class="turn-list" ref="bodyRef">
+        <div v-for="t in displayedTurns" :key="t.id" class="turn" :class="{ 'turn-ph': t.is_placeholder }" :data-ol="t.outline_index">
+          <!-- 题干：教练气泡（左） -->
+          <div class="msg msg-coach">
+            <img :src="mascot" class="msg-avatar" alt="知萤教练" />
+            <div class="msg-main">
+              <div class="msg-meta">
+                <span class="msg-name">知萤教练</span>
+                <span class="q-tag" :class="{ followup: t.is_followup }">
+                  {{ t.is_followup ? '追问' : '考点 ' + ((t.outline_index || 0) + 1) }}
                 </span>
+                <span v-if="t.is_placeholder" class="q-tag ph">未作答</span>
+                <span v-if="diffBadge(t)" class="q-diff" :class="diffBadge(t).cls"
+                  :title="diffBadge(t).tip">{{ diffBadge(t).label }}</span>
+              </div>
+              <div class="msg-bubble coach">
+                <div class="q-text">{{ t.question }}</div>
+                <div v-if="t.is_placeholder" class="ph-note">本场未作答这道题 —— 以上是该考点的考查要点</div>
+                <div v-if="t.source_title" class="q-src" :title="t.source_title">出处：{{ t.source_title }}</div>
               </div>
             </div>
-            <p v-if="t.comment" class="score-comment">{{ t.comment }}</p>
-            <div v-if="t.missing_points && t.missing_points.length" class="score-miss">
-              <div class="score-sub-label">未覆盖的要点</div>
-              <ul><li v-for="(p, i) in t.missing_points" :key="i">{{ p }}</li></ul>
-            </div>
-            <div v-if="t.expected_points && t.expected_points.length" class="score-expect">
-              <div class="score-sub-label">参考答案要点</div>
-              <ul><li v-for="(p, i) in t.expected_points" :key="i">{{ p }}</li></ul>
+          </div>
+
+          <!-- 我的作答：右侧气泡 -->
+          <div v-if="t.user_answer !== null" class="msg msg-user">
+            <div class="msg-main">
+              <div class="msg-bubble user" :class="{ skipped: t.skipped }">
+                {{ t.skipped || t.user_answer === '' ? '（本题已跳过）' : t.user_answer }}
+              </div>
             </div>
           </div>
-          <div v-else-if="t.user_answer !== null && !t._pending" class="score-card failed">
-            <svg class="sc-ico" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6" /><path d="M8 5v3.5" stroke-linecap="round" /><circle cx="8" cy="10.8" r=".8" fill="currentColor" /></svg>
-            <span class="sc-verdict-failed">本题评分失败，未计入总分</span>
+
+          <!-- 评分：教练点评气泡（左） -->
+          <div v-if="t._pending || t.user_answer !== null" class="msg msg-coach">
+            <img :src="mascot" class="msg-avatar" alt="知萤教练" />
+            <div class="msg-main">
+              <div class="msg-meta"><span class="msg-name">知萤教练</span></div>
+              <div v-if="t._pending" class="msg-bubble coach score-card pending">
+                <span class="stage-spinner"></span>{{ stageText || 'AI 正在评分…' }}
+              </div>
+              <div v-else-if="t.user_answer !== null && t.skipped" class="msg-bubble coach score-card skipped">
+                <svg class="sc-ico" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6" /><path d="M5 8h6" stroke-linecap="round" /></svg>
+                <span class="sc-verdict-skipped">{{ t.comment || '本题已跳过' }} · 未计入总分</span>
+              </div>
+              <div v-else-if="t.user_answer !== null && t.score != null" class="msg-bubble coach score-card" :class="t.verdict">
+                <div class="score-head">
+                  <span class="score-num" :style="{ color: scoreColor(t.score) }">{{ t.score }}</span>
+                  <span class="score-verdict" :class="t.verdict">{{ verdictLabel(t.verdict) }}</span>
+                  <div class="score-dims">
+                    <span v-for="d in dimsOf(t)" :key="d.name" class="dim">
+                      <i>{{ d.name }}</i>
+                      <span class="dim-bar"><span class="dim-fill" :style="{ width: d.value + '%', background: scoreColor(d.value) }"></span></span>
+                      <b>{{ d.value }}</b>
+                    </span>
+                  </div>
+                </div>
+                <p v-if="t.comment" class="score-comment">{{ t.comment }}</p>
+                <div v-if="t.missing_points && t.missing_points.length" class="score-miss">
+                  <div class="score-sub-label">未覆盖的要点</div>
+                  <ul><li v-for="(p, i) in t.missing_points" :key="i">{{ p }}</li></ul>
+                </div>
+                <div v-if="t.expected_points && t.expected_points.length" class="score-expect">
+                  <div class="score-sub-label">参考答案要点</div>
+                  <ul><li v-for="(p, i) in t.expected_points" :key="i">{{ p }}</li></ul>
+                </div>
+              </div>
+              <div v-else-if="t.user_answer !== null && !t._pending" class="msg-bubble coach score-card failed">
+                <svg class="sc-ico" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6" /><path d="M8 5v3.5" stroke-linecap="round" /><circle cx="8" cy="10.8" r=".8" fill="currentColor" /></svg>
+                <span class="sc-verdict-failed">本题评分失败，未计入总分</span>
+              </div>
+            </div>
           </div>
 
           <!-- 作答区（仅当前待答的那一题） -->
@@ -344,6 +385,28 @@
         <div v-if="view === 'session' && phase === 'question' && !turns.length" class="turn-empty">
           正在准备第一道题…
         </div>
+          </div>
+        </main>
+        <aside v-if="view === 'session' && outline.length" class="focus-rail">
+          <div class="fr-card">
+            <div class="fr-title">难度自适应</div>
+            <template v-if="(current || {}).adapt">
+              <div class="fr-line">当前难度 <b>{{ DIFF_LABEL[normDiff((currentTurn || {}).difficulty)] || '按题纲' }}</b></div>
+              <div v-if="latestShift" class="fr-event">{{ latestShift.label }}<span class="fr-why">{{ latestShift.tip }}</span></div>
+              <div v-else class="fr-none">与题纲一致，未触发调整</div>
+            </template>
+            <div v-else class="fr-none">本场未开启（新建陪练时可打开）</div>
+          </div>
+          <div class="fr-card">
+            <div class="fr-title">薄弱点</div>
+            <div class="fr-line">已记录 <b>{{ weakPoints.length }}</b> 条</div>
+            <div v-if="weakPoints.length" class="fr-none">最近：{{ weakPoints[weakPoints.length - 1] }}</div>
+          </div>
+          <div class="fr-card">
+            <div class="fr-title">口述作答</div>
+            <div class="fr-none">本地模型转写，音频不出设备</div>
+          </div>
+        </aside>
       </div>
 
       <!-- 成绩单底部操作 -->
@@ -521,6 +584,50 @@ const unansweredTurn = computed(() => {
   return null
 })
 
+// ---------- 作答态三栏聚焦 ----------
+// focusOutline：null = 跟随最新进度；点左侧步骤 = 回看该考点（peek）
+const focusOutline = ref(null)
+const displayedOutline = computed(() => (
+  focusOutline.value != null ? focusOutline.value : currentOutlineIndex.value
+))
+// 中栏只渲染当前考点这一串问答（主考点 + 它的追问）；成绩单仍渲染全部
+const displayedTurns = computed(() => {
+  if (view.value !== 'session') {
+    // 成绩单：把「未出题/未作答」的考点补成占位卡，让考点条每一项都可点可看（优化：点击题目查看相关内容）
+    if (!outline.value.length) return turns.value
+    const covered = new Set(turns.value.map((t) => t.outline_index || 0))
+    const ph = []
+    outline.value.forEach((p, i) => {
+      if (covered.has(i)) return
+      ph.push({
+        id: 'ph-' + i, seq: 900 + i, outline_index: i, is_placeholder: true,
+        question: p.point, difficulty: p.difficulty, is_followup: false,
+        user_answer: null, score: null, verdict: null, dimensions: null,
+        comment: '', missing_points: [], expected_points: [],
+        source_title: '', skipped: false, _pending: false,
+      })
+    })
+    if (!ph.length) return turns.value
+    return turns.value.concat(ph).sort(
+      (a, b) => ((a.outline_index || 0) - (b.outline_index || 0)) || ((a.seq || 0) - (b.seq || 0)))
+  }
+  return turns.value.filter((t) => (t.outline_index || 0) === displayedOutline.value)
+})
+const peeking = computed(() => (
+  view.value === 'session' && focusOutline.value != null && focusOutline.value !== currentOutlineIndex.value
+))
+const currentTurn = computed(() => unansweredTurn.value || turns.value[turns.value.length - 1] || null)
+// 状态轨·薄弱点：已评分题的漏点按出场顺序聚合
+const weakPoints = computed(() => turns.value.flatMap((t) => t.missing_points || []))
+// 状态轨·最近一次难度调整（复用 diffBadge 复算口径；注册期 turns 为空 → 不会真调 diffBadge）
+const latestShift = computed(() => {
+  for (let i = turns.value.length - 1; i >= 0; i--) {
+    const b = diffBadge(turns.value[i])
+    if (b) return b
+  }
+  return null
+})
+
 const refsKey = computed(() => (
   form.scope + '|' + form.materialIds.join(',') + '|'
   + form.noteIds.join(',') + '|' + form.folderIds.join(',')
@@ -691,7 +798,7 @@ watch(refsKey, () => {
 function statusOf(s) { return STATUS_MAP[s] || { label: s || '—', cls: 'draft' } }
 function verdictLabel(v) { return VERDICT_MAP[v] || '' }
 function scoreColor(s) {
-  if (s == null) return 'var(--asc-text-3)'
+  if (s == null) return 'var(--asc-text-2)'   // 占位也用 4.68 对比度（text-3 仅 2.4，空分「—分」曾实测违规）
   if (s >= 80) return '#2e9e5b'
   if (s >= 60) return '#b45309'
   return '#d64545'
@@ -774,7 +881,24 @@ function relTime(iso) {
   return d.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
 }
 function scrollBottom() {
-  nextTick(() => { if (bodyRef.value) bodyRef.value.scrollTop = bodyRef.value.scrollHeight })
+  nextTick(() => {
+    if (!bodyRef.value) return
+    // .turn-list 没有 overflow、不是滚动容器，scrollTop 赋值是 no-op（曾致「答完自动滚到底」从未生效）；
+    // 真正的滚动容器是 el-main（.app-main，与 ReviewView 的 contentScroller 同一口径）
+    const scroller = document.querySelector('.app-main')
+    if (scroller) scroller.scrollTop = scroller.scrollHeight
+  })
+}
+// 步骤轨点击：只允许看「已有题」的考点（当前 + 已答过的）；未来考点没有内容可看 → 锁定
+function focusStep(i) {
+  if (i > currentOutlineIndex.value) return
+  focusOutline.value = i
+}
+// 考点条点击 → 平滑滚动到该考点的第一题（追问与主考点共享 data-ol，取首个即考点起点）
+function jumpToOutline(i) {
+  const host = bodyRef.value
+  const el = host && host.querySelector('[data-ol="' + i + '"]')
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 // 把表单范围转成后端约定的 scope_refs：[{type,id,title}]
@@ -923,6 +1047,7 @@ function onQuestion(p) {
   if (p.progress) { progress.cur = p.progress.cur; progress.total = p.progress.total }
   phase.value = 'question'
   answer.value = ''
+  focusOutline.value = null        // 新题到达 → 退出回看，跟随到最新一题
   scrollBottom()
 }
 
@@ -1584,7 +1709,8 @@ onUnmounted(() => {
 }
 .session-card {
   background: var(--asc-card); border: 1px solid var(--asc-border);
-  border-radius: 14px; padding: 14px 16px; cursor: pointer;
+  border-radius: 16px; padding: 16px 18px; cursor: pointer;
+  box-shadow: 0 1px 2px rgba(31, 35, 41, .03);
   transition: box-shadow .18s ease, transform .18s ease, border-color .18s ease;
 }
 .session-card:hover {
@@ -1630,12 +1756,13 @@ onUnmounted(() => {
 .cr-back:hover, .flow-back:hover { color: var(--asc-primary); }
 .cr-card {
   background: var(--asc-card); border: 1px solid var(--asc-border);
-  border-radius: 14px; padding: 10px 22px;
+  border-radius: 16px; padding: 8px 24px;
 }
 .cr-row {
   display: flex; align-items: center; gap: 14px;
-  padding: 15px 0;
+  padding: 16px 0;
 }
+.cr-row + .cr-row { border-top: 1px solid var(--asc-divider); }
 .cr-row-block { align-items: flex-start; }
 .cr-label {
   flex-shrink: 0; width: 84px; font-size: 13px; font-weight: 600; color: var(--asc-text);
@@ -1658,7 +1785,10 @@ onUnmounted(() => {
 
 /* ===== 会话 / 成绩单 ===== */
 .flow-head {
-  display: flex; align-items: center; gap: 12px; margin-bottom: 14px;
+  display: flex; align-items: center; gap: 12px;
+  max-width: 840px; margin: 0 auto 10px;
+  position: sticky; top: 0; z-index: 6;
+  background: var(--asc-bg); padding: 8px 0 10px;
 }
 .flow-title {
   flex: 1; min-width: 0; font-size: 16px; font-weight: 600; color: var(--asc-text);
@@ -1673,7 +1803,9 @@ onUnmounted(() => {
 .rs-hero {
   background: linear-gradient(160deg, rgba(124, 92, 252, .08), rgba(124, 92, 252, .015) 55%, var(--asc-card) 80%);
   border: 1px solid var(--asc-border);
-  border-radius: 16px; padding: 26px 24px 22px; margin-bottom: 16px;
+  border-radius: 16px; padding: 26px 24px 22px;
+  max-width: 840px; margin: 0 auto 16px;
+  animation: msgIn .25s ease-out both;
 }
 .rs-score { font-size: 44px; font-weight: 700; line-height: 1; letter-spacing: -.5px; }
 .rs-unit { font-size: 15px; font-weight: 500; margin-left: 4px; }
@@ -1694,30 +1826,44 @@ onUnmounted(() => {
 .rs-writeback.muted { color: var(--asc-text-2); }
 
 .outline-bar {
-  display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px;
+  display: flex; flex-wrap: wrap; gap: 6px;
+  max-width: 840px; margin: 0 auto 14px;
+  position: sticky; top: 52px; z-index: 5;
+  background: var(--asc-bg); padding: 4px 0;
 }
-.outline-note { font-size: 12.5px; color: var(--asc-text-2); margin: -6px 0 12px; }
+.outline-bar.in-result .outline-chip.done { opacity: 1; }
+.outline-note { font-size: 12.5px; color: var(--asc-text-2); margin: -6px auto 12px; max-width: 840px; }
 .outline-note b { color: var(--asc-text); font-weight: 600; }
 .outline-chip {
   display: inline-flex; align-items: center; gap: 5px;
   font-size: 12px; color: var(--asc-text-2);
   background: var(--asc-surface-2); border-radius: 8px; padding: 4px 9px;
   max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  cursor: pointer; transition: background .15s ease, color .15s ease;
 }
+.outline-chip:hover { background: var(--asc-primary-soft); color: #5b3fd6; }
+.outline-chip:hover b { color: #5b3fd6; }
 .outline-chip b {
-  color: var(--asc-text-2); font-weight: 600; font-size: 11px;
+  color: #66666a; font-weight: 600; font-size: 11px;   /* surface-2 上 4.48 → ~4.9 */
 }
-.outline-chip.active { background: var(--asc-primary-soft); color: var(--asc-primary); }
-.outline-chip.active b { color: var(--asc-primary); }
+.outline-chip.active { background: var(--asc-primary-soft); color: #5b3fd6; }
+.outline-chip.active b { color: #5b3fd6; }   /* 浅紫底上 #7c5cfc 仅 3.56~3.88 → 5.92 */
 .outline-chip.done { opacity: .5; }
 
 .stage-banner {
-  display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+  display: flex; align-items: center; gap: 10px;
+  max-width: 840px; margin: 0 auto 14px;
   padding: 11px 16px; border-radius: 12px;
   background: var(--asc-primary-soft); font-size: 13px; color: var(--asc-primary);
 }
+.stage-banner::before {
+  content: ''; width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0;
+  background: var(--asc-card) url('../assets/mascot.png') center / cover no-repeat;
+  box-shadow: 0 0 0 1px var(--asc-border);
+}
 .fail-banner {
-  display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+  display: flex; align-items: center; gap: 10px;
+  max-width: 840px; margin: 0 auto 14px;
   padding: 11px 16px; border-radius: 12px;
   background: rgba(214, 69, 69, .08); font-size: 13px; color: #c0392b;
 }
@@ -1729,34 +1875,128 @@ onUnmounted(() => {
 }
 @keyframes drill-spin { to { transform: rotate(360deg); } }
 
-.turn-list { display: flex; flex-direction: column; gap: 16px; }
+/* ===== 对话式逐题区（教练气泡 ↔ 我的气泡） ===== */
+.turn-list { display: flex; flex-direction: column; gap: 26px; max-width: 840px; margin: 0 auto; }
 .turn-empty { padding: 30px 0; font-size: 13px; color: var(--asc-text-2); }
 
-.turn {
-  background: var(--asc-card); border: 1px solid var(--asc-border);
-  border-radius: 14px; padding: 16px 18px;
+/* ===== 作答态三栏聚焦（步骤轨 + 当前题 + 状态轨） ===== */
+.focus-wrap { max-width: 840px; margin: 0 auto; }
+.focus-wrap.focus-grid {
+  display: grid; grid-template-columns: 190px minmax(0, 1fr) 220px;
+  gap: 18px; max-width: 1160px; align-items: start;
 }
-.q-block { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.focus-main { min-width: 0; }
+.focus-heading { font-size: 15px; font-weight: 600; margin: 2px 0 12px; line-height: 1.4; }
+.peek-bar {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+  font-size: 12.5px; color: var(--asc-text-2);
+}
+.focus-steps, .focus-rail {
+  position: sticky; top: 64px;
+  display: flex; flex-direction: column; gap: 8px;
+  /* 15+ 考点时轨道比视口高：钉住后底部够不到 → 轨道自身滚动 */
+  max-height: calc(100vh - 84px); overflow-y: auto;
+}
+/* 考点文案可能很长 → 两行截断，保住轨道紧凑 */
+.fs-text {
+  flex: 1; min-width: 0;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.fs-title, .fr-title { font-size: 12px; font-weight: 600; color: var(--asc-text-2); }
+.fr-title { display: flex; align-items: center; gap: 6px; }
+.fr-title::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--asc-primary); }
+.fr-card:nth-child(2) .fr-title::before { background: #b45309; }
+.fr-card:nth-child(3) .fr-title::before { background: #2e9e5b; }
+.fs-step {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 7px 9px; border-radius: 10px; cursor: pointer;
+  font-size: 12.5px; line-height: 1.45; color: var(--asc-text);
+  transition: background .15s ease;
+}
+.fs-step:hover { background: var(--asc-surface-2); }
+.fs-step.cur { background: var(--asc-primary-soft); box-shadow: inset 2px 0 0 var(--asc-primary); }
+.fs-step.cur .fs-ico { color: #5b3fd6; }
+.fs-step.done { color: var(--asc-text-2); }
+.fs-ico { width: 16px; flex-shrink: 0; text-align: center; font-size: 11px; line-height: 1.7; color: var(--asc-text-2); }
+.fs-step.done .fs-ico { color: #2e9e5b; }
+.fs-follow { font-size: 11px; color: #5b3fd6; flex-shrink: 0; line-height: 1.8; }
+.fs-step.locked { opacity: .45; cursor: default; }
+.fs-step.locked:hover { background: transparent; }
+.fs-step.fs-final { color: var(--asc-text-2); cursor: default; }
+.fs-step.fs-final:hover { background: transparent; }
+.fr-card {
+  background: var(--asc-card); border: 1px solid var(--asc-border);
+  border-radius: 12px; padding: 11px 13px; font-size: 12.5px; line-height: 1.5;
+}
+.fr-line { color: var(--asc-text); }
+.fr-line b { color: #5b3fd6; }   /* 白卡上 #7c5cfc 仅 4.38 → 6+ */
+.fr-event { font-size: 12px; line-height: 1.5; color: var(--asc-text); }
+.fr-why { display: block; margin-top: 3px; color: var(--asc-text-2); }
+.fr-none { color: var(--asc-text-2); font-size: 12px; line-height: 1.5; }
+.flow-head.flow-wide { max-width: 1160px; }
+@media (max-width: 1120px) {
+  .focus-wrap.focus-grid { grid-template-columns: 170px minmax(0, 1fr); }
+  .focus-rail { display: none; }
+}
+@media (max-width: 860px) {
+  .focus-wrap.focus-grid { grid-template-columns: 1fr; }
+  .focus-steps { position: static; flex-direction: row; overflow-x: auto; padding-bottom: 4px; }
+  .fs-step { flex-shrink: 0; }
+  .fs-title { display: none; }
+}
+
+.turn { display: flex; flex-direction: column; gap: 12px; scroll-margin-top: 96px; }
+.msg { display: flex; gap: 10px; animation: msgIn .22s ease-out both; }
+@keyframes msgIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .msg, .rs-hero { animation: none; } }
+.msg-avatar {
+  width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0; object-fit: cover;
+  background: var(--asc-card); margin-top: 2px;
+  box-shadow: 0 0 0 1px var(--asc-border), 0 1px 3px rgba(31, 35, 41, .08);
+}
+.msg-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.msg-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 0 5px 2px; }
+.msg-name { font-size: 12px; font-weight: 600; color: var(--asc-text); }
+.msg-bubble {
+  width: fit-content; max-width: 100%;
+  border-radius: 4px 16px 16px 16px; padding: 12px 16px;
+  background: var(--asc-card); border: 1px solid var(--asc-border);
+  box-shadow: 0 1px 3px rgba(31, 35, 41, .04);
+  font-size: 14.5px; line-height: 1.7; color: var(--asc-text);
+}
+.msg-user { justify-content: flex-end; }
+.msg-user .msg-main { align-items: flex-end; }
+.msg-bubble.user {
+  border-radius: 16px 4px 16px 16px;
+  background: rgba(124, 92, 252, .09); border-color: rgba(124, 92, 252, .2);
+  white-space: pre-wrap; word-break: break-word;
+}
+/* 跳过态：#6a6a6a 在 --asc-surface-2 上实测 4.75:1（--asc-text-2 仅 4.48 不过线） */
+.msg-bubble.user.skipped {
+  background: var(--asc-surface-2); border-color: var(--asc-divider);
+  color: #6a6a6a; font-style: italic;
+}
+.msg-bubble .q-src {
+  display: block; max-width: none; margin-top: 9px; padding-top: 7px;
+  border-top: 1px dashed var(--asc-divider);
+}
+/* 未作答占位卡：虚线描边 + 去阴影，一眼区分「没发生过的题」 */
+.q-tag.ph { background: var(--asc-surface-2); color: #66666a; }
+.turn-ph .msg-bubble.coach { border-style: dashed; background: transparent; box-shadow: none; }
+.ph-note { margin-top: 8px; font-size: 12px; color: var(--asc-text-2); }
 .q-tag {
   font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 20px;
-  background: var(--asc-surface-2); color: var(--asc-text-2);
+  /* --asc-text-2 在 surface-2 上实测仅 4.48 → 加深到 #66666a(~4.9) */
+  background: var(--asc-surface-2); color: #66666a;
 }
-.q-tag.followup { background: rgba(180, 83, 9, .12); color: #b45309; }
+.q-tag.followup { background: rgba(180, 83, 9, .12); color: #92400e; }   /* 琥珀底上 4.26 → 6.0 */
 .q-src { font-size: 11.5px; color: var(--asc-text-2); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .q-text {
   flex-basis: 100%; margin-top: 4px; font-size: 15px; line-height: 1.65;
   color: var(--asc-text); font-weight: 500;
 }
-.a-block { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--asc-divider); }
-.a-label { font-size: 12px; font-weight: 500; letter-spacing: .02em; color: var(--asc-text-2); margin-bottom: 4px; }
-.a-text { font-size: 13.5px; line-height: 1.7; color: var(--asc-text); white-space: pre-wrap; word-break: break-word; border-left: 3px solid rgba(124, 92, 252, .3); padding-left: 12px; }
-.a-text.skipped { color: var(--asc-text-2); font-style: italic; border-left-color: var(--asc-divider); }
 
-.score-card {
-  margin-top: 12px; border-radius: 12px; padding: 14px 16px;
-  background: var(--asc-card); border: 1px solid var(--asc-divider);
-  border-left: 4px solid var(--asc-border);
-}
+.msg-bubble.score-card { width: 100%; padding: 13px 16px; border-left: 4px solid var(--asc-border); }
 .score-card.correct { border-left-color: #2e7d52; }
 .score-card.partial { border-left-color: #b45309; }
 .score-card.wrong { border-left-color: #c0392b; }
@@ -1770,9 +2010,9 @@ onUnmounted(() => {
 .score-num { font-size: 26px; font-weight: 700; line-height: 1; }
 .score-verdict {
   font-size: 11.5px; font-weight: 600; padding: 2px 9px; border-radius: 20px;
-  background: rgba(46, 158, 91, .12); color: #2e7d52;
+  background: rgba(46, 158, 91, .12); color: #246b46;   /* 绿底上 4.40 → 5.59 */
 }
-.score-verdict.partial { background: rgba(180, 83, 9, .12); color: #b45309; }
+.score-verdict.partial { background: rgba(180, 83, 9, .12); color: #92400e; }
 .score-verdict.wrong { background: rgba(214, 69, 69, .12); color: #c0392b; }
 .score-dims { display: flex; gap: 14px; flex-wrap: wrap; margin-left: auto; }
 .dim { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--asc-text-2); }
@@ -1786,18 +2026,28 @@ onUnmounted(() => {
 .score-miss li, .score-expect li { font-size: 13px; line-height: 1.7; color: var(--asc-text); margin-bottom: 2px; }
 .score-expect { border-top: 1px solid var(--asc-border); margin-top: 8px; padding-top: 4px; }
 
-.answer-box { margin-top: 14px; }
+.answer-box {
+  margin-top: 6px;
+  background: var(--asc-card); border: 1px solid var(--asc-border);
+  border-radius: 16px; padding: 8px 12px 10px;
+  box-shadow: 0 2px 12px rgba(31, 35, 41, .05);
+}
+.answer-box :deep(.el-textarea__inner) {
+  border: none; box-shadow: none; background: transparent;
+  padding: 6px 4px; font-size: 14.5px; line-height: 1.65;
+}
 .answer-actions {
   display: flex; align-items: center; gap: 10px; margin-top: 10px;
 }
 .answer-hint { flex: 1; font-size: 12px; color: var(--asc-text-2); }
 .answer-hint.over { color: #b45309; font-weight: 600; }
-.rs-actions { display: flex; justify-content: flex-start; gap: 10px; margin-top: 22px; }
+.rs-actions { display: flex; justify-content: flex-start; gap: 10px; margin: 22px auto 0; max-width: 840px; }
 
 /* ===== 陪练报告（C 档） ===== */
 .rs-report {
   background: var(--asc-card); border: 1px solid var(--asc-border);
-  border-radius: 16px; padding: 18px 22px; margin-bottom: 16px;
+  border-radius: 16px; padding: 18px 22px;
+  max-width: 840px; margin: 0 auto 16px;
 }
 .rp-title { font-size: 14px; font-weight: 600; color: var(--asc-text); margin-bottom: 12px; }
 .rp-dims { display: flex; flex-direction: column; gap: 9px; }
@@ -1831,7 +2081,10 @@ onUnmounted(() => {
 .q-diff.down { background: rgba(46, 158, 91, .12); color: #2a724b; }
 
 /* ===== 语音工具行 ===== */
-.answer-tools { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+.answer-tools {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 4px; padding-top: 9px; border-top: 1px solid var(--asc-divider);
+}
 .rec-hint { font-size: 12px; color: var(--asc-text-2); display: inline-flex; align-items: center; gap: 6px; }
 .rec-hint.err { color: #b45309; }
 .rec-dot {
@@ -1884,5 +2137,7 @@ onUnmounted(() => {
   .answer-hint { flex-basis: 100%; }
   .answer-tools { gap: 8px; }
   .rp-list li { font-size: 12.5px; }
+  .msg-avatar { width: 28px; height: 28px; }
+  .msg-bubble { padding: 10px 13px; font-size: 14px; }
 }
 </style>
