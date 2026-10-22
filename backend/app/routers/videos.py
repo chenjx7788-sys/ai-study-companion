@@ -1976,6 +1976,49 @@ def _cleanup_render_tmp(p: Path) -> None:
         pass
 
 
+def _publish_render_tmp(tmp: Path, out: Path, rep: dict | None) -> None:
+    """渲染成功的**唯一发布出口**：临时成片 → 正式成片（`video.mp4`）。
+
+    ⚠️⚠️ 这一步缺失 = **静默错误**：DB 照常写新体积/新指纹、界面显示「已完成 / 已是最新」，
+       而播放读的是 `v.video_name` 指向的**上一版**文件。实测（2026-10-22）：作品用板书
+       重渲染完毕，播放出来仍是旧的结构图，且没有任何报错。
+    ⚠️ Windows 上目标文件可能被播放器/杀软**短暂占用** → `os.replace` 抛 OSError。
+       先有限重试；仍占用则退化为「原地分块覆盖」。
+       ⚠️ 试过「先把旧片改名搬走」的兜底：目标被占时**旧片自己也改不了名**，等于没兜。
+       ⚠️ 原地覆盖在这里是安全的：走到这一步渲染**已经成功**，旧片没有保护价值；
+          反过来「不发布」会让界面把旧片当新片展示（正是本次事故）。
+    ⚠️ 发布后按**最终文件**复核字节数（对齐渲染报告）：不一致当场抛错置 failed，
+       宁可红一次，也不要让界面把「没换上的旧片」当成功展示。
+    """
+    want = int((rep or {}).get("bytes") or 0)
+    last: OSError | None = None
+    for i in range(4):
+        try:
+            os.replace(tmp, out)
+            last = None
+            break
+        except OSError as e:            # 目标被占用（WinError 5/32）或跨盘
+            last = e
+            time.sleep(0.25 * (i + 1))
+    if last is not None:
+        try:
+            with open(tmp, "rb") as fs, open(out, "wb") as fd:
+                while True:
+                    buf = fs.read(1 << 20)
+                    if not buf:
+                        break
+                    fd.write(buf)
+            try:
+                tmp.unlink()
+            except BaseException:
+                pass
+        except BaseException:
+            raise RuntimeError(f"成片发布失败（目标被占用）：{str(last)[:120]}") from last
+    got = out.stat().st_size if out.exists() else 0
+    if want and got != want:
+        raise RuntimeError(f"成片发布失败：字节数不一致（期望 {want}，实际 {got}）")
+
+
 # 抓帧质量类失败的重试次数（2026-10-22）。判据本身不放宽 —— 实测过一次 1.8 s
 # 的卡顿就能让 182 s 的片子 p99 到 502 ms，放宽到 300 ms 也救不回来，
 # 而重试能救：卡顿是偶发的，重来一遍通常就干净了。
@@ -2106,6 +2149,9 @@ def _run_render_job(vid: int, job: _RenderJob) -> None:
             renderer_svc, job, html=html, audio=audio, tmp_mp4=tmp_mp4,
             out_poster=out_poster, dur=dur)
         job.report = dict(rep or {})
+        # ⚠️⚠️ 必须紧跟渲染成功发布成片：漏了它，DB 会记「新指纹 + 新体积」，
+        #    界面显示「已完成」，而 video.mp4 仍是上一版 → 播放看到旧画面（静默）。
+        _publish_render_tmp(tmp_mp4, out_mp4, rep)
     except renderer_svc.RenderCancelled:
         _cleanup_render_tmp(tmp_mp4)
         db3 = SessionLocal()
