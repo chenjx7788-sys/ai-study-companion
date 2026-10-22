@@ -81,6 +81,14 @@ class MaterialChunk(Base):
     # 空串 = 无位置数据（存量材料/非 PDF）→ 前端「在原文中查看」降级为页级跳转，重解析才回填。
     # ⚠️ 与 content 无关、不参与 extract_sig 指纹。
     img_rect = Column(String(64), default="")
+    # 扫描页/拍照页的**行框**（JSON 数组，归一化 0~1）：
+    #   [{"t": 行文本, "x0","y0","x1","y1": 框, "h": 行高}, ...]
+    # 与 img_rect 的分工：img_rect 是「内嵌图」的单框；line_boxes 是「整页 OCR 的每一行」，
+    # 专供扫描件做**行级**溯源 —— 这类材料没有文字层，`page.search_for()` 用不了。
+    # ⚠️ 必须带 t：cleaner 会按行删页眉/乱码，content 的行序与这里不再一一对应，
+    #    只能靠文本匹配，不能按下标对齐。
+    # 空串 = 无数据（文字层 PDF / 存量材料）→ 前端降级为页级跳转。
+    line_boxes = Column(Text, default="")
 
     material = relationship("Material", back_populates="chunks")
 
@@ -172,7 +180,7 @@ class LLMUsage(Base):
     """LLM 调用记账：估算成本用（流式调用按字符数估算）"""
     __tablename__ = "llm_usage"
     id = Column(Integer, primary_key=True)
-    kind = Column(String(24))                    # 业务场景：summary/section_summary/keywords/explain/ask/transform/chat/suggest/review/quiz/stats_report
+    kind = Column(String(24))                    # 业务场景：summary/section_summary/keywords/explain/ask/transform/chat/suggest/review/quiz/stats_report/video_points_<skin>/embedding_index/embedding_query/test 等
     model = Column(String(64))
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)

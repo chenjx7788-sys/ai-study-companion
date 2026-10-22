@@ -141,10 +141,8 @@ def deindex_note(db: Session, note_id: int):
 
 def deindex_material(db: Session, material_id: int):
     """删除材料时清理其原文索引；笔记索引保留（笔记不随材料删除）"""
-    col = vector_svc.get_collection(vector_svc.CHUNK_COL)
-    results = col.get(where={"material_id": material_id})
-    if results and results.get("ids"):
-        col.delete(ids=results["ids"])
+    vector_svc.with_heal(vector_svc.CHUNK_COL,
+                         lambda col: vector_svc._delete_where(col, {"material_id": material_id}))
     db.query(KbEntry).filter(
         KbEntry.material_id == material_id, KbEntry.ref_type == "chunk").delete()
     db.commit()

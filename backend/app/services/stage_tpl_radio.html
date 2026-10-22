@@ -44,6 +44,8 @@ html, body { margin: 0; padding: 0; background: #e8dfcd; overflow: hidden; }
   position: absolute; left: 0; right: 0; top: 640px; text-align: center;
   font-family: KaiTi, "楷体", "STKaiti", serif; font-style: italic;
   font-size: 58px; letter-spacing: 14px; color: #2e2a24;
+  /* 2026-10-20：pre-line 让署名里的 \n 真正换行；单行文本（无 \n）渲染逐像素不变 */
+  white-space: pre-line;
 }
 .bars {
   position: absolute; left: 50%; top: 720px; transform: translateX(-50%);
@@ -172,20 +174,32 @@ const CUES = buildCues(SEGS, CUE_MAX);
 
 const $ = (id) => document.getElementById(id);
 
-/* ---------- 署名排印自适应（2026-10-13） ----------
-   署名来自用户（brand_text 或作品标题，≤20 字），而 .brand 的 58px / 14px 字距是按
-   2-3 个字设计的：20 个字原样排出来是 1440px 宽的一整条，不像署名、像一行正文。
-   这里按字数**降档**（字号与字距一起收），让长署名仍保持「一行署名」的观感。
+/* ---------- 署名排印自适应（2026-10-13；2026-10-20 支持两行 / 上限 50 字） ----------
+   署名来自用户（brand_text 或作品标题，≤50 字、最多两行 —— svc.norm_brand_text 兜底），
+   而 .brand 的 58px / 14px 字距是按 2-3 个字设计的：长串原样排出来是一整条正文，不像署名。
+   这里按「最长一行的字数」**降档**（字号与字距一起收）；两行时字号封顶 40
+   并把整块垂直中心锚在单行中心（向上长，不压 720px 处的波形条）。
    ⚠️ 纯函数（同一文本 → 同一档位）：逐帧抓帧与 seek(ms) 验收必须一致。
-   ⚠️ 档位表是实测标定的，不是拍的 —— 改一次就要重跑 `_probe_brand_fit_cmd_20261013.py`
-      （真模板 + Range 量文本渲染宽度）重新标定，并把结果同步回那张探针。
-   ⚠️ 前 5 字保持 58/14 原样：短署名（「且 听」这类 2-3 字）与改造前逐像素一致。 */
-const BRAND_TIERS = [[5, 58, 14], [9, 50, 10], [13, 42, 6], [17, 36, 4], [20, 32, 2]];
+   ⚠️ 档位表是实测标定的，不是拍的 —— 改一次就要重跑 `_probe_brand_fit_20261020.py`
+      （真模板 + Range.getClientRects 量每行渲染宽度与纵向边界）重新标定。
+   ⚠️ 单行 ≤20 字的档位与 2026-10-13 版逐一一致：短署名（「且 听」这类）零回归。 */
+const BRAND_TIERS = [[5, 58, 14], [9, 50, 10], [13, 42, 6], [17, 36, 4], [20, 32, 2], [26, 27, 1], [50, 21, 0]];
+const BRAND_TWO_LINE_FS_MAX = 40;   /* 两行字号上限：纵向空间实测标定（见探针） */
+const BRAND_TOP0 = 640;             /* 与 .brand 的 top 一致（两行时以此为锚算偏移） */
 function fitBrand(el, text) {
-  const n = String(text || '').length;
-  let fs = 32, ls = 2;
+  const lines = String(text || '').split('\n');
+  let n = 0;
+  for (let i = 0; i < lines.length; i++) { if (lines[i].length > n) n = lines[i].length; }
+  let fs = 21, ls = 0;
   for (let i = 0; i < BRAND_TIERS.length; i++) {
     if (n <= BRAND_TIERS[i][0]) { fs = BRAND_TIERS[i][1]; ls = BRAND_TIERS[i][2]; break; }
+  }
+  if (lines.length > 1) {
+    /* 两行：字号封顶 + 整块垂直中心锚在单行中心（58×1.2 的一半），向上长不压波形条。
+       ⚠️ 单行时绝不碰 top / lineHeight（保持 2026-10-13 逐像素一致）。 */
+    fs = Math.min(fs, BRAND_TWO_LINE_FS_MAX);
+    el.style.lineHeight = '1.2';
+    el.style.top = (BRAND_TOP0 + 58 * 1.2 / 2 - lines.length * fs * 1.2 / 2) + 'px';
   }
   el.style.fontSize = fs + 'px';
   el.style.letterSpacing = ls + 'px';
@@ -306,8 +320,14 @@ function paint(ms) {
   $('progFill').style.width = (p * 100) + '%';
 }
 
+/* 渲染倍速（2026-10-20）：页钟 = 墙钟 × RATE → 抓帧段墙钟 = 时长 / RATE。
+   ⚠️ 能开倍速的前提：本模板所有动效都是 render(ms) 纯函数（无 CSS transition/keyframes
+      跟墙钟走）—— 所以 __RATE__ 只注入三个解压模板（stage_tpl.html 系还有 CSS 过渡，恒 1.0）。
+   ⚠️ RATE 必须随 __stage.rate 自报：renderer 以页面自报为准（帧时间戳按它换算页时间）。 */
+const RATE = __RATE__;
+
 window.__stage = {
-  total: TOTAL, ms: 0, t0: 0, done: false, running: false,
+  total: TOTAL, rate: RATE, ms: 0, t0: 0, done: false, running: false,
   data: { segs: SEGS, cues: CUES.length, levels: LEVELS.length, arts: ARTS.map(a => a.id || '') },
   ready: function () {
     if (document.fonts && document.fonts.status !== 'loaded') return false;
@@ -321,7 +341,7 @@ window.__stage = {
     self.ms = 0; self.done = false; self.running = true;
     function tick() {
       if (!self.running) return;
-      const ms = Math.min(TOTAL, performance.now() - self.t0);
+      const ms = Math.min(TOTAL, (performance.now() - self.t0) * RATE);
       self.ms = ms;
       render(ms); paint(ms);
       if (ms >= TOTAL) { self.done = true; self.running = false; return; }
@@ -333,7 +353,7 @@ window.__stage = {
   state: function () {
     const self = window.__stage;
     return { ms: self.ms, t0: self.t0, done: self.done, running: self.running,
-             clock: performance.now() - self.t0 };
+             clock: Math.min(TOTAL, (performance.now() - self.t0) * RATE) };
   }
 };
 render(0); paint(0);

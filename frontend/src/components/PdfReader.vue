@@ -77,12 +77,32 @@ function armFlashBox(v) {
     if (canvas && canvas.style.width) {          // 已渲染 → % 定位才有正确基准
       flashBox.value = { page: v.page, rect: v.rect }
       clearTimeout(flashTimer)
-      flashTimer = setTimeout(() => { flashBox.value = null }, 3000)
+      flashTimer = setTimeout(() => { flashBox.value = null }, 3600)
+      centerFlashBox()
       return
     }
     if (++tries < 40) setTimeout(tick, 150)      // 懒渲染等待上限 6s
   }
   tick()
+}
+
+// 框画出来 ≠ 用户看得见：切原文视图时 restoreReadingPosition 只把**页顶**对齐视口顶，
+// 实测 1920 宽下页面下半部的目标行落在 y=1383、阅读区只到 1000 —— 框在视口外闪 3 秒，
+// 用户完全没察觉。这里把框滚进视口；因为 restoreReadingPosition 有 1.8s 的轮询校正，
+// 单次滚动会被它拽回页顶，所以按时间点重复校正（已在视口内就不动），最后一次必然压过它。
+let centerTimers = []
+function centerFlashBox() {
+  centerTimers.forEach(clearTimeout)
+  centerTimers = []
+  ;[0, 250, 600, 1000, 1500, 2100].forEach(ms => centerTimers.push(setTimeout(() => {
+    const wrap = wrapRef.value
+    const el = wrap?.querySelector('.pdf-img-flash')
+    if (!wrap || !el) return
+    const w = wrap.getBoundingClientRect()
+    const r = el.getBoundingClientRect()
+    if (r.top >= w.top + 8 && r.bottom <= w.bottom - 8) return
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  }, ms)))
 }
 watch(() => props.flashRect, (v) => { if (v && v.rect) armFlashBox(v) }, { immediate: true })
 
@@ -230,6 +250,8 @@ async function load() {
 onMounted(load)
 onUnmounted(() => {
   clearTimeout(flashTimer)
+  centerTimers.forEach(clearTimeout)
+  centerTimers = []
   clearTimeout(resizeTimer)
   resizeObserver?.disconnect()
   observer?.disconnect()

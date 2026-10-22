@@ -9,7 +9,9 @@ EPUB 按 spine 章节顺序解析，page_no = 章节序号，章节标题作为 
 """
 from pathlib import Path
 from bisect import bisect_right
+import json
 import re
+import statistics
 import threading
 import hashlib
 
@@ -60,6 +62,10 @@ def parse_pdf(path: str, on_progress=None) -> list[dict]:
     - 无文本层的页已由整页 OCR 覆盖，不再对内嵌图重复 OCR。
     - 内嵌图按 xref 全局去重（页眉 LOGO 跨页复用只认一次）。
 
+    **扫描页走 `_build_scanned_chunks` 统一收尾**（不是逐页即时产出）：
+    因为章节标题识别要「先扫全书」——页眉判据靠跨页高频重复，目录页判据靠整页编号密度，
+    两者都拿不到未来的页。所以先收集、后统一判标题，最后按 page_no 归位。
+
     on_progress：0-100 进度回调（按已处理页数/总页数估算）。
     """
     from . import ocr as ocr_svc
@@ -70,22 +76,30 @@ def parse_pdf(path: str, on_progress=None) -> list[dict]:
     total = len(reader.pages) or 1
     img_ocr_available = ocr_svc.is_available()
     seen_xrefs: set[int] = set()
+    scanned: list[tuple[int, str, list[dict]]] = []
+    # 无书签的文字层 PDF：也要判章节（否则导出 md 一个标题都没有 —— 实测材料 2/7 号）。
+    text_pages: dict[int, list[dict]] = {}
+    text_page_nos: list[int] = []   # 所有有文字层的页（1-based）：统一补行框
+    plain_pages: list[int] = []     # 其中「无书签」的页：才需要跑标题识别
     for i, page in enumerate(reader.pages):
         text = (page.extract_text() or "").strip()
         if not text:
             try:
-                text = _ocr_pdf_page(path, i)   # 空文本页 → OCR 兜底
+                text, lines = _ocr_pdf_page_rich(path, i)
             except Exception:
-                text = ""   # 依赖缺失/识别失败：降级为空，交由上层标记扫描件
+                text, lines = "", []   # 依赖缺失/识别失败：降级为空，交由上层标记扫描件
             if text:
-                # 章节 = 页码 ≤ 当前页的最后一个书签（无书签则为空）
-                idx = bisect_right(mark_pages, i + 1) - 1
-                section = mark_paths[idx] if idx >= 0 else ""
-                chunks.append({"content": text, "page_no": i + 1, "section_path": section})
+                scanned.append((i, text, lines))
         else:
             # 有文本层：正文正常入库，另对内嵌图做 OCR 补漏
             idx = bisect_right(mark_pages, i + 1) - 1
             section = mark_paths[idx] if idx >= 0 else ""
+            _plain = not section and not mark_paths
+            if _plain:
+                # 行列表延后到循环外统一构建：整本只开一次 fitz（逐页 open 实测 113ms/页，
+                # 249 页的书光开文件就要 28s）。正文口径**不变**，仍是 extract_text()。
+                plain_pages.append(i + 1)
+            text_page_nos.append(i + 1)
             chunks.append({"content": text, "page_no": i + 1, "section_path": section})
             if img_ocr_available:
                 try:
@@ -101,7 +115,175 @@ def parse_pdf(path: str, on_progress=None) -> list[dict]:
                     })
         if on_progress:
             on_progress(int((i + 1) / total * 100))
+    # 文字层行框：一次打开批量建，挂到「正文块」上（内嵌图块有自己的 img_rect，不叠整页框）。
+    tmap = _text_line_map(path, text_page_nos)
+    for c in chunks:
+        if c.get("img_rect"):
+            continue
+        lines = tmap.get(c["page_no"])
+        if lines:
+            c["line_boxes"] = json.dumps(lines, ensure_ascii=False)
+    for pno in plain_pages:
+        if tmap.get(pno):
+            text_pages[pno] = tmap[pno]
+    if scanned:
+        chunks.extend(_build_scanned_chunks(scanned, mark_pages, mark_paths))
+    if text_pages:
+        sec_by_page = _text_outline_sections(text_pages)
+        for c in chunks:
+            if not (c.get("section_path") or ""):
+                c["section_path"] = sec_by_page.get(c["page_no"], "")
+    if scanned or text_pages:
+        chunks.sort(key=lambda c: c["page_no"])
     return chunks
+
+
+def _path_seg(s: str) -> str:
+    """标题放进 section_path 前，转义标题内的斜杠（半角 → 全角 `／`）。
+
+    ⚠️ 不转义的后果（实测）：标题「小红书/公众号」「课程/图书页」里的 `/`
+       会被当成层级分隔符，导出时 `split("/")` 把标题劈成两半 → 目录多出半截标题。
+    """
+    return (s or "").replace("/", "／")
+
+
+def _text_lines_from_page(page) -> list[dict]:
+    """fitz 页 → 行列表：`t` / `h` 字号 / 归一化框 / `src:"text"`。
+
+    与扫描页 `line_boxes` 同构（`t,x0,y0,x1,y1,h`），所以前端一套 Dice 定位能直接用。
+    ⚠️ **行序按 y0 排，与 `extract_text()` 的行序不一致**（页眉被它排到首行）。
+       所以 `md_export._page_geometry` 见到 `src=="text"` 必须**逐行全等**才敢用 x1 判据，
+       只比前 3 行会在「恰好同序」的页上整体错位一行。
+    ⚠️ 必须走 PyMuPDF：`parse_pdf` 的 `reader` 是 pypdf 的 `PageObject`，
+       没有 `.rect` / `get_text("dict")`（第一版直接传 page，AttributeError）。
+    ⚠️ 文字层的 `h` 是**真实字号**（扫描件是 OCR 行框高度，会抖），可放心当「行高」用。
+    """
+    height = page.rect.height or 1.0
+    width = page.rect.width or 1.0
+    try:
+        d = page.get_text("dict")
+    except Exception:
+        return []
+    out: list[dict] = []
+    for b in d.get("blocks", []):
+        for ln in b.get("lines", []):
+            spans = ln.get("spans") or []
+            t = "".join(s.get("text", "") for s in spans).strip()
+            if not t:
+                continue
+            try:
+                h = max(float(s.get("size", 0)) for s in spans)
+                x0, y0, x1, y1 = ln["bbox"]
+            except Exception:
+                continue
+            out.append({
+                "t": t,
+                "h": round(h, 1),
+                "x0": round(x0 / width, 4),
+                "y0": round(y0 / height, 4),
+                "x1": round(x1 / width, 4),
+                "y1": round(y1 / height, 4),
+                "src": "text",
+            })
+    out.sort(key=lambda x: x["y0"])
+    return out
+
+
+def _text_line_map(pdf_path: str, pages: list[int]) -> dict[int, list[dict]]:
+    """一次打开 PDF、批量取多页行框（页码 1-based）。单页失败只丢该页，不影响整本。"""
+    import pymupdf as fitz
+
+    out: dict[int, list[dict]] = {}
+    if not pages:
+        return out
+    doc = fitz.open(pdf_path)
+    try:
+        for pno in pages:
+            try:
+                out[pno] = _text_lines_from_page(doc[pno - 1])
+            except Exception:
+                out[pno] = []
+    finally:
+        doc.close()
+    return out
+
+
+def _pdf_text_page_lines(pdf_path: str, page_index: int) -> list[dict]:
+    """单页版（页码 0-based）：给「只要一页」的调用方留的薄封装。"""
+    import pymupdf as fitz
+
+    doc = fitz.open(pdf_path)
+    try:
+        return _text_lines_from_page(doc[page_index])
+    finally:
+        doc.close()
+
+
+def _text_outline_sections(text_pages: dict[int, list[dict]]) -> dict[int, str]:
+    """无书签的文字层 PDF：按页算 section_path。返回 page_no → 章节路径。
+
+    ① 编号判据优先（`第X章` / `1.2` / `一、`）。
+    ② 一条编号都没有 + 每页中位行数 < 8 → 幻灯片式材料，退化为「页级小节」。
+       这类材料的「章节」就是每一页（课件 / PPT 导出），编号判据必然 0 命中。
+    """
+    from . import outline as outline_svc
+
+    if not text_pages:
+        return {}
+    order = sorted(text_pages)
+    pages = [text_pages[k] for k in order]
+    repeated = outline_svc.collect_repeated(pages)
+    numbered, numbered_pages = 0, 0
+    for ls in pages:
+        hit = sum(1 for ln in ls if outline_svc.detect_level(ln["t"], y0=ln.get("y0")))
+        numbered += hit
+        if hit:
+            numbered_pages += 1
+    counts = sorted(len(x) for x in pages)
+    median_lines = counts[len(counts) // 2] if counts else 0
+
+    # 判「有编号」不能只看「≥1 行」：幻灯片式材料的**目录页**里也会写「第一章 / 第二章」，
+    # 两行编号就够把整本推进编号分支（实测自测用例栽在这）。
+    # 要求「编号行 ≥3 且分布在 ≥2 页」，真书的章节密度远高于此。
+    if (numbered < 3 or numbered_pages < 2) and median_lines < 8:
+        # 幻灯片式：一页一节。标题取「本页最大字号那行」，取不到就只给页号。
+        #
+        # ⚠️ 三处实测坑（材料 7 号，61 页课件）：
+        #   ① 竖排大字被拆成单字行（`欢`/`迎`/`大`/`家`，字号 80）—— 取最大字号就取到「欢」，
+        #      所以要求标题 ≥2 字；
+        #   ② 目录页本身没有章节归属，跳过（沿用上一节），否则目录会变成一个 `# 目录` 小节；
+        #   ③ 同一个标题连续跨好几页（产品层次分了 4 屏），逐页造 heading 会得到 4 个同名标题
+        #      → 标题与上一页相同时沿用上一节，只在标题真正变化时才新开。
+        out: dict[int, str] = {}
+        last_sec, last_title = "", ""
+        for pno, ls in zip(order, pages):
+            cand = [x for x in ls
+                    if not outline_svc._PAGE_NO.match(x["t"].strip())
+                    and len(outline_svc.clean_title(x["t"])) <= outline_svc.MAX_TITLE_CHARS]
+            title = outline_svc.clean_title(max(cand, key=lambda x: x["h"])["t"]) if cand else ""
+            norm = title.replace(" ", "")
+            if (len(norm) < 2 or norm.lower() in ("目录", "目次", "contents")
+                    or outline_svc.is_toc_page(ls)):
+                out[pno] = last_sec
+                continue
+            if norm != last_title:
+                last_title = norm
+                last_sec = f"P{pno} {title}"
+            out[pno] = last_sec
+        return out
+
+    heights = [ln["h"] for ls in pages for ln in ls if ln.get("h")]
+    body_h = statistics.median(heights) if heights else None
+    builder = outline_svc.OutlineBuilder()
+    out = {}
+    for pno, ls in zip(order, pages):
+        if not outline_svc.is_toc_page(ls):
+            for ln in outline_svc.merge_wrapped_title(ls):
+                key = outline_svc.clean_title(ln["t"]).replace(" ", "")
+                builder.feed(ln["t"], height=ln.get("h"), body_height=body_h,
+                             y0=ln.get("y0"), repeated=key in repeated)
+        out[pno] = builder.path()
+    return out
 
 
 def _render_pdf_page(pdf_path: str, page_index: int, dpi: int = 200):
@@ -131,6 +313,141 @@ def _ocr_pdf_page(pdf_path: str, page_index: int, dpi: int = 200) -> str:
     from . import ocr as ocr_svc
     img = _render_pdf_page(pdf_path, page_index, dpi)
     return ocr_svc.ocr_image_to_text(img)
+
+
+def _merge_row_lines(lines: list[dict], gap_tol: float = 0.03) -> list[dict]:
+    """把「同一视觉行被拆成的多个框」合并回一行（按 y 聚类 → 按 x 拼接）。
+
+    ⚠️ 为什么必须做：实测扫描件第 1 页的大标题被 det 拆成三个框
+       （`第1章` / `AI产品经理` / `为"当产品经理遇上AI"`），而 `recognize_boxes` 按
+       **行中心 y 优先**排序 —— 三个框的 y 差 0.003，排序结果就是「为…」跑到「AI产品经理」
+       前面，拼出来的标题是反的。这不是显示问题，是**入库文本本身就是错的**。
+    ⚠️ gap_tol 是「同一行」的横向间隙上限（占页宽）。双栏排版的栏间距远大于 3%，
+       所以宽松的聚类不会把左右栏粘成一行；真双栏材料会退化为「不合并」，不比现状差。
+    """
+    if not lines:
+        return lines
+    rows: list[dict] = []
+    for ln in sorted(lines, key=lambda x: ((x["y0"] + x["y1"]) / 2, x["x0"])):
+        cy = (ln["y0"] + ln["y1"]) / 2
+        row = None
+        for r in rows:
+            rcy = (r["y0"] + r["y1"]) / 2
+            tol = max(min(ln["h"], r["h"]) * 0.6, 0.008)
+            if abs(cy - rcy) <= tol:
+                row = r
+                break
+        if row is None:
+            rows.append({"y0": ln["y0"], "y1": ln["y1"], "h": ln["h"], "parts": [ln]})
+        else:
+            row["parts"].append(ln)
+            row["y0"] = min(row["y0"], ln["y0"])
+            row["y1"] = max(row["y1"], ln["y1"])
+
+    out: list[dict] = []
+    for r in rows:
+        parts = sorted(r["parts"], key=lambda x: x["x0"])
+        merged: list[list[dict]] = []      # 按横向间隙再切一次（防止跨栏粘连）
+        for p in parts:
+            if merged and p["x0"] - merged[-1][-1]["x1"] > gap_tol:
+                merged.append([p])
+            elif merged:
+                merged[-1].append(p)
+            else:
+                merged.append([p])
+        for seg in merged:
+            text = ""
+            prev_x1 = None
+            for p in seg:
+                if prev_x1 is not None and p["x0"] - prev_x1 > 0.004:
+                    text += " "
+                text += p["t"]
+                prev_x1 = p["x1"]
+            text = text.strip()
+            if not text:
+                continue
+            y0 = min(p["y0"] for p in seg)
+            y1 = max(p["y1"] for p in seg)
+            out.append({
+                "t": text,
+                "x0": min(p["x0"] for p in seg),
+                "y0": y0,
+                "x1": max(p["x1"] for p in seg),
+                "y1": y1,
+                "h": round(y1 - y0, 4),
+            })
+    out.sort(key=lambda x: (x["y0"], x["x0"]))
+    return out
+
+
+def _ocr_pdf_page_rich(pdf_path: str, page_index: int, dpi: int = 200) -> tuple[str, list[dict]]:
+    """渲染 + OCR，同时返回整页文本与**行框**。
+
+    行框归一化到页面宽高（0~1，左上原点），字段与 chunk.line_boxes 的落库格式一致：
+        {"t": 行文本, "x0","y0","x1","y1": 归一化框, "h": 归一化行高}
+
+    ⚠️ 必须走 `recognize_boxes` 而不是 `ocr_image_to_text` —— 后者只吐拼好的文本、
+       把坐标全丢掉，导致扫描件的「在原文中查看」永远只能跳到页、画不出具体位置。
+    ⚠️ 行高 h 是标题识别的度量（无编号时兜底），归一化后才能跨页比较。
+    """
+    from . import ocr as ocr_svc
+    img = _render_pdf_page(pdf_path, page_index, dpi)
+    h, w = img.shape[:2]
+    lines: list[dict] = []
+    for b in ocr_svc.recognize_boxes(img):
+        t = (b.get("t") or "").strip()
+        if not t:
+            continue
+        y0, y1 = b["y0"] / h, b["y1"] / h
+        lines.append({
+            "t": t,
+            "x0": round(b["x0"] / w, 4),
+            "y0": round(y0, 4),
+            "x1": round(b["x1"] / w, 4),
+            "y1": round(y1, 4),
+            "h": round(y1 - y0, 4),
+        })
+    lines = _merge_row_lines(lines)
+    return "\n".join(x["t"] for x in lines), lines
+
+
+def _build_scanned_chunks(scanned: list[tuple[int, str, list[dict]]],
+                          mark_pages: list[int], mark_paths: list[str]) -> list[dict]:
+    """扫描页收尾：定章节归属 + 序列化行框。
+
+    ⚠️ 书签（mark_pages）存在时**不做**标题识别：书签是人工标注的权威层级，
+       识别只用来给「完全没有书签」的材料兜底。两者混用会让 section 在册页/附录处跳变。
+    ⚠️ 所有扫描页必须一起处理（不能逐页即时产出）：页眉判据靠跨页高频重复、
+       目录页判据靠整页编号密度，逐页处理时这两条都拿不到全书视野。
+    """
+    from . import outline as outline_svc
+
+    pages = [lines for _, _, lines in scanned]
+    repeated = outline_svc.collect_repeated(pages)
+    heights = [ln["h"] for p in pages for ln in p if ln.get("h")]
+    body_h = statistics.median(heights) if heights else None
+    has_marks = bool(mark_pages)
+    builder = outline_svc.OutlineBuilder()
+
+    out: list[dict] = []
+    for i, text, lines in scanned:
+        if has_marks:
+            idx = bisect_right(mark_pages, i + 1) - 1
+            section = mark_paths[idx] if idx >= 0 else ""
+        else:
+            if not outline_svc.is_toc_page(lines):
+                for ln in outline_svc.merge_wrapped_title(lines):
+                    key = outline_svc.clean_title(ln["t"]).replace(" ", "")
+                    builder.feed(ln["t"], height=ln.get("h"), body_height=body_h,
+                                 y0=ln.get("y0"), repeated=key in repeated)
+            section = builder.path()
+        out.append({
+            "content": text,
+            "page_no": i + 1,
+            "section_path": section,
+            "line_boxes": json.dumps(lines, ensure_ascii=False) if lines else "",
+        })
+    return out
 
 
 # 内嵌图 OCR 的最小/最大尺寸门槛（像素），用于过滤图标、装饰线与整页扫描件
@@ -241,16 +558,45 @@ def _ocr_pdf_page_images(pdf_path: str, page_index: int, seen_xrefs: set) -> lis
 
 
 def parse_image(path: str, on_progress=None) -> list[dict]:
-    """图片文件（截图/拍照书页/板书照片）→ OCR → 单块文本（page_no=1）"""
+    """图片文件（截图/拍照书页/板书照片）→ OCR → 单块文本（page_no=1）
+
+    与扫描 PDF 一样保留**行框**（line_boxes）：拍照书页是最常见的溯源场景，
+    用户问「这句在哪」时必须能在原图上画出来，而不是只给一张整图。
+    单张图片没有章节结构，section_path 恒为空。
+    """
     from . import ocr as ocr_svc
     if on_progress:
         on_progress(10)
-    text = ocr_svc.ocr_image_to_text(path)
+    boxes = ocr_svc.recognize_boxes(path)
+    if not boxes:
+        if on_progress:
+            on_progress(100)
+        return []
+    from PIL import Image as _Image
+    with _Image.open(path) as im:
+        w, h = im.size
+    lines = []
+    for b in boxes:
+        t = (b.get("t") or "").strip()
+        if not t:
+            continue
+        y0, y1 = b["y0"] / h, b["y1"] / h
+        lines.append({
+            "t": t,
+            "x0": round(b["x0"] / w, 4),
+            "y0": round(y0, 4),
+            "x1": round(b["x1"] / w, 4),
+            "y1": round(y1, 4),
+            "h": round(y1 - y0, 4),
+        })
+    lines = _merge_row_lines(lines)
     if on_progress:
         on_progress(100)
+    text = "\n".join(x["t"] for x in lines)
     if not text.strip():
         return []
-    return [{"content": text, "page_no": 1, "section_path": ""}]
+    return [{"content": text, "page_no": 1, "section_path": "",
+             "line_boxes": json.dumps(lines, ensure_ascii=False)}]
 
 
 def _docx_page_breaks(para) -> int:
@@ -446,13 +792,18 @@ def parse_docx(path: str) -> list[dict]:
     has_breaks = any(_docx_page_breaks(b) for b in blocks if isinstance(b, Paragraph))
     num_kinds = _docx_numbering_kinds(doc)
 
-    chunks, page, section, chars = [], 1, "", 0
+    chunks, page, chars = [], 1, 0
     img_ocr_available = ocr_svc.is_available()
+    # 章节路径按 heading level 建栈累加（`一级/二级/三级`）。
+    # ⚠️ 原先是 `section = text` 直接覆盖 → section_path 永远只有一级，
+    #    导出时全部标题都落在 `#`，docx 的标题层级信息彻底丢失（实测 51 号 50 个标题全平）。
+    sec_stack: list[tuple[int, str]] = []
     seen_rids: set[str] = set()
 
     def _emit(text: str, bump: int = 0):
         """写入一块，并按估算方式推进页码"""
         nonlocal page, chars
+        section = "/".join(_path_seg(x[1]) for x in sec_stack)
         chunks.append({"content": text, "page_no": page, "section_path": section})
         chars += len(text)
         if not has_breaks:
@@ -468,7 +819,9 @@ def parse_docx(path: str) -> list[dict]:
                 level = _docx_heading_level(b.style.name if b.style else "")
                 marker, indent = _docx_list_marker(b, num_kinds)
                 if level:
-                    section = text                       # 章节路径用纯文本
+                    while sec_stack and sec_stack[-1][0] >= level:
+                        sec_stack.pop()
+                    sec_stack.append((level, text))
                     _emit(f"{'#' * level} {text}", n_breaks)
                 elif marker:
                     _emit(f"{'  ' * indent}{marker} {text}", n_breaks)
@@ -495,7 +848,7 @@ def parse_docx(path: str) -> list[dict]:
                     if t:
                         chunks.append({"content": f"[图片] {t}",
                                        "page_no": para_page,
-                                       "section_path": section})
+                                       "section_path": "/".join(x[1] for x in sec_stack)})
         else:                                            # Table
             for md_table in _docx_table_markdown(b, lambda c: _md_cell(c.text)):
                 _emit(md_table)
@@ -550,6 +903,10 @@ def parse_pptx(path: str) -> list[dict]:
     return chunks
 
 
+# Markdown 标题行的层级前缀（`#` 后必须有空格，才能排除 `#话题#` 标签行）
+_HEAD_MARK_LOCAL = re.compile(r"^(#{1,6})\s+")
+
+
 def split_markdown(text: str) -> list[dict]:
     """Markdown 纯文本 → 文本块：按空行分段落，标题行（# 开头）更新 section_path，page_no=段落序号
 
@@ -563,14 +920,24 @@ def split_markdown(text: str) -> list[dict]:
     所以此前只有文件来源、问题没暴露；一旦接入外部文本就是必现缺陷。
     """
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    chunks, section, page = [], "", 1
+    chunks, page = [], 1
+    # 按标题层级建栈累加（`一级/二级/三级`）。
+    # ⚠️ 原先 `section = 首行` 直接覆盖 → section_path 永远只有一级，
+    #    出处展示看不出层次，导出侧也拿不到层级（实测 44 号 PRD 三层被压成一层）。
+    stack: list[tuple[int, str]] = []
     for block in text.split("\n\n"):
         block = block.strip()
         if not block:
             continue
         first_line = block.splitlines()[0].strip()
-        if first_line.startswith("#"):
-            section = first_line.lstrip("#").strip()
+        m = _HEAD_MARK_LOCAL.match(first_line)
+        if m:
+            level = min(len(m.group(1)), 6)
+            title = first_line.lstrip("#").strip()
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, title))
+        section = "/".join(_path_seg(x[1]) for x in stack)
         chunks.append({"content": block, "page_no": page, "section_path": section})
         page += 1
     return chunks

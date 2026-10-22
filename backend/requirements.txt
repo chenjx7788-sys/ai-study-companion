@@ -44,3 +44,13 @@ sherpa-onnx>=1.13
 # 打包时剔除 babel/locale-data 后降到 +11.3MB —— 实测中文抽取不依赖它（见 _fetch_probe/probe4_babel_trim.py）。
 # ⚠️ 打包后必须实测：静态抓取 + SPA 判定 + 公众号抓取三态都正常。
 trafilatura>=2.2
+# AI 视频渲染：无头 Chromium 抓帧（CDP screencast，见 app/services/renderer.py）。
+# ⚠️ 锁 ==1.57.0：它对应的浏览器 build（chromium-1200）是实测「npmmirror + 微软 CDN
+#    双源均可下载」的最新版本（2026-10-20：build ≥1217 的 chromium-win64.zip 双源皆缺，
+#    微软网关 400 / npmmirror 404）。浏览器本体不随包，首次渲染按需下载（renderenv.py）。
+playwright==1.57.0
+# 动效图解皮肤（stage_tpl_motion.html）的公式：LaTeX → MathML 在后端转换，
+# 浏览器用 Chromium MathML Core 原生渲染（系统 Cambria Math 字体）——
+# 不引 KaTeX/MathJax：零 JS 库、零字体资产（授权与体积两个坑都不踩）。
+# 纯 Python、体积小；缺包时 video.tex_to_mathml 返回 None，公式退化为文本块（不白屏）。
+latex2mathml>=3.77

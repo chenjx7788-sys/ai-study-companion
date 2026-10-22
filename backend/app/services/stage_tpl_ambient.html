@@ -213,8 +213,14 @@ function paint(ms) {
   $('progFill').style.width = (p * 100) + '%';
 }
 
+/* 渲染倍速（2026-10-20）：页钟 = 墙钟 × RATE → 抓帧段墙钟 = 时长 / RATE。
+   ⚠️ 能开倍速的前提：本模板所有动效都是 render(ms) 纯函数（无 CSS transition/keyframes
+      跟墙钟走）—— 所以 __RATE__ 只注入三个解压模板（stage_tpl.html 系还有 CSS 过渡，恒 1.0）。
+   ⚠️ RATE 必须随 __stage.rate 自报：renderer 以页面自报为准（帧时间戳按它换算页时间）。 */
+const RATE = __RATE__;
+
 window.__stage = {
-  total: TOTAL, ms: 0, t0: 0, done: false, running: false,
+  total: TOTAL, rate: RATE, ms: 0, t0: 0, done: false, running: false,
   data: { segs: SEGS, inner: INNER, hasDoc: HAS_DOC, src: SRC },
   ready: function () {
     if (document.fonts && document.fonts.status !== 'loaded') return false;
@@ -229,7 +235,7 @@ window.__stage = {
     self.ms = 0; self.done = false; self.running = true;
     function tick() {
       if (!self.running) return;
-      const ms = Math.min(TOTAL, performance.now() - self.t0);
+      const ms = Math.min(TOTAL, (performance.now() - self.t0) * RATE);
       self.ms = ms;
       render(ms); paint(ms);
       if (ms >= TOTAL) { self.done = true; self.running = false; return; }
@@ -241,7 +247,7 @@ window.__stage = {
   state: function () {
     const self = window.__stage;
     return { ms: self.ms, t0: self.t0, done: self.done, running: self.running,
-             clock: performance.now() - self.t0 };
+             clock: Math.min(TOTAL, (performance.now() - self.t0) * RATE) };
   }
 };
 render(0); paint(0);

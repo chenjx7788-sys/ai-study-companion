@@ -5,6 +5,8 @@ export const materialApi = {
   list: (params) => http.get('/materials', { params }),
   detail: (id) => http.get(`/materials/${id}`),
   chunks: (id) => http.get(`/materials/${id}/chunks`),
+  // 某页的扫描行框（只在「在原文中定位」时按需取，避免首屏传整本坐标）
+  pageBoxes: (id, pageNo) => http.get(`/materials/${id}/page/${pageNo}/boxes`),
   updateChunk: (materialId, chunkId, content) => http.put(`/materials/${materialId}/chunks/${chunkId}`, { content }),
   deleteChunk: (materialId, chunkId) => http.delete(`/materials/${materialId}/chunks/${chunkId}`),
   deletePage: (materialId, pageNo) => http.delete(`/materials/${materialId}/pages`, { params: { page_no: pageNo } }),
@@ -21,6 +23,8 @@ export const materialApi = {
   }),
   update: (id, payload) => http.patch(`/materials/${id}`, payload),   // 标签/阅读进度
   exportNotesUrl: (id) => `/api/materials/${id}/notes/export`,
+  // 正文导出（带标题层级 / 页码锚 / 图内文字附录）。与上面「笔记导出」是两回事。
+  exportMarkdownUrl: (id) => `/api/materials/${id}/export.md`,
   remove: (id) => http.delete(`/materials/${id}`),
   retryParse: (id) => http.post(`/materials/${id}/reparse`),
   fulltextSearch: (q, folderId) => http.get('/materials/search/fulltext', { params: { q, folder_id: folderId ?? undefined } }),
@@ -142,6 +146,10 @@ export const simpleLearnApi = {
   note: (materialId) => http.get('/simple-learn/note', { params: { material_id: materialId } }),
   // 只重跑出题（讲义不动）：用于「讲义已生成但出题失败」时的重试
   quiz: (materialId, quizCount) => http.post('/simple-learn/quiz', { material_id: materialId, quiz_count: quizCount }),
+  // 分章讲义（长材料）：章节清单 + 各章生成状态
+  chapters: (materialId) => http.get('/simple-learn/chapters', { params: { material_id: materialId } }),
+  // 单章补生成 SSE（事件与 run/stream 相同；要完整路径，streamSSE 走 fetch）
+  chapterStreamUrl: '/api/simple-learn/chapter/stream',
 }
 
 // 语音模型（Whisper 转写模型：状态 / 下载 / 进度）
@@ -158,6 +166,14 @@ export const zipvoiceApi = {
   download: () => http.post('/zipvoice/download'),
   downloadStatus: () => http.get('/zipvoice/download/status'),
   voices: () => http.get('/zipvoice/voices')
+}
+
+// AI 视频渲染组件（Chromium 内核：状态 / 按需下载 / 进度）
+// 与 asrApi / zipvoiceApi 同构 —— 前端复用同一套「下载 + 轮询」交互
+export const renderenvApi = {
+  status: () => http.get('/renderenv/status'),
+  download: () => http.post('/renderenv/download'),
+  downloadStatus: () => http.get('/renderenv/download/status')
 }
 
 // 设置（PRD 模块 F）
@@ -273,6 +289,8 @@ export const videoApi = {
   render: (id, skipGate = false) => http.post(`/videos/${id}/render`, skipGate ? { skip_gate: true } : {}),
   renderStreamUrl: (id) => `/api/videos/${id}/render/stream`,
   renderStatus: (id) => http.get(`/videos/${id}/render/status`),
+  // 取消渲染（幂等）：排队中立即出队，渲染中由服务端在检查点收口；DB 复用 failed+「已取消渲染」
+  renderCancel: (id) => http.post(`/videos/${id}/render/cancel`),
   audioUrl: (id, v) => `/api/videos/${id}/audio${v ? `?v=${v}` : ''}`,
   srtUrl: (id) => `/api/videos/${id}/srt`,
   // 播放器内字幕轨（<track> 只认 WebVTT；与 SRT 同一条时间轴）
@@ -298,4 +316,16 @@ export const videoApi = {
   // 删除一张上传的背景（内置背景不是文件、后端会拒）。返回带 used_by：
   // 「有几个作品正在用它」，前端据此在确认框里如实说明后果（与 deleteAvatar 同一口径）。
   deleteBackground: (id) => http.delete(`/videos/background/${id}`),
+}
+
+// 客户端更新（routers/update.py）：检查 / 下载 / 进度 / 定位 / 清空下载
+// ⚠️ check 的 timeout 必须留够：后端会依次试三个源（每个 8s），最坏 24s，
+//    用默认 120s 虽也够，但显式收窄能在断网时更快失败（自动检查不该拖住任何交互）。
+export const updateApi = {
+  check: (force = false) => http.get(`/update/check${force ? '?force=1' : ''}`, { timeout: 40000 }),
+  progress: () => http.get('/update/progress', { timeout: 15000 }),
+  download: (version = '') => http.post('/update/download', { version }),
+  cancel: () => http.post('/update/cancel'),
+  reveal: (path = '') => http.post('/update/reveal', { path }),
+  clear: () => http.post('/update/clear'),
 }

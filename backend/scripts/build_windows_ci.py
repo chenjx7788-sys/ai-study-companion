@@ -507,19 +507,33 @@ def main() -> int:
     step("[2/5] 前端构建（vite build → frontend/dist）")
     npm = which_npm()
     log("  使用 npm：%s" % npm)
-    rmtree(FRONTEND_DIR / "dist")
-    t_fe = time.time()
-    run([npm, "ci"], FRONTEND_DIR, "npm ci")
-    log("  npm ci 之后：node_modules/%s；vditor/dist 存在=%s"
-        % (_count_items(FRONTEND_DIR / "node_modules"),
-           (FRONTEND_DIR / "node_modules" / "vditor" / "dist").exists()))
-    run([npm, "run", "build"], FRONTEND_DIR, "npm run build")
-    fe_index = FRONTEND_DIR / "dist" / "index.html"
-    if not fe_index.exists():
-        raise SystemExit("[ERROR] 前端产物缺失：%s" % fe_index)
-    fe_files = [p for p in (FRONTEND_DIR / "dist").rglob("*") if p.is_file()]
-    log("  前端产物：%d 个文件，index.html %d bytes；本步累计 %.0fs"
-        % (len(fe_files), fe_index.stat().st_size, time.time() - t_fe))
+    if os.environ.get("SKIP_NPM_CI", "0") == "1":
+        # ⚠️ 本机沙箱删除配额有限时用（npm ci 会先清空 node_modules，被护栏拦下后还会
+        #    留下残缺的 .bin，此后 npm run 找不到 vite）。复用既有 node_modules 与
+        #    已构建的 frontend/dist —— 因此**调用前必须先手动构建前端**。CI 上不要设。
+        fe_pre = FRONTEND_DIR / "dist" / "index.html"
+        if not (FRONTEND_DIR / "node_modules" / "vite" / "bin" / "vite.js").exists():
+            raise SystemExit("[ERROR] SKIP_NPM_CI=1 但 node_modules/vite 缺失，无法复用")
+        if not fe_pre.exists():
+            raise SystemExit("[ERROR] SKIP_NPM_CI=1 但 frontend/dist/index.html 缺失（先手动构建）")
+        log("  [WARN] SKIP_NPM_CI=1 —— 跳过 npm ci / build，复用 frontend/dist（构建于 %s）"
+            % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(fe_pre.stat().st_mtime)))
+        fe_files = [p for p in (FRONTEND_DIR / "dist").rglob("*") if p.is_file()]
+        log("  前端产物：%d 个文件，index.html %d bytes" % (len(fe_files), fe_pre.stat().st_size))
+    else:
+        rmtree(FRONTEND_DIR / "dist")
+        t_fe = time.time()
+        run([npm, "ci"], FRONTEND_DIR, "npm ci")
+        log("  npm ci 之后：node_modules/%s；vditor/dist 存在=%s"
+            % (_count_items(FRONTEND_DIR / "node_modules"),
+               (FRONTEND_DIR / "node_modules" / "vditor" / "dist").exists()))
+        run([npm, "run", "build"], FRONTEND_DIR, "npm run build")
+        fe_index = FRONTEND_DIR / "dist" / "index.html"
+        if not fe_index.exists():
+            raise SystemExit("[ERROR] 前端产物缺失：%s" % fe_index)
+        fe_files = [p for p in (FRONTEND_DIR / "dist").rglob("*") if p.is_file()]
+        log("  前端产物：%d 个文件，index.html %d bytes；本步累计 %.0fs"
+            % (len(fe_files), fe_index.stat().st_size, time.time() - t_fe))
 
     # ── [3/5] PyInstaller ────────────────────────────────────────────────
     step("[3/5] PyInstaller 打包（onedir）")
@@ -685,6 +699,9 @@ def assert_package(zip_path: Path, fe_count: int, model_path: Path) -> None:
     need(base + "base_library.zip", "标准库归档 base_library.zip")
     need(base + "dist/index.html", "前端入口 dist/index.html")
     need(base + "extension/manifest.json", "浏览器扩展随包")
+    # AI 视频渲染：playwright 包 + driver 必须随包（0.1.6 漏收的缺口，2026-10-20 补）
+    need(base + "playwright/driver/package/browsers.json", "playwright driver 随包")
+    need(base + "playwright/driver/node.exe", "playwright driver node.exe 随包")
 
     # ⚠️ 舞台模板 + 预置形象素材：`collect_all()` 收不到的**数据文件**，只在打包版暴露
     #    （源码态读工作树里的真文件 → 缺了也一切正常，本项目已两次栽在这类「只漏打包版」）。

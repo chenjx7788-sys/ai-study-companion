@@ -180,6 +180,16 @@ def test_model(payload: dict, request: Request):
     if not getattr(r, "choices", None):
         raise HTTPException(400, "连接失败：返回内容不是有效的 OpenAI 兼容响应"
                                  "（请检查 Base URL 是否需以 /v1 结尾）")
+    # Token 记账：ping 调用虽小（max_tokens=1），也是真实消耗，纳入统计（失败静默）
+    try:
+        from ..services.llm import log_usage
+        if getattr(r, "usage", None):
+            log_usage("test", model, int(r.usage.prompt_tokens or 0),
+                      int(r.usage.completion_tokens or 0))
+        else:
+            log_usage("test", model, 1, 1, estimated=True)
+    except Exception:
+        pass
     return {"ok": True, "latency_ms": int((time.time() - t0) * 1000), "model": model}
 
 

@@ -68,13 +68,21 @@ function fitWidth() {
 // 顺序推进：同名正文段落不会被误标 —— 每个标题只认「上一个命中之后的第一个」匹配。
 function norm(s) { return (s || '').replace(/\s+/g, ' ').trim() }
 
+// 目录条目可能是**多级 section_path**（`章/节/小节`），而段落的 textContent 只有末级标题：
+// 拿整条路径去比对，只有一级标题能命中（实测 23 条目录只标出 1 个锚点，其余点击静默无效）。
+// 比对用末级；`／` 是全角转义（标题自带的斜杠，见 parser._path_seg），比对前还原成半角。
+function leafTitle(t) {
+  const segs = String(t || '').split('/')
+  return (segs[segs.length - 1] || '').replace(/／/g, '/')
+}
+
 function tagSections() {
   const titles = (props.sections || []).filter(Boolean)
   if (!titles.length || !host.value) return
   const paras = [...host.value.querySelectorAll('p')]
   let pi = 0
   for (const title of titles) {
-    const want = norm(title)
+    const want = norm(leafTitle(title))
     for (; pi < paras.length; pi++) {
       if (norm(paras[pi].textContent) === want) {
         paras[pi].setAttribute('data-section', title)

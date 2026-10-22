@@ -22,7 +22,13 @@
         <span class="nav-icon" v-html="helpIcon"></span>
         <span class="nav-label">使用帮助</span>
       </div>
-      <div class="aside-footer"><span v-if="version" class="ver-tag">版本号：v{{ version }}</span></div>
+      <div class="aside-footer">
+        <span v-if="version" class="ver-tag clickable"
+          :title="hasUpdate ? '有新版本 v' + updateInfo.latest + '，点击查看' : '点击检查更新'"
+          @click="openUpdate">
+          版本号：v{{ version }}<i v-if="hasUpdate" class="upd-dot"></i>
+        </span>
+      </div>
       <div class="collapse-btn" :title="sidebarCollapsed ? '展开菜单' : '折叠菜单'" @click="toggleSidebar">
         <svg v-if="sidebarCollapsed" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5l7 7-7 7"/><path d="M12 5l7 7-7 7"/></svg>
         <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 5l-7 7 7 7"/><path d="M12 5l-7 7 7 7"/></svg>
@@ -36,6 +42,18 @@
           还差一步：配置 LLM 模型后，即可开始导入资料、AI 问答与复习
         </span>
         <el-button size="small" type="primary" @click="$router.push('/settings')">前往配置</el-button>
+      </div>
+      <div v-if="!isBare && updateTip" class="update-banner">
+        <span class="update-banner-text">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 21h16"/></svg>
+          新版本 v{{ updateInfo.latest }} 已发布
+        </span>
+        <span class="update-banner-ops">
+          <el-button size="small" type="primary" @click="openUpdate">查看更新</el-button>
+          <span class="update-banner-close" title="本次不再提示" @click="dismissUpdateTip">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </span>
+        </span>
       </div>
       <router-view v-slot="{ Component }">
         <!-- ⚠️ key 不能省：/study/A → /study/B 命中的是**同一条路由记录**、只换 params，
@@ -52,6 +70,9 @@
       <img :src="mascot" class="float-mascot" alt="知萤猫头鹰" />
       <span class="float-bubble">有学习问题，问伴伴</span>
     </div>
+
+    <!-- 客户端更新弹窗（v-model 双向：子组件里「稍后」也会关掉） -->
+    <UpdateDialog v-if="!isBare" v-model="updateOpen" :info="updateInfo" @ignore="ignoreUpdateVersion" />
 
     <!-- 首次使用分步引导 -->
     <el-tour v-if="!isBare" v-model="tourOpen" placement="right" @close="onTourClose">
@@ -92,8 +113,11 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import mascot from './assets/mascot.png'
-import { reviewApi, settingsApi, materialApi } from './api'
+import { reviewApi, settingsApi, materialApi, updateApi } from './api'
 import { ElMessage } from 'element-plus'
+import { storeToRefs } from 'pinia'
+import UpdateDialog from './components/UpdateDialog.vue'
+import { useUpdateStore } from './stores/update'
 
 const route = useRoute()
 const router = useRouter()
@@ -124,6 +148,20 @@ let dueTimer = null
 // 未配置 LLM 时的引导提示（配置完成后消失）
 const needSetup = ref(false)
 const version = ref('')
+
+// ---------- 客户端更新 ----------
+// 状态与「已忽略版本 / 提示次数」全在 stores/update.js（单一真相）：
+// 设置页也要读写同一份，否则在设置页忽略后，侧栏红点还挂着。
+const updateStore = useUpdateStore()
+const { info: updateInfo, tip: updateTip, dialogOpen: updateOpen } = storeToRefs(updateStore)
+const hasUpdate = computed(() => updateStore.hasUpdate)
+const openUpdate = () => updateStore.openDialog()
+const dismissUpdateTip = () => updateStore.dismissTip()
+function ignoreUpdateVersion(v) {
+  updateStore.ignore(v)
+  ElMessage.success('已忽略 v' + (v || '') + '，下一个版本会再次提醒')
+}
+
 async function checkSetup() {
   try {
     const { data } = await settingsApi.get()
@@ -153,6 +191,10 @@ onMounted(() => {
     if (!isBare.value) setTimeout(() => { tourOpen.value = true }, 600)
   })
   // 点击遮罩空白处 = 跳过引导（否则遮罩会拦下所有点击，造成「界面卡死」的错觉）
+  // 先恢复「已忽略的版本 / 已提示次数」，再延迟 8s 静默检查：
+  // 不抢首屏、不抢模型加载；失败静默
+  updateStore.hydrate()
+  setTimeout(() => updateStore.autoCheck(), 8000)
   document.addEventListener('click', onMaskClick, true)
 })
 onUnmounted(() => dueTimer && clearInterval(dueTimer))
@@ -321,6 +363,35 @@ watch(() => route.path, (path) => {
   font-size: 13px; color: var(--asc-primary); font-weight: 500;
 }
 .setup-banner-text svg { flex-shrink: 0; }
+/* 版本号可点（检查更新入口）：保留原胶囊样式，只加交互反馈 */
+.ver-tag.clickable { cursor: pointer; transition: background .15s ease, color .15s ease; }
+.ver-tag.clickable:hover { background: var(--asc-primary-soft); color: var(--asc-primary); }
+/* 新版本红点：不挤压文字，绝对定位在胶囊右上 */
+.ver-tag.clickable { position: relative; }
+.upd-dot {
+  position: absolute; top: -3px; right: -3px;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #e54545; box-shadow: 0 0 0 2px var(--asc-bg);
+}
+/* 新版本提示条：与 setup-banner 同构，但用强调色区分「可操作」与「必须处理」 */
+.update-banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  padding: 8px 22px;
+  background: linear-gradient(90deg, rgba(124, 92, 252, .10), rgba(124, 92, 252, .04));
+  border-bottom: 1px solid rgba(124, 92, 252, .16);
+}
+.update-banner-text {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--asc-primary); font-weight: 500;
+}
+.update-banner-text svg { flex-shrink: 0; }
+.update-banner-ops { display: inline-flex; align-items: center; gap: 10px; }
+.update-banner-close {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 6px; cursor: pointer;
+  color: var(--asc-text-2); transition: background .15s ease, color .15s ease;
+}
+.update-banner-close:hover { background: rgba(0, 0, 0, .06); color: var(--asc-text); }
 /* ===== E1 全局悬浮问答入口（伴伴 IP） ===== */
 .float-chat {
   position: fixed; right: 26px; bottom: 26px; z-index: 90;

@@ -38,13 +38,16 @@
         <!-- 画面署名（电台浅色/深色画面底部那行字）。
              ⚠️ 只在电台皮肤下显示：其余皮肤的画面里**没有这个位置**，
                 给一个填了却永远不出现在成片里的输入框，比不显示更糟。
-             ⚠️ maxlength 与后端 svc.BRAND_TEXT_MAX 必须一致（20）。 -->
+             ⚠️ maxlength 与后端 svc.BRAND_TEXT_MAX 必须一致（50，**含换行符**）；
+                行数上限 svc.BRAND_TEXT_MAX_LINES（2）—— 多出的行后端归一化时丢弃。 -->
         <div v-if="brandSkin" class="field">
           <label class="field-label">画面署名</label>
-          <el-input v-model="form.brand_text" maxlength="20" show-word-limit
+          <el-input v-model="form.brand_text" type="textarea" :rows="2"
+                    maxlength="50" show-word-limit
                     placeholder="留空则用作品标题" />
           <p class="field-hint">
-            电台画面底部那行字。标题太长放不下时，在这里填一个短一些的；
+            电台画面底部那行字，最多 50 字、可换 1 次行（两行如「作品名 / 出品方」）。
+            标题太长放不下时，在这里填一个短一些的；
             改完需<b>重新生成</b>才会出现在成片里。
           </p>
         </div>
@@ -70,9 +73,9 @@
             <template #self>
               <div class="field">
                 <label class="field-sub-label">素材类型</label>
-                <el-select v-model="form.source_type" style="width: 100%">
-                  <el-option v-for="s in opts.source_types" :key="s.key" :value="s.key" :label="s.label" />
-                </el-select>
+                <el-radio-group v-model="form.source_type" class="src-type-tabs">
+                  <el-radio-button v-for="s in opts.source_types" :key="s.key" :value="s.key">{{ s.label }}</el-radio-button>
+                </el-radio-group>
               </div>
 
               <div v-if="form.source_type === 'article'" class="field">
@@ -259,16 +262,17 @@
             :precheck="precheckSkins"
             :previews="opts.previews"
           />
-          <!-- ⚠️⚠️ 【数字人口播】形象行整块**暂停入口**（2026-10-14，产品决定：方案重想好之后
-               再启动研发与规划）。后端 /options 的 skins 列表已同步注释「数字人口播」，
-               用户暂时选不到该视觉风格 → 本行 v-if 条件永不为真；渲染链路与已有作品的
-               播放、重新生成全部保留（不静默改作品）。
+          <!-- ⚠️⚠️ 【数字人口播】形象行整块**暂停入口**（2026-10-20 晚，产品决定：方向定为
+               「声音 + 板书」，数字人放弃；板书 Demo 见 _probe_blackboard_20261020/board_demo.mp4）。
+               后端 /options 与 /precheck 的「数字人口播」已同步注释 → 本行 v-if 永不为真；
+               渲染链路（stage.py::_th_dom / stage_tpl.html）与形象素材全部保留（不静默改作品）。
                恢复方法：① 去掉本外层注释；② 把下方 3 处「普通文字」行还原成 HTML 注释
                （原注释的尖括号已去掉，避免嵌套注释提前终止外层注释）；③ 后端两处 skins
                （/options 列表 + /precheck 预检）一起加回。
 
                [以下为暂停的原始内容]
                数字人口播的形象：只允许预置素材或用户本人上传（PRD 3.7.6 合规）
+               入口 2026-10-20 曾重新开启（形象保留背景 + 羽化），同日方向改判板书后再次暂停
           <div v-if="form.skin === 'talking_head'" class="avatar-row">
             <div class="avatar-list">
               <button v-for="a in opts.avatars" :key="a.id" type="button" class="avatar-item"
@@ -410,28 +414,35 @@
           <div class="work-grid">
             <button v-for="w in list" :key="w.id" type="button" class="work-card"
                     @click="openWork(w.id)">
-              <div v-if="w.has_video && w.poster_name" class="work-thumb">
-                <img :src="videoApi.posterUrl(w.id, w.video_bytes)" alt="" loading="lazy" />
+              <!-- 封面（2026-10-20 美化）：有海报用海报（16:9 通栏，不再写死 118px 压扁）；
+                   无海报用皮肤色渐变占位 —— 两种卡同高，消除「无封面卡视觉塌陷」。 -->
+              <div class="work-thumb">
+                <img v-if="w.has_video && w.poster_name"
+                     :src="videoApi.posterUrl(w.id, w.video_bytes)" alt="" loading="lazy" />
+                <div v-else class="work-thumb-ph" :data-skin="w.skin">
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3" stroke="currentColor" stroke-width="1.5"/><path d="M10 9.3l5 2.7-5 2.7V9.3z" fill="currentColor"/></svg>
+                </div>
+                <span class="badge work-badge" :class="statusClass(w.status)">{{ cardStatusText(w) }}</span>
               </div>
-              <div class="work-card-top">
-                <span class="work-title">{{ w.title }}</span>
-                <span class="badge" :class="statusClass(w.status)">{{ cardStatusText(w) }}</span>
-              </div>
+              <span class="work-title">{{ w.title }}</span>
               <div class="work-meta">
-                <span>{{ w.skin_label }}</span>
                 <span>{{ fmtMs(w.duration_ms) }}</span>
+                <span>{{ w.skin_label }}</span>
                 <span v-if="w.has_video && w.video_bytes">{{ fmtBytes(w.video_bytes) }}</span>
-                <span>{{ w.shot_count }} 分镜 / {{ w.step_count }} 步点</span>
               </div>
-              <div class="work-meta">
-                <span v-if="w.gate_skipped" class="bad-text">未通过质量自检</span>
-                <span v-else-if="w.gate_passed === true" class="ok-text">质量自检通过</span>
-                <span v-else-if="w.gate_passed === false" class="bad-text">质量自检未通过</span>
-                <span v-else>未自检</span>
-                <span>{{ w.audio_source === 'podcast' ? '复用播客音轨' : '本片音轨' }}</span>
-                <span v-if="w.has_video">已成片</span>
+              <!-- 质量状态：图标 + 文字，不再是 color-only（WCAG 1.4.1）。
+                   「已成片」不重复展示 —— 封面上浮的 badge 已表达。 -->
+              <div class="work-state">
+                <span v-if="w.gate_skipped" class="ws-item bad"><svg viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M7 1.8 13 12H1L7 1.8z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M7 5.6v3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="7" cy="10.2" r=".7" fill="currentColor"/></svg>未通过质量自检</span>
+                <span v-else-if="w.gate_passed === true" class="ws-item ok"><svg viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="5.6" stroke="currentColor" stroke-width="1.3"/><path d="M4.6 7.2l1.7 1.7 3.1-3.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>质量自检通过</span>
+                <span v-else-if="w.gate_passed === false" class="ws-item bad"><svg viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M7 1.8 13 12H1L7 1.8z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M7 5.6v3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="7" cy="10.2" r=".7" fill="currentColor"/></svg>质量自检未通过</span>
+                <span v-else class="ws-item mut"><svg viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="5.6" stroke="currentColor" stroke-width="1.3"/><path d="M4.4 7h5.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>未自检</span>
+                <span class="ws-src">{{ w.audio_source === 'podcast' ? '复用播客音轨' : '本片音轨' }}</span>
               </div>
-              <p v-if="w.error" class="work-error">{{ w.error }}</p>
+              <!-- 失败原因默认收起一行，点击展开/收起（@click.stop 不触发开卡） -->
+              <p v-if="w.error" class="work-err" :class="{ open: ui.errOpen === w.id }"
+                 :title="ui.errOpen === w.id ? '点击收起' : '点击展开完整原因'"
+                 @click.stop="ui.errOpen = ui.errOpen === w.id ? 0 : w.id">{{ w.error }}</p>
             </button>
           </div>
         </template>
@@ -504,6 +515,10 @@
                     可离开页面，渲染在后台继续；回来会自动接上进度
                   </span>
                   <span v-else-if="!opts.render_ready" class="actions-hint">{{ opts.render_reason }}</span>
+                  <el-button v-if="!opts.render_ready && opts.render_blocker === 'chromium' && !rdl.downloading"
+                             size="small" @click="startRenderDl">
+                    下载渲染组件（约 {{ opts.render_dl_size_mb || 170 }}MB）
+                  </el-button>
                 </div>
                 <!-- 跳过质量闸门（PRD 3.9.7 / 验收 #33）：连续 3 次未通过才出现；
                      跳过 = 知情放弃质量保障，成片标注「未通过质量自检」并记录在案 -->
@@ -518,7 +533,14 @@
                 <div v-if="rendering" class="render-bar">
                   <el-progress :percentage="renderPct" :stroke-width="8" :show-text="false" />
                   <span class="render-stage">{{ renderStageText }}</span>
+                  <el-button size="small" text type="danger" class="render-cancel-btn"
+                             :loading="cancelling" @click="cancelRender">取消</el-button>
                 </div>
+                <div v-if="rdl.downloading" class="render-bar">
+                  <el-progress :percentage="rdl.progress" :stroke-width="8" :show-text="false" />
+                  <span class="render-stage">{{ rdl.status === 'extracting' ? '正在校验与解压组件…' : `正在下载渲染组件 ${rdl.downloaded_mb}/${rdl.total_mb}MB` }}</span>
+                </div>
+                <p v-if="!rdl.downloading && rdl.error" class="notice warn">渲染组件下载失败：{{ rdl.error }}，可重新点击下载</p>
                 <p v-if="renderError" class="notice warn">{{ renderError }}</p>
                 <p v-if="showQuality" class="render-quality">
                   上次渲染：{{ renderQualityText }}
@@ -553,8 +575,9 @@
           <!-- 讲稿（可逐句编辑；改一句丢该句时间戳，不触发重新合成） -->
           <div v-show="ui.tab === 'script'" class="dtab-panel">
             <!-- 已成片作品的独立音轨放讲稿旁（听音轨校文案）；无成片时音轨在上方预览区 -->
-            <audio v-if="cur.has_audio && cur.has_video" class="player panel-audio"
-                   :src="videoApi.audioUrl(cur.id, cur.audio_bytes)" controls />
+            <AudioBar v-if="cur.has_audio && cur.has_video"
+                      :src="videoApi.audioUrl(cur.id, cur.audio_bytes)"
+                      :duration-ms="cur.duration_ms" label="音轨" />
             <h4 class="sec-title">
               讲稿
               <span class="sec-note">改过 {{ dirtyCount }} 句 · 时间轴来自音轨，改动后请重跑自检</span>
@@ -697,8 +720,9 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import PageHead from '../components/PageHead.vue'
 import SkinPicker from '../components/SkinPicker.vue'
 import AudioSourcePicker from '../components/AudioSourcePicker.vue'
+import AudioBar from '../components/AudioBar.vue'
 import NoteEditorDialog from '../components/NoteEditorDialog.vue'
-import { statsApi, videoApi, podcastApi } from '../api'
+import { statsApi, videoApi, podcastApi, renderenvApi } from '../api'
 import { errMsg } from '../api/http'
 import { streamSSE } from '../utils/sse'
 
@@ -725,7 +749,7 @@ const STATUS_LABEL = {
 // 闸门给的是机器可执行的 fix 键；按钮动作在模板里，这里是照着做的说明文字。
 const FIX_HINT = {
   fill_steps: '只重跑定位与步点生成（不动讲稿与音轨），补完自动重跑自检',
-  manual_locate: '从材料原文里挑一段原样存在的短语手动指定；或换一份材料 / 改用结构图方案',
+  manual_locate: '从材料原文里挑一段原样存在的短语手动指定；或换一份材料 / 改用 PPT 课件 / 板书方案',
   resynth_audio: '复用播客 → 去「AI 播客」页重新合成那条播客；本片音轨 → 点左侧「重新生成讲稿与分镜」会连带重合成音轨（讲稿文本不变）',
   free_space: '清理磁盘空间后重试',
 }
@@ -738,7 +762,7 @@ const STAGE_LABEL = {
 //    （构建与文本断言都全绿，只有真机打开才发现）。
 const RENDER_STAGE_LABEL = {
   queued: '排队中', stage: '准备舞台页', capture: '录制画面',
-  mux: '合成音视频', finalize: '写入成片', done: '完成',
+  encode: '编码成片', mux: '合成音视频', finalize: '写入成片', done: '完成',
 }
 // 后端 /videos/options 目前不下发 highlight_semantics（播客页有）。
 // 这里给一份最小兜底，避免「三色划线」来源在视频页无法选择颜色。
@@ -755,6 +779,7 @@ const showSteps = ref(false)
 const scriptDirty = ref(false)
 // 渲染（阶段 2）：与生成同构的「启动或附着」—— 离开页面任务照跑，回来重新订阅。
 const rendering = ref(false)
+const cancelling = ref(false)
 const renderPct = ref(0)
 const renderStage = ref('')
 const renderPos = ref(0)
@@ -788,7 +813,7 @@ const opts = ref({
   // 全局背景库（解压型三皮肤共用）+「支持自定义背景的皮肤」名单（以后端下发为准）
   backgrounds: [], bg_skins: [], previews: [],
   length_presets: [], gen_modes: [], hints: {}, output: {},
-  render_ready: false, render_reason: '', llm_ready: false,
+  render_ready: false, render_reason: '', render_blocker: '', render_dl_size_mb: 0, llm_ready: false,
 })
 const list = ref([])
 const cur = ref(null)
@@ -797,12 +822,17 @@ const precheck = ref(null)
 const scriptDraft = ref([])
 const stage = reactive({ key: '', detail: {} })
 // 界面布局状态（V8 美化）：生成台四组折叠 + 详情页签。纯界面态，不进任何请求体。
-const ui = reactive({ gBasic: true, gAudio: true, gVisual: true, gAdv: false, tab: 'script' })
+const ui = reactive({ gBasic: true, gAudio: true, gVisual: true, gAdv: false, tab: 'script',
+                errOpen: 0 })  // 作品库：展开哪张卡的失败原因（0 = 都收起，2026-10-20）
 const avatarInput = ref(null)
 const bgInput = ref(null)
 const uploadingBg = ref(false)
 const deletingBg = ref(false)
 let planAbort = null
+
+// 渲染组件（Chromium）按需下载状态：与语音模型同一套「下载 + 轮询」交互
+const rdl = reactive({ downloading: false, progress: 0, downloaded_mb: 0, total_mb: 0, status: '', error: '' })
+let rdlTimer = null
 
 // ---------- 试听（音色与背景音乐共用，与播客同一状态机） ----------
 // 三态：previewId 空 = 待试听（▶）；previewBusy = 等待音频到达（转圈）；
@@ -1050,8 +1080,11 @@ const renderStageText = computed(() => {
     return renderPos.value > 1 ? `排队中：前面还有 ${renderPos.value - 1} 部` : '排队中'
   }
   const base = RENDER_STAGE_LABEL[renderStage.value] || '渲染中'
-  if (renderStage.value === 'capture') return `${base} ${renderPct.value}%`
-  return base
+  // ⚠️ 百分比要**所有阶段**都显示：后端现在把「抓帧 → 编码 → 合流」算进同一条
+  //    0–100 的尺子（原来只在抓帧阶段报，抓帧一结束就冻在 99%，而其后还有约
+  //    1.1× 片长的 x264 编码 → 用户看到「99% 卡死好几分钟」）。这里若仍只给
+  //    capture 显示百分比，编码阶段的爬升就全看不见了。
+  return `${base} ${Math.max(0, Math.min(99, Number(renderPct.value) || 0))}%`
 })
 // ⚠️ 必须声明在 renderQuality 之后：setup 里 computed 注册即同步求值一次（TDZ 会整页白屏）
 const renderQualityText = computed(() => {
@@ -1216,6 +1249,7 @@ async function reloadAll() {
   loading.value = true
   try {
     await Promise.all([loadOptions(), loadList(), loadBgm()])
+    resumeRenderDl()   // 不 await：下载状态查询不阻塞主加载
     const id = route.params.id ? Number(route.params.id) : null
     if (id) {
       // ⚠️ 直接打开 /video/:id（或刷新页面）时 watch 不会触发 → 这里必须自己接
@@ -1230,6 +1264,55 @@ async function reloadAll() {
   } finally {
     loading.value = false
   }
+}
+
+// ---------- 渲染组件按需下载（Chromium，约 170MB；与语音模型同一交互） ----------
+async function startRenderDl() {
+  try {
+    await renderenvApi.download()
+    rdl.downloading = true
+    rdl.error = ''
+    pollRenderDl()
+  } catch (e) {
+    ElMessage.error(errMsg(e, '启动下载失败'))
+  }
+}
+async function pollRenderDl() {
+  if (rdlTimer) clearTimeout(rdlTimer)
+  try {
+    const { data } = await renderenvApi.downloadStatus()
+    rdl.downloading = !!data.downloading
+    rdl.status = data.status || ''
+    rdl.progress = data.progress || 0
+    rdl.downloaded_mb = data.downloaded_mb || 0
+    rdl.total_mb = data.total_mb || 0
+    if (data.status === 'error') {
+      rdl.error = data.error || '下载失败'
+      return
+    }
+    if (data.downloading) {
+      rdlTimer = setTimeout(pollRenderDl, 1000)
+      return
+    }
+    if (data.status === 'done') {
+      // 组件就位 → 重新拉取选项与前置检查，渲染按钮应点亮
+      await loadOptions()
+      if (cur.value) await loadPrecheck(cur.value.id)
+      ElMessage.success('渲染组件已就绪，可以出片了')
+    }
+  } catch (e) {
+    rdlTimer = setTimeout(pollRenderDl, 2000)   // 轮询本身失败：退避重试
+  }
+}
+// 页面载入时若组件正在下载中（上次离开页面时在跑），接上轮询
+async function resumeRenderDl() {
+  try {
+    const { data } = await renderenvApi.downloadStatus()
+    if (data.downloading) {
+      rdl.downloading = true
+      pollRenderDl()
+    }
+  } catch (e) { /* 状态查询失败不影响主流程 */ }
 }
 
 // ============================================================================
@@ -1509,6 +1592,30 @@ async function resumeIfRunning(id) {
  *    所以重复点击、离开页面再回来都安全，不会起第二个渲染进程。
  * ⚠️ SSE 只是进度订阅者：断开连接**不会**中断渲染（调度线程自己跑到底）。
  */
+/** 取消渲染：排队中 → 服务端立即出队；渲染中 → 服务端在下一个检查点（≈16ms）收口。
+ *  取消不是失败：后端复用 failed + 「已取消渲染」文案，经 SSE 的 err 通路带回来。 */
+async function cancelRender() {
+  if (!cur.value || cancelling.value) return
+  try {
+    await ElMessageBox.confirm(
+      '取消后本次渲染进度作废；已有成片、讲稿、音轨都不受影响。',
+      '取消渲染',
+      { confirmButtonText: '取消渲染', cancelButtonText: '继续渲染', type: 'warning' },
+    )
+  } catch { return }
+  cancelling.value = true
+  try {
+    await videoApi.renderCancel(cur.value.id)
+    // ⚠️ 不在这里抢跑复位 rendering：服务端收口后广播 err（「已取消渲染」），
+    //    runRender 的 SSE 回调负责收尾并刷新详情，两处同时写会互相盖。
+  } catch (e) {
+    ElMessage.error(errMsg(e, '取消失败'))
+  } finally {
+    cancelling.value = false
+  }
+}
+
+
 async function runRender(id, { skipGate = false } = {}) {
   if (rendering.value) return
   if (!opts.value.render_ready) {
@@ -1542,7 +1649,13 @@ async function runRender(id, { skipGate = false } = {}) {
         if (payload && payload.video) applyVideo(payload.video)
         if (payload && payload.report) renderQuality.value = payload.report
       },
-      (msg) => { renderError.value = msg || '渲染失败'; ElMessage.error(msg || '渲染失败') },
+      (msg) => {
+        // 用户主动取消不是失败：不挂错误条、不用 error toast（文案口径：已取消渲染）
+        const cancelled = !!msg && msg.includes('已取消')
+        renderError.value = cancelled ? '' : (msg || '渲染失败')
+        if (cancelled) ElMessage.info(msg)
+        else ElMessage.error(msg || '渲染失败')
+      },
       (meta) => {
         renderStage.value = (meta && meta.stage) || ''
         renderPct.value = (meta && meta.pct) || 0
@@ -2024,8 +2137,8 @@ function cardStatusText(w) {
   const pos = Number(w.render_position) || 0
   // 队列里还没轮到（stage 空或 'queued'）：给出位次，和详情页 renderStageText 同口径
   if (!s || s === 'queued') return pos > 1 ? `排队中：前面还有 ${pos - 1} 部` : '排队中'
-  if (s === 'capture') return `${RENDER_STAGE_LABEL[s] || '渲染中'} ${Number(w.render_pct) || 0}%`
-  return RENDER_STAGE_LABEL[s] || '渲染中'
+  // 与详情页 renderStageText 同口径：所有阶段都带百分比（原因见那里的注释）。
+  return `${RENDER_STAGE_LABEL[s] || '渲染中'} ${Number(w.render_pct) || 0}%`
 }
 
 // ============================================================================
@@ -2077,6 +2190,7 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   stopListPoll()         // 离开页面停掉作品库轮询
+  if (rdlTimer) clearTimeout(rdlTimer)   // 渲染组件下载轮询（后台下载本身不中断）
   stopPreview()          // 离开页面把试听停掉，避免后台还在响
   reportPlay()           // V2：离开页面把观看时长报掉
   if (planAbort) planAbort.abort()
@@ -2132,6 +2246,10 @@ onBeforeUnmount(() => {
 .field-group-start { border-top: 1px solid var(--asc-divider); padding-top: 18px; }
 .field-label { font-size: 13px; font-weight: 600; color: var(--asc-text); }
 .field-sub-label { font-size: 12.5px; color: var(--asc-text-2); }
+/* 素材类型：分段 tab 切换（互斥单选走分段控件，与 DrillView/LibraryView 同形）；换行兜底窄栏 */
+.src-type-tabs { display: flex; flex-wrap: wrap; row-gap: 6px; width: 100%; }
+.src-type-tabs :deep(.el-radio-button) { flex: 1 0 auto; }
+.src-type-tabs :deep(.el-radio-button__inner) { width: 100%; padding-left: 8px; padding-right: 8px; }
 .field-hint { margin: 0; font-size: 12px; line-height: 1.6; color: #6e6e6e; }
 .field-hint b { color: var(--asc-text); }
 .field-hint.bad { color: #b6342c; }
@@ -2245,6 +2363,7 @@ onBeforeUnmount(() => {
 }
 .render-bar :deep(.el-progress) { flex: 1; min-width: 0; }
 .render-stage { flex: none; font-size: 12.5px; color: #6a48ee; }
+.render-cancel-btn { flex: none; margin-left: 2px; }
 .render-quality { margin: 8px 0 0; font-size: 12px; color: #6e6e6e; }
 .stage-line { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; font-size: 12.5px; color: #6a48ee; }
 .stage-dot {
@@ -2253,25 +2372,63 @@ onBeforeUnmount(() => {
 }
 @keyframes pulse { 0%, 100% { opacity: .3; transform: scale(.85); } 50% { opacity: 1; transform: scale(1.1); } }
 .empty-line { margin: 6px 0 14px; font-size: 13px; color: #6e6e6e; }
-.work-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+.work-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
 .work-card {
-  text-align: left; cursor: pointer; padding: 12px 13px; border-radius: 10px;
-  background: var(--asc-card); border: 1px solid transparent;
+  text-align: left; cursor: pointer; padding: 10px 10px 12px; border-radius: 12px;
+  background: var(--asc-card); border: 1px solid var(--asc-border);
   box-shadow: 0 1px 2px rgba(16, 24, 40, .05);
-  display: flex; flex-direction: column; gap: 7px; transition: all .15s ease;
+  display: flex; flex-direction: column; gap: 8px;
+  /* 只动 transform/阴影/边框色（不碰 width/height/top/left）→ 无布局抖动（2026-10-20 美化） */
+  transition: box-shadow .18s ease, border-color .18s ease, transform .18s ease;
 }
-.work-card:hover { box-shadow: 0 8px 24px -10px rgba(16, 24, 40, .18); }
-.work-card-top { display: flex; align-items: center; gap: 8px; }
+.work-card:hover {
+  box-shadow: 0 10px 26px -12px rgba(16, 24, 40, .22);
+  border-color: rgba(106, 72, 238, .35); transform: translateY(-1px);
+}
+.work-card:focus-visible { outline: 2px solid #6a48ee; outline-offset: 2px; }
+/* 封面 16:9 通栏：卡片多宽比例都恒定，海报不再被拦腰裁（原写死 118px 高 ≈3:1 宽扁条） */
+.work-thumb {
+  position: relative; border-radius: 8px; overflow: hidden;
+  aspect-ratio: 16 / 9; background: #0c0c0f;
+}
+.work-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* 无海报占位封面：按皮肤气质分组配色（默认覆盖 source/graph/graph_paper/graph_clean） */
+.work-thumb-ph {
+  width: 100%; height: 100%; display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(135deg, #e9edf3, #d7dfe9); color: #5a6a7d;
+}
+.work-thumb-ph svg { width: 34px; height: 34px; opacity: .85; }
+.work-thumb-ph[data-skin="radio"] { background: linear-gradient(135deg, #efe6d2, #ddcfb2); color: #6b5f45; }
+.work-thumb-ph[data-skin="night"] { background: linear-gradient(135deg, #232041, #171430); color: #8f89c0; }
+.work-thumb-ph[data-skin="ambient"] { background: linear-gradient(135deg, #1d2b33, #122026); color: #6e8a94; }
+.work-thumb-ph[data-skin="motion"] { background: linear-gradient(135deg, #1c2547, #0b1020); color: #58c4dd; }
+.work-badge { position: absolute; top: 8px; right: 8px; box-shadow: 0 1px 5px rgba(0, 0, 0, .28); }
 .work-title {
-  flex: 1; min-width: 0; font-size: 13.5px; font-weight: 600; color: var(--asc-text);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.work-meta { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px; color: #6e6e6e; }
-.work-card .work-meta + .work-meta { font-size: 11.5px; }
-.work-error {
-  margin: 0; font-size: 12px; color: #b6342c; line-height: 1.5;
+  padding: 0 2px; font-size: 14px; font-weight: 600; line-height: 1.4; color: var(--asc-text);
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  min-height: 2.8em; /* 两行占位：一行/两行标题的卡片底部仍对齐 */
 }
+.work-meta {
+  display: flex; gap: 6px 12px; flex-wrap: wrap;
+  /* 左 padding +6px：补偿标题首字「《」的全角字形留白，让 meta 墨缘与标题墨缘对齐（2026-10-22 墨迹级实测差恒为 6px） */
+  padding: 0 2px 0 8px;
+  font-size: 12px; color: #6e6e6e; font-variant-numeric: tabular-nums;
+}
+.work-state {
+  display: flex; align-items: center; gap: 6px 12px; flex-wrap: wrap;
+  padding: 0 2px; font-size: 12px;
+}
+.ws-item { display: inline-flex; align-items: center; gap: 5px; font-weight: 500; }
+.ws-item svg { width: 13px; height: 13px; flex-shrink: 0; }
+.ws-item.ok { color: #2c7a45; }
+.ws-item.bad { color: #b6342c; }
+.ws-item.mut { color: #6e6e6e; font-weight: 400; }
+.ws-src { color: #6e6e6e; }
+.work-err {
+  margin: 0; padding: 0 2px; font-size: 12px; color: #b6342c; line-height: 1.5; cursor: pointer;
+  display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden;
+}
+.work-err.open { -webkit-line-clamp: unset; display: block; }
 .badge {
   font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: 999px; flex-shrink: 0;
   background: var(--asc-surface-2); color: var(--asc-text-2);
@@ -2323,12 +2480,7 @@ onBeforeUnmount(() => {
 .script-time { font-size: 11.5px; color: #6e6e6e; padding-top: 6px; font-variant-numeric: tabular-nums; }
 .script-spk { font-size: 11.5px; color: var(--asc-text-2); padding-top: 6px; }
 .player { width: 100%; margin-bottom: 10px; border-radius: 10px; background: #000; }
-/* 作品卡片封面缩略图（V7 / PRD 3.11.3） */
-.work-thumb { margin: -2px -2px 2px; }
-.work-thumb img {
-  width: 100%; height: 118px; object-fit: cover; border-radius: 6px;
-  display: block; background: #000;
-}
+/* 作品卡片封面样式已并入 .work-grid 区块（2026-10-20 美化：16:9 通栏 + 皮肤色占位封面） */
 /* 闸门操作列的说明文字（V5） */
 .fix-hint { margin-top: 4px; font-size: 12px; color: #6e6e6e; line-height: 1.5; }
 /* 未命中句手动定位面板（V5 / PRD 3.9.5 判据 4） */
@@ -2423,7 +2575,6 @@ onBeforeUnmount(() => {
 .dtab.active { color: #6a48ee; font-weight: 600; border-bottom-color: #6a48ee; }
 .dtab-panel { padding-top: 6px; }
 .dtab-panel .sec-title { margin-top: 12px; }
-.panel-audio { margin: 8px 0 2px; }
 .danger-end { margin-left: auto; }
 /* 质量页签里的次要统计行（原 9 项统计中降级的 6 项） */
 .stats-row--sub { margin: 8px 0 4px; }

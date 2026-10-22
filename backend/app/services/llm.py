@@ -130,6 +130,11 @@ def chat(messages: list[dict], model: str | None = None, kind: str = "chat") -> 
         raise _llm_error(e)
     if resp.usage:
         log_usage(kind, use_model, resp.usage.prompt_tokens, resp.usage.completion_tokens)
+    else:
+        # 服务商未返回 usage → 按字符粗估（与流式口径一致），否则这次调用在统计里整个消失
+        content = resp.choices[0].message.content or ""
+        total_in = sum(len(m["content"]) for m in messages)
+        log_usage(kind, use_model, int(total_in / 1.6), int(len(content) / 1.6), estimated=True)
     return resp.choices[0].message.content
 
 
@@ -194,6 +199,11 @@ def summary_chat(messages: list[dict], kind: str = "summary") -> str:
         raise _llm_error(e)
     if resp.usage:
         log_usage(kind, use_model, resp.usage.prompt_tokens, resp.usage.completion_tokens)
+    else:
+        # 服务商未返回 usage → 按字符粗估（与流式口径一致），否则这次调用在统计里整个消失
+        content = resp.choices[0].message.content or ""
+        total_in = sum(len(m["content"]) for m in messages)
+        log_usage(kind, use_model, int(total_in / 1.6), int(len(content) / 1.6), estimated=True)
     return resp.choices[0].message.content
 
 
@@ -467,6 +477,21 @@ verdict 判定：score >= 80 且无关键错误 → correct；40-79 或漏掉主
 ## 硬约束（绝不违犯）
 - 用页码/时间标注出处（图片用 (P1)；音视频用 (第N分钟)）。
 - 输出纯 Markdown，简洁为主。""",
+    "prompt_learn_note_chapter": """你是一名顶尖学习教练。下面给你的是一部材料中的**其中一章**（不是全文）。请把这一章【转译】成一段结构化的学习笔记：让一个非本专业的初学者，不看原文也能抓住本章骨架、理解核心概念、并记住要点。
+
+## 输出结构（必须严格照此）
+
+1. 第一行输出 `## {章名}`（用用户消息里给出的章名，不要自己另起）。
+2. `### 本章必记要点`（3-7 条，每条一句话、可直接背诵）。
+3. `### 逐节转译`（按本章内部的小节/脉络推进，用大白话讲清"是什么、为什么、怎么用"；关键概念首次出现给一句人话解释；保留本章的例子与数据，但用自己的话重讲）。
+4. `### 本章小结`（◆ 三句话收束本章：本章解决了什么问题 / 核心抓手 / 最容易记错的一点）。
+
+## 硬约束（绝不违犯）
+
+- 关键要点末尾用 (P页码) 标注出处，页码取自原文中的 [P数字] 标记。
+- 只讲本章：不提及其他章节、不说"本书/全文"、不编造本章没有的内容。
+- 是转译不是照抄，但不得丢失本章的关键信息量。
+- 输出纯 Markdown。""",
     "prompt_doc_kind": """你是一名材料分类助手。请判断下面这段材料正文属于哪一类，只输出一个 JSON 对象，不要输出其他内容：
 {"kind": "practical|conceptual|narrative", "reason": "一句话理由（≤30字）"}
 
@@ -686,14 +711,20 @@ verdict 判定：score >= 80 且无关键错误 → correct；40-79 或漏掉主
 6. 不要写「如图所示」「请看这一页」这类依赖画面的指代 —— 画面由系统自动定位，
    你只要把内容讲清楚。
 7. 不要用「它」「这个」「上面提到的」开头指代上一句的主语：每一句都要能独立听懂。
-8. 不编造素材中没有的事实和数据""",
+8. 不编造素材中没有的事实和数据
+9. 【叙事结构，仅当素材是论文 / 技术研究类内容时】按讲解型论文视频的弧线组织：
+   钩子（一个意外结论或挑衅性问题，先声夺人）→ 问题（这项工作之前缺什么、什么办法不好用）
+   → 核心洞见（论文最妙的那一步，给足篇幅与类比）→ 机制（它是怎么做到的，简化讲）
+   → 证据（最有说服力的前后对比 / 关键数字，只挑一两个）→ 意义（为什么重要、开启了什么）。
+   相关工作一句话带过，实现细节与超参数不讲。素材不是论文类时不套用此条""",
     "prompt_video_points": """你是一名信息图编辑。请依据下面的视频讲稿与分镜表，为每个镜头设计「若干屏」结构图画面。
 
 严格输出一个 JSON 对象，不要输出其他任何内容（不要 Markdown 代码块）：
 {"title": "全片标题（不超过 14 字）",
  "scenes": [{"shot": 1, "title": "镜头标题（不超过 12 字）",
              "screens": [{"layout": "grid",
-                          "elements": [{"t": "元素文本（不超过 16 字）", "k": "concept", "seg": 1}]}]}]}
+                          "elements": [{"t": "元素文本（不超过 16 字）", "k": "concept", "seg": 1,
+                                        "tex": ["A_i =", "\\frac{r_i}{\\sum_j r_j}"]（可选，仅公式元素）}]}]}]}
 
 字段说明：
 - shot：镜头编号（必须使用分镜表里给定的编号，每个镜头恰好出现一次）
@@ -710,6 +741,34 @@ verdict 判定：score >= 80 且无关键错误 → correct；40-79 或漏掉主
   讲体系组成用 hub、讲层次递进用 pyramid，都不像就用 grid
 - elements：这一屏里逐个点亮的元素；t 短句或短语，一个元素只讲一件事；
   k 只能取 concept（概念 / 机制）、good（良方 / 做法）、cost（代价 / 边界）
+- tex（**可选**，只有讲稿里明确出现公式 / 数学关系的元素才给）：LaTeX 源码
+  按**讲解顺序**拆成 2-6 项的数组（每项只含数学符号，不含中文）；
+  此时 t 写这个公式的口头称呼（如「优势归一化」）。
+  讲稿里没有的公式绝不编造；这一屏没有公式就**不要输出这个字段**
+- chart（**可选**，只有讲稿里明确给出一组**数字的对比或趋势**才给）：
+  {"type": "bar 或 line", "items": [{"label": "讲稿原词", "value": 数字}]}
+  bar 用于 2-6 项对比（如几个方案的得分），line 用于 2-8 个点的趋势（如逐季度变化）；
+  value **必须是讲稿里原样出现的数字**（不得换算单位、不得估算、不得编造）；
+  label 用讲稿里的原词（不超过 8 字）；此时 t 写这组数据的口头称呼
+  （如「三种方案得分对比」）。这一屏没有数据对比就**不要输出这个字段**
+- sketch（**可选**，板书 / 动效图解两个皮肤共用：板书会把它画成一整块黑板上
+  的简图、一笔一笔写出来；动效图解会把它变成**这一屏的结构图**，每个 label 逐个
+  长出来、并按 type 摆成链 / 左右对照 / 层级 / 四宫格）。
+  只有讲稿里真的存在**结构性关系**才给，type 只能取这四值之一：
+  flow     = 步骤 / 因果链：labels 2-4 个，按先后顺序，每项是链上一步
+  compare  = 两方取舍对比：labels **4 或 6 个（必须偶数）**，**前一半是左边一方、
+             后一半是右边一方**；每边第一个是该方的标题，后面是该方的论据
+  quadrant = 两维定位（如投入×回报）：labels **正好 4 个**，顺序固定为
+             「左上 / 右上 / 右下 / 左下」；另给 x（横轴名）、y（纵轴名），各 ≤8 字
+  pyramid  = 层级 / 递进：labels 3-4 个，**从顶层写到底层**（如 工具→方法→判断→视野）
+  硬规则：
+  ① 一个元素最多带一个 sketch，**不许与 tex / chart 同时给**；整条视频里带 sketch
+     的元素不超过「总屏数 ÷ 3」—— 宁可少给，满屏都是图反而没人看
+  ② labels 里每个词都必须**在本屏元素或讲稿里原样出现过**，不得自创、不得凑数；
+     同一张图里不许出现两个相同的标签
+  ③ 每个 label ≤ 8 个字（黑板上是大字，长了装不下也看不清）
+  ④ 这一屏只是并列罗列、彼此没有步骤 / 对比 / 层次 / 两维关系 → **不要给**
+  ⑤ 给了 sketch 时，t 写「这张图在讲什么」（4-18 字）：它会成为这一板的标题
 - seg：该元素应当在第几句讲稿被点亮（必须在所属镜头的句号范围内）
 
 要求：
@@ -726,7 +785,16 @@ verdict 判定：score >= 80 且无关键错误 → correct；40-79 或漏掉主
 5. 每个镜头都要有元素，不许留空镜头
 6. 元素文本用讲稿里出现过的说法，不要自创新词
 7. concept / good / cost 三类都要在全片出现；「代价 / 边界 / 风险」要单独成元素，不要混进良方
-8. 不要编造讲稿里没有的内容""",
+8. 不要编造讲稿里没有的内容
+9. 公式元素（带 tex 的）**每屏最多 1 个**，且 k 取 concept；只有讲稿真的在推公式才给，
+   一整条视频没有公式元素完全正常
+10. 数据图元素（带 chart 的）**每屏最多 1 个**，且 k 取 concept；只有讲稿真的给了
+    一组数字才给，一整条视频没有数据图元素完全正常；chart 与 tex 不要同时给一个元素
+11. 草图元素（带 sketch 的）：**有结构关系就给**（动效图解靠它出图，只给文字卡
+    就是一屏框框），上限仍是「总屏数 ÷ 3」。判断标准是讲稿里**真的存在**步骤链 /
+    两方取舍 / 层级递进 / 两维定位之一；**不许为了凑数硬造关系** —— 图上画出一条
+    讲稿里没有的因果，比不画这张图糟得多。labels 必须是本屏元素或讲稿里原样出现
+    的词，这条会被程序校验，编造的整张图会被丢弃""",
     "prompt_video_anchor": """你是一名信息检索助手。下面是一份视频讲稿（每行一句，行首是序号）。
 请为每一句挑出 1-4 个「定位关键词（anchor）」，用来在原始资料里找到这一句讲的是哪一处。
 
@@ -924,20 +992,68 @@ def classify_doc_kind(chunks: list[dict], fmt: str | None = None) -> str:
         return "auto"   # 判定是增强项：失败绝不拖垮讲义生成
 
 
+# ---------- 章节切分（按章截断 / 分章生成共用；纯本地计算，不调 LLM） ----------
+
+def split_chapters(chunks: list[dict]) -> list[dict]:
+    """把原文块按「顶级章节」归并成有序章列表。
+
+    归并键 = section_path 的**第一段**（层级分隔符 `/`；标题自带的 `/` 在解析层
+    已转成全角，故按 `/` 切安全）。连续同键的块归一章；section_path 为空的块
+    归入「卷首内容」章。返回 [{"key","name","chunks","chars"}]。
+    **所有块都没有章节结构时返回 []**（调用方退回整文处理，行为与章节化之前一致）。
+    """
+    if not any((c.get("section_path") or "").strip() for c in chunks):
+        return []
+    chapters: list[dict] = []
+    for c in chunks:
+        sp = (c.get("section_path") or "").strip()
+        key = sp.split("/", 1)[0] if sp else ""
+        if chapters and chapters[-1]["key"] == key:
+            chapters[-1]["chunks"].append(c)
+        else:
+            chapters.append({"key": key, "name": key or "卷首内容", "chunks": [c]})
+    for ch in chapters:
+        ch["chars"] = len(format_chunks(ch["chunks"]))
+    return chapters
+
+
+def chapter_prefix_count(chapters: list[dict], limit: int) -> int:
+    """返回「整章纳入也不超 limit」的前缀章数（0 = 第一章自身就超限）。"""
+    total, n = 0, 0
+    for ch in chapters:
+        add = ch["chars"] + (2 if n else 0)     # 章与章之间是 "\n\n" 拼接
+        if total + add > limit:
+            break
+        total += add
+        n += 1
+    return n
+
+
 def learn_note_coverage(chunks: list[dict]) -> dict:
     """讲义覆盖度（纯字符串长度计算，不调 LLM）。
 
-    材料超长时 generate_learn_note 会截断到 LEARN_NOTE_MAX_CHARS，**末尾章节整段丢失**。
-    调用方可据此提示用户「讲义只覆盖了材料的一部分」，避免误以为覆盖全文。
+    材料超长时 generate_learn_note 会截断：有章节结构时**截在章节边界**
+    （末尾章整章舍弃，不把某一章切在半截）；无结构时退回按 LEARN_NOTE_MAX_CHARS 硬切。
+    covered/missing_chapters 供调用方提示「哪些章没覆盖」，无结构时为空。
     """
     total = len(format_chunks(chunks))
-    used = min(total, LEARN_NOTE_MAX_CHARS)
-    return {
-        "total_chars": total,
-        "used_chars": used,
-        "ratio": round(used / total, 4) if total else 1.0,
-        "truncated": total > LEARN_NOTE_MAX_CHARS,
-    }
+    cov = {"total_chars": total, "truncated": total > LEARN_NOTE_MAX_CHARS,
+           "covered_chapters": [], "missing_chapters": []}
+    if not cov["truncated"]:
+        cov["used_chars"] = total
+        cov["ratio"] = 1.0
+        return cov
+    chapters = split_chapters(chunks)
+    if chapters:
+        n = chapter_prefix_count(chapters, LEARN_NOTE_MAX_CHARS)
+        kept = [c for ch in chapters[:n] for c in ch["chunks"]]
+        cov["used_chars"] = len(format_chunks(kept)) if kept else LEARN_NOTE_MAX_CHARS
+        cov["covered_chapters"] = [ch["name"] for ch in chapters[:n]]
+        cov["missing_chapters"] = [ch["name"] for ch in chapters[n:]]
+    else:
+        cov["used_chars"] = LEARN_NOTE_MAX_CHARS
+    cov["ratio"] = round(cov["used_chars"] / total, 4) if total else 1.0
+    return cov
 
 
 def _learn_note_inputs(chunks: list[dict], title: str | None = None,
@@ -946,7 +1062,12 @@ def _learn_note_inputs(chunks: list[dict], title: str | None = None,
     text = format_chunks(chunks)
     cov = learn_note_coverage(chunks)
     if cov["truncated"]:
-        text = text[:LEARN_NOTE_MAX_CHARS]
+        if cov["covered_chapters"]:
+            # 按章截断：只取「整章纳入也不超限」的前缀章，不把某一章切在半截
+            kept = split_chapters(chunks)[:len(cov["covered_chapters"])]
+            text = format_chunks([c for ch in kept for c in ch["chunks"]])
+        else:
+            text = text[:LEARN_NOTE_MAX_CHARS]
     head = f"（材料标题「{title}」仅作理解主题用，笔记标题请用它）\n" if title else ""
     if cov["truncated"]:
         head += ("⚠️ 本次只提供了材料的前一部分（材料过长已被截断）："
@@ -960,7 +1081,13 @@ def _learn_note_inputs(chunks: list[dict], title: str | None = None,
         warn = (f"> ⚠️ **{LEARN_TRUNC_MARK}**：本材料共约 {cov['total_chars']:,} 字，"
                 f"单次处理上限 {LEARN_NOTE_MAX_CHARS:,} 字，"
                 f"本讲义仅覆盖前 {cov['used_chars']:,} 字（约 {cov['ratio'] * 100:.1f}%），"
-                f"未覆盖的章节不会出现在本讲义中。\n\n")
+                f"未覆盖的章节不会出现在本讲义中。\n")
+        if cov["missing_chapters"]:
+            names = cov["missing_chapters"]
+            shown = "、".join(f"《{n}》" for n in names[:6])
+            tail = f" 等 {len(names)} 章" if len(names) > 6 else ""
+            warn += f"> 未覆盖章节：{shown}{tail}。\n"
+        warn += "\n"
     return messages, cov, warn
 
 
@@ -1002,6 +1129,40 @@ def generate_learn_note_stream(chunks: list[dict], title: str | None = None,
             first = False
         else:
             first = False
+        yield piece
+
+
+def generate_learn_note_chapter_stream(chapter: dict, title: str | None = None,
+                                       doc_kind: str = "auto",
+                                       chapter_no: int = 1, chapter_total: int = 1):
+    """单章讲义（流式）：把一章转译成结构化笔记段，逐 token yield。
+
+    与整篇 generate_learn_note_stream 同构：章内仍超 LEARN_NOTE_MAX_CHARS 时硬切，
+    并在段首垫「覆盖范围提示」（此时缺的不是整章，而是**本章末尾**）。
+    ⚠️ 分章一律走 prompt_learn_note_chapter（章级输出结构统一）；doc_kind 参数保留
+       仅为调用签名一致，便于以后按内容性质分化章工艺。
+    """
+    text = format_chunks(chapter["chunks"])
+    warn = ""
+    if len(text) > LEARN_NOTE_MAX_CHARS:
+        warn = (f"> ⚠️ **{LEARN_TRUNC_MARK}**：本章共约 {len(text):,} 字，"
+                f"超出单次处理上限 {LEARN_NOTE_MAX_CHARS:,} 字，本章末尾内容未覆盖。\n\n")
+        text = text[:LEARN_NOTE_MAX_CHARS]
+    if title:
+        head = (f"（材料标题「{title}」，本次只提供第 {chapter_no}/{chapter_total} 章"
+                f"《{chapter['name']}》，请只为这一章写笔记）\n")
+    else:
+        head = (f"（本次只提供第 {chapter_no}/{chapter_total} 章《{chapter['name']}》，"
+                f"请只为这一章写笔记）\n")
+    if warn:
+        head += "⚠️ 本章内容过长已被截断：请如实转译已提供部分，不要声称覆盖本章全部。\n"
+    messages = [
+        {"role": "system", "content": get_prompt("prompt_learn_note_chapter")},
+        {"role": "user", "content": f"{head}以下是本章原文（含页码标记）：\n\n{text}"},
+    ]
+    if warn:
+        yield warn
+    for piece in summary_chat_stream(messages, kind="learn_note"):
         yield piece
 
 
@@ -1297,10 +1458,29 @@ def generate_podcast_script_direct(source_title: str, source_text: str,
 
 # ---------- AI 视频（模块 K · V1.0） ----------
 # 视频不重造链路：讲稿与结构图内容都走 summary_chat（与播客 / 陪练同模型）。
-# 记账 kind：video_script（讲稿 + 定位锚点）、video_points（结构图元素与要点）。
+# 记账 kind：video_script（讲稿 + 定位锚点）、video_points_*（结构图元素与要点，按皮肤拆开）。
 # ⚠️ 埋点边界（PRD 4.2）：埋点不含讲稿正文与来源内容，只上报行为量与长度。
 
 VIDEO_KINDS = ("concept", "good", "cost")
+
+# 结构图记账 kind → 视觉方案（皮肤）映射。
+# ⚠️ 为什么要拆：graph / graph_paper / graph_clean / ppt / board / motion 六个皮肤
+#    共用同一条 points 生成分支（同一份数据，只换画法），过去都记成 video_points
+#    → 「Token 消耗」页看不出是哪个类型在花钱。拆开后每类可单独统计。
+# ⚠️ 不在此表里的 skin（空/未知）回落旧的 `video_points`，历史数据口径不变。
+POINTS_SKIN_KINDS = {
+    "graph": "video_points_graph",
+    "graph_paper": "video_points_graph_paper",
+    "graph_clean": "video_points_graph_clean",
+    "ppt": "video_points_ppt",
+    "board": "video_points_board",
+    "motion": "video_points_motion",
+}
+
+
+def points_usage_kind(skin: str = "") -> str:
+    """结构图调用的记账 kind：按视觉方案拆分（空/未知 → 旧的 video_points）。"""
+    return POINTS_SKIN_KINDS.get((skin or "").strip(), "video_points")
 
 # 单个镜头的元素上限（PRD 3.6.6 #4）：9 个元素叠在一起会糊。
 VIDEO_MAX_GROUP = 8
@@ -1341,7 +1521,8 @@ def generate_video_script(source_title: str, source_text: str, script_chars: int
 
 def generate_video_points(script_text: str, seg_count: int,
                           point_count: int | None = None,
-                          shots: list | None = None) -> dict:
+                          shots: list | None = None,
+                          skin: str = "") -> dict:
     """结构图内容：讲稿 → {title, elements:[{t,k,seg,group,sc}],
                        scenes:[{shot,title,screens:[{layout,s,e}]}]}。
 
@@ -1357,7 +1538,10 @@ def generate_video_points(script_text: str, seg_count: int,
        而用户能做的只有「再点一次生成」→ 数量严重不足时**内部重试一次**，
        并把「上一次差多少」明确告诉模型（PRD 3.6.8 的「重试 1 次」策略，
        从"生成失败"扩展到"数量不足"；这里只重试、**不编造**任何元素）。
+    ⚠️ `skin`：实际视觉方案（graph/graph_paper/graph_clean/ppt/board/motion），
+       **只用于记账 kind 的拆分**，不影响提示词与产出。
     """
+    kind = points_usage_kind(skin)
     n = max(8, int(point_count or seg_count))
     segs = _split_point_lines(script_text, seg_count)
     shots = _valid_point_shots(shots, seg_count)
@@ -1366,7 +1550,7 @@ def generate_video_points(script_text: str, seg_count: int,
         # ---- 有分镜表：按镜头边界分批（绝不劈开镜头），模型按镜头出 title/layout ----
         batches = _point_batches(segs, shots)
         if len(batches) <= 1:
-            return _gen_points_single(script_text, seg_count, n, shots_table=shots)
+            return _gen_points_single(script_text, seg_count, n, shots_table=shots, kind=kind)
         merged: list = []
         scenes_all: list = []
         title = ""
@@ -1379,7 +1563,7 @@ def generate_video_points(script_text: str, seg_count: int,
             local_table = [{"n": i, "a": sh["a"] - seg_cursor, "b": sh["b"] - seg_cursor}
                            for i, sh in enumerate(b_shots, 1)]
             sub = _gen_points_single(text, take, max(8, -(-n * take // len(segs))),
-                                     want_title=(not title), shots_table=local_table)
+                                     want_title=(not title), shots_table=local_table, kind=kind)
             title = title or str(sub.get("title") or "")
             for e in sub.get("elements") or []:
                 try:
@@ -1434,7 +1618,7 @@ def generate_video_points(script_text: str, seg_count: int,
                 -(-n // POINT_CHUNK_EVENT_BUDGET),
                 -(-len(segs) // POINT_CHUNK_SEG_BUDGET))
     if k <= 1:
-        return _gen_points_single(script_text, seg_count, n)
+        return _gen_points_single(script_text, seg_count, n, kind=kind)
 
     # ⚠️ 分句失败（格式不符）时 `segs` 为 None → k 保持 1 → 走上面的单批路径，
     #    绝不因为「分不开」把原本能生成的情况弄坏。
@@ -1450,7 +1634,7 @@ def generate_video_points(script_text: str, seg_count: int,
         cursor += take
         text = "\n".join(f"{j}. {t}" for j, t in enumerate(part, 1))
         sub = _gen_points_single(text, len(part), max(8, -(-n // k)),
-                                 want_title=(not title))
+                                 want_title=(not title), kind=kind)
         title = title or str(sub.get("title") or "")
         for e in sub.get("elements") or []:
             try:
@@ -1556,10 +1740,12 @@ def _split_point_lines(script_text: str, seg_count: int) -> list | None:
 
 
 def _gen_points_single(script_text: str, seg_count: int, need: int,
-                       want_title: bool = True, shots_table: list | None = None) -> dict:
+                       want_title: bool = True, shots_table: list | None = None,
+                       kind: str = "video_points") -> dict:
     """**单批**结构图要点：讲稿 → {title, elements, scenes}。
 
     `generate_video_points` 分批后每一批都走这里，接口与旧实现等价。
+    ⚠️ `kind`：记账用的业务场景（由 `points_usage_kind(skin)` 算出，按皮肤拆分）。
     ⚠️ 只让模型给「第几句」（seg），**绝对毫秒由后端按该句的 start_ms 算**：
        让模型写毫秒是必错的（它不知道 TTS 之后的真实时间轴）。
     ⚠️ `shots_table` 是批内分镜表 [{n,a,b}]（句号也是批内编号）；给了它，
@@ -1587,7 +1773,7 @@ def _gen_points_single(script_text: str, seg_count: int, need: int,
     raw = summary_chat([
         {"role": "system", "content": prompt},
         {"role": "user", "content": user},
-    ], kind="video_points")
+    ], kind=kind)
     obj = _parse_video_points(raw, seg_count, shots_table)
     got = len(obj.get("elements") or [])
     if got >= max(8, int(n * 0.6)):
@@ -1601,7 +1787,7 @@ def _gen_points_single(script_text: str, seg_count: int, need: int,
                 f"⚠️ 上一次只给出了 {got} 个元素，**数量不足**。"
                 f"本次必须给出不少于 {n} 个元素（平均每句约 {per_seg} 个），"
                 f"否则视频会出现长时间画面静止、无法通过质量闸门。")},
-        ], kind="video_points")
+        ], kind=kind)
         obj2 = _parse_video_points(raw2, seg_count, shots_table)
         if len(obj2.get("elements") or []) > got:
             return obj2
@@ -1674,7 +1860,45 @@ def _clamp_point(it, seg_count: int) -> dict | None:
     except (TypeError, ValueError):
         seg = 1
     seg = max(1, min(seg, max(1, seg_count)))
-    return {"t": t[:24], "k": k, "seg": seg, "group": 1}
+    out = {"t": t[:24], "k": k, "seg": seg, "group": 1}
+    # tex（可选，2026-10-21 动效图解）：公式元素。数组 = 按讲解顺序逐项的 LaTeX；
+    # 字符串视为单项。只透白名单外的**形状**（长度/项数），不校验 LaTeX 合法性 ——
+    # 非法公式在 `video.tex_to_mathml` 转换时失败、退化为文本块，不会白屏。
+    # ⚠️ 旧皮肤（graph/ppt/board 等）从不读这个字段，透传对它们零影响。
+    raw_tex = it.get("tex")
+    terms = None
+    if isinstance(raw_tex, list):
+        terms = [str(x).strip()[:120] for x in raw_tex if str(x or "").strip()][:8]
+    elif isinstance(raw_tex, str) and raw_tex.strip():
+        terms = [raw_tex.strip()[:240]]
+    if terms:
+        out["tex"] = terms
+    # chart（可选，2026-10-21 动效图解 P1）：数据图元素。校验只认「形状合法」——
+    # type 白名单、2-8 项、value 是非负有限数、label 截断；任一项不合法整体丢弃
+    # （降级为普通文本块，不白屏）。⚠️ value 的**真实性**靠提示词约束
+    # （必须是讲稿里出现的数字），这里只防模型把结构写坏。
+    raw_ch = it.get("chart")
+    if isinstance(raw_ch, dict):
+        ctype = str(raw_ch.get("type") or "").strip().lower()
+        items = raw_ch.get("items")
+        if ctype in ("bar", "line") and isinstance(items, list):
+            vals = []
+            for x in items[:8]:
+                if not isinstance(x, dict):
+                    vals = None
+                    break
+                try:
+                    fv = float(x.get("value"))
+                except (TypeError, ValueError):
+                    vals = None
+                    break
+                if fv != fv or fv < 0 or fv in (float("inf"), float("-inf")):
+                    vals = None
+                    break
+                vals.append({"label": str(x.get("label") or "")[:10], "value": fv})
+            if vals and len(vals) >= 2:
+                out["chart"] = {"type": ctype, "items": vals}
+    return out
 
 
 def _split_screen_units(els: list, layout: str, limits: dict) -> list:

@@ -1,6 +1,6 @@
 <template>
-  <div class="page settings-page">
-    <PageHead title="管理中心" sub="管理 LLM、向量模型与本地数据配置">
+  <div class="page settings-page" :style="{ '--asc-set-head-h': headH + 'px' }">
+    <PageHead ref="pageHeadRef" title="管理中心" sub="管理 LLM、向量模型与本地数据配置">
       <template #icon>
         <svg viewBox="0 0 16 16" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round">
           <circle cx="8" cy="8" r="2.2" />
@@ -402,34 +402,69 @@
       <template #header>
         <div class="card-head">
           <span>Token 消耗</span>
-          <el-button size="small" text @click="loadUsage">刷新</el-button>
+          <div class="card-head-actions">
+            <el-radio-group v-model="usagePeriod" size="small" fill="var(--asc-primary)">
+              <el-radio-button label="今日" value="today" />
+              <el-radio-button label="累计" value="all" />
+            </el-radio-group>
+            <el-button size="small" text @click="loadUsage">
+              <el-icon class="usage-refresh" :class="{ spinning: usageLoading }"><RefreshRight /></el-icon>刷新
+            </el-button>
+          </div>
         </div>
       </template>
       <div v-if="usage.all._total.calls" class="usage-body">
-        <div class="usage-totals">
-          <div class="storage-item">
-            <span class="storage-num">{{ usage.today._total.calls }}</span>
-            <span class="storage-label">今日调用</span>
+        <div class="usage-metrics">
+          <div class="usage-metric-card">
+            <div class="usage-metric-top">
+              <span class="usage-metric-num">{{ fmtTokens(usage[usagePeriod]._total.tokens) }}</span>
+              <span class="usage-metric-unit">tokens</span>
+            </div>
+            <div class="usage-metric-label">{{ usagePeriod === 'today' ? '今日消耗' : '累计消耗' }}</div>
+            <div class="usage-metric-compare">占累计 {{ usagePercent(usage[usagePeriod]._total.tokens, usage.all._total.tokens) }}</div>
           </div>
-          <div class="storage-item">
-            <span class="storage-num">{{ fmtTokens(usage.today._total.tokens) }}</span>
-            <span class="storage-label">今日 Token</span>
-          </div>
-          <div class="storage-item">
-            <span class="storage-num">{{ usage.all._total.calls }}</span>
-            <span class="storage-label">累计调用</span>
-          </div>
-          <div class="storage-item">
-            <span class="storage-num">{{ fmtTokens(usage.all._total.tokens) }}</span>
-            <span class="storage-label">累计 Token</span>
+          <div class="usage-metric-card">
+            <div class="usage-metric-top">
+              <span class="usage-metric-num">{{ usage[usagePeriod]._total.calls }}</span>
+              <span class="usage-metric-unit">次</span>
+            </div>
+            <div class="usage-metric-label">{{ usagePeriod === 'today' ? '今日调用' : '累计调用' }}</div>
+            <div class="usage-metric-compare">占累计 {{ usagePercent(usage[usagePeriod]._total.calls, usage.all._total.calls) }}</div>
           </div>
         </div>
-        <div class="usage-kinds">
-          <span v-for="(v, k) in usageKinds" :key="k" class="usage-chip">
-            {{ kindLabel(k) }} {{ v.calls }} 次 / {{ fmtTokens(v.prompt_tokens + v.completion_tokens) }}
-          </span>
+
+        <div class="usage-section">
+          <div class="usage-section-title">
+            <span>业务分布</span>
+            <span class="usage-section-sub">按 Token 数排序 · 共 {{ Object.keys(usageKinds).length }} 类</span>
+          </div>
+          <div class="usage-list">
+            <div v-for="([k, v], idx) in usageKindsSorted" :key="k" class="usage-row">
+              <div class="usage-rank">{{ idx + 1 }}</div>
+              <div class="usage-row-main">
+                <div class="usage-row-head">
+                  <span class="usage-kind">{{ kindLabel(k) }}</span>
+                  <span class="usage-kind-nums">
+                    <b>{{ fmtTokens(v.prompt_tokens + v.completion_tokens) }}</b> tokens
+                    <span class="usage-kind-split">·</span>
+                    {{ v.calls }} 次
+                    <span class="usage-kind-share">{{ usageKindShare(v.prompt_tokens + v.completion_tokens) }}</span>
+                  </span>
+                </div>
+                <div class="usage-bar-wrap">
+                  <div class="usage-bar" :style="{ width: usageBarWidth(v.prompt_tokens + v.completion_tokens) }" />
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
-        <p class="storage-tip">流式调用按字符数估算（≈1.6 字符/token），非流式调用为 API 返回的精确值</p>
+
+        <p class="storage-tip">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4">
+            <circle cx="8" cy="8" r="6.5" /><path d="M8 5v3.5l2.5 1.3" stroke-linecap="round" />
+          </svg>
+          流式调用按字符数估算（≈1.6 字符/token），非流式调用优先使用 API 返回的精确值
+        </p>
       </div>
       <el-empty v-else description="暂无调用记录（配置 Key 后使用 AI 功能即开始统计）" :image-size="60" />
     </el-card>
@@ -520,16 +555,60 @@
       </el-form>
     </el-card>
       </el-tab-pane>
+
+      <el-tab-pane label="关于" name="about">
+      <el-card class="set-card" shadow="never">
+      <template #header>
+        <div class="card-head">
+          <span>关于知萤</span>
+          <el-tag v-if="updateStore.hasUpdate" type="warning" size="small">
+            可更新到 v{{ updateStore.latest }}
+          </el-tag>
+          <el-tag v-else-if="updateStore.upstreamHasUpdate" type="info" size="small">
+            v{{ updateStore.latest }} 已忽略
+          </el-tag>
+          <el-tag v-else type="info" size="small">已是最新</el-tag>
+        </div>
+      </template>
+      <div class="about-grid">
+        <div class="about-row">
+          <span class="about-k">当前版本</span>
+          <span class="about-v">v{{ aboutVersion || updateStore.current || '—' }}</span>
+        </div>
+        <div class="about-row">
+          <span class="about-k">运行平台</span>
+          <span class="about-v">{{ aboutPlatform }}</span>
+        </div>
+        <div class="about-row">
+          <span class="about-k">安装目录</span>
+          <span class="about-v about-mono">{{ updateStore.installDir || '—' }}</span>
+        </div>
+        <div class="about-row">
+          <span class="about-k">下载目录</span>
+          <span class="about-v about-mono">{{ updateStore.downloadDir || '—' }}</span>
+        </div>
+      </div>
+      <div class="about-ops">
+        <el-button :loading="aboutChecking" @click="doCheckUpdate">检查更新</el-button>
+        <el-button text type="primary" @click="router.push({ path: '/help', query: { sec: 'changelog' } })">查看更新日志</el-button>
+      </div>
+      <p class="storage-tip">
+        有新版本时，侧栏底部版本号旁会出现红点；同一版本自动提示最多 3 次，之后只留红点。
+        更新只替换程序目录，你的资料、笔记与配置存放在独立的数据目录，不受影响。
+      </p>
+      </el-card>
+      </el-tab-pane>
     </el-tabs>
   </div>
 </template>
 
 <script setup>
-import { reactive, ref, computed, onMounted } from 'vue'
-import { Search } from '@element-plus/icons-vue'
+import { reactive, ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { Search, RefreshRight } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { useRouter, useRoute } from 'vue-router'
-import { settingsApi } from '../api'
+import { settingsApi, updateApi } from '../api'
+import { useUpdateStore } from '../stores/update'
 import http from '../api/http'
 import { errMsg } from '../api/http'
 import { useAsr } from '../composables/useAsr'
@@ -792,6 +871,7 @@ const promptFields = [
   { key: 'prompt_learn_note_conceptual', label: '简单学 · 讲义（认知思维类）', desc: '认知类材料（心理 / 商业 / 理论）的讲义工艺：核心问题 / 底层假设 / 思维框架 / 适用边界；有清晰章节时沿用章回体', category: 'study' },
   { key: 'prompt_learn_note_practical', label: '简单学 · 讲义（工具实用类）', desc: '工具类材料（技术手册 / 操作指南 / 规范）的讲义工艺：操作流程 S{n} / 判断标准 / 禁忌坑点 / 适用边界；不套场景比喻', category: 'study' },
   { key: 'prompt_learn_note_fragment', label: '简单学 · 讲义（碎片内容）', desc: '图片 OCR / 音视频转写的要点清单工艺：逐条信息点 + 标注出处；禁止编造章节与隐喻、禁止补全与拔高', category: 'study' },
+  { key: 'prompt_learn_note_chapter', label: '简单学 · 讲义（分章）', desc: '长材料按章生成时的章级工艺：本章必记要点 / 逐节转译 / 本章小结；只讲本章、不提全书', category: 'study' },
   { key: 'prompt_drill_examiner', label: 'AI 陪练 · 出题', desc: '按考点出题 / 追问（出题纲·出题·追问三模式共用，注意保留 JSON 输出格式说明）', category: 'study' },
   { key: 'prompt_drill_judge', label: 'AI 陪练 · 评分', desc: '对作答打分并给出维度评价 / 遗漏点 / 追问建议（注意保留 JSON 输出格式说明）', category: 'study' },
   { key: 'prompt_note_rewrite', label: '文本改写', desc: '改写选中文字或整条内容（笔记 / 材料文本共用，更通顺/专业/简洁）', category: 'note' },
@@ -813,6 +893,7 @@ const prompts = reactive({
   prompt_summary: '', prompt_keywords: '', prompt_explain: '',
   prompt_kb_qa: '', prompt_general: '', prompt_review: '', prompt_suggest: '', prompt_quiz: '', prompt_learn_note: '',
   prompt_learn_note_conceptual: '', prompt_learn_note_practical: '', prompt_learn_note_fragment: '',
+  prompt_learn_note_chapter: '',
   prompt_note_rewrite: '', prompt_note_expand: '', prompt_note_summarize: '', prompt_note_continue: '',
 })
 const promptDefaults = reactive({})
@@ -900,14 +981,20 @@ async function backup() {
 
 const restoring = ref(false)
 const usage = reactive({ today: { _total: { calls: 0, tokens: 0 } }, all: { _total: { calls: 0, tokens: 0 } } })
+const usagePeriod = ref('today')
+const usageLoading = ref(false)
 
 // Token 统计业务展示顺序（按业务流），未收录的新 kind 自动排在最后
 const KIND_ORDER = ['summary', 'section_summary', 'keywords', 'explain', 'ask', 'transform',
                     'chat', 'suggest', 'review', 'quiz', 'learn_note', 'drill', 'drill_judge', 'stats_report',
-                    'podcast_brief', 'podcast_script', 'video_script', 'video_points',
-                    'knowledge_graph']
+                    'podcast_brief', 'podcast_script', 'video_script',
+                    'video_points', 'video_points_graph', 'video_points_graph_paper',
+                    'video_points_graph_clean', 'video_points_ppt', 'video_points_board',
+                    'video_points_motion',
+                    'knowledge_graph', 'embedding_index', 'embedding_query', 'test']
 const usageKinds = computed(() => {
-  const { _total, ...rest } = usage.all
+  const rows = usage[usagePeriod.value] || { _total: { calls: 0, tokens: 0 } }
+  const { _total, ...rest } = rows
   const ordered = {}
   for (const k of KIND_ORDER) {
     if (rest[k]) ordered[k] = rest[k]
@@ -917,6 +1004,27 @@ const usageKinds = computed(() => {
   }
   return ordered
 })
+const usageKindsSorted = computed(() => {
+  return Object.entries(usageKinds.value)
+    .sort((a, b) => (b[1].prompt_tokens + b[1].completion_tokens) - (a[1].prompt_tokens + a[1].completion_tokens))
+})
+const usageMaxTokens = computed(() => {
+  return usageKindsSorted.value.reduce((m, [, v]) => Math.max(m, v.prompt_tokens + v.completion_tokens), 0)
+})
+const usageTotalTokensSelected = computed(() => usage[usagePeriod.value]?._total?.tokens || 0)
+const usageKindShare = (tokens) => {
+  const total = usageTotalTokensSelected.value
+  if (!total) return '0%'
+  return Math.max(0.1, Math.round((tokens / total) * 1000) / 10).toFixed(1).replace('.0', '') + '%'
+}
+const usageBarWidth = (tokens) => {
+  const max = usageMaxTokens.value || 1
+  return Math.max(2, Math.round((tokens / max) * 100)) + '%'
+}
+const usagePercent = (part, total) => {
+  if (!total) return '0%'
+  return Math.round((part / total) * 1000) / 10 + '%'
+}
 const kindLabel = (k) => ({
   summary: '摘要', section_summary: '分章总结', keywords: '知识点',
   explain: '解读/追问', ask: '材料提问', transform: '文本加工',
@@ -924,14 +1032,23 @@ const kindLabel = (k) => ({
   learn_note: '简单学',
   drill: 'AI 陪练', drill_judge: '陪练评分',
   stats_report: '学习报告', podcast_brief: '播客简报', podcast_script: '播客脚本',
-  video_script: '视频讲稿', video_points: '视频结构图',
+  video_script: '视频讲稿', video_points: '视频结构图（历史）',
+  video_points_graph: '结构图', video_points_graph_paper: '纸感结构图',
+  video_points_graph_clean: '清透结构图', video_points_ppt: 'PPT 课件',
+  video_points_board: '板书', video_points_motion: '动效图解',
   knowledge_graph: '知识图谱',
+  embedding_index: '向量入库', embedding_query: '检索向量', test: '连接测试',
 }[k] || k)
 const fmtTokens = (n) => n >= 10000 ? (n / 10000).toFixed(1) + 'w' : (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n))
 
 async function loadUsage() {
-  const { data } = await settingsApi.usage()
-  Object.assign(usage, data)
+  usageLoading.value = true
+  try {
+    const { data } = await settingsApi.usage()
+    Object.assign(usage, data)
+  } finally {
+    usageLoading.value = false
+  }
 }
 
 async function onRestore({ file }) {
@@ -1014,6 +1131,26 @@ async function regenExtToken() {
     ElMessage.error('生成失败：' + ((e && e.message) || '请稍后重试'))
   }
 }
+
+// ---------- 顶部标题区吸顶：把 .page-head 的真实高度写进 CSS 变量 ----------
+// ⚠️ 高度是内容驱动的（图标 44px / 标题 20px / 副标题 12.5px，副标题一换行就变）
+// → tab 条的 sticky top 必须引用实测值，写死数字迟早静默错位。
+const pageHeadRef = ref(null)
+const headH = ref(0)
+let headRO = null
+onMounted(() => {
+  const el = pageHeadRef.value && pageHeadRef.value.$el
+  if (!el) return
+  const sync = () => { headH.value = el.getBoundingClientRect().height }
+  sync()
+  if (typeof ResizeObserver !== 'undefined') {
+    headRO = new ResizeObserver(sync)
+    headRO.observe(el)
+  }
+})
+onBeforeUnmount(() => {
+  if (headRO) { headRO.disconnect(); headRO = null }
+})
 
 onMounted(async () => {
   const { data } = await settingsApi.get()
@@ -1111,10 +1248,77 @@ async function rebuildAll() {
     rebuildingAll.value = false
   }
 }
+// ---------- 关于 / 检查更新 ----------
+const updateStore = useUpdateStore()
+const aboutChecking = ref(false)
+const aboutVersion = ref('')
+const aboutPlatform = computed(() => {
+  const map = { win: 'Windows', 'macos-arm64': 'macOS（Apple Silicon）', 'macos-x86_64': 'macOS（Intel）' }
+  const k = updateStore.info?.platform
+  return k ? (map[k] || k) : '—'
+})
+
+async function loadAbout() {
+  updateStore.hydrate()
+  try {
+    // 版本号走轻接口（必成功）；更新信息走 check 的 6h 缓存（不额外打网络）
+    const { data } = await http.get('/version')
+    aboutVersion.value = data.version
+  } catch { /* 静默 */ }
+  try {
+    const { data } = await updateApi.check(false)
+    if (!updateStore.info) updateStore.info = data
+  } catch { /* 静默：断网时只显示版本号 */ }
+}
+onMounted(loadAbout)
+
+async function doCheckUpdate() {
+  aboutChecking.value = true
+  try {
+    const r = await updateStore.manualCheck()
+    if (!r.ok) {
+      ElMessage.warning(r.message)
+      return
+    }
+    if (!r.hasUpdate) {
+      ElMessage.success('已是最新版本 v' + updateStore.current)
+      return
+    }
+    updateStore.dialogOpen = true
+  } finally {
+    aboutChecking.value = false
+  }
+}
 </script>
 
 <style scoped>
-.settings-tabs :deep(.el-tabs__header) { margin-bottom: 16px; }
+/* ===== 顶部标题区 + 七个 tab 双吸顶（2026-10-22） ===== 
+   滚动容器是 el-main（.app-main，overflow:auto）；中间祖先都不能有 overflow:hidden，
+   否则 sticky 会退化成「原地不动」——el-tabs 本身不设 overflow，
+   el-tabs__content 的 overflow:hidden 只包内容区、不包 header，故无需改动。
+   负 margin 把底衬铺到 .page 的 32px 内边距之外，滚动时两侧不留透明缝。 */
+
+/* 标题区：padding-top 12 + 下面 .settings-page 的 padding-top 16 = 改前的 28px，
+   静止态位置逐像素不变；原 margin-bottom 18px 转成 padding-bottom，
+   吸顶时这 18px 由底色盖住，滚动内容不会从缝里露出来。 */
+.settings-page { padding-top: 16px; }
+.settings-page :deep(.page-head) {
+  position: sticky; top: 0; z-index: 21;
+  margin: 0 -32px;
+  padding: 12px 32px 18px;
+  background: var(--asc-bg);
+}
+
+/* tab 条：sticky top 取标题区的实测高度（--asc-set-head-h 由 ResizeObserver 写入）；
+   height:auto 是为了让 padding 不被 el-tabs 默认的 40px 定高挤掉。 */
+.settings-tabs :deep(.el-tabs__header) {
+  position: sticky; top: var(--asc-set-head-h, 79px); z-index: 20;
+  height: auto;
+  margin: 0 -32px 16px;
+  padding: 0 32px;
+  background: var(--asc-bg);
+  box-shadow: 0 1px 0 var(--asc-border);
+}
 .settings-tabs :deep(.el-tabs__item) { font-size: 14px; }
 .set-card {
   max-width: 870px; margin-bottom: 18px;
@@ -1175,13 +1379,76 @@ async function rebuildAll() {
 .card-head-tip { font-size: 12px; color: var(--asc-text-3); font-weight: 400; }
 .prompt-label { font-size: 14px; font-weight: 600; }
 
-.usage-body { display: flex; flex-direction: column; gap: 12px; }
-.usage-totals { display: flex; gap: 32px; }
-.usage-kinds { display: flex; gap: 8px; flex-wrap: wrap; }
-.usage-chip {
-  font-size: 12px; color: var(--asc-text-2);
-  background: var(--asc-surface-2); border-radius: 6px; padding: 3px 10px;
+.usage-body { display: flex; flex-direction: column; gap: 20px; }
+
+/* ===== Token 消耗页 redesign ===== */
+.card-head-actions { display: flex; align-items: center; gap: 12px; }
+
+.usage-metrics { display: grid; grid-template-columns: repeat(2, minmax(140px, 1fr)); gap: 16px; }
+.usage-metric-card {
+  background: var(--asc-card); border: 1px solid var(--asc-border);
+  border-radius: var(--asc-radius); padding: 18px 18px 14px;
+  transition: border-color .18s ease, box-shadow .18s ease;
 }
+.usage-metric-card:hover { border-color: var(--asc-primary); box-shadow: var(--asc-shadow-hover); }
+.usage-metric-top { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.usage-metric-num { font-size: 28px; font-weight: 700; color: var(--asc-text); letter-spacing: -.5px; }
+.usage-metric-unit { font-size: 13px; color: var(--asc-text-3); font-weight: 500; }
+.usage-metric-label { font-size: 13px; color: var(--asc-text-2); font-weight: 500; margin-bottom: 4px; }
+.usage-metric-compare { font-size: 12px; color: var(--asc-text-3); }
+
+.usage-section-title {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 12px;
+  font-size: 14px; font-weight: 600; color: var(--asc-text);
+}
+.usage-section-sub { font-size: 12px; color: var(--asc-text-3); font-weight: 400; }
+
+.usage-list { display: flex; flex-direction: column; gap: 10px; }
+.usage-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px; border-radius: 10px;
+  border: 1px solid var(--asc-border); background: var(--asc-card);
+  transition: background .15s ease, border-color .15s ease;
+}
+.usage-row:hover { background: var(--asc-surface-2); border-color: var(--asc-primary); }
+.usage-rank {
+  flex: none; width: 24px; height: 24px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 600; color: var(--asc-text-2);
+  background: var(--asc-surface-2);
+}
+.usage-row:first-child .usage-rank { background: var(--asc-primary); color: #fff; }
+.usage-row-main { flex: 1; min-width: 0; }
+.usage-row-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 8px;
+}
+.usage-kind { font-size: 13.5px; font-weight: 600; color: var(--asc-text); }
+.usage-kind-nums { font-size: 12.5px; color: var(--asc-text-2); white-space: nowrap; }
+.usage-kind-nums b { color: var(--asc-text); font-weight: 600; }
+.usage-kind-split { margin: 0 5px; color: var(--asc-text-3); }
+.usage-kind-share { margin-left: 8px; font-size: 11.5px; color: var(--asc-primary); font-weight: 500; }
+.usage-bar-wrap { height: 6px; border-radius: 3px; background: var(--asc-surface-2); overflow: hidden; }
+.usage-bar {
+  height: 100%; border-radius: 3px;
+  background: linear-gradient(90deg, var(--asc-primary) 0%, var(--asc-cyan) 100%);
+  transition: width .35s ease-out;
+}
+
+.usage-refresh { margin-right: 4px; transition: transform .4s ease; }
+.usage-refresh.spinning { animation: usage-spin 1s linear infinite; }
+@keyframes usage-spin { to { transform: rotate(360deg); } }
+
+.storage-tip { font-size: 13px; color: var(--asc-text-3); margin: 10px 0 0; }
+
+@media (max-width: 620px) {
+  .usage-metrics { grid-template-columns: 1fr; }
+  .usage-row-head { flex-direction: column; align-items: flex-start; gap: 4px; }
+  .usage-kind-nums { white-space: normal; }
+  .card-head-actions { flex-wrap: wrap; justify-content: flex-end; }
+}
+
 .storage-row .el-upload { margin-left: 0; }
 
 /* 语音模型区块 */
@@ -1332,4 +1599,14 @@ async function rebuildAll() {
 .drill-form { margin-top: 14px; }
 .drill-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .drill-hint { font-size: 12.5px; color: var(--asc-text-2); }
+/* ===== 关于 / 检查更新 ===== */
+.about-grid { display: flex; flex-direction: column; gap: 10px; max-width: 760px; }
+.about-row { display: flex; align-items: flex-start; gap: 14px; font-size: 13px; }
+.about-k { width: 76px; flex-shrink: 0; color: var(--asc-text-2); }
+.about-v { color: var(--asc-text); word-break: break-all; }
+.about-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; color: var(--asc-text-2);
+}
+.about-ops { margin-top: 16px; display: flex; align-items: center; gap: 10px; }
 </style>

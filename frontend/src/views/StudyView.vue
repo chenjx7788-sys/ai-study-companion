@@ -18,7 +18,8 @@
       <div class="pane-title">目录</div>
       <div class="toc">
         <div v-for="s in sections" :key="s.path" class="toc-item" :class="{ active: s.key === activeSection }">
-          <span class="toc-text" @click="scrollToSection(s)">{{ s.path }}</span>
+          <span class="toc-text" :style="{ paddingLeft: (12 + (s.level - 1) * 12) + 'px' }"
+            :title="s.path" @click="scrollToSection(s)">{{ s.label }}</span>
           <el-button class="toc-sum" size="small" text type="primary"
             :loading="sectionSummarizing === s.path" @click="summarizeSection(s)">总结</el-button>
         </div>
@@ -103,41 +104,36 @@
               v-html="renderMd(c.content)"></div>
           </div>
         </template>
-        <!-- 其余格式：按页分组呈现 -->
+        <!-- 其余格式：按页分组呈现；编辑态 = 整篇统一编辑面（块间以 asc:chunk 注释行分隔，保存按标记切回逐块写库） -->
         <template v-else>
-          <template v-for="group in pagedChunks" :key="group.page">
-            <div v-if="!isImage" :id="'page-' + group.page" class="page-marker" :class="{ 'seekable': isMedia }"
-             @click="isMedia && seekToMinute(group.page)">
-              <span>{{ blockUnitText(group.page) }}</span>
-              <el-button v-if="transcriptEditing" class="page-del-btn edit-del-btn" size="small" text type="danger"
-                @click.stop="deletePage(group.page)">删除本页</el-button>
-            </div>
-            <template v-if="transcriptEditing">
-              <div v-for="c in group.items" :key="c.id" class="chunk-edit-row">
-                <div class="edit-row-head">
-                  <el-button class="edit-del-btn" size="small" text type="danger" @click="deleteChunk(c)">删除此块</el-button>
-                </div>
-                <textarea v-show="!editPreviewOn" v-model="transcriptDraft[c.id]" class="edit-textarea" :rows="editRows(transcriptDraft[c.id])"
-                  @mouseup.stop="onEditSelect($event, c)" @keyup="onEditSelect($event, c)" @blur="hidePolishBar"></textarea>
-                <div v-if="editPreviewOn" class="edit-preview md-body" v-html="renderMd(transcriptDraft[c.id] || '')"></div>
+          <template v-if="transcriptEditing">
+            <textarea v-show="!editPreviewOn" v-model="unifiedDraft" class="edit-textarea edit-textarea-unified"
+              @mouseup.stop="onEditSelect($event)" @keyup="onEditSelect($event)" @blur="hidePolishBar"></textarea>
+            <div v-if="editPreviewOn" class="edit-preview md-body" v-html="renderEditPreview(unifiedDraft)"></div>
+          </template>
+          <template v-else>
+            <template v-for="group in pagedChunks" :key="group.page">
+              <div v-if="!isImage" :id="'page-' + group.page" class="page-marker" :class="{ 'seekable': isMedia }"
+               @click="isMedia && seekToMinute(group.page)">
+                <span>{{ blockUnitText(group.page) }}</span>
               </div>
-            </template>
-            <template v-else v-for="c in group.items" :key="c.id">
-              <!-- 内嵌图 OCR 块（书籍类）：默认收成一行折叠条 —— OCR 产物多为图表标签/目录
-                   碎片（非线性正文），整段平铺会截断阅读流；点击原地展开为卡片。 -->
-              <div v-if="isInlineImgOcr(c)" class="imgocr-inline" :data-page="group.page" :data-chunk="c.id">
-                <button type="button" class="imgocr-inline-bar" @click="toggleImgOcr(c.id)">
-                  <span>🖼 图片中的文字 · {{ blockUnitText(group.page) }} · {{ imgocrTextLen(c) }} 字</span>
-                  <span class="imgocr-inline-act">{{ imgocrOpen[c.id] ? '收起' : '展开' }}</span>
-                </button>
-                <div v-if="imgocrOpen[c.id]" class="imgocr-inline-body">
-                  <div v-if="canOriginLocate" class="imgocr-inline-tools">
-                    <button type="button" class="imgocr-origin-link" @click.stop="viewImgOcrOrigin(group.page, parseImgRect(c))">在原文中查看</button>
+              <template v-for="c in group.items" :key="c.id">
+                <!-- 内嵌图 OCR 块（书籍类）：默认收成一行折叠条 —— OCR 产物多为图表标签/目录
+                     碎片（非线性正文），整段平铺会截断阅读流；点击原地展开为卡片。 -->
+                <div v-if="isInlineImgOcr(c)" class="imgocr-inline" :data-page="group.page" :data-chunk="c.id">
+                  <button type="button" class="imgocr-inline-bar" @click="toggleImgOcr(c.id)">
+                    <span>🖼 图片中的文字 · {{ blockUnitText(group.page) }} · {{ imgocrTextLen(c) }} 字</span>
+                    <span class="imgocr-inline-act">{{ imgocrOpen[c.id] ? '收起' : '展开' }}</span>
+                  </button>
+                  <div v-if="imgocrOpen[c.id]" class="imgocr-inline-body">
+                    <div v-if="canOriginLocate" class="imgocr-inline-tools">
+                      <button type="button" class="imgocr-origin-link" @click.stop="viewImgOcrOrigin(group.page, parseImgRect(c))">在原文中查看</button>
+                    </div>
+                    <div class="chunk imgocr-inline-content" v-html="renderChunk(c)"></div>
                   </div>
-                  <div class="chunk imgocr-inline-content" v-html="renderChunk(c)"></div>
                 </div>
-              </div>
-              <component v-else :is="isRichMd ? 'div' : 'p'" class="chunk" :class="{ 'chunk-image': isImage, 'rich': isRichMd }" :data-page="group.page" :data-chunk="c.id" :data-section="c.section_path || ''" v-html="renderChunk(c)"></component>
+                <component v-else :is="isRichMd ? 'div' : 'p'" class="chunk" :class="{ 'chunk-image': isImage, 'rich': isRichMd }" :data-page="group.page" :data-chunk="c.id" :data-section="c.section_path || ''" v-html="renderChunk(c)"></component>
+              </template>
             </template>
           </template>
           <el-empty v-if="pagedChunks.length === 0" :description="isMedia ? '未识别到语音内容' : (isImage ? '未识别到文字，可在原文视图查看图片' : '无文本内容（扫描件请切换原文视图）')" />
@@ -156,7 +152,7 @@
         </div>
         <div v-if="transcriptEditing" class="transcript-save">
           <el-button type="primary" :loading="transcriptSaving" @click="saveTranscript">保存修改</el-button>
-          <el-button v-if="isRichMd" text type="primary" class="edit-preview-btn" @click="editPreview = !editPreview">{{ editPreview ? '继续编辑' : '预览排版' }}</el-button>
+          <el-button text type="primary" class="edit-preview-btn" @click="editPreview = !editPreview">{{ editPreview ? '继续编辑' : '预览排版' }}</el-button>
           <span class="transcript-hint">修改会同步更新知识库检索，不影响已生成的摘要/知识点</span>
         </div>
         <!-- 语音模型下载引导（音视频未装 Whisper / 下载中时显示） -->
@@ -425,6 +421,31 @@
           </div>
           <!-- 已有讲义（含流式实时打字 / 已落库） -->
           <div v-else-if="learnNote || learnDisplayContent" class="summary-body pane-wrap">
+            <!-- 分章讲义章条：长材料按章生成；未生成的章不出现在讲义中，可逐章补 -->
+            <div v-if="learnChapters.length" class="learn-chapters">
+              <div class="learn-ch-head">
+                <span>本材料共 {{ learnChapters.length }} 章 · 已生成 {{ learnChapters.filter(c => c.generated).length }} 章</span>
+                <span v-if="learnChapters.some(c => !c.generated)" class="learn-ch-hint">未生成的章默认收起；点已生成章名可定位到讲义对应章节</span>
+              </div>
+              <div class="learn-ch-list">
+                <div v-for="ch in learnChVisible" :key="ch.i" class="learn-ch" :class="{ 'is-done': ch.generated }">
+                  <span class="learn-ch-dot" aria-hidden="true"></span>
+                  <span class="learn-ch-name" :class="{ 'is-link': ch.generated }"
+                    :title="ch.generated ? '定位到讲义中的本章' : ''"
+                    @click="ch.generated && scrollToLearnChapter(ch)">{{ ch.name }}</span>
+                  <span class="learn-ch-chars">约 {{ (ch.chars / 1000).toFixed(1) }}k 字</span>
+                  <span v-if="learnChLoading === ch.i" class="learn-ch-status"><span class="asking-dots"><i></i><i></i><i></i></span>生成中</span>
+                  <el-button v-else-if="!ch.generated" size="small" text type="primary"
+                    :disabled="learnLoading || learnChLoading >= 0" @click="genLearnChapter(ch)">生成</el-button>
+                  <el-button v-else size="small" text type="warning"
+                    :disabled="learnLoading || learnChLoading >= 0" @click.stop="genLearnChapter(ch)">重新生成</el-button>
+                </div>
+                <button v-if="learnChHiddenCount > 0 || !learnChCollapsed" type="button" class="learn-ch-toggle"
+                  @click="learnChCollapsed = !learnChCollapsed">
+                  {{ learnChCollapsed ? `展开其余 ${learnChHiddenCount} 个未生成章节` : '收起未生成章节' }}
+                </button>
+              </div>
+            </div>
             <div class="pane-scroll">
               <div ref="learnMdEl" class="md-preview summary-text" v-html="renderLearnMd(learnDisplayContent)" @click="onSummaryClick"></div>
             </div>
@@ -462,6 +483,7 @@
             </div>
             <p class="pe-title">一键生成学习讲义</p>
             <p class="pe-sub">结构化笔记 + 记忆钩子，并出题同步到复习</p>
+            <p v-if="learnChapters.length" class="pe-sub">本材料共 {{ learnChapters.length }} 章，将先生成前 {{ learnChMeta?.auto_count || 1 }} 章，其余章可稍后逐章补生成</p>
             <el-button type="primary" :loading="learnLoading" @click="genLearn">生成学习讲义</el-button>
           </div>
         </el-tab-pane>
@@ -561,7 +583,7 @@
     </el-dialog>
 
     <!-- 分章总结结果弹窗（B7） -->
-    <el-dialog v-model="sectionDialog.show" :title="`本章总结：${sectionDialog.section}`" width="600px">
+    <el-dialog v-model="sectionDialog.show" :title="`本章总结：${prettyPath(sectionDialog.section)}`" width="600px">
       <div class="md-preview" v-html="renderMd(sectionDialog.content)"></div>
       <template #footer>
         <el-button text type="primary" @click="sectionToNote">转笔记</el-button>
@@ -782,7 +804,7 @@ const sectionDialog = reactive({ show: false, section: '', content: '', anchor: 
 const toolbar = reactive({ show: false, x: 0, y: 0, text: '', page: 1, chunkId: null, range: null, hasHighlight: false, epub: false })
 
 // 编辑模式选中文字 → AI 加工（改写/扩写/续写/总结，textarea 选区，非 window.getSelection）
-const polishBar = reactive({ show: false, x: 0, y: 0, text: '', chunkId: null, page: 0, start: 0, end: 0 })
+const polishBar = reactive({ show: false, x: 0, y: 0, text: '', start: 0, end: 0 })
 
 // 笔记加工（改写/扩写/总结）
 const TRANSFORM_LABELS = { rewrite: '改写', expand: '扩写', continue: '续写', summarize: '总结' }
@@ -797,6 +819,12 @@ const summaryMdEl = ref(null)        // 摘要 md 容器（供 (P页码) 后处�
 const learnMdEl = ref(null)          // 讲义 md 容器（同上）
 const isFullscreen = ref(false)
 const learnLive = ref('')            // 流式生成中的讲义正文累积（仅生成中有效；落库后由 learnNote 接管）
+// 分章讲义（长材料按章生成）：无章节结构/短材料时 learnChapters 为空 → 走整篇 UI，不显示章条
+const learnChapters = ref([])        // 章清单 [{i,name,chars,generated,version}]
+const learnChMeta = ref(null)        // {structured, auto_count, total_chars}
+const learnChLive = ref('')          // 单章补生成中的流式累积（拼在已生成讲义后面展示）
+const learnChLoading = ref(-1)       // 正在补生成的章序号（-1=无）
+const learnGenChapter = ref(null)    // 整跑分章模式当前章 {i,total,name}（进度文案用）
 
 // 三栏拖拽调宽（左目录 / 右 AI 面板，中栏自适应）
 const LEFT_MIN = 180, LEFT_MAX = 480, LEFT_DEFAULT = 240
@@ -909,6 +937,74 @@ const parseImgRect = (c) => {
   return v.length === 4 && v.every(n => Number.isFinite(n)) ? v : null
 }
 const pdfImgFlash = ref(null)   // { page, rect } —— 传给 PdfReader 的图级闪烁目标
+
+// ---------- 扫描页行框定位（后端 line_boxes） ----------
+// 扫描件没有文字层，前端原本拿不到「这句话在页面的哪个位置」。后端解析时把每行 OCR 框
+// 存进 chunk.line_boxes，这里按文本相似度找出命中行，换算成 PdfReader 要的 [x0,y0,x1,y1]。
+// ⚠️ 不能按下标对齐 content 的行：cleaner 会按行删页眉/乱码，两边行序早就不同了 → 只能比文本。
+const pageBoxCache = new Map()   // `${mid}:${page}` → 该页所有行框（跨块合并）
+const bigrams = (s) => {
+  const m = new Map()
+  for (let i = 0; i < s.length - 1; i++) {
+    const k = s.slice(i, i + 2)
+    m.set(k, (m.get(k) || 0) + 1)
+  }
+  return m
+}
+// Dice 系数（双字组重叠率）：中文上比字符集合更稳，且是 O(n)，不会因为长段落卡住渲染
+function diceSim(a, b) {
+  if (!a || !b) return 0
+  if (a === b) return 1
+  if (a.length < 2 || b.length < 2) return 0
+  const A = bigrams(a), B = bigrams(b)
+  let inter = 0, total = 0
+  for (const [k, v] of A) {
+    total += v
+    const w = B.get(k)
+    if (w) inter += Math.min(v, w)
+  }
+  for (const [, v] of B) total += v
+  return total ? (2 * inter) / total : 0
+}
+// 片段比行更长时，「整段 vs 整行」会被摊薄：书体正文行均长 ~31 字，30 字片段经常
+// 横跨两行，最长的那行也只能拿到 0.4~0.5 的 Dice。改成按行等长滑动窗口取最高。
+// 实测（3 份文字层 PDF、626 个 30 字片段）：框内确实是该句 69.2% → 80.0%。
+function bestDice(frag, line) {
+  const L = line.length
+  if (L < 2 || frag.length < 2) return 0
+  if (frag.length <= L + 2) return diceSim(frag, line)
+  let best = diceSim(frag.slice(0, L), line)
+  for (let st = 1; st + L <= frag.length; st += 2) {
+    const s = diceSim(frag.slice(st, st + L), line)
+    if (s > best) best = s
+  }
+  return best
+}
+async function locateLineRect(page, text) {
+  const mid = material.value?.id
+  const want = String(text || '').replace(/\s+/g, '')
+  if (!mid || !want || !page) return null
+  const key = `${mid}:${page}`
+  try {
+    if (!pageBoxCache.has(key)) {
+      const { data } = await materialApi.pageBoxes(mid, page)
+      pageBoxCache.set(key, (data || []).flatMap((c) => c.lines || []))
+    }
+    const lines = pageBoxCache.get(key) || []
+    let best = null
+    for (const ln of lines) {
+      const s = bestDice(want, String(ln.t || '').replace(/\s+/g, ''))
+      if (!best || s > best.s) best = { s, ln }
+    }
+    // 阈值偏松：来源片段是「截断的前 N 字」，与整行天然有长度差；误差只会让框偏一点，
+    // 但不命中就等于回到「只能跳页」，所以宁可偏也不空。
+    if (!best || best.s < 0.42) return null
+    return [best.ln.x0, best.ln.y0, best.ln.x1, best.ln.y1]
+  } catch (e) {
+    return null   // 接口失败/该页无行框 → 降级页级跳转，不打断阅读
+  }
+}
+
 function viewImgOcrOrigin(page, rect) {
   // 有 rect → PdfReader 在图的位置画闪烁框（图级定位）；无 → 降级为页级跳转
   pdfImgFlash.value = rect ? { page, rect } : null
@@ -953,11 +1049,24 @@ const sections = computed(() => {
   for (const c of visibleChunks.value) {
     if (c.section_path && !seen.has(c.section_path)) seen.set(c.section_path, c.page_no)
   }
-  return [...seen.entries()].map(([path, page]) => ({ path, page, key: normPath(path) }))
+  return [...seen.entries()].map(([path, page]) => {
+    const segs = path.split('/').map(x => x.trim()).filter(Boolean)
+    return {
+      path, page, key: normPath(path),
+      // 只显示末级标题 + 层级缩进：侧栏 172~260px，整条 section_path 会被 ellipsis
+      // 截成「每条都一样的前缀」，64 条目录看起来像 64 个重复标题。
+      // ⚠️ path/key/sectionTitles 仍是完整路径（滚动定位、原文锚点、分章总结都靠它们）。
+      level: Math.max(1, segs.length),
+      label: (segs.length ? segs[segs.length - 1] : path).replace(/／/g, '/'),
+    }
+  })
 })
 // 目录条目原文（给 Word 原文视图匹配段落锚点：用原文，由 reader 自行归一化）
 const sectionTitles = computed(() => sections.value.map(s => s.path))
 const activeSection = ref('')
+// 展示用：section_path 为避开层级分隔符 `/` 把标题内的斜杠存成全角 `／`（parser._path_seg），
+// 落库/接口传参必须保持原值，只有**给人看**的地方还原成半角。
+const prettyPath = (t) => (t || '').replace(/／/g, '/')
 
 const shortTime = (iso) => iso ? iso.slice(5, 16).replace('T', ' ') : ''
 
@@ -1065,19 +1174,15 @@ function downloadFile() {
     a.click()
     document.body.removeChild(a)
   } else {
-    // 文本视图：下载文本内容（统一导出 .md）
-    // ⚠️ 走 visibleChunks 而不是 chunks：图片 OCR 文字不显示也不导出，
-    //    保持「屏幕 / 导出」同一份内容（避免两个入口给出不同产物）。
-    const text = visibleChunks.value.map(c => c.content || '').join('\n\n')
-    const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
+    // 文本视图：走后端导出端点，产物带标题层级 / 页码锚 / 图内文字附录。
+    // ⚠️ 不再在前端拼 visibleChunks —— 实测那样出的 md 有 0 个 `#`（章节层级丢光）、
+    //    82% 的行是硬折行（「实质生 / 产的高原期」这种断开），而且目录页原样混在开头。
     const a = document.createElement('a')
-    a.href = url
-    a.download = `${material.value?.title || '文本'}.md`
+    a.href = materialApi.exportMarkdownUrl(materialId)
+    a.download = ''   // 后端 Content-Disposition 已带文件名
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)
-    URL.revokeObjectURL(url)
   }
   ElMessage.success('开始下载')
 }
@@ -1301,7 +1406,7 @@ async function summarizeSection(s) {
 
 async function sectionToNote() {
   try {
-    await createNote(`本章总结：${sectionDialog.section}`, sectionDialog.content,
+    await createNote(`本章总结：${prettyPath(sectionDialog.section)}`, sectionDialog.content,
       'ai_asset', null, { section_path: sectionDialog.section })
     await refreshNotes()
     sectionDialog.show = false
@@ -1322,10 +1427,19 @@ const flashHl = computed(() => {
   return page && hl ? { page, text: String(hl) } : null
 })
 
+// 来源定位目标要**记住**：route 里的 page/hl 只活 3 秒（下面那个 timer 会清掉），
+// 但用户往往先读文本、过一会儿才切原文 —— 那时 flashHl 已经是 null 了。
+const lastSourceLoc = ref(null)   // { page, text }
+
 // 跨页来源跳转（如知识库「跳转原文」）→ 3 秒临时高亮后清除 page/hl 参数，避免常亮/动画重播
 let flashQueryTimer = null
 watch(flashHl, (fl) => {
   if (!fl) return
+  lastSourceLoc.value = fl
+  // 提前对齐 activePage：切原文视图时 restoreReadingPosition 读的就是它。
+  // 若等切视图时再设，会和「切换视图」那条 watch 里的 restore 并发，
+  // 两边各跑一套 1.8s 轮询校正、互相拽回原页（实测框挂在 P2、视口停在 P1）。
+  activePage.value = fl.page
   if (flashQueryTimer) clearTimeout(flashQueryTimer)
   flashQueryTimer = setTimeout(() => {
     const q = { ...route.query }
@@ -1336,6 +1450,20 @@ watch(flashHl, (fl) => {
   // 跨页来源跳转命中图片 OCR 文字（默认隐藏）→ 文本高亮无从匹配，说明一声。
   // 放在 nextTick：路由参数落地时 chunks 可能还没加载完。
   nextTick(() => hiddenChunkHint(fl.page, fl.text))
+}, { immediate: true })
+
+// 切到原文视图时：若带着来源定位目标、且该页有扫描行框 → 在页内画出命中位置。
+// 刻意**不**自动切视图：那会打断正在读文本的人。用户自己点「原文」才定位。
+watch(viewMode, async (v) => {
+  const fl = lastSourceLoc.value
+  if (v !== 'origin' || !fl) return
+  if (pdfImgFlash.value && pdfImgFlash.value.page === fl.page) return
+  const rect = await locateLineRect(fl.page, fl.text)
+  if (rect && viewMode.value === 'origin') {
+    pdfImgFlash.value = { page: fl.page, rect }
+    // 一次性：画完就消费掉，避免之后每次切原文都被拽回来源页（用户可能在原文里自由翻）
+    lastSourceLoc.value = null
+  }
 })
 
 // 按页聚合高亮：chain=已 AI 解读（紫）/ note=已转笔记（琥珀）
@@ -2195,29 +2323,73 @@ async function addAllToReview() {
   }
 }
 
-// 转写校对：编辑音视频转写文本（纠同音字），保存后同步向量索引
+// 转写/正文校对：整篇统一编辑面（手感 = 编辑一份连续文档），保存时按块标记切回逐块写库。
+// 为什么不做「整篇 md 直接重解析」：PDF 的 chunk 是页级单元，page_no / line_boxes 撑着
+// 原文对照、目录高亮与定位闪框 —— 整篇重切必丢页结构。逐块写回 = 页结构不动，只换编辑手感。
 const transcriptEditing = ref(false)
-const transcriptDraft = reactive({})
 const transcriptSaving = ref(false)
+const unifiedDraft = ref('')
 
-// 编辑态 md 预览（仅解析层产出 md 语法的 docx/epub/pptx；退出编辑自动复位）
+// 编辑态 md 预览（统一编辑面对所有格式开放；退出编辑自动复位）
 const editPreview = ref(false)
-const editPreviewOn = computed(() => editPreview.value && isRichMd.value)
+const editPreviewOn = computed(() => editPreview.value)
 watch(transcriptEditing, (v) => { if (!v) editPreview.value = false })
 
-// 编辑框高度随内容自适应：估行数（min 3 / max 24），让长内容不再挤在小框里
-function editRows(content) {
-  const n = (content || '').length
-  if (!n) return 3
-  const lines = (content.match(/\n/g) || []).length + 1
-  return Math.min(24, Math.max(3, lines, Math.ceil(n / 55)))
+// 由当前块内容生成「未修改」基准串（进入编辑 / 改动检测共用同一口径）。
+// 块标记是独占一行的 HTML 注释，带块 id 与页码提示；保存时按它切回逐块。
+function unifiedSourceText() {
+  return visibleChunks.value
+    .map(c => `<!-- asc:chunk ${c.id} | ${blockUnitText(c.page_no)} -->\n${c.content || ''}`)
+    .join('\n\n')
+}
+
+// 解析编辑面文本 → 按标记切回块；未出现的标记 = 待删块。
+// ⚠️ 任一校验失败直接拒存（不落半个库）：陌生标记 / 标记被复制 / 标记顺序被移动。
+function parseUnifiedDraft(text) {
+  const marks = []
+  const re = /<!--\s*asc:chunk\s+(\d+)(?:\s*\|[^>]*)?-->/g
+  let m
+  while ((m = re.exec(text))) marks.push({ id: +m[1], at: m.index, end: m.index + m[0].length })
+  const ids = visibleChunks.value.map(c => c.id)
+  // 标记全删但还有正文：新增内容没有归属块，保存会把它**静默丢掉** → 拒存并指路
+  if (!marks.length) {
+    if (text.trim()) return { error: '块分隔标记全被删除了，新增的内容将无处保存。请恢复标记（或放弃本次修改）' }
+    return { regions: [], deletions: ids, error: '' }
+  }
+  // 首标记之前的内容同样没有归属块（region 从标记行之后起算）→ 拒存，别静默丢
+  if (text.slice(0, marks[0].at).trim()) {
+    return { error: '第一个块分隔标记之前不能放内容（保存时会丢失），请把它移到任意标记行下方' }
+  }
+  const idSet = new Set(ids)
+  const seen = new Set()
+  for (const mk of marks) {
+    if (!idSet.has(mk.id)) return { error: '检测到陌生的块分隔标记，请恢复原样或放弃修改' }
+    if (seen.has(mk.id)) return { error: '块分隔标记被复制了，请恢复原样或放弃修改' }
+    seen.add(mk.id)
+  }
+  // 顺序校验：标记序列必须是原块序的保序子序列（块内容可跨块挪动，块次序不可换）
+  let cursor = 0
+  for (const mk of marks) {
+    const idx = ids.indexOf(mk.id, cursor)
+    if (idx < 0) return { error: '块分隔标记的顺序被移动了（不支持调整页/块次序），请恢复原样或放弃修改' }
+    cursor = idx + 1
+  }
+  const regions = marks.map((mk, i) => ({
+    id: mk.id,
+    text: text.slice(mk.end, i + 1 < marks.length ? marks[i + 1].at : text.length).trim(),
+  }))
+  return { regions, deletions: ids.filter(id => !seen.has(id)), error: '' }
 }
 
 function hasTranscriptChanges() {
-  for (const c of chunks.value) {
-    if ((transcriptDraft[c.id] || '').trim() !== (c.content || '').trim()) return true
-  }
-  return false
+  return unifiedDraft.value.trim() !== unifiedSourceText().trim()
+}
+
+// 预览排版：先剥掉块标记再渲染。
+// ⚠️ 本页 md 实例未开 html（createMd 默认 html:false），HTML 注释会被转义成**可见文本**
+//    （实测：预览里整行露出 asc:chunk 标记）→ 必须在渲染前剥掉，不能指望渲染器吞掉。
+function renderEditPreview(text) {
+  return renderMd((text || '').replace(/<!--\s*asc:chunk\s+\d+(?:\s*\|[^>]*)?-->/g, ''))
 }
 
 // md 材料「编辑文本」：跳转到 Vditor 富文本编辑页（复用 EditorView，带来源标记）
@@ -2227,7 +2399,7 @@ function editMdDocument() {
 
 async function toggleTranscriptEdit() {
   if (!transcriptEditing.value) {
-    for (const c of chunks.value) transcriptDraft[c.id] = c.content
+    unifiedDraft.value = unifiedSourceText()
     transcriptEditing.value = true
     return
   }
@@ -2253,21 +2425,45 @@ async function toggleTranscriptEdit() {
 }
 
 async function saveTranscript() {
+  const parsed = parseUnifiedDraft(unifiedDraft.value)
+  if (parsed.error) { ElMessage.error(parsed.error); return }
+  // 缺失标记 = 删除该块：逐块列清并确认，绝不静默删
+  if (parsed.deletions.length) {
+    const names = parsed.deletions.map(id => {
+      const c = chunks.value.find(x => x.id === id)
+      return c ? blockUnitText(c.page_no) : `#${id}`
+    })
+    // 列表最多摆 8 个：整本删除时几百个页签会把确认框撑爆
+    const pages = names.slice(0, 8).join('、') + (names.length > 8 ? ` 等 ${names.length} 个` : '')
+    try {
+      await ElMessageBox.confirm(
+        `检测到有 ${parsed.deletions.length} 个文本块的分隔标记被移除（${pages}），保存将删除这些块且不可恢复。`,
+        '删除确认',
+        { confirmButtonText: '删除并保存', cancelButtonText: '返回编辑', type: 'warning' })
+    } catch { return }
+  }
   transcriptSaving.value = true
   try {
     let changed = 0
     let warnCount = 0
-    for (const c of chunks.value) {
-      const draft = (transcriptDraft[c.id] || '').trim()
-      if (draft && draft !== c.content) {
-        const { data } = await materialApi.updateChunk(materialId, c.id, draft)
+    for (const r of parsed.regions) {
+      const c = chunks.value.find(x => x.id === r.id)
+      if (!c) continue
+      // 空 region 不覆盖原内容（防误清空）；双侧 trim 比对，避免尾随空白造成「假修改」
+      if (r.text && r.text !== (c.content || '').trim()) {
+        const { data } = await materialApi.updateChunk(materialId, r.id, r.text)
         if (data.reindex_warning) warnCount++
-        c.content = draft
+        c.content = r.text
         changed++
       }
     }
-    if (warnCount) ElMessage.warning(`已保存 ${changed} 处修改，但 ${warnCount} 处索引更新失败，可能检索不到`)
-    else ElMessage.success(changed ? `已保存 ${changed} 处修改` : '无修改')
+    for (const id of parsed.deletions) await materialApi.deleteChunk(materialId, id)
+    if (parsed.deletions.length) await loadChunks()
+    const parts = []
+    if (changed) parts.push(`已保存 ${changed} 处修改`)
+    if (parsed.deletions.length) parts.push(`已删除 ${parsed.deletions.length} 个块`)
+    if (warnCount) ElMessage.warning(`${parts.join('，') || '无修改'}，但 ${warnCount} 处索引更新失败，可能检索不到`)
+    else ElMessage.success(parts.join('，') || '无修改')
     transcriptEditing.value = false
   } catch (e) {
     ElMessage.error(errMsg(e, '保存失败'))
@@ -2282,36 +2478,6 @@ async function loadChunks() {
   chunks.value = data
 }
 
-async function deleteChunk(c) {
-  try {
-    await ElMessageBox.confirm('删除这个文本块？删除后不可恢复。', '删除文本块', {
-      confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning',
-    })
-  } catch { return }
-  try {
-    await materialApi.deleteChunk(materialId, c.id)
-    ElMessage.success('已删除')
-    await loadChunks()
-  } catch (e) {
-    ElMessage.error(errMsg(e, '删除失败'))
-  }
-}
-
-async function deletePage(page) {
-  try {
-    await ElMessageBox.confirm('删除整页文本？删除后不可恢复。', '删除整页', {
-      confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning',
-    })
-  } catch { return }
-  try {
-    const { data } = await materialApi.deletePage(materialId, page)
-    material.value.page_count = data.page_count
-    ElMessage.success('已删除整页')
-    await loadChunks()
-  } catch (e) {
-    ElMessage.error(errMsg(e, '删除失败'))
-  }
-}
 
 // 测一测：基于资料核心内容出题，同步到复习
 const quizCards = ref([])
@@ -2374,20 +2540,73 @@ const LEARN_STAGE_TEXT = {
   quiz: '正在出题并同步到复习…',
 }
 const LEARN_STAGE_PCT = { prepare: 12, note: 48, quiz: 82 }
-const learnStageText = computed(() => LEARN_STAGE_TEXT[learnStage.value] || '正在生成…')
+const learnStageText = computed(() => {
+  // 分章模式：当前章进度更诚实（整跑=逐章转译，单章补=该章转译中）
+  if (learnStage.value === 'note' && learnGenChapter.value) {
+    const c = learnGenChapter.value
+    return `正在转译第 ${c.i + 1}/${c.total} 章《${c.name}》…`
+  }
+  return LEARN_STAGE_TEXT[learnStage.value] || '正在生成…'
+})
 const learnPercent = computed(() => LEARN_STAGE_PCT[learnStage.value] || (learnLoading.value ? 5 : 0))
-// 讲义展示正文：流式生成中优先显示实时累积（逐 token 打字），落库后切回 learnNote
-const learnDisplayContent = computed(() => learnLive.value || (learnNote.value?.content || ''))
+
+// 章条默认只列「已生成 / 生成中」的章：长材料 16+ 章时全列会占满整栏、把讲义正文压出首屏；
+// 未生成章收进「展开其余 N 个未生成章节」。
+const learnChCollapsed = ref(true)
+const learnChVisible = computed(() => learnChCollapsed.value
+  ? learnChapters.value.filter(c => c.generated || learnChLoading.value === c.i)
+  : learnChapters.value)
+const learnChHiddenCount = computed(() => learnChapters.value.length - learnChVisible.value.length)
+
+// 点击已生成章名 → 滚动定位到讲义正文对应「## 章名」标题并短暂高亮。
+// 分章讲义的章标题就是 ## {章名}；归一化后相等优先、包含兜底（标题可能带注入的图标节点）。
+function scrollToLearnChapter(ch) {
+  const root = learnMdEl.value
+  if (!root) return
+  const norm = (s) => (s || '').replace(/\s+/g, '')
+  const target = norm(ch.name)
+  const hs = [...root.querySelectorAll('h2')]
+  const hit = hs.find(h => norm(h.textContent) === target) || hs.find(h => norm(h.textContent).includes(target))
+  if (!hit) return
+  hit.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  hit.classList.remove('learn-h2-hit')   // 连点同一章时重置过渡，保证再次闪
+  void hit.offsetWidth
+  hit.classList.add('learn-h2-hit')
+  setTimeout(() => hit.classList.remove('learn-h2-hit'), 1600)
+}
+// 讲义展示正文：整跑流式优先；落库后切回 learnNote；单章补生成时把正在打字的章拼在已生成讲义后面
+const learnDisplayContent = computed(() => {
+  if (learnLive.value) return learnLive.value
+  const base = learnNote.value?.content || ''
+  if (learnChLive.value) return base ? `${base}\n\n${learnChLive.value}` : learnChLive.value
+  return base
+})
+
+// 分章清单：仅「有章节结构且 >1 章」时保留，否则清空走整篇 UI（不显示章条）
+async function loadLearnChapters() {
+  try {
+    const { data } = await simpleLearnApi.chapters(materialId)
+    if (data?.structured && (data.chapters || []).length > 1) {
+      learnChapters.value = data.chapters
+      learnChMeta.value = data
+    } else {
+      learnChapters.value = []
+      learnChMeta.value = null
+    }
+  } catch { learnChapters.value = []; learnChMeta.value = null }
+}
 
 async function loadLearn() {
   try {
     const { data } = await simpleLearnApi.note(materialId)
     learnNote.value = data || null
   } catch { learnNote.value = null }   // 404「尚未生成」属正常空态
+  loadLearnChapters()   // 不阻塞讲义展示：章条慢一拍出现可接受
 }
 
 // 回到页面：仍在生成 → 附着看进度；否则读回已有讲义
 async function resumeLearn() {
+  loadLearnChapters()   // 章条与讲义状态解耦：先拉清单，生成完成后还会再刷
   try {
     const { data } = await simpleLearnApi.status(materialId)
     if (data?.note) learnNote.value = data.note
@@ -2407,6 +2626,7 @@ async function resumeLearn() {
 // 「生成中」这条 SSE 的控制器：组件卸载时必须 abort，
 // 否则每进出一次页面就多留一条挂到后台任务结束的不死连接。
 let learnAbort = null
+let learnChAbort = null              // 单章补生成的 SSE 控制器（离开页面断开，同 learnAbort 纪律）
 
 async function genLearn() {
   if (learnLoading.value) return
@@ -2416,6 +2636,7 @@ async function genLearn() {
   learnQuizCount.value = 0
   learnQuizError.value = ''
   learnLive.value = ''                 // 清空上一轮流式累积，准备接收新一轮 token
+  learnGenChapter.value = null
   learnAbort = new AbortController()
   try {
     await streamSSE(
@@ -2429,6 +2650,8 @@ async function genLearn() {
         // ⚠️ 出题失败是「降级」：后端在 done 里带 quiz.error（status 仍是 done）。
         //    旧实现只读 created → 出题失败被当成成功，用户完全不知情。
         learnQuizError.value = payload.quiz?.error || ''
+        learnGenChapter.value = null
+        loadLearnChapters()             // 分章模式：刷新章条（已生成章打勾）
       },
       (msg) => { learnError.value = msg || '生成失败' },   // error
       undefined,
@@ -2436,6 +2659,10 @@ async function genLearn() {
         if (payload.stage) learnStage.value = payload.stage
         if (payload.note) learnNote.value = payload.note
         if (payload.quiz?.error) learnQuizError.value = payload.quiz.error
+        // 分章模式：当前章进度（正在转译第 x/N 章《章名》）
+        if (payload.chapter != null) {
+          learnGenChapter.value = { i: payload.chapter, total: payload.chapter_total, name: payload.chapter_name }
+        }
       },
       learnAbort.signal,                // ⚠️ 第 8 参：离开页面时断开这条长连接
     )
@@ -2456,6 +2683,39 @@ async function genLearn() {
     learnLoading.value = false
     learnStage.value = ''
     learnLive.value = ''
+    learnGenChapter.value = null
+  }
+}
+
+// 单章补生成 / 单章重新生成：SSE 事件与整跑相同，目标只是「一章」。
+// 生成完成后整篇讲义（拼装视图）由 loadLearn 读回 —— 落库口径在后端，前端不拼内容。
+async function genLearnChapter(ch) {
+  if (learnChLoading.value >= 0 || learnLoading.value) return
+  learnChLoading.value = ch.i
+  learnError.value = ''
+  learnChLive.value = ''
+  learnChAbort = new AbortController()
+  try {
+    await streamSSE(
+      simpleLearnApi.chapterStreamUrl,
+      { material_id: materialId, chapter: ch.i },
+      (t) => { learnChLive.value += t },        // token：逐字累积，拼在已生成讲义后展示
+      () => {                                    // done（streamSSE 同步回调，loadLearn 不等 await）
+        learnChLive.value = ''
+        loadLearn()                              // 读回拼装视图（含本章 + 最新分章头 + 章条状态）
+        ElMessage.success(`第 ${ch.i + 1} 章《${ch.name}》讲义已生成`)
+      },
+      (msg) => { learnError.value = msg || '章节生成失败' },
+      undefined,
+      undefined,
+      learnChAbort.signal,
+    )
+  } catch (e) {
+    if (e?.name !== 'AbortError') learnError.value = errMsg(e, '章节生成失败')
+  } finally {
+    learnChAbort = null
+    learnChLoading.value = -1
+    learnChLive.value = ''
   }
 }
 
@@ -2555,7 +2815,7 @@ function copySelection() {
 // ---------- 编辑模式选中文字 → AI 加工（改写/扩写/续写/总结） ----------
 
 // 编辑 textarea 内选区（textarea 用 selectionStart/End，不走 window.getSelection）
-function onEditSelect(e, c) {
+function onEditSelect(e) {
   const el = e.target
   if (!el || typeof el.selectionStart !== 'number') return
   const start = el.selectionStart, end = el.selectionEnd
@@ -2563,8 +2823,6 @@ function onEditSelect(e, c) {
   if (!text.trim()) { hidePolishBar(); return }
   const rect = el.getBoundingClientRect()
   polishBar.show = true
-  polishBar.chunkId = c.id
-  polishBar.page = c.page_no || 0
   polishBar.text = text
   polishBar.start = start
   polishBar.end = end
@@ -2581,7 +2839,7 @@ function copyEditSelection() {
 }
 
 // ---------- 编辑视图选中文字 → AI 加工（改写/扩写/总结，流式） ----------
-const editTransform = reactive({ show: false, mode: 'rewrite', original: '', result: '', streaming: false, chunkId: null, start: 0, end: 0 })
+const editTransform = reactive({ show: false, mode: 'rewrite', original: '', result: '', streaming: false, start: 0, end: 0 })
 const editTransformTitle = computed(() => 'AI ' + (TRANSFORM_LABELS[editTransform.mode] || '加工'))
 
 async function openEditTransform(mode) {
@@ -2589,7 +2847,6 @@ async function openEditTransform(mode) {
   editTransform.mode = mode
   editTransform.original = text
   editTransform.result = ''
-  editTransform.chunkId = polishBar.chunkId
   editTransform.start = polishBar.start
   editTransform.end = polishBar.end
   editTransform.streaming = true
@@ -2610,30 +2867,18 @@ async function openEditTransform(mode) {
   }
 }
 
-async function adoptEditTransform() {
+function adoptEditTransform() {
   if (!editTransform.result.trim()) { ElMessage.warning('结果为空，无法采用'); return }
-  const chunkId = editTransform.chunkId
-  if (chunkId != null) {
-    const cur = transcriptDraft[chunkId] || ''
-    if (editTransform.mode === 'continue') {
-      // 续写：保留原选段，续写内容追加在其后（end 为选区结束位置）
-      transcriptDraft[chunkId] = cur.substring(0, editTransform.end) + '\n\n' + editTransform.result + cur.substring(editTransform.end)
-    } else {
-      transcriptDraft[chunkId] = cur.substring(0, editTransform.start) + editTransform.result + cur.substring(editTransform.end)
-    }
+  // 统一编辑面：按选区偏移在整篇草稿上原地替换，点「保存修改」时统一落库
+  const cur = unifiedDraft.value
+  if (editTransform.mode === 'continue') {
+    // 续写：保留原选段，续写内容追加在其后（end 为选区结束位置）
+    unifiedDraft.value = cur.substring(0, editTransform.end) + '\n\n' + editTransform.result + cur.substring(editTransform.end)
+  } else {
+    unifiedDraft.value = cur.substring(0, editTransform.start) + editTransform.result + cur.substring(editTransform.end)
   }
   editTransform.show = false
-  // 采用即保存该块，并同步 chunks 内容（避免「保存修改」重复提交）
-  if (chunkId != null) {
-    try {
-      await materialApi.updateChunk(materialId, chunkId, transcriptDraft[chunkId])
-      const c = chunks.value.find(x => x.id === chunkId)
-      if (c) c.content = transcriptDraft[chunkId]
-      ElMessage.success(editTransform.mode === 'continue' ? '已续写并保存' : '已采用并保存')
-    } catch (e) {
-      ElMessage.error(errMsg(e, '保存失败'))
-    }
-  }
+  ElMessage.success(editTransform.mode === 'continue' ? '已续写，保存后生效' : '已采用，保存后生效')
 }
 
 // ---------- 学习时长埋点（模块 H：心跳 30s，切后台暂停，无操作暂停） ----------
@@ -2769,6 +3014,7 @@ onUnmounted(() => {
   // ⚠️ 断开简单学的 SSE：后端生成是独立线程、照跑不误（回来还能附着），
   //    但这条读连接不能跟着一直挂着。genLearn 里已捕获 AbortError、不会误报失败。
   learnAbort?.abort()
+  learnChAbort?.abort()
 })
 </script>
 
@@ -3400,11 +3646,6 @@ onUnmounted(() => {
 }
 /* 长文档分组摘要的进度条：与 gen-tip 同区居中收窄，不撑满整栏 */
 .gen-progress { width: 240px; margin: 8px auto 0; flex-shrink: 0; }
-.chunk-edit-row { margin-bottom: 10px; }
-.edit-row-head {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 4px;
-}
 /* 编辑模式原生 textarea（替换 el-input，选区事件更可靠） */
 .edit-textarea {
   width: 100%; border: none; outline: none; resize: vertical;
@@ -3414,11 +3655,8 @@ onUnmounted(() => {
   transition: box-shadow .18s ease;
 }
 .edit-textarea:focus { box-shadow: 0 0 0 1.5px var(--asc-primary) inset; }
-.page-del-btn { margin-left: 8px; flex-shrink: 0; }
-/* 删除按钮弱化：默认隐藏，hover 所在行/页时浮现 */
-.edit-del-btn { opacity: 0; transition: opacity .15s ease; }
-.chunk-edit-row:hover .edit-del-btn,
-.page-marker:hover .edit-del-btn { opacity: 1; }
+/* 统一编辑面：整篇一个编辑区，给个够用的起步高度（可拖拽拉高） */
+.edit-textarea-unified { min-height: 55vh; }
 /* Markdown 整篇阅读排版 */
 .md-reader .reader-inner { max-width: 760px; }
 .md-body {
@@ -3588,4 +3826,28 @@ onUnmounted(() => {
 .summary-text :deep([data-ico="summary"]) { --ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6.5h8.5M4 12h8.5M4 17.5h5'/%3E%3Cpath d='m14.4 16.6 2.2 2.2 4.4-4.8'/%3E%3C/svg%3E"); }
 .summary-text :deep([data-ico="anchor"]) { --ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='4.8' r='1.9'/%3E%3Cpath d='M12 6.7V21'/%3E%3Cpath d='M4.8 13.2a7.2 7.2 0 0 0 14.4 0'/%3E%3Cpath d='M9 9.6h6'/%3E%3C/svg%3E"); }
 .summary-text :deep([data-ico="flag"]) { --ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5.4 21V3.9'/%3E%3Cpath d='M5.4 4.7h11.2l-1.9 3.9 1.9 3.9H5.4'/%3E%3C/svg%3E"); }
+
+/* ===== 分章讲义章条 ===== */
+.learn-chapters {
+  border: 1px solid #e5e7eb; border-radius: 10px;
+  padding: 10px 12px; margin-bottom: 10px; background: #fafafa;
+}
+.learn-ch-head { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: #374151; margin-bottom: 6px; }
+.learn-ch-hint { color: #6e6e6e; }
+.learn-ch { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 13px; }
+.learn-ch + .learn-ch { border-top: 1px dashed #eeeeee; }
+.learn-ch-dot { width: 7px; height: 7px; border-radius: 50%; background: #d1d5db; flex: none; }
+.learn-ch.is-done .learn-ch-dot { background: #22c55e; }
+.learn-ch-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #1f2937; }
+.learn-ch-chars { color: #6e6e6e; font-size: 12px; flex: none; }
+.learn-ch-status { color: #6e6e6e; font-size: 12px; display: inline-flex; align-items: center; gap: 4px; flex: none; }
+/* 章条列表限高内滚：长材料章多时不把讲义正文压出首屏 */
+.learn-ch-list { max-height: 252px; overflow-y: auto; }
+/* 已生成章名可点击定位到正文对应章节 */
+.learn-ch-name.is-link { cursor: pointer; color: var(--asc-primary); }
+.learn-ch-name.is-link:hover { text-decoration: underline; }
+.learn-ch-toggle { background: none; border: 0; padding: 6px 0 2px; font-size: 12px; color: var(--asc-primary); cursor: pointer; }
+.learn-ch-toggle:hover { text-decoration: underline; }
+/* 定位命中标题的短暂高亮；v-html 注入内容必须 :deep() 穿透 */
+.summary-text :deep(h2.learn-h2-hit) { background: #fdf0d5; border-radius: 6px; transition: background 1.2s ease; }
 </style>

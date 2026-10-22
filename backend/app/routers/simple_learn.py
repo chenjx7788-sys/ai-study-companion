@@ -32,6 +32,7 @@ DEFAULT_QUIZ_COUNT = 8
 HEARTBEAT_SEC = 10.0
 JOB_TTL_SEC = 600          # 已结束任务保留 10 分钟，够「离开又回来」取到结果
 KEEP_NOTE_VERSIONS = 3     # 讲义只保留最近 N 版（每版约 7k 字，无限累积会持续吃库）
+KEEP_CH_VERSIONS = 2    # 分章讲义每章只留最近 2 版（章数多，版本控制要比整篇更紧）
 MAX_CONCURRENT_JOBS = 3    # 全局并发闸：同时「生成中」的任务数上限
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -89,6 +90,105 @@ def _prune_note_versions(db: Session, material_id: int, keep: int = KEEP_NOTE_VE
     return max(0, len(rows) - keep)
 
 
+# ---------- 分章讲义（长材料按章生成；每章一条 AIAsset） ----------
+
+def _chapter_notes(db: Session, material_id: int) -> dict:
+    """每章最新一版讲义：{章序号(int): AIAsset}（type=learn_note_ch，anchor.ch 为章序号）。"""
+    rows = (db.query(AIAsset)
+            .filter(AIAsset.material_id == material_id, AIAsset.type == "learn_note_ch")
+            .order_by(AIAsset.version.desc()).all())
+    latest = {}
+    for a in rows:
+        ch = (a.anchor or {}).get("ch")
+        if isinstance(ch, int) and ch not in latest:
+            latest[ch] = a
+    return latest
+
+
+def _prune_chapter_versions(db: Session, material_id: int, ch: int,
+                            keep: int = KEEP_CH_VERSIONS) -> int:
+    """只留某章最近 keep 版（同 _prune_note_versions：先 flush 否则查询看不到新版）。"""
+    db.flush()
+    rows = [a for a in (db.query(AIAsset)
+                        .filter(AIAsset.material_id == material_id,
+                                AIAsset.type == "learn_note_ch")
+                        .order_by(AIAsset.version.desc()).all())
+            if (a.anchor or {}).get("ch") == ch]
+    for a in rows[keep:]:
+        db.delete(a)
+    return max(0, len(rows) - keep)
+
+
+def _chapter_manifest(db: Session, material_id: int, chunks: list[dict]) -> dict:
+    """章节清单：每章的生成状态 + 默认自动生成的章数（前端章条的数据源）。
+
+    structured=False（无章节结构）时 chapters 为空，前端走整篇 UI（不显示章条）。
+    auto_count ≥ 1：第一章自身就超限时，整跑也至少生成第一章（章内截断兜底）。
+    """
+    chapters = llm.split_chapters(chunks)
+    notes = _chapter_notes(db, material_id)
+    items = []
+    for i, ch in enumerate(chapters):
+        n = notes.get(i)
+        items.append({"i": i, "name": ch["name"], "chars": ch["chars"],
+                      "generated": n is not None, "version": (n.version if n else 0)})
+    auto = llm.chapter_prefix_count(chapters, llm.LEARN_NOTE_MAX_CHARS) if chapters else 0
+    return {"structured": bool(chapters), "chapters": items,
+            "auto_count": max(auto, 1) if chapters else 0,
+            "total_chars": len(llm.format_chunks(chunks))}
+
+
+def _assembled_note(db: Session, material_id: int, chunks: list[dict]) -> dict | None:
+    """把各章讲义拼成「一整篇」视图（/note 读回、转笔记、前端展示共用）。
+
+    version = 各章 version 之和：任一章新生成/重生成都会让它变大
+    → 前端「讲义已更新 · 更新笔记」按 version 比对照常工作（⚠️ 只比 version，不比正文）。
+    无章节讲义时返回 None（调用方退回整篇 learn_note）。
+    """
+    notes = _chapter_notes(db, material_id)
+    if not notes:
+        return None
+    manifest = _chapter_manifest(db, material_id, chunks)
+    items = manifest["chapters"]
+    missing = [c["name"] for c in items if not c["generated"]]
+    if missing:
+        shown = "、".join(f"《{n}》" for n in missing[:6])
+        tail = f" 等 {len(missing)} 章" if len(missing) > 6 else ""
+        head = (f"> 📖 **分章讲义**：本材料共约 {manifest['total_chars']:,} 字、"
+                f"{len(items)} 章，已生成 {len(notes)}/{len(items)} 章；"
+                f"未生成：{shown}{tail}（可在本页下方逐章补生成）。")
+    else:
+        head = (f"> 📖 **分章讲义**：本材料共约 {manifest['total_chars']:,} 字、"
+                f"{len(items)} 章，已全部生成。")
+    parts = [head] + [notes[i].content for i in sorted(notes)]
+    newest = max(notes.values(), key=lambda a: a.created_at or datetime.min)
+    return {"id": newest.id, "material_id": material_id, "type": "learn_note",
+            "content": "\n\n".join(parts),
+            "version": sum((n.version or 1) for n in notes.values()),
+            "created_at": newest.created_at.isoformat() if newest.created_at else None}
+
+
+def _gen_one_chapter(db: Session, mid: int, title: str, doc_kind: str,
+                     chapters: list[dict], ch_idx: int, job) -> AIAsset:
+    """生成一章并落库（整跑分章模式与单章补生成共用）。token 逐段广播给 SSE 订阅者。"""
+    parts: list[str] = []
+    for piece in llm.generate_learn_note_chapter_stream(
+            chapters[ch_idx], title=title, doc_kind=doc_kind,
+            chapter_no=ch_idx + 1, chapter_total=len(chapters)):
+        parts.append(piece)
+        job.note_buf.append(piece)
+        job.broadcast("token", {"t": piece, "chapter": ch_idx})
+    prev = _chapter_notes(db, mid).get(ch_idx)
+    note = AIAsset(material_id=mid, type="learn_note_ch", content="".join(parts),
+                   anchor={"ch": ch_idx, "name": chapters[ch_idx]["name"]},
+                   version=(prev.version + 1) if prev else 1)
+    db.add(note)
+    _prune_chapter_versions(db, mid, ch_idx)
+    db.commit()
+    db.refresh(note)
+    return note
+
+
 def _quiz_source_text(db: Session, material_id: int, chunks: list[dict]) -> str:
     """出题的输入文本：**讲义优先**，没有讲义才退回材料原文块。
 
@@ -96,7 +196,11 @@ def _quiz_source_text(db: Session, material_id: int, chunks: list[dict]) -> str:
     → 题只覆盖原文的几个百分点。实测材料 41：讲义覆盖 52%、出题仅 13% ⇒ **题与讲义对不上**
     （用户读完讲义去做题，题目却来自另一段内容）。
     讲义本身是全文压缩（几千字量级），拿它出题 ⇒ 出题覆盖面与讲义严格一致。
+    ⚠️ 分章讲义（learn_note_ch）优先于整篇讲义：长材料的讲义本来就按章存。
     """
+    ch_notes = _chapter_notes(db, material_id)
+    if ch_notes:
+        return "\n\n".join(n.content for _, n in sorted(ch_notes.items()))
     a = _latest_note(db, material_id)
     if a and (a.content or "").strip():
         return a.content
@@ -170,25 +274,43 @@ def _run_learn_job(mid: int, title: str, quiz_count: int, job: _LearnJob) -> Non
 
         # 阶段 2/3：生成结构化笔记（流式边生成边广播 token）
         job.stage = "note"
-        job.broadcast("progress", {"status": "running", "stage": "note"})
-        # 逐 token 广播：前端据此实时渲染「正在打字」的讲义，不必等全文生成完。
-        # 全文累积到 content，落库口径与旧非流式版本一致（截断提示块已由生成器垫在最前）。
-        content_parts: list[str] = []
-        for piece in llm.generate_learn_note_stream(chunks, title=title, doc_kind=doc_kind):
-            content_parts.append(piece)
-            job.note_buf.append(piece)
-            job.broadcast("token", {"t": piece})
-        content = "".join(content_parts)
-        prev = _latest_note(db, mid)
-        note = AIAsset(material_id=mid, type="learn_note", content=content,
-                       version=(prev.version + 1) if prev else 1)
-        db.add(note)
-        # 同事务裁掉第 4 版及更早的（见 _prune_note_versions：旧版永不清理会持续吃库）
-        _prune_note_versions(db, mid)
-        db.commit()
-        db.refresh(note)
-        job.note = note_to_dict(note)
-        job.broadcast("progress", {"status": "running", "stage": "note", "note": job.note})
+        # 分章模式：有章节结构且整篇超限 → 逐章生成（每章完整、单独落库），
+        # 默认只生成「整章纳入也不超限」的前缀章，其余章由用户在学习页逐章补生成。
+        # 无章节结构 / 不超限 → 整篇单次生成（行为与分章化之前完全一致）。
+        chapters = llm.split_chapters(chunks)
+        if chapters and llm.learn_note_coverage(chunks)["truncated"]:
+            auto_n = max(llm.chapter_prefix_count(chapters, llm.LEARN_NOTE_MAX_CHARS), 1)
+            for ci in range(auto_n):
+                job.broadcast("progress", {"status": "running", "stage": "note",
+                                           "chapter": ci, "chapter_total": auto_n,
+                                           "chapter_name": chapters[ci]["name"]})
+                if ci:
+                    # 章间分隔：前端流式累积的拼接顺序与落库拼装视图一致
+                    job.note_buf.append("\n\n")
+                    job.broadcast("token", {"t": "\n\n", "chapter": ci})
+                _gen_one_chapter(db, mid, title, doc_kind, chapters, ci, job)
+            job.note = _assembled_note(db, mid, chunks)
+            job.broadcast("progress", {"status": "running", "stage": "note", "note": job.note})
+        else:
+            job.broadcast("progress", {"status": "running", "stage": "note"})
+            # 逐 token 广播：前端据此实时渲染「正在打字」的讲义，不必等全文生成完。
+            # 全文累积到 content，落库口径与旧非流式版本一致（截断提示块已由生成器垫在最前）。
+            content_parts: list[str] = []
+            for piece in llm.generate_learn_note_stream(chunks, title=title, doc_kind=doc_kind):
+                content_parts.append(piece)
+                job.note_buf.append(piece)
+                job.broadcast("token", {"t": piece})
+            content = "".join(content_parts)
+            prev = _latest_note(db, mid)
+            note = AIAsset(material_id=mid, type="learn_note", content=content,
+                           version=(prev.version + 1) if prev else 1)
+            db.add(note)
+            # 同事务裁掉第 4 版及更早的（见 _prune_note_versions：旧版永不清理会持续吃库）
+            _prune_note_versions(db, mid)
+            db.commit()
+            db.refresh(note)
+            job.note = note_to_dict(note)
+            job.broadcast("progress", {"status": "running", "stage": "note", "note": job.note})
 
         # 阶段 3/3：出题入队（失败降级，不连带笔记失败）
         job.stage = "quiz"
@@ -246,6 +368,19 @@ def _run_learn_job(mid: int, title: str, quiz_count: int, job: _LearnJob) -> Non
         db.close()
 
 
+def _any_job_running(mid: int) -> bool:
+    """该材料是否有「整跑」或「任一章」任务在跑（启动新任务前的互斥检查）。
+
+    ⚠️ 调用方须已持有 _JOBS_LOCK。键有两种：整跑=mid(int)，单章=(mid, ch_idx)。
+    """
+    for k, j in _LEARN_JOBS.items():
+        if j.status != "running":
+            continue
+        if k == mid or (isinstance(k, tuple) and k[0] == mid):
+            return True
+    return False
+
+
 def _start_or_attach_job(mid: int, title: str, quiz_count: int) -> _LearnJob:
     """启动生成任务；若该材料已有任务在跑 → 直接返回它（调用方附着看进度）。"""
     with _JOBS_LOCK:
@@ -253,6 +388,8 @@ def _start_or_attach_job(mid: int, title: str, quiz_count: int) -> _LearnJob:
         job = _LEARN_JOBS.get(mid)
         if job and job.status == "running":
             return job
+        if _any_job_running(mid):
+            raise HTTPException(409, "该材料有章节讲义正在生成中，请稍候再试")
         # 全局并发闸：不限流时可以对 N 份材料同时点生成，起 N 个线程并发打 LLM，
         # 还会连带占满连接池。超限直接 429（用户可等一个跑完再点）。
         running = sum(1 for j in _LEARN_JOBS.values() if j.status == "running")
@@ -287,48 +424,138 @@ def run_stream(req: RunReq):
         db.close()
     quiz_count = req.quiz_count or DEFAULT_QUIZ_COUNT
     job = _start_or_attach_job(req.material_id, title, quiz_count)
+    return StreamingResponse(_attach_stream(job), media_type="text/event-stream",
+                             headers=SSE_HEADERS)
 
-    def gen():
-        q: queue.Queue = queue.Queue()
+
+def _attach_stream(job: _LearnJob):
+    """SSE 附着生成器：补状态快照 → 补发已生成 token → 订阅广播（整跑/单章共用）。
+
+    ⚠️ 刻意保持**同步 def**（与 simple_learn 既有 SSE 一致）：体內只做队列转发，
+       真正的阻塞 LLM/DB 都在任务线程里；改 async 反而会把队列等待搬上事件循环。
+    """
+    q: queue.Queue = queue.Queue()
+    with _JOBS_LOCK:
+        job.subs.append(q)
+    try:
+        # 附着瞬间补一份当前状态快照：中途回来能看到「进行到哪一步」而非干等。
+        if job.status == "done":
+            yield _sse("done", {"note": job.note, "quiz": job.quiz})
+            return
+        if job.status == "failed":
+            yield _sse("error", {"message": job.error})
+            return
+        yield _sse("progress", {"status": "running", "stage": job.stage,
+                                "note": job.note})
+        # 附着瞬间补发「已生成但尚未落库」的讲义 token：中途离开又回来，
+        # 前端要把前半段内容也续上（否则只看到回来后生成的另一半）。
+        for piece in job.note_buf:
+            yield _sse("token", {"t": piece})
+        while True:
+            try:
+                kind, payload = q.get(timeout=HEARTBEAT_SEC)
+            except queue.Empty:
+                yield ": ping\n\n"
+                continue
+            if kind == "progress":
+                yield _sse("progress", payload)
+                continue
+            if kind == "token":
+                yield _sse("token", payload)
+                continue
+            if kind == "error":
+                yield _sse("error", payload)
+                return
+            yield _sse("done", payload)
+            return
+    finally:
         with _JOBS_LOCK:
-            job.subs.append(q)
-        try:
-            # 附着瞬间补一份当前状态快照：中途回来能看到「进行到哪一步」而非干等。
-            if job.status == "done":
-                yield _sse("done", {"note": job.note, "quiz": job.quiz})
-                return
-            if job.status == "failed":
-                yield _sse("error", {"message": job.error})
-                return
-            yield _sse("progress", {"status": "running", "stage": job.stage,
-                                    "note": job.note})
-            # 附着瞬间补发「已生成但尚未落库」的讲义 token：中途离开又回来，
-            # 前端要把前半段内容也续上（否则只看到回来后生成的另一半）。
-            for piece in job.note_buf:
-                yield _sse("token", {"t": piece})
-            while True:
-                try:
-                    kind, payload = q.get(timeout=HEARTBEAT_SEC)
-                except queue.Empty:
-                    yield ": ping\n\n"
-                    continue
-                if kind == "progress":
-                    yield _sse("progress", payload)
-                    continue
-                if kind == "token":
-                    yield _sse("token", payload)
-                    continue
-                if kind == "error":
-                    yield _sse("error", payload)
-                    return
-                yield _sse("done", payload)
-                return
-        finally:
-            with _JOBS_LOCK:
-                if q in job.subs:
-                    job.subs.remove(q)
+            if q in job.subs:
+                job.subs.remove(q)
 
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+def _run_chapter_job(mid: int, ch_idx: int, title: str, job: _LearnJob) -> None:
+    """单章补生成任务线程（与 _run_learn_job 同款：自开 DB 会话，与 SSE 连接解耦）。"""
+    db = SessionLocal()
+    try:
+        job.stage = "note"
+        job.broadcast("progress", {"status": "running", "stage": "note",
+                                   "chapter": ch_idx})
+        chunks = _load_chunks(db, mid)
+        chapters = llm.split_chapters(chunks)
+        if not chapters or not (0 <= ch_idx < len(chapters)):
+            job.status = "failed"
+            job.error = "章节不存在或材料没有章节结构"
+            job.broadcast("error", {"message": job.error})
+            return
+        _m = db.get(Material, mid)
+        doc_kind = (_m.doc_kind if _m else "") or "auto"
+        note = _gen_one_chapter(db, mid, title, doc_kind, chapters, ch_idx, job)
+        d = note_to_dict(note)
+        d["chapter"] = ch_idx
+        job.note = d
+        job.status = "done"
+        job.stage = "done"
+        job.broadcast("done", {"note": d, "chapter": ch_idx})
+    except BaseException as e:          # noqa: BLE001
+        db.rollback()
+        job.status = "failed"
+        job.error = str(e)[:200]
+        job.broadcast("error", {"message": str(e)[:200]})
+    finally:
+        job.finished_at = time.time()
+        db.close()
+
+
+def _start_chapter_job(mid: int, ch_idx: int, title: str) -> _LearnJob:
+    """启动单章补生成；该章已有任务在跑 → 直接返回它（调用方附着看进度）。"""
+    with _JOBS_LOCK:
+        _purge_jobs()
+        key = (mid, ch_idx)
+        job = _LEARN_JOBS.get(key)
+        if job and job.status == "running":
+            return job
+        if _any_job_running(mid):
+            raise HTTPException(409, "该材料有讲义任务正在生成中，请稍候再试")
+        running = sum(1 for j in _LEARN_JOBS.values() if j.status == "running")
+        if running >= MAX_CONCURRENT_JOBS:
+            raise HTTPException(
+                429, f"同时生成的任务过多（上限 {MAX_CONCURRENT_JOBS} 个），请等一个完成后再试")
+        job = _LearnJob()
+        _LEARN_JOBS[key] = job
+    threading.Thread(target=_run_chapter_job, args=(mid, ch_idx, title, job),
+                     daemon=True).start()
+    return job
+
+
+class ChapterReq(BaseModel):
+    material_id: int
+    chapter: int
+
+
+@router.get("/chapters")
+def get_chapters(material_id: int, db: Session = Depends(get_db)):
+    """章节清单 + 各章生成状态（前端章条的数据源；无章节结构时 structured=False）。"""
+    m = _get_material_or_404(db, material_id)
+    return _chapter_manifest(db, m.id, _load_chunks(db, m.id))
+
+
+@router.post("/chapter/stream")
+def chapter_stream(req: ChapterReq):
+    """SSE 单章补生成：事件与 /run/stream 相同（progress/token/done/error）。
+
+    ⚠️ 同 run_stream：**不能**挂 Depends(get_db)（SSE 流会占住池连接），
+       自开短会话只做校验，校验完立刻还回去。
+    """
+    db = SessionLocal()
+    try:
+        m = _get_material_or_404(db, req.material_id)
+        title = m.title
+    finally:
+        db.close()
+    job = _start_chapter_job(req.material_id, req.chapter, title)
+    return StreamingResponse(_attach_stream(job), media_type="text/event-stream",
+                             headers=SSE_HEADERS)
 
 
 @router.get("/run/status")
@@ -401,9 +628,12 @@ def rerun_quiz(req: QuizReq, db: Session = Depends(get_db)):
 
 @router.get("/note")
 def get_note(material_id: int, db: Session = Depends(get_db)):
-    """读回该材料最新一版学习笔记（无则 404）"""
+    """读回该材料最新一版学习笔记（分章材料返回拼装视图；无则 404）"""
     if not db.get(Material, material_id):
         raise HTTPException(404, "材料不存在")
+    asm = _assembled_note(db, material_id, _load_chunks(db, material_id))
+    if asm:
+        return asm
     a = _latest_note(db, material_id)
     if not a:
         raise HTTPException(404, "该材料尚未生成学习笔记")

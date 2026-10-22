@@ -76,6 +76,32 @@ for pkg in ['faster_whisper', 'ctranslate2', 'onnxruntime', 'tokenizers',
     binaries += b
     hiddenimports += h
 
+# AI 视频渲染：playwright 包 + driver（sync_playwright 的进程外驱动，driver/node +
+# driver/package/**）。⚠️ node.exe 必须确认进包：collect_all 的 binaries 只收动态库
+# （dll/pyd/so），.exe 只能随 datas 进；漏收则打包版 sync_playwright 起不来、AI 视频
+# 渲染必死 —— 这里显式断言，缺失时大声失败而不是出个残包。
+try:
+    d, b, h = collect_all('playwright')
+    datas += d
+    binaries += b
+    hiddenimports += h
+    _pw_node = 'node.exe' if _sys.platform != 'darwin' else 'node'
+    _pw_have = any(str(_t[0]).replace('\\', '/').endswith('playwright/driver/' + _pw_node)
+                   for _t in datas)
+    if not _pw_have:
+        import importlib.util as _ilu_pw
+        _pw_spec = _ilu_pw.find_spec('playwright')
+        _pw_dir = _os_tpl.path.dirname(_pw_spec.origin) if _pw_spec and _pw_spec.origin else ''
+        _pw_node_src = _os_tpl.path.join(_pw_dir, 'driver', _pw_node)
+        if not _os_tpl.path.isfile(_pw_node_src):
+            raise SystemExit('[spec] 未找到 playwright driver/%s：%s' % (_pw_node, _pw_node_src))
+        binaries += [(_pw_node_src, 'playwright/driver')]
+        print('[spec] playwright driver/%s 经 binaries 补收' % _pw_node)
+    else:
+        print('[spec] playwright driver/%s 已随 datas 收进包' % _pw_node)
+except ImportError:
+    raise SystemExit('[spec] playwright 未安装（requirements.txt 已声明 ==1.57.0），请先 pip install')
+
 # macOS 额外收集 pyobjc：pywebview 原生窗口依赖 Cocoa/WebKit（PyInstaller 不自动收集其二进制）。
 # ⚠️ 2026-09-22（AI 浏览器下线）后，**cocoa 是 macOS 的首要后端**而非回落候选：
 #    `webview/guilib.py::initialize` 的 Darwin 分支是 `[import_cocoa, import_qt]`，

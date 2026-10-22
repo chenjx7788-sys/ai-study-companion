@@ -22,7 +22,7 @@ NOTE_COL = "kb_notes"
 
 # ---------- embedding ----------
 
-def _embed_via_api(texts: list[str], conf: dict) -> list[list[float]]:
+def _embed_via_api(texts: list[str], conf: dict, kind: str = "embedding_index") -> list[list[float]]:
     from openai import OpenAI
     client = OpenAI(
         base_url=conf.get("embedding_base_url") or conf["llm_base_url"],
@@ -30,13 +30,27 @@ def _embed_via_api(texts: list[str], conf: dict) -> list[list[float]]:
         timeout=60,
     )
     resp = client.embeddings.create(model=conf["embedding_model"], input=texts)
+    # Token 记账：embedding 调用只消耗 prompt_tokens（input），无 completion。
+    # 不记账的话「建索引/检索」的 API 向量成本在 Token 消耗页完全隐形。
+    try:
+        from .llm import log_usage
+        usage = getattr(resp, "usage", None)
+        if usage and getattr(usage, "prompt_tokens", None) is not None:
+            log_usage(kind, conf["embedding_model"], int(usage.prompt_tokens), 0)
+        else:
+            # 服务商未返回 usage → 按字符粗估（与 llm.py 流式口径一致）
+            log_usage(kind, conf["embedding_model"],
+                      int(sum(len(t) for t in texts) / 1.6), 0, estimated=True)
+    except Exception:
+        pass
     return [d.embedding for d in resp.data]
 
 
 def embed_texts(texts: list[str], is_query: bool = False) -> list[list[float]]:
     conf = settings_store.load()
     if conf.get("embedding_model"):
-        return _embed_via_api(texts, conf)
+        # 入库（材料/笔记索引，量大）与检索（单条 query，量小）分开记账，便于定位成本
+        return _embed_via_api(texts, conf, kind="embedding_query" if is_query else "embedding_index")
     # 本地兜底：BGE-small-zh 中文向量模型（ONNX 量化版，首次从国内镜像下载 ~25MB）
     return _bge_embed(texts, is_query)
 
@@ -107,6 +121,80 @@ def get_collection(name: str):
 
 def _collection_for(kind: str) -> str:
     return NOTE_COL if kind == "note" else CHUNK_COL
+
+
+# ---------- hnsw 索引损坏自愈 ----------
+# 实测（2026-10-20）：集合句柄所在进程之外写过的 hnsw 段，新进程读/写该集合全抛
+# InternalError「Error executing plan … Error loading hnsw index」；不坏另一个集合。
+# 后果面极大：写入路径（reindex_chunk / index_material 的 add）全失败、检索路径静默降级。
+_HEALED: set[str] = set()
+_rebuild_started = False
+
+
+def _is_index_corruption(exc: Exception) -> bool:
+    """只认「索引文件损坏」签名（hnsw / error executing plan）。
+
+    ⚠️ embedding 失败、网络超时、配置错误**绝不**触发 —— 否则自愈会把好集合也删掉。
+    """
+    s = str(exc).lower()
+    return "hnsw" in s or "error executing plan" in s
+
+
+def _drop_collection(name: str) -> None:
+    import chromadb
+    try:
+        chromadb.PersistentClient(path=str(settings.chroma_dir)).delete_collection(name)
+    except Exception:
+        pass
+
+
+def _schedule_full_rebuild() -> None:
+    """自愈后集合已空：KbEntry/SQLite 是事实来源，向量可重生 → 后台线程全量重建。
+
+    ⚠️ 懒 import 防循环依赖（kb_index 依赖本模块）；中断只告警 —— 写入路径已在新集合上继续。
+    """
+    global _rebuild_started
+    if _rebuild_started:
+        return
+    _rebuild_started = True
+    import threading
+
+    def _job():
+        try:
+            from ..database import SessionLocal
+            from ..models import Material, Note
+            from . import kb_index
+            db = SessionLocal()
+            try:
+                for m in db.query(Material).filter(Material.parsed_status == "success").all():
+                    kb_index.index_material(db, m.id)
+                for n in db.query(Note).all():
+                    kb_index.index_note(db, n)
+            finally:
+                db.close()
+        except Exception as e:
+            import logging
+            logging.getLogger("uvicorn.error").warning(f"向量索引自愈重建中断: {e}")
+
+    threading.Thread(target=_job, daemon=True).start()
+
+
+def with_heal(name: str, op):
+    """用「损坏自愈」包一次集合操作：撞上损坏签名 → 删坏集合 → 起后台全量重建 →
+    在新空集合上重试本次操作（读到空集合 = 暂时少命中，后台重建逐步回填）。
+    每进程每集合最多自愈一次（防循环自愈）。"""
+    try:
+        return op(get_collection(name))
+    except Exception as e:
+        if name in _HEALED or not _is_index_corruption(e):
+            raise
+        _HEALED.add(name)
+        import logging
+        logging.getLogger("uvicorn.error").warning(
+            f"向量集合 {name} 索引损坏（{e}）→ 自愈：删除坏集合并后台全量重建")
+        _drop_collection(name)
+        _schedule_full_rebuild()
+        return op(get_collection(name))
 
 
 def make_embedding_id(kind: str, ref_id: int, seq: int = 0) -> str:
@@ -216,7 +304,10 @@ def index_texts(items: list[dict], kind: str):
     """批量入库（幂等，先删后增）：items = [{embedding_id, text, metadata}]"""
     if not items:
         return
-    col = get_collection(_collection_for(kind))
+    with_heal(_collection_for(kind), lambda col: _index_into(col, items))
+
+
+def _index_into(col, items: list[dict]):
     col.delete(ids=[i["embedding_id"] for i in items])  # 不存在的 id 会被忽略
     batch = 4   # 小批量：降低 embedding 内存峰值（内存紧张环境下 16 会 MemoryError）
     for i in range(0, len(items), batch):
@@ -240,6 +331,20 @@ def _clean_metadata(meta: dict) -> dict:
 
 # ---------- 检索 ----------
 
+
+def _query_col(col, q_emb, top_k: int, where: dict | None):
+    if col.count() == 0:
+        return None
+    n = min(top_k, col.count())
+    if where:
+        # where 过滤后的匹配数可能小于 n_results，先查匹配数避免 chroma 报错
+        matched = col.get(where=where)
+        if not matched or not matched.get("ids"):
+            return None
+        n = min(n, len(matched["ids"]))
+    return col.query(query_embeddings=[q_emb], n_results=n, **({"where": where} if where else {}))
+
+
 def search(query: str, top_k: int | None = None, kinds: tuple = ("chunk", "note"),
            where: dict | None = None) -> list[dict]:
     """按集合检索 → 加权合并。
@@ -257,17 +362,9 @@ def search(query: str, top_k: int | None = None, kinds: tuple = ("chunk", "note"
     if "note" in kinds:
         candidates.append((NOTE_COL, note_w))
     for name, weight in candidates:
-        col = get_collection(name)
-        if col.count() == 0:
+        res = with_heal(name, lambda col: _query_col(col, q_emb, top_k, where))
+        if not res:
             continue
-        n = min(top_k, col.count())
-        if where:
-            # where 过滤后的匹配数可能小于 n_results，先查匹配数避免 chroma 报错
-            matched = col.get(where=where)
-            if not matched or not matched.get("ids"):
-                continue
-            n = min(n, len(matched["ids"]))
-        res = col.query(query_embeddings=[q_emb], n_results=n, **({"where": where} if where else {}))
         for i in range(len(res["ids"][0])):
             distance = res["distances"][0][i]
             meta = res["metadatas"][0][i] or {}
@@ -285,17 +382,17 @@ def search(query: str, top_k: int | None = None, kinds: tuple = ("chunk", "note"
 
 # ---------- 删除 ----------
 
-def delete_by_ref(ref_type: str, ref_id: int):
-    col = get_collection(_collection_for(ref_type))
-    results = col.get(where={"ref_id": ref_id})
+def _delete_where(col, where: dict):
+    results = col.get(where=where)
     if results and results.get("ids"):
         col.delete(ids=results["ids"])
+
+
+def delete_by_ref(ref_type: str, ref_id: int):
+    with_heal(_collection_for(ref_type), lambda col: _delete_where(col, {"ref_id": ref_id}))
 
 
 def delete_by_material(material_id: int):
     """删除材料时联动清理其全部索引（按 metadata.material_id 匹配）"""
     for name in (CHUNK_COL, NOTE_COL):
-        col = get_collection(name)
-        results = col.get(where={"material_id": material_id})
-        if results and results.get("ids"):
-            col.delete(ids=results["ids"])
+        with_heal(name, lambda col: _delete_where(col, {"material_id": material_id}))

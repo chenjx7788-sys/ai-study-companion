@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import html as _html
+import re
 import threading
 from pathlib import Path
 
@@ -39,6 +40,12 @@ _TEMPLATE_RELAX = {
     "night": Path(__file__).with_name("stage_tpl_night.html"),
     "ambient": Path(__file__).with_name("stage_tpl_ambient.html"),
 }
+# PPT 课件（2026-10-20，方案 A）也是独立模板：画面语法是「课件页 + 常驻节导航」，
+# 与信息型（同一份 graph_svg 铺在右栏）完全不同，且**不需要** graph_svg
+# —— 那是结构图的画法，课件页上的内容是条目列表，不是节点图。
+_TEMPLATE_PPT = Path(__file__).with_name("stage_tpl_ppt.html")
+_TEMPLATE_BOARD = Path(__file__).with_name("stage_tpl_board.html")
+_TEMPLATE_MOTION = Path(__file__).with_name("stage_tpl_motion.html")
 
 # ambient 的光晕参数（探针验证值；六个周期互质 23/31/9/29/17/14，避免长片可察觉的拍频循环）。
 AMBIENT_GLOW = [
@@ -425,14 +432,13 @@ _LAYOUT_FN = {"grid": _lay_grid, "flow": _lay_flow, "hub": _lay_hub,
 #   · **颜色必须显式**：本项目「颜色类」未实现，写类名会掉成黑色。文字色与装饰色**分开**：
 #     青绿装饰 `#4B9B8B` 在纸底只有 **3.00:1** → 只能画线/描边；正文用 `#2F7A6B`(4.64:1) /
 #     `#5E6865`(5.24:1)。荧光笔 `#F4D35E` 上压墨色 `#263238` 是 **8.98:1**，安全。
-#   · **人物插画确定性**：按 (材料键 + 镜头号) 取模选姿势 —— 随机会让同一配置每次产物不同，
-#     `script_signature` 指纹失效、「一键重建」不可复现。
+#   · **顶部不再有人物插画**（2026-10-22 移除）：原先按 (材料键 + 镜头号) 取模选姿势的
+#     程序化线稿小人被判「无信息价值」，且第三套姿势里有一条悬空折线与一条横跨躯干的弧。
 
 _P_INK = "#263238"        # 标题 / 正文（纸底 ≈12.6:1）
 _P_INK2 = "#5E6865"       # 说明文字（卡片底 5.66:1，过 AA）
 _P_TEAL = "#4B9B8B"       # **装饰**青绿（线 / 强调条 / 描边）
 _P_TEAL_TX = "#2F7A6B"    # **文字**青绿（纸底 4.64:1 / 卡片底 5.02:1）
-_P_TILE = "#EDF4F1"       # 图标底
 _P_CARD = "#FFFDF7"       # 条目卡底
 _P_LINE = "#E8E1D0"       # 卡片描边 / 分隔线
 _P_YELLOW = "#F4D35E"     # 荧光笔
@@ -443,6 +449,10 @@ _P_ITEM_GAP = 14.0
 # 单条最高（rows<=2 时放宽 —— 少条目镜头里一律封 150 会留下一条空带）
 _P_ROW_CAP_WIDE = 210.0
 _P_ROW_CAP = 150.0
+# 宽档分列的卡宽下限：再窄标题一行只剩 7–8 字，折两行就顶到正文。
+_P_MIN_CARD_W = 360.0
+# flow 卡片的限宽：全宽 1168px 时短标题右侧 89% 是空白（见 `_pp_flow`）。
+_P_FLOW_MAX_W = 820.0
 
 
 def _paper_glyph(kind: str, color: str) -> str:
@@ -462,43 +472,6 @@ def _paper_glyph(kind: str, color: str) -> str:
     return ('<circle cx="12" cy="9.4" r="4.3"/>'
             '<path d="M9.7 15.1h4.6M10.6 18h2.8"/>'
             '<path d="M12 2.7v1.3M4.7 9.4H3.4M20.6 9.4h-1.3"/>')
-
-
-def _paper_figure(seed_key: str) -> str:
-    """程序化线稿人物（内置 / 零资产 / 确定性）。
-
-    三套姿势按 `md5(seed_key)` 取模选一个；主体比例完全一致，只差手臂与道具
-    （同一支片子里换镜头不会「换了一个人」）。
-    ⚠️ 不承载任何**必须阅读**的信息 —— 它只是画面锚点；闸门也不拿它当内容正确性依据。
-    """
-    import hashlib
-    h = int(hashlib.md5(str(seed_key or "").encode("utf-8")).hexdigest()[:8], 16)
-    pose = h % 3
-    if pose == 0:
-        arms = ('<path d="M44 70q-11 9-13 21"/>'
-                '<path d="M76 70q13 3 17-13"/>'
-                f'<rect x="84" y="44" width="20" height="15" rx="2.4" fill="{_P_CARD}"/>')
-    elif pose == 1:
-        arms = ('<path d="M44 72q-9 12-7 23"/>'
-                '<path d="M76 72q9 12 7 23"/>'
-                f'<path d="M30 78h13v11h-13z" fill="{_P_CARD}"/>')
-    else:
-        arms = ('<path d="M44 71q16 12 32 0"/>'
-                f'<path d="M92 62v22M92 62l9-6"/>')
-    return (
-        f'<circle cx="60" cy="86" r="57" fill="{_P_TILE}"/>'
-        f'<g fill="none" stroke="{_P_TEAL_TX}" stroke-width="2.6" '
-        f'stroke-linecap="round" stroke-linejoin="round">'
-        '<circle cx="60" cy="34" r="18"/>'
-        '<path d="M44 28q16-19 32 0"/>'
-        f'<circle cx="53.5" cy="34" r="1.8" fill="{_P_TEAL_TX}" stroke="none"/>'
-        f'<circle cx="66.5" cy="34" r="1.8" fill="{_P_TEAL_TX}" stroke="none"/>'
-        '<path d="M55 41q5 3.6 10 0"/>'
-        '<path d="M60 52v6"/>'
-        '<path d="M42 101q0-43 18-43t18 43z"/>'
-        f'{arms}'
-        '<path d="M52 101v22M68 101v22"/>'
-        '</g>')
 
 
 def _paper_stroke_hl(x: float, y: float, w: float, h: float) -> str:
@@ -565,16 +538,28 @@ def _paper_boxes_in(n: int, x0: float | None = None, x1: float | None = None,
 def _paper_boxes(n: int) -> list:
     """默认版式分格：n ≤ 3 单列（真正的纵向列表），n ≥ 4 转双列。
 
-    ⚠️ 为什么比 `_card_boxes` 更早转双列（那个是 n≥5）：纸感条目比卡片多了
-       **序号 + 图标行**与**说明行**，单列 4 条只剩 102px/条，标题折两行就挤到正文；
-       转双列后每条 210px，反而更舒展。
-    ⚠️ 铺满档（2026-10-14）最多三列：理由同 `_card_boxes` —— 双列在 1168px 的跨度上
-       每列 577px，条目里「序号 + 图标 + 标题 + 说明」挤在左侧一条、右侧全空。
+    ⚠️ 为什么 n≥4 才转多列：纸感条目比卡片多了 **序号 + 图标行** 与 **说明行**，
+       单列 4 条只剩 102px/条，标题折两行就挤到正文。
+    ⚠️ 列数不是 `min(n, 3)`（2026-10-22 改）：那个写法把 n=4 排成 3+1（右下空 2 格）、
+       n=7 排成 3+3+1（末行孤一条），与本文档「n≤3 单列」也自相矛盾。
+       现在按「空位最少 → 行数最少 → 卡更宽」挑：n=4→2 列(2+2)、n=5/6→3 列、
+       n=7/8→2 列(577px，长标题不折爆)。卡宽下限 `_P_MIN_CARD_W` 保证一行 ≥9 字。
     """
     if n <= 0:
         return []
     if _BX1 > _BX1_NARROW + 1.0:
-        cols = min(n, 3)
+        cols = 1
+        if n >= 4:
+            best = None
+            for c in range(2, min(n, 3) + 1):
+                cw = (_BX1 - _BX0 - _P_ITEM_GAP * (c - 1)) / c
+                if cw < _P_MIN_CARD_W:
+                    continue
+                r = (n + c - 1) // c
+                key = (r * c - n, r, -cw)
+                if best is None or key < best[0]:
+                    best = (key, c)
+            cols = best[1] if best else 2
     else:
         cols = 1 if n <= 3 else 2
     rows = (n + cols - 1) // cols
@@ -668,7 +653,7 @@ def _paper_item(x: float, y: float, w: float, h: float, kind: str, text,
     if lines:
         hl = "".join(
             _paper_stroke_hl(tx - 5.0, top + lh_t * (i + 0.06), 
-                             min(tw + 4.0, _text_units(ln) * m["title"] + 6.0),
+                             min(tw + 10.0, _text_units(ln) * m["title"] + 11.0),
                              lh_t * 0.92)
             for i, ln in enumerate(lines))
         out.append(f'<g class="el p-hl p-hl-static" data-at="{a0 + 260}">{hl}</g>')
@@ -687,8 +672,13 @@ def _paper_item(x: float, y: float, w: float, h: float, kind: str, text,
     return _el(at, "".join(out), cls="pwrap")
 
 
-def _paper_head(sh: dict, k: int, at, seed_key: str) -> str:
-    """纸感镜头条：CHAPTER 标记 + 标题 + 手绘下划线 + 人物插画（右上）。"""
+def _paper_head(sh: dict, k: int, at) -> str:
+    """纸感镜头条：CHAPTER 标记 + 标题 + 手绘下划线。
+
+    ⚠️ 右上角的程序化线稿人物已于 2026-10-22 按用户决定**整体移除**（判定为无信息
+       价值；且三套姿势里 pose2 的手臂本就是悬空折线 + 横跨躯干，画坏了）。顶部右侧
+       留白改由「左对齐标题 + 下方内容区」的对角关系承担，不再设第二视觉锚点。
+    """
     ttl = _wrap_cjk(str(sh.get("l") or ""), 17.0, 1)[0]
     tw = min(560.0, max(70.0, _text_units(ttl) * 36.0 + 10.0))
     a0 = int(at or 0)
@@ -698,12 +688,7 @@ def _paper_head(sh: dict, k: int, at, seed_key: str) -> str:
     ul = _el(a0 + 200, f'<path class="pul" d="M72 {143:.1f} '
                        f'C{72 + tw * 0.32:.1f} 139.6, {72 + tw * 0.66:.1f} 146.0, '
                        f'{72 + tw:.1f} 142.2"/>', cls="p-hl-static")
-    # ⚠️ 铺满档把插画推到最右：706 原本是「右栏左沿」的位置，跨度一放宽它就悬在画面
-    #    正中偏右、与左侧标题失去对角呼应（2026-10-14 取图实证）。窄档保持 706。
-    fig_x = 1088.0 if _BX1 > _BX1_NARROW + 1.0 else 706.0
-    fig = _el(a0 + 320, f'<g class="pfig" transform="translate({fig_x:.0f},30) scale(0.9)">'
-                        f'{_paper_figure(seed_key)}</g>', cls="pfigwrap")
-    return head + ul + fig
+    return head + ul
 
 
 def _pp_grid(pts: list) -> str:
@@ -722,7 +707,11 @@ def _pp_flow(pts: list) -> str:
     n = len(pts)
     if n < 2:
         return _pp_grid(pts)
-    boxes = _paper_boxes_in(n, _BX0, _BX1, _BY0, _BY1, cols=1, cap=_P_ROW_CAP)
+    # 卡片限宽并居中：全宽 1168px 时 7 字标题只占 11%，右侧 89% 是空的。
+    # 820px ≈ 一行 30 个全角字，仍明显宽于双列卡（577），不破坏「步进」观感。
+    fw = min(_BX1 - _BX0, _P_FLOW_MAX_W)
+    fx0 = _BX0 + (_BX1 - _BX0 - fw) / 2.0
+    boxes = _paper_boxes_in(n, fx0, fx0 + fw, _BY0, _BY1, cols=1, cap=_P_ROW_CAP)
     out = []
     for i, (p, (x, y, w, h)) in enumerate(zip(pts, boxes), 1):
         out.append(_paper_item(x, y, w, h, _kind(p), p.get("t"), p.get("at"), i,
@@ -774,11 +763,14 @@ def _pp_compare(pts: list) -> str:
                f'{cx:.1f} {_BY1 - 6:.1f}"/>'
                f'<g transform="translate({cx:.1f},{(_BY0 + _BY1) / 2:.1f}) rotate(-90)">'
                f'<text class="pvstx" text-anchor="middle">对比</text></g>')]
+    # ⚠️ 两栏必须用**同一个行数**算格：各自按自己的条数算，5 条时左 3 行 143px、
+    #    右 2 行 210px（差 47%），7 条时 104 vs 143.3（差 38%）—— 一眼就是「没对齐」。
+    rows = max(half, n - half)
     for items, x in cols:
         if not items:
             continue
-        boxes = _paper_boxes_in(len(items), x, x + cw, _BY0, _BY1, cols=1,
-                                cap=_P_ROW_CAP_WIDE)
+        boxes = _paper_boxes_in(rows, x, x + cw, _BY0, _BY1, cols=1,
+                                cap=_P_ROW_CAP_WIDE)[:len(items)]
         for i, (p, (bx, by, bw, bh)) in enumerate(zip(items, boxes), 1):
             num = i if x == _BX0 else i + half
             out.append(_paper_item(bx, by, bw, bh, _kind(p), p.get("t"), p.get("at"),
@@ -807,11 +799,16 @@ def _pp_hub(pts: list) -> str:
         out.append(_el(pts[0].get("at"),
                        f'<path class="pflow" d="M{min(xs):.1f} {bus_y:.1f} '
                        f'L{max(xs):.1f} {bus_y:.1f}"/>'))
-        for b in boxes:
+        for j, b in enumerate(boxes):
             bx = b[0] + b[2] / 2.0
+            # 同列第 2 行起不再从母线出发（那条线会横穿上一行的卡片），
+            # 改为「接上一张卡的下沿」→ 每列一条连续脊线，6 个分支都有线。
+            # ⚠️ 旧实现统一画 `bus_y → bus_y+8`：同列 3 行支线 x 完全相同（重叠成 1 条），
+            #    且 8px 够不到第 2 行卡（距母线 124px）→ 4 个分支悬空。
+            y0 = bus_y if j < 2 else (boxes[j - 2][1] + boxes[j - 2][3])
             out.append(_el(pts[0].get("at"),
-                           f'<path class="pflow" d="M{bx:.1f} {bus_y:.1f} '
-                           f'L{bx:.1f} {bus_y + 8.0:.1f}" marker-end="url(#parr)"/>'))
+                           f'<path class="pflow" d="M{bx:.1f} {y0:.1f} '
+                           f'L{bx:.1f} {b[1] - 3.0:.1f}" marker-end="url(#parr)"/>'))
     out.append(_paper_item(cx - head_w / 2.0, _BY0, head_w, head_h, _kind(pts[0]),
                            pts[0].get("t"), pts[0].get("at"), 1,
                            _paper_metrics(head_h, head_w)))
@@ -821,7 +818,7 @@ def _pp_hub(pts: list) -> str:
     return "".join(out)
 
 
-def _paper_layout(layout: str, pts: list, seed_key: str) -> str:
+def _paper_layout(layout: str, pts: list) -> str:
     """纸感版式分发。语义版式仍生效，只是换成纸感构图。"""
     lay = str(layout or "grid").strip().lower()
     if lay == "hub":
@@ -889,8 +886,11 @@ def _clean_boxes(n: int, cols: int | None = None, cap: float | None = None,
     if cols is None:
         # ⚠️ 铺满档最多三列（同 `_card_boxes` / `_paper_boxes`：双列在 1168px 跨度上
         #    每列 577px，卡片内容只占左侧一条）。窄档口径原样保留。
+        # ⚠️⚠️ 但 **n == 4 必须用两列**（2026-10-22）：三列会排成 3+1，第二行只剩一张卡
+        #    贴在左边、右侧空出 2/3 —— 而「每屏 4 条」是提示词（每屏 3-6 个元素）里最
+        #    常见的档位之一。2×2 的卡宽 577 反而更舒展，字号档位不受影响（按高度分档）。
         if _BX1 > _BX1_NARROW + 1.0:
-            cols = min(n, 3)
+            cols = 2 if n == 4 else min(n, 3)
         else:
             cols = 1 if n <= 3 else 2
     rows = (n + cols - 1) // cols
@@ -1003,9 +1003,14 @@ def _clean_head(sh: dict, k: int, at, n_pts: int) -> str:
     #    「镜头」字样；「N 个要点」保留 —— 它对听众是内容信息（本段要讲几条），
     #    不是制作信息。若日后也要去掉，把整条 `<text class="ckick2">` 删掉即可
     #    （紫色序号 `ckick` 独立成节点，不受影响）。
+    # ⚠️⚠️ `n_pts <= 0` = **不显示**这行（2026-10-22）：多屏镜头由调用方传 0。
+    #    页眉在屏循环之外只生成一次，拿的是整个镜头的条数；分屏后每屏只显示其中
+    #    一部分 → 三屏都写「9 个要点」而每屏实有 3 条，等于画面在说假话。
+    #    单屏时数字 == 屏内条数，照常显示。
+    kick2 = (f'<text class="ckick2" x="112" y="62">{int(n_pts)} 个要点</text>'
+             if int(n_pts) > 0 else "")
     head = _el(a0, f'<text class="ckick" x="72" y="64">{k + 1:02d}</text>'
-                   f'<text class="ckick2" x="112" y="62">'
-                   f'{int(n_pts)} 个要点</text>'
+                   f'{kick2}'
                    f'<text class="cttl2" x="72" y="118">{_esc(ttl)}</text>',
                cls="cwrap")
     bar = _el(a0 + 200, '<rect class="cbar" x="72" y="134" width="46" '
@@ -1014,9 +1019,25 @@ def _clean_head(sh: dict, k: int, at, n_pts: int) -> str:
 
 
 def _cl_grid(pts: list) -> str:
-    """grid：清透卡片平铺（图标 + 标题 + 副标题）。"""
+    """grid：清透卡片平铺（图标 + 标题 + 副标题）。
+
+    ⚠️ 末行不满时**整行水平居中**（2026-10-22）：5 条 = 3+2、7 条 = 3+3+1 时，
+       左对齐会让最后一行贴左、右边空出整格，像「少画了一张卡」。
+       居中只改 x 偏移，不动列宽 / 字号 / 行高 —— 卡片尺寸契约不变。
+       `cols=1` 的档位（n ≤ 3 窄档）算出来的 shift 恒为 0，天然无副作用。
+    """
+    boxes = _clean_boxes(len(pts))
+    if boxes:
+        last_y = boxes[-1][1]
+        last = [b for b in boxes if abs(b[1] - last_y) < 1.0]
+        if last and len(last) < len(boxes):
+            span = (last[-1][0] + last[-1][2]) - last[0][0]
+            shift = ((_BX1 - _BX0) - span) / 2.0 - (last[0][0] - _BX0)
+            if abs(shift) > 0.5:
+                boxes = [(x + (shift if abs(y - last_y) < 1.0 else 0.0), y, w, h)
+                         for (x, y, w, h) in boxes]
     out = []
-    for p, (x, y, w, h) in zip(pts, _clean_boxes(len(pts))):
+    for p, (x, y, w, h) in zip(pts, boxes):
         out.append(_clean_item(x, y, w, h, _kind(p), p.get("t"), p.get("at"),
                                _clean_metrics(h, w)))
     return "".join(out)
@@ -1092,6 +1113,12 @@ def _cl_compare(pts: list) -> str:
     cols = ((pts[:half], _BX0), (pts[half:], _BX0 + cw + mid_gap))
     cx = (_BX0 + _BX1) / 2.0
     head_h = 64.0
+    # ⚠️⚠️ 两栏**共用行高**（2026-10-22）：各栏按自己的行数算 `row_h` 时，n=5（3+2）
+    #    会让左栏表框底 484、右栏 374 —— 差 110px，肉眼就是「一栏长一栏短」。
+    #    改成按两栏最大行数统一算，短栏底部留白、两栏底边对齐。
+    _y_top = _BY0 + head_h + 10.0
+    _max_rows = max([len(it) - 1 for it, _x in cols] + [0])
+    _row_h = min(110.0, (_BY1 - _y_top) / max(1, _max_rows))
     out = [_el(pts[0].get("at"),
                f'<circle class="cvs" cx="{cx:.1f}" cy="{_BY0 + 150:.1f}" r="20"/>'
                f'<text class="cvst" x="{cx:.1f}" y="{_BY0 + 155.5:.1f}" '
@@ -1116,9 +1143,9 @@ def _cl_compare(pts: list) -> str:
                        for i, ln in enumerate(ttl))))
         if not rows:
             continue
-        y_top = _BY0 + head_h + 10.0
-        row_h = min(110.0, (_BY1 - y_top - 0.0) / len(rows))
-        tab_h = row_h * len(rows)
+        y_top = _y_top
+        row_h = _row_h
+        tab_h = row_h * max(1, _max_rows)
         # 表框随表头一起亮（空表框 = 待填充的表格，行再逐条长出来）
         out.append(_el(a0, f'<rect class="crows" x="{x:.1f}" y="{y_top:.1f}" '
                            f'width="{cw:.1f}" height="{tab_h:.1f}" rx="12"/>',
@@ -1176,7 +1203,11 @@ def _cl_pyramid(pts: list) -> str:
         t = i / max(1, n - 1)
         r, g, b = (round(c0[j] + (c1[j] - c0[j]) * t) for j in range(3))
         fill = f"#{r:02X}{g:02X}{b:02X}"
-        ink = "#FFFFFF" if t < 0.5 else _C_INK
+        # ⚠️⚠️ 白字**只给最顶层**（t == 0，底色 #6B5CE7 白字 4.87:1，过 AA）。
+        #    原判据 `t < 0.5` 是按**层序号比例**选字色，不是按背景实际亮度：渐变走到
+        #    t=0.4 时底色已是 #A096EF，白字只剩 2.59:1（6 层时第 3 层）—— 画面主体读不清。
+        #    切深字后最差的一层是 t=0.2（底色 #8579EB）深字 4.80:1，仍过 AA。
+        ink = "#FFFFFF" if t <= 0.0 else _C_INK
         w = full * (0.40 + 0.60 * t)
         y = y0 + i * (h + gap)
         a0 = int(p.get("at") or 0)
@@ -1210,7 +1241,7 @@ def _clean_layout(layout: str, pts: list) -> str:
 
 
 def graph_svg(shots: list, pts_by_scene: list, at_by_scene: list,
-              skin: str = "graph", seed: str = "", wide: bool = False) -> str:
+              skin: str = "graph", wide: bool = False) -> str:
     """铺满开关的持有者：把布局区跨度切到对应档，跑完**必定**复位。
 
     ⚠️ 为什么是「模块级切换 + 锁」而不是给布局函数加参数：`_BX1` 被二十多个绘制原语
@@ -1225,13 +1256,13 @@ def graph_svg(shots: list, pts_by_scene: list, at_by_scene: list,
     with _LAYOUT_LOCK:
         _BX1 = _BX1_WIDE if wide else _BX1_NARROW
         try:
-            return _graph_svg_body(shots, pts_by_scene, at_by_scene, skin, seed)
+            return _graph_svg_body(shots, pts_by_scene, at_by_scene, skin)
         finally:
             _BX1 = _BX1_NARROW
 
 
 def _graph_svg_body(shots: list, pts_by_scene: list, at_by_scene: list,
-                    skin: str = "graph", seed: str = "") -> str:
+                    skin: str = "graph") -> str:
     """按 points 与**每个镜头的分屏**生成结构图皮肤的全部 SVG 场景。
 
     每个镜头一个 `<svg class="scene" data-scene="k">`（**场景数 == 镜头数** ——
@@ -1284,9 +1315,11 @@ def _graph_svg_body(shots: list, pts_by_scene: list, at_by_scene: list,
                        'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
                        '</marker></defs>')
         if theme == "paper":
-            out.append(_paper_head(sh, k, ttl_at, f"{seed}|{k}"))
+            out.append(_paper_head(sh, k, ttl_at))
         elif theme == "clean":
-            out.append(_clean_head(sh, k, ttl_at, len(pts)))
+            # ⚠️ 多屏镜头传 0（= 不显示「N 个要点」）：页眉在屏循环外只生成一次，
+            #    整镜条数写到每一屏上就是假信息（2026-10-22 实测 3 屏各写「9 个要点」）。
+            out.append(_clean_head(sh, k, ttl_at, len(pts) if n_scr == 1 else 0))
         else:
             # ⚠️ 标题必须截断：`.ttl` 是 34px 居中，可用宽度约 24 个全角字符；
             #    LLM 现在给的镜头标题 ≤16 字（生成侧已钳制），这里只做双保险。
@@ -1312,7 +1345,7 @@ def _graph_svg_body(shots: list, pts_by_scene: list, at_by_scene: list,
             if layout not in svc.GRAPH_LAYOUTS:
                 layout = "grid"
             if theme == "paper":
-                body = _paper_layout(layout, groups[j], f"{seed}|{k}|{j}")
+                body = _paper_layout(layout, groups[j])
             elif theme == "clean":
                 body = _clean_layout(layout, groups[j])
             else:
@@ -1327,6 +1360,22 @@ def _graph_svg_body(shots: list, pts_by_scene: list, at_by_scene: list,
 
 
 # ---------- 材料页导出 ----------
+
+def _placeholder_page(page):
+    """出图失败页的占位图（深灰底 + 页码），保住 `pages/img_NN` 编号稠密。
+
+    ⚠️ 为什么必须占位而不是跳过：舞台页按 `SRC_PAGES[p-1]` **下标**直取文件名，
+       跳过一个编号会让这页之后**整片错页**且全程静默（2026-10-22 探针证实）。
+    """
+    from PIL import Image, ImageDraw
+    w = max(2, int(float(getattr(page, "width", 595) or 595) * PAGE_DPI / 72.0))
+    h = max(2, int(float(getattr(page, "height", 842) or 842) * PAGE_DPI / 72.0))
+    im = Image.new("RGB", (w, h), (60, 60, 68))
+    d = ImageDraw.Draw(im)
+    d.text((w // 2, h // 2), f"Page {getattr(page, 'no', '?')} render failed",
+           fill=(200, 200, 210), anchor="mm")
+    return im
+
 
 def _page_image(loc, page):
     """把一页转成 PIL.Image（统一入口，兼容三种页面对象）。
@@ -1379,9 +1428,14 @@ def export_pages(db, v) -> tuple:
             except BaseException:
                 im = None
             if im is None:
-                continue
+                # ⚠️ 绝不 continue（编号空洞 = 整片错页，见 _placeholder_page）
+                im = _placeholder_page(page)
+                print(f"  [材料原件] 第 {getattr(page, 'no', '?')} 页出图失败 → 占位图代替")
             w, h = im.size
-            if h:
+            # ⚠️ 只取**首页**比例（2026-10-22 修复）：循环覆写会让 aspect=末页比例，
+            #    混合方向材料里首页被拉变形（探针证实横竖混排变形 2 倍）。
+            #    单一 aspect 只是首帧兜底；舞台页换页后按当前图 natural 比例重算。
+            if h and not aspect:
                 aspect = float(w) / float(h)
             name = f"img_{i:02d}.jpg"
             im.save(str(outdir / name), "JPEG", quality=86)
@@ -1451,7 +1505,12 @@ def _th_dom(v, avatar: dict | None) -> str:
         #    而不是黑块。打包漏收素材时这层能兜住：画面只是「不动」，不会「变黑」。
         # ⚠️ **不给 autoplay**：起播必须由 `__stage.start()` 统一发起，与页钟同一起点，
         #    否则视频自己先跑起来，与渲染时钟错开一个不确定的偏移。
-        fig = (f'<video id="thFig" class="th-photo" src="{_esc(mot)}" '
+        # ⚠️ 动效视频的 class 由 `bg` 口径决定（不是「所有 video 都免 mask」）：
+        #    · matte（抠像版，人物已分离）→ th-alpha 免 mask，否则发丝被羽化又削一层；
+        #    · keep（带背景）→ **必须保留 mask**，靠羽化把矩形边缘化开融进舞台。
+        _bg = str((avatar or {}).get("bg") or "keep")
+        vcls = "th-photo th-alpha" if _bg == "matte" else "th-photo"
+        fig = (f'<video id="thFig" class="{vcls}" src="{_esc(mot)}" '
                f'poster="{_esc(src)}" muted loop playsinline '
                f'preload="auto"></video>')
     elif src:
@@ -1520,16 +1579,30 @@ def _avatar_src(v, avatar: dict | None) -> str:
             break
     if up is None:
         # 预置形象：包内只读资源（白名单查 file，不拼接任何外部字符串）
-        # 2026-10-13 PNG 路线：优先用抠好的透明底 `{aid}_alpha.png`（边缘干净、
-        # 免 CSS mask），没有才回落带背景的 jpg。
+        # ⚠️ 静态图选 alpha 还是原图，由 `bg` 口径决定（见 video.py::BUILTIN_AVATARS）：
+        #    · keep  → **带背景**原图 jpg（影棚底是真实布光，配 CSS 羽化最自然）；
+        #    · matte → 抠好的透明底 `{aid}_alpha.png`（绿幕必须去背）。
+        #    2026-10-20 之前是「一律优先 alpha」—— 那会让保留背景的口径失效：
+        #    视频是背景版、静态回落却是透明版，同一个形象两种观感。
         alpha = svc.preset_dir() / (aid + "_alpha.png")
-        try:
-            if alpha.is_file():
-                up = alpha
-        except BaseException:
-            up = None
-        if up is None:
+        bg = str((svc.avatar_info(aid) or {}).get("bg") or "keep")
+        up = None
+        if bg == "matte":
+            try:
+                if alpha.is_file():
+                    up = alpha
+            except BaseException:
+                up = None
+            if up is None:
+                up = svc.preset_file(aid)
+        else:
             up = svc.preset_file(aid)
+            if up is None:
+                try:
+                    if alpha.is_file():
+                        up = alpha
+                except BaseException:
+                    up = None
     # 目标文件名跟源扩展名走（PNG 透明底必须保住 alpha，不能写成 .jpg）
     dst_name = "avatar.png" if (up is not None and up.suffix.lower() == ".png") else "avatar.jpg"
     src = svc.video_dir(v.id) / dst_name
@@ -1580,7 +1653,14 @@ def _avatar_motion(v, avatar: dict | None) -> str:
     except BaseException:
         up = None
     if up is None:
-        up = svc.preset_video(aid)
+        bg = str((svc.avatar_info(aid) or {}).get("bg") or "keep")
+        if bg == "matte":
+            # ⚠️ 绿幕形象只能用抠像版；`{aid}.webm` 是**绿幕原始版**，绝不能当兜底
+            #    （成片里会是一整块绿）。没有抠像版就回落静态图 —— 宁可不动，不能出绿。
+            up = svc.preset_matte_video(aid)
+        else:
+            # keep：优先「保留背景」的原始视频，没有才退回包内那支（可能是抠像版）
+            up = svc.preset_bg_video(aid) or svc.preset_video(aid)
     if up is None:
         return ""
     dst = svc.video_dir(v.id) / "avatar.webm"
@@ -1661,9 +1741,23 @@ def stage_payload(db, v) -> dict:
         k = str(p.get("k") or "concept")
         if k not in ("concept", "good", "cost"):
             k = "concept"
-        pts_by_scene[si].append({"at": at, "t": str(p.get("t") or ""), "k": k,
-                                 "sc": max(0, int(p.get("sc") or 0)),
-                                 "wa": 1 if k == "cost" else 0})
+        row = {"at": at, "t": str(p.get("t") or ""), "k": k,
+               "sc": max(0, int(p.get("sc") or 0)),
+               "wa": 1 if k == "cost" else 0}
+        # tex（可选，动效图解）：公式元素的 LaTeX 逐项数组，透传进 motion 的分页。
+        if isinstance(p.get("tex"), list) and p["tex"]:
+            row["tex"] = p["tex"]
+        # chart（可选，动效图解 P1）：数据图元素，同 tex 的透传纪律。
+        if isinstance(p.get("chart"), dict) and p["chart"].get("items"):
+            row["chart"] = p["chart"]
+        # sketch（可选，整屏图板 2026-10-21）：结构草图。**板书与动效图解都读**
+        # （板书：ppt_slides(with_sketch=True) 画黑板简图；动效图解：motion_slides
+        #  的 _expand_sketch 把 labels 变成一屏结构化图）。
+        # ⚠️ PPT 课件的 `els` 契约**不放宽** —— 课件模板按 els 画，多一张空 els
+        #    的图板页就是「只有标题的白页」。
+        if isinstance(p.get("sketch"), dict):
+            row["sketch"] = p["sketch"]
+        pts_by_scene[si].append(row)
     for g in pts_by_scene:
         g.sort(key=lambda x: x["at"])
 
@@ -1690,6 +1784,754 @@ def stage_payload(db, v) -> dict:
     }
 
 
+# ========== PPT 课件（方案 A：0ms 起就是内容页）2026-10-20 ==========
+#
+# 为什么分页与页标题算在**后端**而不是模板里：
+#   ① 导出 `.pptx` 要复用同一份页结构 —— 两处各写一份必然漂移成
+#      「视频里 16 页、导出的课件 15 页」这种最难解释的错；
+#   ② 分页规则（过滤超时条目 / 均分）要能被探针**直接断言**，而不是从截图反推。
+#
+# 方案 A 的硬约束来自两份真实成片的实测：`SEGS[0].a` 都是 0 —— 第 0 帧就在讲内容，
+# 没有片头空隙。所以这里**刻意不生成封面 / 目录页**：它们只能占用真实讲解时间
+# （完整课件形态实测牺牲 18.4% 时长 + 18 条内容）。课件感改由「页眉面包屑 +
+# 大页码 + 常驻节导航 + 底部时间轴」提供。
+PPT_PER_PAGE = 6                         # 单页条目上限（均分时用）
+_PPT_TITLE_LO, _PPT_TITLE_HI = 12, 20    # 回退标题的目标字数区间
+
+
+def _ppt_punct_off(s: str) -> str:
+    """去空白与中文标点 —— 只服务「是不是字面前缀」这一个判定。"""
+    return re.sub(r"[\s，。；、：！？,;:!?…—·\"'（）()《》【】]+", "", str(s or ""))
+
+
+def _ppt_short_title(text: str) -> str:
+    """从讲稿句子切一个读得通的短标题（按标点累加，落在 12~20 字）。
+
+    ⚠️ 只是**兜底**：正常数据走 LLM 给的镜头标题（见 `_ppt_shot_title`）。
+       兜底存在的理由很具体 —— 存量作品的 `shots[].l` 是按字数硬截的
+       （实测 video 6：「培训班要加直播第一反应往」这种半句话），不能当页标题。
+    """
+    t = re.sub(r"\s+", "", str(text or ""))
+    if not t:
+        return ""
+    out = ""
+    for p in re.split(r"(?<=[，。；、：！？,;:])", t):
+        if len(out + p) > _PPT_TITLE_HI:
+            break
+        out += p
+        if len(out) >= _PPT_TITLE_LO:
+            break
+    return out.rstrip("，。；、：,;:") or t[:_PPT_TITLE_HI]
+
+
+def _ppt_is_cut(shot_label: str, first_seg: str) -> bool:
+    """`shots[].l` 是「从首句硬截出的半句」还是「LLM 命名的标题」。
+
+    判据：去标点后 `l` 是首句的**字面前缀**且 ≥10 字 → 判为截断。
+    实测命中（video 6）：l="培训班要加直播第一反应往"，首句="培训班要加直播，第一反应往往…"。
+    反例（LLM 命名）：l="直播平台的三种方案"，首句是口语「那第一个问题就是…」→ 不是前缀
+    → 直接用 LLM 标题（质量远好于任何自动切分，所以这条判据的方向必须是「别误杀」）。
+    """
+    l, f = _ppt_punct_off(shot_label), _ppt_punct_off(first_seg)
+    return len(l) >= 10 and bool(f) and f.startswith(l)
+
+
+def _ppt_shot_title(shot: dict, segs: list) -> str:
+    """一节的页标题：优先 LLM 标题，坏数据才回退「按标点切首句」。
+
+    ⚠️ 回退取句规则：该节时间内**第一条 ≥6 字的句子**。纯口语填充（「对。」）
+       做标题毫无信息量；实测 video 9 首句「那AgenticRAG和普通RAG比」就是半句话。
+    """
+    a = int(shot.get("a") or 0)
+    b = max(int(shot.get("b") or 0), a + 1)
+    first = ""
+    for s in segs:
+        if not (a <= int(s.get("a") or 0) < b):
+            continue
+        t = str(s.get("t") or "").strip()
+        if not first:
+            first = t
+        if len(_ppt_punct_off(t)) >= 6:
+            first = t
+            break
+    label = str(shot.get("l") or "").strip()
+    if label and not _ppt_is_cut(label, first):
+        return label
+    return _ppt_short_title(first) or label or "第 %d 节" % int(shot.get("n") or 0)
+
+
+# ========== 板书 · 整屏图板（sketch）2026-10-21 ==========
+# 一张图 = 一板：带 sketch 的要点从条目流里**摘出来**独占一页，前后条目照常分页。
+# ⚠️⚠️ 只有板书侧启用（`ppt_slides(payload, with_sketch=True)`）。
+#     PPT 课件与 `.pptx` 导出**必须**保持旧签名，否则会多出空 `els` 的图板页。
+# ⚠️ 校验与接地**不在本文件**：`svc.norm_sketch` / `svc.sketch_grounded`（video.py）。
+#    落库时已校验过一轮，这里再校验是给「存量/手改数据」兜底 —— 两处必须同一份实现。
+
+# 图板页的**时长下限**（毫秒）。低于这个数就不画图，降级成普通条目页：
+# 标题要先写 1.48s，整张图还有 STROKE_MIN / LABEL_MIN 的硬下限，页长不够时
+# **图根本画不完** —— 成片表现是「翻到一页空黑板，几百毫秒后又翻走」
+# （实测 1.2s 页：图要到 b+1840ms 才画完，可见期内一笔都没落）。
+# 阈值按最坏情形取余量：compare 6 标签实测需 ≈4.15s → 取 4.6s。
+# ⚠️ 这不是抄模板的时序公式，是**策略值**：模板一旦调慢、这页画不完，
+#    `probe_sketch_edge.py` 的 E14（最短允许页 · 四原语）会立刻红。
+SKETCH_MIN_MS = 4600
+# ⚠️ 吞的目标就是 SKETCH_MIN_MS 本身，**不要加余量**：实测（3 部真作品 × 243 个
+#    位置注入）need=4600 → 84.0%、4660 → 81.9%、4800 → 81.5% —— 余量把「页长恰好
+#    4600~4660、本来画得完」的位置判死，收益是负的。收敛规则顶的 +1ms 只影响页长
+#    恰好等于 4600 的那极少数位置，不值得拿 2 个百分点换。
+# 一板最多吞 2 条：再多就是「讲了半分钟、板上一张图不动」，注意力早走了。
+SKETCH_ABSORB_MAX = 2
+# 吞完之后这一板最多能有多长。极端稀疏处（图后面只有 1 条要点、再下一条在 20s 后）
+# 吞 1 条会把页拉到 20s：图 4s 画完、剩下 16s 一动不动 —— 不如降级成文字页。
+SKETCH_ABSORB_MAX_MS = 9000
+
+
+def _ppt_el(e) -> dict:
+    """一条要点 → 页内条目（板书模板与 `.pptx` 导出共用的一份结构）。"""
+    t = str(e["t"])
+    return {"at": int(e["at"]), "t": t,
+            "k": str(e.get("k") or "concept"),
+            # st：轨迹节点画勾还是叉（后端判，模板只读）
+            "st": svc.item_state(t),
+            # num：阶梯的数字；非数字条目为 null
+            "num": svc.item_num(t)}
+
+
+def _blk_first_at(blk) -> int:
+    """分页块首条要点的时刻（sketch 块里的元素是 (e, sk) 二元组）。"""
+    it = blk[0]
+    return int((it[0] if isinstance(it, tuple) else it)["at"])
+
+
+def _absorb_sketch_blocks(blocks: list, sec_a: int, sec_b: int) -> dict:
+    """图板页太短时，把**紧邻的后续要点**吞进这一板（A 方案，2026-10-21）。
+
+    为什么必须吞：一板图从标题写完到画完约 4.1s，而相邻要点的间距中位只有 2.2s ——
+    65 个图板位置里 60 个不够长，原先全部降级成文字页，**一张图都出不来**。
+
+    为什么吞了不算丢内容：被吞的要点**不再单独出页**（文字不上板），但它的语义由
+    这张图的标签承载，讲稿照常讲、页区间 `b` 延到它讲完 —— **声画零不同步**。
+    代价是整板静止时间变长（实测 30%+），换来图真的画得完。
+
+    返回 {blocks 下标: [被吞条目]}；blocks **就地**改动（被吞条目从 list 块头部摘除）。
+    ⚠️ 只在 with_sketch=True 的板书路径上调用。`b` 的估算口径必须与 `ppt_slides`
+       的「b = 下一页 a」一致，否则这里以为够了、那边仍是 2s → 又降级。
+    """
+    absorbed = {}
+    for j, (kind, blk) in enumerate(blocks):
+        if kind != "sketch":
+            continue
+        # 这一板的起点 a（与 ppt_slides 同口径）：本节第一块取镜头起点，否则取该点 at
+        start = sec_a if j == 0 else int(blk[0][0]["at"])
+        # 只吞**紧邻的 list 块**：下一块也是图板 → 那一板自己都缺时间，吞了会连环塌
+        if j + 1 >= len(blocks) or blocks[j + 1][0] != "list":
+            continue
+        nxt = blocks[j + 1][1]
+
+        def _b_after(k: int) -> int:
+            """吞掉 nxt 前 k 条之后，本板的 b（下一页起点）会落在哪。"""
+            rest = nxt[k:]
+            if rest:
+                return int(rest[0]["at"])
+            # 吞光了 → 下一页就是后面的块；本节没有后续块 → 节末
+            if j + 2 < len(blocks):
+                return _blk_first_at(blocks[j + 2][1])
+            return sec_b
+
+        need = SKETCH_MIN_MS
+        k = SKETCH_ABSORB_MAX + 1          # 哨兵：吞满上限仍不够 / 一跳太远
+        for kk in range(0, min(SKETCH_ABSORB_MAX, len(nxt)) + 1):
+            span = _b_after(kk) - start
+            if span < need:
+                continue                   # 还不够长，继续往下吞
+            # 够长了：kk==0 表示本来就不缺时间（不吞）；kk>0 还要保证没一跳跳太远
+            if kk == 0 or span <= SKETCH_ABSORB_MAX_MS:
+                k = kk
+            break
+        if k == 0 or k > SKETCH_ABSORB_MAX:
+            # 本来够长 / 吞满上限也不够 → 不动：留给降级判定，别白丢文字
+            continue
+        absorbed[j] = list(nxt[:k])
+        blocks[j + 1] = ("list", nxt[k:])
+    return absorbed
+
+
+def _page_blocks(els: list) -> list:
+    """把一节的条目切成「分页块」：带 sketch 的点各自成块，其余连续点合一块。
+
+    返回 [(kind, els)]，kind ∈ {"list", "sketch"}，顺序即讲稿顺序。
+    """
+    out, buf = [], []
+    for e in els:
+        sk = svc.norm_sketch(e.get("sketch")) if isinstance(e.get("sketch"), dict) else None
+        if sk:
+            if buf:
+                out.append(("list", buf))
+                buf = []
+            out.append(("sketch", [(e, sk)]))
+        else:
+            buf.append(e)
+    if buf:
+        out.append(("list", buf))
+    return out
+
+
+def _sketch_title(e, fallback: str) -> str:
+    """图板页的标题 = 这张图要讲什么（该要点自己的说法）；过长/过短退回镜头标题。"""
+    t = str(e.get("t") or "").strip()
+    n = len(_ppt_punct_off(t))
+    return t if 4 <= n <= 18 else fallback
+
+
+def ppt_slides(payload: dict, with_sketch: bool = False) -> tuple:
+    """生成课件的 `(nav, slides)`：单一口径，舞台模板与 `.pptx` 导出共用。
+
+    nav    = [{no, title, a, b}]                        左侧节导航 / 时间轴刻度
+    slides = [{no, total, shot, title, a, b, els, shape}]  每页条目 / 时间区间 / 形状
+    ⚠️ `shape` 只对 ppt 与 board 有意义（board 不读）；""= 清单，模板据此
+       走「逐条入场」（存量行为），非空 = 整页常驻的形状页。
+
+    ⚠️⚠️ 必须过滤 `at >= TOTAL` 的条目：实测 video 6 第 6 节有 4 条 at 落在
+       218746~228566，而全片只到 216912 —— 它们在成片里**永远不出现**。
+       不过滤的后果是页数/页码被虚高、末页多出 4 条永远看不见的条目。
+       （导出 `.pptx` 时应保留它们：课件可以比视频全；视频侧只播能播到的。）
+    ⚠️ 切页要**均分**不要按固定条数硬切：实测 7 条硬切 6+1 → 尾页只剩
+       「开箱即用」四个字、整屏空白，是全套样张里最难看的一页。
+
+    ⚠️⚠️ 页起点语义（2026-10-21 改，板书 + PPT 同步）：本节**第一页**的 `a` =
+       镜头起点 `shot.a`，不是首条 `at`。本片数据里两者恰好相等（points 从镜头开头
+       就编号，gap 全为 0），所以这条对现状是**语义加固**而不是效果改动：
+       ① 将来若某节首条晚出现，章节一开讲就翻到新板，不必等第一条；
+       ② 一个镜头被均分成多页时，第 2 页起的 `a` 仍是「该页首条 at」——
+          那才是「页标题与首条同时出现」的真因，修法在板书模板侧
+          （`LINE_MIN_DELAY`：第一条落笔不早于标题写完），不在分页。
+       第一页 `a` 一律收敛到 0，否则片头是一段黑屏。
+    """
+    total = int(payload["total"])
+    shots, pts, segs = payload["shots"], payload["points"], payload["segs"]
+
+    nav, slides = [], []
+    pending_sketch = []         # [(page, el, 镜头标题, 被吞条目)]：页边界定了再判时长
+    for i, sh in enumerate(shots):
+        title = _ppt_shot_title(sh, segs)
+        sec_a = int(sh.get("a") or 0)
+        nav.append({"no": i + 1, "title": title,
+                    "a": sec_a, "b": int(sh.get("b") or 0)})
+        els = [e for e in (pts[i] if i < len(pts) else []) if int(e["at"]) < total]
+        if not els:
+            continue            # 该节全部条目都超时 → 这一节没有可播内容，不占页
+        # 切块：带 sketch 的点独占一块（整屏图板），其余连续点合一块再按条数均分。
+        # ⚠️ with_sketch=False 时是单块 —— 与改造前**逐字节等价**的行为。
+        blocks = _page_blocks(els) if with_sketch else [("list", els)]
+        # A（2026-10-21）：图板页时长不够 → 吞掉紧邻的后续要点，而不是放弃这张图。
+        # ⚠️ 必须在生成页**之前**做：它改的是 blocks（条目从后续 list 块里摘掉），
+        #    页边界与页码随之后移；事后再去改 page["b"] 会让相邻两页重叠。
+        absorbed = (_absorb_sketch_blocks(blocks, sec_a, int(sh.get("b") or 0))
+                    if with_sketch else {})
+        first_page = True       # 本节第一页取镜头起点（页起点语义，见 docstring）
+        for j, (kind, blk) in enumerate(blocks):
+            if kind == "sketch":
+                e, sk = blk[0]
+                page = {"shot": i,
+                        # 图板页标题 = 这张图讲什么（不是镜头标题）：
+                        # 这一板只有图，标题就是图的题；该要点的文字也不丢。
+                        "title": _sketch_title(e, title),
+                        "a": sec_a if first_page else int(e["at"]),
+                        "els": [], "shape": "",
+                        "sketch": sk}
+                slides.append(page)
+                ab = absorbed.get(j) or []
+                if ab:
+                    # 被吞要点：文字不上板（语义由这张图的标签承载），只留档给探针/日志
+                    page["absorbed"] = [str(x["t"]) for x in ab]
+                # 页边界要等全部页生成后才知道，先记下元素：太短就降级
+                pending_sketch.append((page, e, title, ab))
+                first_page = False
+                continue
+            n_page = max(1, -(-len(blk) // PPT_PER_PAGE))
+            base, extra = divmod(len(blk), n_page)
+            cur = 0
+            for k in range(n_page):
+                n = base + (1 if k < extra else 0)
+                grp = blk[cur:cur + n]
+                cur += n
+                if grp:
+                    # ⚠️ 必须是**新变量名**：这里若写回 `els`，第二轮 `grp = els[cur:...]`
+                    #    切的就是上一页那条短列表 → 空 → 后续页整页跳过。
+                    #    实测 13 条只出 5 条（丢 8 条），且不报错、截图也看不出。
+                    # 结构构造统一走 _ppt_el（图板降级路径也要用同一份）
+                    page = [_ppt_el(e) for e in grp]
+                    slides.append({"shot": i, "title": title,
+                                   # 页起点：本节第一页 = 镜头起点，
+                                   # 节内后续页 = 该页首条 at。
+                                   "a": sec_a if first_page else int(grp[0]["at"]),
+                                   "els": page,
+                                   # shape：""=清单（现状）。判定见 svc.pick_shape
+                                   "shape": svc.pick_shape(page)})
+                    first_page = False
+    # ⚠️ 兜底：全片没有任何可播的视觉步点（points 为空、或所有 at 都 >= TOTAL）。
+    #    不兜的话模板的 `slideAt()` 会拿到 undefined → paintSlide 抛错 → **白屏成片**，
+    #    而用户看到的只是「这视频是黑的」，没有任何线索指向"这份作品的步点全超时了"。
+    if not slides:
+        slides = [{"shot": 0,
+                   "title": _ppt_shot_title(shots[0], segs) if shots else "全片",
+                   "a": 0, "b": max(1, total), "els": [], "shape": "", "no": 1, "total": 1}]
+    # 页起点收敛（与上面页起点语义配套）：
+    #   ① 第一页 a 一律 0 —— 否则片头 0~a 这段时间没有任何页，模板只能给黑屏；
+    #   ② 相邻页 a 严格递增 —— 页区间首尾相接（b = 下一页 a）的前提，
+    #      不能靠「b <= a 时 b = a+1」去救，那会把下一页的 b 也顶歪。
+    slides[0]["a"] = 0
+    for i in range(1, len(slides)):
+        if int(slides[i]["a"]) <= int(slides[i - 1]["a"]):
+            slides[i]["a"] = int(slides[i - 1]["a"]) + 1
+    # 页边界首尾相接：b = 下一页 a，末页 = TOTAL。保证任何时刻「有且只有一页」
+    for i, s in enumerate(slides):
+        s["b"] = int(slides[i + 1]["a"]) if i + 1 < len(slides) else total
+        if s["b"] <= s["a"]:
+            s["b"] = s["a"] + 1
+        s["no"] = i + 1
+        s["total"] = len(slides)
+    # 还是太短（没有可吞的后续要点 / 吞满上限也不够）→ 降级成普通条目页。
+    # ⚠️ 只改 els/title/sketch，**不动 a/b** —— 页边界与页码因此完全不受影响。
+    # ⚠️⚠️ 降级时**已吞的要点必须一起上板**：它们已经从后续 list 块里摘掉了，这一页
+    #    若只显示自己那一条，这几条要点就既没有图、也没有文字 —— 内容凭空消失，
+    #    而成片里只是「少了一句话」，不报错、截图也看不出来。
+    for page, e, sec_title, ab in pending_sketch:
+        if page["b"] - page["a"] >= SKETCH_MIN_MS:
+            continue
+        rows = sorted([e] + list(ab), key=lambda x: int(x["at"]))
+        page["els"] = [_ppt_el(x) for x in rows]
+        page["title"] = sec_title
+        page.pop("sketch", None)
+        page.pop("absorbed", None)     # 文字已上板，别让探针以为还在图里
+    return nav, slides
+
+
+def _build_ppt_stage(db, v) -> Path:
+    """PPT 课件舞台页：独立模板，页结构与标题在注入前**已全部算好**。"""
+    payload = stage_payload(db, v)
+    nav, slides = ppt_slides(payload)
+    title = getattr(v, "title", "") or "AI 视频"
+    repl = {
+        "__TITLE__": _esc(title),          # 只用于 <title>（HTML 上下文）
+        "__TITLE_JS__": _j(title),         # JS 里用 JSON 字面量，避免引号转义踩坑
+        "__NAV__": _j(nav),
+        "__SLIDES__": _j(slides),
+        "__SEGS__": _j(payload["segs"]),
+        "__TOTAL__": str(int(payload["total"])),
+    }
+    tpl = _TEMPLATE_PPT.read_text(encoding="utf-8")
+    for k, val in repl.items():
+        tpl = tpl.replace(k, val)
+    # ⚠️ 漏替换的占位符会让 JS 直接语法错 → **白屏成片**（黑屏 3 分钟没人知道为什么）。
+    #    当场失败远好于渲出一片黑：与 source 皮肤「没有原件画面就报错」同一纪律。
+    left = sorted(set(re.findall(r"__[A-Z][A-Z_]*__", tpl)))
+    if left:
+        raise ValueError("PPT 课件模板存在未替换的占位符：%s" % ", ".join(left))
+    out = svc.stage_abspath(v.id)
+    out.write_text(tpl, encoding="utf-8", newline="\n")
+    return out
+
+
+def _build_board_stage(db, v) -> Path:
+    """板书 · 粉笔舞台页：独立模板。
+
+    页结构复用 `ppt_slides()`（与 PPT 课件、.pptx 导出同一份分页口径）：
+    每页 = 一板，条目按各自的 at 逐行「写上黑板」；good/cost 条目写完自动
+    圈画/下划线（points 的语义标注直接变成教学动作）。
+    """
+    payload = stage_payload(db, v)
+    # ⚠️ 只有板书要图板页；同一个 payload 走 PPT 时必须是旧签名（见 SKETCH_TYPES 段）。
+    nav, slides = ppt_slides(payload, with_sketch=True)
+    title = getattr(v, "title", "") or "AI 视频"
+    repl = {
+        "__TITLE__": _esc(title),
+        # ⚠️ 没有 __TITLE_JS__：板书模板不在 JS 里用标题（只在 <title> 与页标题里，
+        #    页标题来自 slides[].title）。原先把 PPT 的替换表整段照搬，多注入一个
+        #    模板里根本不存在的占位符 —— 无害但是死代码，接手的人会以为有依赖。
+        "__NAV__": _j(nav),
+        "__SLIDES__": _j(slides),
+        "__SEGS__": _j(payload["segs"]),
+        "__TOTAL__": str(int(payload["total"])),
+    }
+    tpl = _TEMPLATE_BOARD.read_text(encoding="utf-8")
+    for k, val in repl.items():
+        tpl = tpl.replace(k, val)
+    # ⚠️ 漏替换的占位符 = 白屏成片，当场报错（与 PPT 模板同一纪律）。
+    left = sorted(set(re.findall(r"__[A-Z][A-Z_]*__", tpl)))
+    if left:
+        raise ValueError("板书模板存在未替换的占位符：%s" % ", ".join(left))
+    out = svc.stage_abspath(v.id)
+    out.write_text(tpl, encoding="utf-8", newline="\n")
+    return out
+
+
+# ========== 动效图解（motion，2026-10-21，论文讲解/Vibe 知识形态）==========
+#
+# 页 = (镜头, 屏)：「画布」随讲解生长；换屏时**同 id 元素滑动变换**（morph）
+# 而不是整屏硬切 —— 这是它与所有既有皮肤的本质区别。
+# ⚠️ 分页语义与 ppt_slides **刻意不同**：课件按条数均分重排，动效图解必须
+#    保住模型的「屏」（sc）—— 一屏 = 画布的一个状态，均分会破坏「哪些元素
+#    同屏」这件事本身（morph 的连续性就建立在同屏/跨屏关系上）。
+# ⚠️⚠️ id 合成在**后端**，绝不交给模型（与「形状判定在后端」同一纪律）：
+#    同镜头内「归一化文本相同 = 同一对象」；公式元素用 tex 全文做 id。
+#    补点会复用文案 → 同屏撞 id 加序号后缀（同屏两块相同文案是**两块**，
+#    跨屏相同文案才是「同一个」——后缀只在屏内去重，跨屏匹配只看主 id）。
+def _motion_el_id(e: dict) -> str:
+    tex = e.get("tex")
+    if isinstance(tex, list) and tex:
+        return "f:" + "|".join(str(x) for x in tex)
+    return "t:" + re.sub(r"\s+", "", str(e.get("t") or "")).lower()
+
+
+# ---- 容量预算（2026-10-21，长屏溢出守卫）----
+# 根因：补点机制会给长句在同一 sc 里塞填充点 → 一屏实际元素数 = 模型给的（≤8）
+# + 补点（长句再 +2~4）；实测 10 元素混合屏 4 个溢出视口底沿、6 个压字幕区。
+# 拆法 = 「同 sc 连续子页」：元素 id 不变，morph/ghost 机制天然保住连续性，
+# 语义零伤害（❌ 不要整栈缩放：字会糊）。
+# 预算口径（与模板布局实测对齐）：垂直栈/对照列按总高（块高 + 行距 34），
+# flow 横排按总宽（块宽 + 箭头位 44）。
+# ⚠️⚠️ 2026-10-21 真实作品（id=12，89 个元素）标定：原估算比真实布局**小 22-23%**
+#   （纯文本 76→真实 93 高、376→真实 461 宽），导致 flow 页实际总宽冲到 2150 把
+#   末端算出画（右端 1947 > 1920）。系数已按实测校准（宽 34→41、常量 70→84；
+#   高 76→91），预算同时改成**真实可用宽高**。改这两个数前必须重测，别按感觉调。
+_MOTION_H_BUDGET = 680.0    # 垂直栈单列 / compare 每列的总高预算（校准后 ≈ 真实 px）
+_MOTION_W_BUDGET = 1790.0   # flow 横排总宽预算（= 1920 - 两侧 65 边距）
+_MOTION_GAP_H = 34.0
+_MOTION_ARROW_W = 44.0
+
+
+def _motion_el_hw(e: dict) -> tuple:
+    """元素的估算占位（宽, 高）px —— 与模板布局同口径的保守估算（宁可高估）。
+
+    ⚠️ 系数 90 / 49 / 104 是**真实作品标定值**（id=12，89 元素，按模板当前的
+       主要字号档 44px 拟合：units 5..12 实测宽 323..652，拟合残差 ±5%）。
+       ⚠️ 改模板 fsChip 档位后**必须重跑 `_calib_motion_width_20261021.py` 重新
+       拟合**：字号一变，真实宽高就整体缩放，旧系数会让拆页判断失真。
+       多元素页字更小 → 估算偏高 → 拆页更早（刻意偏保守，牺牲一页不牺牲出画）。
+    """
+    if e.get("chart"):
+        return (790.0, 370.0)
+    if e.get("mml"):
+        return (900.0, 150.0)
+    t = str(e.get("t") or "")
+    return (min(1240.0, 90.0 + 49.0 * _text_units(t)), 104.0)
+
+
+def _motion_rebalance(pages: list) -> list:
+    """消除「单条元素页」（flow 画不出箭头、compare 右半屏全空）。
+
+    ⚠️⚠️ 旧版借条不收敛：借出方 >=2 就借，借完可能变 1（[2,1] -> [1,2]，单条页
+       只是从尾部搬到头部，而循环已经跳过）。实测 flow 3 条 >=10 字必现（拆分
+       [2,1] -> 借后 [1,2]），新作品的高频路径。
+    策略（收敛式，每轮要么单条页数 -1、要么页数 -1）：
+      1. **借条**：只从「借完仍 >=2 条」（即 >=3 条）的相邻页借 —— 不制造新单条页；
+      2. **并页**：借无可借（总量 <4 的 [2,1] 类）→ 并入相邻页。并入后可能超容量
+         预算，**交模板侧缩字号 / 退版式兜底**（flow 有 26px 下限 + 退 grid 双保险，
+         垂直栈 3 条文本根本不会超预算才走到这）——宁可字小一页，不要空屏一页。
+    ⚠️ chart / mml 大图元素的单条页**豁免**（数据图 / 公式独占一页是合法排版，
+       两个 chart 并一页 774px 反而超 680 预算出画）。
+    """
+    if len(pages) < 2:
+        return pages
+    pages = [list(p) for p in pages]
+
+    def _big(page) -> bool:
+        return any(e.get("chart") or e.get("mml") for e in page)
+
+    while True:
+        singles = [i for i, p in enumerate(pages)
+                   if len(p) == 1 and not _big(p)]
+        if not singles:
+            return pages
+        i = singles[0]
+        # 借条：借出方借完必须仍 >=2（即 >=3 才借）
+        if i > 0 and len(pages[i - 1]) >= 3:
+            pages[i].insert(0, pages[i - 1].pop())
+            continue
+        if i + 1 < len(pages) and len(pages[i + 1]) >= 3:
+            pages[i].append(pages[i + 1].pop(0))
+            continue
+        # 借无可借 → 并入元素较少的相邻页（超预算交模板缩字号兜底）
+        if i > 0 and (i + 1 >= len(pages)
+                      or len(pages[i - 1]) <= len(pages[i + 1])):
+            pages[i - 1].append(pages[i][0])
+            pages.pop(i)
+        elif i + 1 < len(pages):
+            pages[i + 1].insert(0, pages[i][0])
+            pages.pop(i)
+        else:
+            return pages
+
+def _motion_split(els: list, layout: str) -> list:
+    """把一屏的元素按容量拆成若干连续子页（不拆 = 单元素列表原样返回）。
+
+    ⚠️ 绝不拆单个元素本身（一个数据图超预算也独自成页 —— 拆块才是灾难）。
+    """
+    if not els:
+        return []
+    if layout == "flow":
+        pages, cur, acc = [], [], 0.0
+        for e in els:
+            add = _motion_el_hw(e)[0] + (cur and _MOTION_ARROW_W or 0.0)
+            if cur and acc + add > _MOTION_W_BUDGET:
+                pages.append(cur)
+                cur, acc = [], 0.0
+                add = _motion_el_hw(e)[0]
+            cur.append(e)
+            acc += add
+        if cur:
+            pages.append(cur)
+        return _motion_rebalance(pages)
+    if layout == "compare":
+        # 对照：模板按**页内**前一半左列、后一半右列分侧 —— 容量模拟必须用同一规则
+        #    （曾按整组分侧：拆分后页内半边错位，左右列失衡）。
+        pages, cur = [], []
+        for e in els:
+            cand = cur + [e]
+            half = -(-len(cand) // 2)
+            lh = (sum(_motion_el_hw(x)[1] for x in cand[:half])
+                  + _MOTION_GAP_H * max(0, half - 1))
+            rh = (sum(_motion_el_hw(x)[1] for x in cand[half:])
+                  + _MOTION_GAP_H * max(0, len(cand) - half - 1))
+            if cur and max(lh, rh) > _MOTION_H_BUDGET:
+                pages.append(cur)
+                cur = [e]
+            else:
+                cur = cand
+        if cur:
+            pages.append(cur)
+        return _motion_rebalance(pages)
+    # 垂直栈（grid / hub / pyramid 及未知版式的兜底）
+    pages, cur, acc = [], [], 0.0
+    for e in els:
+        add = _motion_el_hw(e)[1] + (cur and _MOTION_GAP_H or 0.0)
+        if cur and acc + add > _MOTION_H_BUDGET:
+            pages.append(cur)
+            cur, acc = [], 0.0
+            add = _motion_el_hw(e)[1]
+        cur.append(e)
+        acc += add
+    if cur:
+        pages.append(cur)
+    return _motion_rebalance(pages)
+
+
+# ---- sketch 图板页（A，2026-10-21）----
+# sketch.type → 动效图解版式。quadrant 没有专属版式：4 个标签正好落 2×2 网格
+# （grid 分支在 n>=3 时就是两列网格），视觉上就是四宫格，不新造版式。
+_SKETCH_LAYOUT = {"flow": "flow", "compare": "compare",
+                  "pyramid": "pyramid", "quadrant": "grid"}
+
+
+def _expand_sketch(slides: list) -> list:
+    """把「带 sketch 的要点」从文字页里摘出来，独占一屏图板页。
+
+    ⚠️⚠️ 为什么必须拆页而不是塞进原页：sketch 的 labels 是**另一套文案**
+       （≤8 字的结构标签），和同屏的短句混在一起会既不像图也不像列表；
+       板书皮肤就是「一张图 = 一板」的语义，两个皮肤必须同口径。
+    ⚠️ before / after 是原页的**子集**（原页已过 _motion_split），所以不会超容量。
+    ⚠️ 图板页 `a` = sketch 元素自己的 at —— 图卡必须在它被讲到的那一句出现。
+    """
+    out = []
+    for s in slides:
+        els = s.get("els") or []
+        sk_rows = [e for e in els if isinstance(e.get("sk"), dict)]
+        # ⚠️ 整屏只有 1 条 sketch 也要展开（修6，2026-10-21）：那正是模型
+        # 专为这张图开了一屏的理想场景，旧逻辑 len(els)<2 会把它退化成文字 chip。
+        if not sk_rows:
+            out.append(s)
+            continue
+        se = sk_rows[0]
+        at = int(se["at"])
+        before = [e for e in els if e is not se and int(e["at"]) < at]
+        after = [e for e in els if e is not se and int(e["at"]) >= at]
+        labels = [str(x).strip()[:24] for x in (se["sk"].get("labels") or [])][:6]
+        labels = [x for x in labels if x]
+        if len(labels) < 2:
+            # 标签不够撑一屏（接地校验放过了但太短）→ 不值得拆，保持原样
+            out.append(s)
+            continue
+        lay = _SKETCH_LAYOUT.get(str(se["sk"].get("type") or ""), "grid")
+        # ⚠️⚠️ quadrant 的象限顺序是「左上 / 右上 / 右下 / 左下」（顺时针），而 grid
+        #   版式按行从左到右填充（2 列时 2=左下 3=右下）→ 不换位置就把「右下」摆到
+        #   左下角（探针实测坐标 766 vs 992 反了）。位置正确优先于出现顺序。
+        if str(se["sk"].get("type") or "") == "quadrant" and len(labels) == 4:
+            labels[2], labels[3] = labels[3], labels[2]
+        if before:
+            out.append({**s, "els": before, "a": int(before[0]["at"])})
+        used = {}
+        rows = []
+        for lb in labels:
+            base = "%d|%s" % (s["shot"], _motion_el_id({"t": lb}))
+            n_seen = used.get(base, 0) + 1
+            used[base] = n_seen
+            rows.append({"at": at, "t": lb, "k": "concept",
+                         "id": base if n_seen == 1 else "%s#%d" % (base, n_seen),
+                         "mml": None})
+        # 页眉标题：优先用「这张图在讲什么」（sketch 的 t，4-18 字，与板书同口径），
+        # 空/超长才回落镜头标题 —— 图板页顶着镜头名会与画面内容对不上。
+        st = str(se.get("t") or "").strip()
+        page = {"shot": s["shot"], "sc": s["sc"], "layout": lay,
+                "title": st if 2 <= len(st) <= 20 else s["title"],
+                "a": at, "els": rows, "skpage": True}
+        # quadrant 的轴名随页下发（修3）：后端强制校验过 x/y，不传给模板就是
+        # 「校验了却永远不画」——四宫格在画面上退化成 2x2 文字网格。
+        if str(se["sk"].get("type") or "") == "quadrant":
+            page["qaxes"] = {"x": str(se["sk"].get("x") or "")[:8],
+                             "y": str(se["sk"].get("y") or "")[:8]}
+        out.append(page)
+        if after:
+            # 图板页保底 1200ms（修4，2026-10-21）：sketch 与后一条同 at 时
+            # （同一句连给两条），旧逻辑会让图板页被页边界压成 1ms —— 整张图
+            # 0 帧消失。把 after 页起点后推，图板页至少活 1200ms；after 页
+            # 元素 at 可能 < 页 a → 页首即全亮，语义等价于「提前点亮」，可接受。
+            out.append({**s, "els": after, "a": max(at + 1200, int(after[0]["at"]))})
+    return out
+
+
+def motion_slides(payload: dict) -> tuple:
+    """生成动效图解的 `(nav, slides)`。
+
+    nav    = [{no, title, a, b}]                        与 ppt 同口径（按镜头）
+    slides = [{no, total, shot, sc, title, a, b, els}]  页 = (镜头, 屏)
+    els    = [{at, t, k, id, mml}]   mml = [MathML 字符串] | None（公式元素）
+
+    ⚠️⚠️ 同样必须过滤 `at >= TOTAL` 的条目（ppt_slides 的实测教训：它们在成片
+       里永远不出现，只虚高页数）。视频侧只播能播到的。
+    """
+    total = int(payload["total"])
+    shots, pts, segs = payload["shots"], payload["points"], payload["segs"]
+
+    nav, slides = [], []
+    for i, sh in enumerate(shots):
+        title = _ppt_shot_title(sh, segs)
+        nav.append({"no": i + 1, "title": title,
+                    "a": int(sh.get("a") or 0), "b": int(sh.get("b") or 0)})
+        els = [e for e in (pts[i] if i < len(pts) else []) if int(e["at"]) < total]
+        if not els:
+            continue            # 该节全部条目超时 → 不占页（与 ppt_slides 同口径）
+        # 按屏（sc）分组，屏内保持 at 升序（stage_payload 已按 at 排好）
+        by_sc: dict = {}
+        for e in els:
+            by_sc.setdefault(int(e.get("sc") or 0), []).append(e)
+        # 屏的版式：取 shots.screens 归一化后的 screens[sc]（LLM 已在选 flow/hub/
+        # compare/pyramid —— 动效图解**不再丢弃它**：flow=横排箭头链、compare=左右
+        # 对照，其余版式落回垂直栈）。sc 越界（旧数据/手工改）→ 最后一屏版式兜底。
+        # ⚠️⚠️ 页顺序必须按屏内最早 at 排，不能按 sc 编号排（2026-10-22 真实数据
+        #   抓到：LLM 给的 sc1 时间倒序在 sc0 前 —— 提示词「屏按讲稿顺序」是软约束，
+        #   模型会违反）。按 sc 排会让页序列时间倒序 → 「b = 下一页 a」把前一页
+        #   压成 1ms（整页 0 帧消失）。版式仍按 sc 取，只有页顺序按时间。
+        screens = sh.get("screens") or []
+        for sc in sorted(by_sc, key=lambda k: min(int(e["at"]) for e in by_sc[k])):
+            grp = by_sc[sc]
+            lay = ""
+            if screens:
+                src = screens[sc] if sc < len(screens) else screens[-1]
+                lay = str(src.get("layout") or "")
+            lay = lay if lay in svc.GRAPH_LAYOUTS else "grid"
+            used: dict = {}
+            out_els = []
+            for e in grp:
+                # 镜头作用域前缀（2026-10-22）：morph 语义是「同镜头内同一对象
+                # 连续生长」，旧实现没有镜头前缀，跨镜头同名文案（成本/收益这类
+                # 高频词）会被误认为同一对象 → 换镜头时元素从上一屏位置飞过来。
+                base = "%d|%s" % (i, _motion_el_id(e))
+                n_seen = used.get(base, 0) + 1
+                used[base] = n_seen
+                row = {"at": int(e["at"]), "t": str(e.get("t") or ""),
+                       "k": str(e.get("k") or "concept"),
+                       "id": base if n_seen == 1 else "%s#%d" % (base, n_seen),
+                       "mml": svc.tex_to_mathml(e.get("tex"))
+                              if isinstance(e.get("tex"), list) else None}
+                # chart（数据图元素）进模板（模板自绘 SVG，无需转换）。
+                # ⚠️ 这里再做一次数值校验：正常数据 `_clamp_point` 已拦过，但旧作品
+                #    的 points 可能来自旧版本或被手工改过 —— float("abc") 直接抛会让
+                #    整页白屏。脏数据 → 丢弃 chart（模板按 chip 画），绝不白屏。
+                # A（2026-10-21）：sketch 透传到 motion 行 —— 图板页后处理要用
+                # （板书侧走的是另一条 els 契约，互不影响）。
+                if isinstance(e.get("sketch"), dict):
+                    row["sk"] = e["sketch"]
+                if isinstance(e.get("chart"), dict) and e["chart"].get("items"):
+                    try:
+                        ctype = str(e["chart"].get("type") or "")
+                        items2 = [{"label": str(x.get("label") or "")[:10],
+                                   "value": float(x.get("value"))}
+                                  for x in e["chart"]["items"] if isinstance(x, dict)]
+                        items2 = [x for x in items2
+                                  if x["value"] == x["value"]
+                                  and 0 <= x["value"] < float("inf")]
+                        if ctype in ("bar", "line") and len(items2) >= 2:
+                            row["chart"] = {"type": ctype, "items": items2[:8]}
+                    except (TypeError, ValueError):
+                        pass
+                out_els.append(row)
+            # 容量拆分（长屏溢出守卫）：超预算 → 同 sc 连续子页
+            for chunk in _motion_split(out_els, lay):
+                slides.append({"shot": i, "sc": sc, "layout": lay, "title": title,
+                               "a": int(chunk[0]["at"]), "els": chunk})
+    # ⚠️ 兜底（与 ppt_slides 同源）：全片没有可播步点时给一页空画布，
+    #    否则模板 `slideAt()` 拿 undefined → 白屏成片。
+    if not slides:
+        slides = [{"shot": 0, "sc": 0, "layout": "grid",
+                   "title": _ppt_shot_title(shots[0], segs) if shots else "全片",
+                   "a": 0, "b": max(1, total), "els": [], "no": 1, "total": 1}]
+    # A：sketch 要点摘出来独占一屏（必须在算页边界之前 —— 图板页也有 a/b）
+    slides = _expand_sketch(slides)
+    # 页边界首尾相接：b = 下一页 a，末页 = TOTAL。保证任何时刻「有且只有一页」
+    for i, s in enumerate(slides):
+        s["b"] = int(slides[i + 1]["a"]) if i + 1 < len(slides) else total
+        if s["b"] <= s["a"]:
+            s["b"] = s["a"] + 1
+        # 图板页：labels 本身没有时间戳（它们不是讲稿句），同一 at 塞进来就会
+        # 「一瞬间全亮」—— 动效图解的灵魂（逐个长出）就没了。按本页真实时长均分，
+        # 系数 0.85 保证最后一个标签仍在 b 之前播完。
+        if s.get("skpage"):
+            n_e = len(s["els"])
+            span = max(1, s["b"] - s["a"])
+            step = span * 0.85 / max(1, n_e)
+            for j, e in enumerate(s["els"]):
+                e["at"] = int(s["a"] + step * j)
+        # 孤条页（<2 元素）强制回落垂直栈：flow 单条画不出箭头、compare 单条
+        # 右半屏全空 —— 单元素用「重点句式」展示反而成立。一行覆盖所有来源
+        # （_motion_split 的豁免大图、_expand_sketch 拆出的单条 before/after）。
+        if len(s["els"]) < 2 and s["layout"] in ("flow", "compare"):
+            s["layout"] = "grid"
+        s["no"] = i + 1
+        s["total"] = len(slides)
+    # 契约：第一页 a 必须收敛到 0（与 ppt_slides 同口径）—— 否则 slideAt 在
+    # ms < a 时仍返回第一页，开片会有几百毫秒的空白画布（图板页居首时必现）。
+    if slides and slides[0]["a"] > 0:
+        slides[0]["a"] = 0
+    return nav, slides
+
+
+def _build_motion_stage(db, v) -> Path:
+    """动效图解舞台页：独立模板，页结构（屏）与 id 在注入前**已全部算好**。"""
+    payload = stage_payload(db, v)
+    nav, slides = motion_slides(payload)
+    title = getattr(v, "title", "") or "AI 视频"
+    repl = {
+        "__TITLE__": _esc(title),          # 只用于 <title>（HTML 上下文）
+        "__TITLE_JS__": _j(title),         # JS 里用 JSON 字面量，避免引号转义踩坑
+        "__NAV__": _j(nav),
+        "__SLIDES__": _j(slides),
+        "__SEGS__": _j(payload["segs"]),
+        "__TOTAL__": str(int(payload["total"])),
+    }
+    repl["__RATE__"] = str(svc.render_rate_for("motion"))
+    tpl = _TEMPLATE_MOTION.read_text(encoding="utf-8")
+    for k, val in repl.items():
+        tpl = tpl.replace(k, val)
+    # ⚠️ 漏替换的占位符 = 白屏成片，当场报错（与 PPT/板书模板同一纪律）。
+    left = sorted(set(re.findall(r"__[A-Z][A-Z_]*__", tpl)))
+    if left:
+        raise ValueError("动效图解模板存在未替换的占位符：%s" % ", ".join(left))
+    out = svc.stage_abspath(v.id)
+    out.write_text(tpl, encoding="utf-8", newline="\n")
+    return out
+
+
 def build_stage(db, v, avatar: dict | None = None) -> Path:
     """生成舞台页 HTML 并返回路径（`videos_root/{id}/stage.html`）。
 
@@ -1702,6 +2544,17 @@ def build_stage(db, v, avatar: dict | None = None) -> Path:
     # 解压型皮肤（radio / night / ambient）走**独立模板**（DOM 结构与信息型完全不同）
     if skin in _TEMPLATE_RELAX:
         return _build_relax_stage(db, v, skin)
+    # PPT 课件（2026-10-20）：同样走独立模板 —— 它不需要 graph_svg（课件页上是条目
+    # 列表，不是节点图），也不必导出材料原件页（不读 SRC/原件）。
+    # ⚠️ 必须放在 `need_pages` 之前：课件皮肤与 source 无关，白导 57 页 PDF 是分钟级浪费。
+    if skin == "ppt":
+        return _build_ppt_stage(db, v)
+    # 板书（2026-10-20）：同为独立模板 + 不读原件页（理由同 ppt：白导 PDF 是分钟级浪费）。
+    if skin == "board":
+        return _build_board_stage(db, v)
+    # 动效图解（2026-10-21）：同为独立模板 + 不读原件页（理由同上）。
+    if skin == "motion":
+        return _build_motion_stage(db, v)
     inner = _inner_of(v)
     need_pages = (skin == "source") or (inner == "source")
 
@@ -1734,19 +2587,18 @@ def build_stage(db, v, avatar: dict | None = None) -> Path:
     _info = svc.avatar_info(_aid) or {}
     _tint = _info.get("tint")
     av_render["tint"] = _tint if _tint is not None else svc.BUILTIN_AVATARS[0]["tint"]
+    # 背景口径透传给 `_th_dom`：决定要不要免 mask（见 video.py::BUILTIN_AVATARS 的 bg 说明）
+    av_render["bg"] = str(_info.get("bg") or "keep")
     th_dom = _th_dom(v, av_render)
     avatar_pos = str(getattr(v, "avatar_pos", "") or "right").lower()
     if avatar_pos not in ("left", "right", "pip"):
         avatar_pos = "right"
 
-    # ⚠️ seed 必须由「材料键（退回作品号）」定 —— 纸感主题的人物插画按它取模选姿势，
-    #    用 random 会让同一配置每次产物不同，指纹失效、「一键重建」不可复现。
     # ⚠️ 铺满档（2026-10-14）：只给三个**非口播**结构图皮肤 —— 右栏移除后腾出的空间
     #    还给内容。数字人口播·结构图的 `skin` 是 talking_head（不在 `GRAPH_SKINS` 里），
     #    天然拿到 `wide=False`：那一档右侧站的是数字人形象，铺满会把卡片压到人身上。
     svg = graph_svg(payload["shots"], payload["points"], payload["at_by_scene"],
                     skin=skin,
-                    seed=svc.first_material_id(v) or f"video-{getattr(v, 'id', 0)}",
                     wide=(skin in svc.GRAPH_SKINS))
 
     # 口播（talking_head）：注入真实人声 RMS 包络（A+C，2026-10-13）。
@@ -1839,6 +2691,9 @@ def _build_relax_stage(db, v, skin: str) -> Path:
         "__VARIANT__": variant,
         # 动效开关（见模块级 MOTION_ENABLED 注释）：模板里的 render(ms) 纯函数是否启用
         "__MOTION__": "1" if MOTION_ENABLED else "0",
+        # 渲染倍速（2026-10-20）：页钟 × RATE。⚠️ 漏填 = 页面残留 __RATE__ 字面量直接坏
+        # （占位符零残留探针会拦）；只有纯函数模板能 >1（口径 svc.render_rate_for）。
+        "__RATE__": str(svc.render_rate_for(skin)),
     }
 
     if skin in ("radio", "night"):

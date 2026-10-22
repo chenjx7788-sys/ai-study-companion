@@ -2,6 +2,7 @@
 
 解析状态机：parsing → success / failed / scanned（无文本层的扫描件）
 """
+import json
 import posixpath
 import re
 import shutil
@@ -19,6 +20,7 @@ from ..database import get_db, SessionLocal
 from ..models import Material, MaterialChunk, AIAsset, Note, Highlight, Folder
 from ..services import parser as parser_svc
 from ..services import external as external_svc
+from ..services import md_export as md_export_svc
 
 router = APIRouter(prefix="/materials", tags=["materials"])
 
@@ -202,6 +204,7 @@ def _parse_material(material_id: int):
                 section_path=c.get("section_path", ""),
                 kind=_chunk_kind(c["content"], m),
                 img_rect=c.get("img_rect", ""),
+                line_boxes=c.get("line_boxes", ""),
             ))
         m.page_count = max(c["page_no"] for c in chunks)
         db.commit()   # 先落 chunks，供索引查询
@@ -851,6 +854,34 @@ def get_chunks(material_id: int, db: Session = Depends(get_db)):
              "img_rect": r.img_rect or ""} for r in rows]
 
 
+@router.get("/{material_id}/page/{page_no}/boxes")
+def page_line_boxes(material_id: int, page_no: int, db: Session = Depends(get_db)):
+    """取某页各块的**行框**（扫描件 / 拍照页的行级溯源）。
+
+    为什么单独开接口、不塞进 `/chunks`：一本书的行框有几百 KB，学习页首屏完全用不到，
+    只有点「在原文中查看」时才需要这一页。塞进列表等于每开一次材料就传一遍整书坐标。
+
+    返回 `[{"chunk_id", "lines": [{"t","x0","y0","x1","y1","h"}]}]`；
+    该页没有行框（文字层 PDF / 存量未重解析材料）→ `lines` 为空数组，
+    前端据此降级为页级跳转（与 img_rect 缺失时的降级口径一致）。
+    """
+    m = db.get(Material, material_id)
+    if not m:
+        raise HTTPException(404, "材料不存在")
+    rows = (db.query(MaterialChunk)
+            .filter(MaterialChunk.material_id == material_id,
+                    MaterialChunk.page_no == page_no)
+            .order_by(MaterialChunk.id).all())
+    out = []
+    for r in rows:
+        try:
+            lines = json.loads(r.line_boxes) if r.line_boxes else []
+        except (TypeError, ValueError):
+            lines = []          # 坏数据不能让接口 500：降级成「无行框」即可
+        out.append({"chunk_id": r.id, "lines": lines})
+    return out
+
+
 class ChunkUpdateReq(BaseModel):
     content: str
 
@@ -1177,6 +1208,33 @@ def export_notes(material_id: int, db: Session = Depends(get_db)):
         media_type="text/markdown; charset=utf-8",
         headers={"Content-Disposition": f"attachment; filename*=utf-8''"
                  + __import__("urllib.parse", fromlist=["quote"]).quote(f"{m.title}-笔记.md")},
+    )
+
+
+@router.get("/{material_id}/export.md")
+def export_markdown(material_id: int, db: Session = Depends(get_db)):
+    """导出材料正文为 Markdown（带标题层级 / 页码锚 / 图内文字附录）。
+
+    与 `/{id}/notes/export` 分工：那个导的是**笔记**（Note 表），这个导的是**正文**。
+    ⚠️ 渲染逻辑全在 `services/md_export.py`，这里只做取数与响应 ——
+       段落合并/目录页判定都是「看数据说话」的活，塞进路由既测不动也会和前端各写一份。
+    """
+    from fastapi.responses import Response
+    m = db.get(Material, material_id)
+    if not m:
+        raise HTTPException(404, "材料不存在")
+    rows = (db.query(MaterialChunk)
+            .filter(MaterialChunk.material_id == material_id)
+            .order_by(MaterialChunk.page_no, MaterialChunk.id).all())
+    if not rows:
+        raise HTTPException(400, "该材料还没有正文（可能仍在解析或解析失败）")
+    text = md_export_svc.build_markdown(m, rows)
+    return Response(
+        content=text.encode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename*=utf-8''"
+                 + __import__("urllib.parse", fromlist=["quote"]).quote(
+                     md_export_svc.export_filename(m))},
     )
 
 

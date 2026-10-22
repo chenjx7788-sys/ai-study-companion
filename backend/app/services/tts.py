@@ -499,7 +499,12 @@ def preview(voice_id: str, rate: str = "+0%", provider: str = DEFAULT_PROVIDER,
     复用 _synth_one_cached 的多重重试 —— edge-tts 会间歇性抽风，试听同样需要。
     """
     if voice_id not in VOICE_IDS:
-        raise ValueError(f"未知音色：{voice_id}")
+        # ZipVoice 音色（zv:*）不在 edge 内置目录里：按 zipvoice 音色表校验，
+        # 否则试听入口会把全部本地音色误判为「未知音色」（2026-10-20 坐实）。
+        from . import zipvoice as zv
+        if not (zv.is_zv_voice(voice_id)
+                and any(v["id"] == voice_id for v in zv.list_voices())):
+            raise ValueError(f"未知音色：{voice_id}")
 
     text = preview_text(voice_id)
     key = hashlib.md5(f"{voice_id}|{rate}|{text}".encode("utf-8")).hexdigest()[:10]
@@ -508,5 +513,8 @@ def preview(voice_id: str, rate: str = "+0%", provider: str = DEFAULT_PROVIDER,
         cache_path.mkdir(parents=True, exist_ok=True)
 
     sem = asyncio.Semaphore(1)
+    # ⚠️ zv 音色 id 含 ":"（NTFS 的 ADS 分隔符）→ 缓存文件名必须先清洗，
+    #    否则写缓存抛 OSError 被静默吞掉，试听每次都重新合成。
+    safe_voice = voice_id.replace(":", "_")
     return asyncio.run(_synth_one_cached(
-        text, voice_id, rate, provider, sem, cache_path, f"{voice_id}-{key}.mp3"))
+        text, voice_id, rate, provider, sem, cache_path, f"{safe_voice}-{key}.mp3"))

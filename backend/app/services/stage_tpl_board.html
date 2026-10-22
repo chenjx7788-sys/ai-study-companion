@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<style>
+  /* ==========================================================================
+     板书 · 粉笔（2026-10-20 立，2026-10-21 按自测结论重做翻页/字幕/护栏）
+     数据由 stage.py 注入：__NAV__ + __SLIDES__（ppt_slides 单一口径，与 PPT 课件同源）
+     —— 分页与页标题**在后端算**，模板只负责画。
+
+     画面语义（全部由数据驱动，无随机）：
+       1) 页 = 一板。页标题先写（页首起 380ms 后），条目按各自的 at 逐行写上黑板
+          —— at 是「这句话被说出口的时刻」，书写与讲解天然同步；
+          但**第一条的落笔不早于标题写完**（LINE_MIN_DELAY），否则标题会「自己长出来」。
+       2) 条目 kind：concept=粉笔白；good=黄色 + 写完画圈；cost=暖橙 + 写完下划线。
+       3) 粉笔头跟着正在书写的前缘走（**标题优先**，见 render）；激光点停在最后写完的行。
+       4) 刻意**没有**封面/片头：第 0 帧就在写标题。
+
+     ⚠️⚠️ 全部动效必须是 `ms → 状态` 的纯函数（只写在 render(ms) 里）。
+        合成器时钟不可 seek，任何交给 CSS 自己跑的动效都会让
+        「拖进度条看到的」与「成片里的」不是同一个画面。
+     ⚠️ 帧预算：render(ms) p99 必须 <60ms —— 节点缓存、写完就停手（settled）、
+        进度条走 scaleX，与 PPT 模板同一套纪律。
+     ⚠️ 字体只用 Windows 自带的楷体/华文楷体/华文新魏：打包目标全是 Windows。
+     ========================================================================== */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; }
+  body {
+    font-family: "KaiTi", "楷体", "STKaiti", "华文楷体", serif;
+    background: #0e1713; color: #f4f1e4;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  }
+  :root {
+    --chalk: #f4f1e4;
+    --dim: #cfd3c2;
+    --good: #ffd25e;
+    --cost: #ff9d7e;
+    --laser: #ff5147;
+  }
+
+  #stage { position: relative; width: 1920px; height: 1080px;
+           background: radial-gradient(ellipse 120% 100% at 50% 42%,
+             #31453c 0%, #22312a 46%, #15211b 78%, #0e1713 100%); }
+  /* 粉笔噪点 + 四角压暗（程序化纹理，零资产） */
+  #grain { position: absolute; inset: 0; opacity: .05; pointer-events: none;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/></filter><rect width='240' height='240' filter='url(%23n)'/></svg>"); }
+  #vig { position: absolute; inset: 0; pointer-events: none;
+         background: radial-gradient(ellipse 105% 90% at 50% 46%,
+           transparent 58%, rgba(0, 0, 0, .42) 100%); }
+
+  /* 一页 = 一板。**两套页层**用于翻页交叉淡入（旧页淡出期间新页已就位，
+     而新页前 380ms 是空的 → 不存在新旧文字叠影）。
+     ⚠️ 黑板底色在 #stage 上、页层里只有粉笔字 → 「淡到 0」= 一块干净黑板。 */
+  .pl { position: absolute; inset: 0; opacity: 0; }
+  .ptitle { position: absolute; top: 96px; left: 0; right: 0; text-align: center;
+            font-family: "STXinwei", "华文新魏", "KaiTi", serif;
+            font-size: 84px; letter-spacing: 10px; color: var(--chalk);
+            text-shadow: 0 0 2px rgba(244, 241, 228, .5); }
+  .ptitle .tx { display: inline-block; clip-path: inset(0 100% 0 0); }
+
+  .lines { position: absolute; left: 290px; right: 290px; top: 292px; }
+  .ln { text-align: left; }
+  .ln .tx { display: inline-block; clip-path: inset(0 100% 0 0);
+            letter-spacing: 3px; color: var(--chalk);
+            text-shadow: 0 0 1px rgba(244, 241, 228, .35); }
+  .ln.good .tx { color: var(--good); }
+  .ln.cost .tx { color: var(--cost); }
+
+  /* 圈画层：椭圆 / 下划线（pathLength=100 描边驱动） */
+  .marks { position: absolute; inset: 0; pointer-events: none; }
+  .mark { fill: none; stroke: var(--good); stroke-width: 6; stroke-linecap: round;
+          filter: drop-shadow(0 0 3px rgba(255, 210, 94, .35)); }
+  .mark.cost { stroke: var(--cost);
+               filter: drop-shadow(0 0 3px rgba(255, 157, 126, .35)); }
+
+  /* 整屏图板（sketch）：笔画在 SVG 里按 dash 一笔一笔长出来，标签是 HTML span
+     （clip-path 擦写，与 .tx 同一套机制）。
+     ⚠️ 标签**不用** SVG <text>：SVG 元素的 clip-path 百分比 inset 解析基准
+        与 HTML 不一样，擦写会整体闪/不生效；span 是已经验证过的路径。 */
+  .figure { position: absolute; inset: 0; pointer-events: none; }
+  .figure .sk { fill: none; stroke: var(--chalk); stroke-width: 6;
+                stroke-linecap: round; stroke-linejoin: round;
+                filter: drop-shadow(0 0 2px rgba(244, 241, 228, .28)); }
+  .figlabels { position: absolute; inset: 0; pointer-events: none; }
+  .figlabels .skl { position: absolute; white-space: nowrap;
+                    letter-spacing: 2px; color: var(--chalk);
+                    clip-path: inset(0 100% 0 0);
+                    text-shadow: 0 0 1px rgba(244, 241, 228, .35); }
+  .figlabels .skl.head { color: var(--good); }
+
+  /* 粉笔头 / 激光点 */
+  #pen { position: absolute; width: 14px; height: 14px; border-radius: 50%;
+         background: #fff; box-shadow: 0 0 10px 3px rgba(255, 255, 255, .55);
+         opacity: 0; pointer-events: none; }
+  #laser { position: absolute; width: 20px; height: 20px; border-radius: 50%;
+           background: radial-gradient(circle, #ff6b5e 0%, #ff3b2d 45%,
+             rgba(255, 59, 45, 0) 72%);
+           box-shadow: 0 0 22px 8px rgba(255, 59, 45, .38);
+           opacity: 0; pointer-events: none; }
+
+  /* 字幕条：26px 基准（主模板 .subbar 同规格）。
+     ⚠️ 板书是**单行胶囊**（主模板是全宽换行），超宽必须由 JS 缩字号收进来：
+        实测作品 13 有 7/18 句自然宽 >1492px、最长 1805px —— 不改就是文字冲出胶囊
+        甚至顶出 1920 画幅（成片丢字）。见 fitSub()。 */
+  #sub { position: absolute; left: 50%; bottom: 46px; transform: translateX(-50%);
+         max-width: 1560px; padding: 12px 34px; border-radius: 13px;
+         background: rgba(6, 10, 8, .55); border: 1px solid rgba(244, 241, 228, .15);
+         font-size: 26px; letter-spacing: 1.5px; color: var(--chalk);
+         white-space: nowrap; opacity: 0; }
+  /* 极长句（缩到 20px 仍装不下，实测数据里没有）才折行。
+     ⚠️ 折行会往上长，所以同时把胶囊压到更低处（bottom 46→20）：两行 20px 时
+        顶边约 976，仍在条目区视觉底边硬上限（962）之下，不会压到最后一条的圈画。 */
+  #sub.wrap { white-space: normal; text-align: center; line-height: 1.45; bottom: 20px; }
+
+  /* 底部进度：scaleX 走合成器 */
+  #prog { position: absolute; left: 0; bottom: 0; width: 100%; height: 4px;
+          background: rgba(244, 241, 228, .08); }
+  #progFill { width: 100%; height: 100%; transform-origin: left center;
+              transform: scaleX(0);
+              background: linear-gradient(90deg,
+                rgba(255, 210, 94, .55), rgba(255, 210, 94, .9)); }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="grain"></div>
+  <!-- 两套页层：当前页持有 id（对探针/历史断言稳定），另一层只在交叉淡入时承载旧页 -->
+  <div class="pl" id="page">
+    <div class="ptitle" id="ptitle"><span class="tx"></span></div>
+    <div class="lines" id="lines"></div>
+    <svg class="figure" viewBox="0 0 1920 1080"></svg>
+    <div class="figlabels"></div>
+    <svg class="marks" id="marks" viewBox="0 0 1920 1080"></svg>
+  </div>
+  <div class="pl">
+    <div class="ptitle"><span class="tx"></span></div>
+    <div class="lines"></div>
+    <svg class="figure" viewBox="0 0 1920 1080"></svg>
+    <div class="figlabels"></div>
+    <svg class="marks" viewBox="0 0 1920 1080"></svg>
+  </div>
+  <div id="vig"></div>
+  <div id="pen"></div>
+  <div id="laser"></div>
+  <div id="sub"></div>
+  <div id="prog"><div id="progFill"></div></div>
+</div>
+
+<script>
+/* NAV=[{no,title,a,b}] · SLIDES=[{no,total,shot,title,a,b,els:[{at,t,k}]}]
+   SEGS=[{s,t,a,b}] 讲稿句（毫秒） · TOTAL=全片毫秒 */
+const NAV = __NAV__;
+const SLIDES = __SLIDES__;
+const SEGS = __SEGS__;
+const TOTAL = __TOTAL__;
+
+const FADE = 380;          /* 交叉淡入/淡出时长（与 TITLE_D 相等：淡完正好开始写字） */
+const TITLE_D = 380;       /* 页首 → 开始写标题（≥FADE：不在半透明的板上起笔） */
+const TITLE_MS = 1100;     /* 标题书写时长 */
+const MARK_MS = 600;       /* 圈/下划线描边时长 */
+const MARK_GAP = 80;       /* 写完 → 起笔圈画之间的停顿（让「写完」被看见） */
+/* ⚠️⚠️ 条目书写排布（2026-10-21，修自测 B2「标题自己长出来」）：
+   实测作品 13 的 14 页里，首条 `at` **全部等于页起点**（points 从镜头开头编号），
+   旧模板的标题窗 [a+80, a+1180] 与首条必重叠 → 14/14 页都是「标题在写、粉笔头在第一条」。
+   所以整页书写排布要后移到「标题写完」之后：
+     · 首条 at 已晚于标题写完 → 原样不动；
+     · 首条 at 早于标题写完 → 整页平移；平移后末行若越过页尾余量，
+       按同一比例**压缩**书写节奏（等比缩放 ⇒ 先后次序与「互不重叠」都不变）。
+   代价：每页第一条晚至 1.48s 出现；语义上更像老师：先写标题，再写要点。 */
+const LINE_MIN_DELAY = TITLE_D + TITLE_MS;
+const PAGE_TAIL = 200;     /* 末行必须写完在页尾前 200ms */
+const DUR_MIN = 420, DUR_MAX = 1600, DUR_R = 0.55;   /* 书写时长 = 到下一行间隔的 55% */
+const TITLE_FS = 84;       /* 标题基准字号（超宽逐档收，见 paint） */
+const TITLE_MAXW = 1700;   /* 标题宽度上限（#ptitle 全宽 1920，两侧各留 110） */
+const LINE_MAXW = 1340;    /* 条目宽度上限（与 .lines 的 left/right:290 一致） */
+const LINES_BOTTOM = 962;  /* 条目区**视觉**底边硬上限（含圈画的溢出；单行字幕顶边 ≈977） */
+const MARK_PAD = 22;       /* 圈/下划线相对文字矩形的最大外扩（椭圆 ry+12 + 描边） */
+const SUB_MAXW = 1492;     /* 字幕可用文字宽（1560 − 左右 padding 34×2） */
+const SUB_FS = 26;         /* 字幕基准字号（主模板同规格，别调小） */
+const NS = 'http://www.w3.org/2000/svg';
+
+const penEl = document.getElementById('pen');
+const laserEl = document.getElementById('laser');
+const subEl = document.getElementById('sub');
+const progFill = document.getElementById('progFill');
+
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const ease = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+
+/* ---------- 两套页层 ----------
+   ⚠️ `#page/#ptitle/#lines/#marks` 这四个 id 跟着「当前页」换到对应图层上：
+      探针与历史断言都按这些 id 读当前页，双图层不能出现两个同 id
+      （querySelector 会取到正在淡出的旧页）。样式一律按 class 写 → 换 id 无副作用。 */
+const layers = Array.prototype.map.call(document.querySelectorAll('.pl'), (root) => {
+  const pt = root.querySelector('.ptitle');
+  return {
+    root, pt,
+    tx: pt.querySelector('.tx'),
+    lines: root.querySelector('.lines'),
+    marks: root.querySelector('.marks'),
+    figure: root.querySelector('.figure'),
+    flabels: root.querySelector('.figlabels'),
+    page: null, no: null,
+  };
+});
+let activeIdx = -1;
+function setActive(i) {
+  if (i === activeIdx) return;
+  activeIdx = i;
+  layers.forEach((ly, k) => {
+    const on = k === i;
+    ly.root.id = on ? 'page' : '';
+    ly.pt.id = on ? 'ptitle' : '';
+    ly.lines.id = on ? 'lines' : '';
+    ly.marks.id = on ? 'marks' : '';
+  });
+}
+
+/* ---------- 页查找：页边界首尾相接（ppt_slides 保证），线性扫即可（页数 ≤30） ---------- */
+function slideIndexAt(ms) {
+  let k = 0;
+  for (let i = 0; i < SLIDES.length; i++) if (ms >= SLIDES[i].a) k = i;
+  return k;
+}
+
+/* ---------- 建一页：DOM + 一次性测量 + 圈画元素 ---------- */
+function fontFor(n) {
+  return n <= 4 ? 56 : n === 5 ? 52 : n === 6 ? 48 : n === 7 ? 44 : 40;
+}
+
+function mkEllipse(rect, cls) {
+  const el = document.createElementNS(NS, 'ellipse');
+  const cx = rect.x + rect.w / 2, cy = rect.y + rect.h / 2;
+  el.setAttribute('cx', cx); el.setAttribute('cy', cy);
+  el.setAttribute('rx', rect.w / 2 + 16); el.setAttribute('ry', rect.h / 2 + 12);
+  el.setAttribute('transform', 'rotate(-2 ' + cx + ' ' + cy + ')');
+  el.setAttribute('class', cls);
+  el.setAttribute('pathLength', '100');
+  el.setAttribute('stroke-dasharray', '100');
+  el.setAttribute('stroke-dashoffset', '100');
+  return el;
+}
+
+function mkUnderline(rect, cls) {
+  const el = document.createElementNS(NS, 'path');
+  const y = rect.y + rect.h + 8;
+  el.setAttribute('d', 'M ' + (rect.x - 8) + ' ' + y +
+    ' Q ' + (rect.x + rect.w / 2) + ' ' + (y + 10) + ' ' + (rect.x + rect.w + 8) + ' ' + (y - 3));
+  el.setAttribute('class', cls);
+  el.setAttribute('pathLength', '100');
+  el.setAttribute('stroke-dasharray', '100');
+  el.setAttribute('stroke-dashoffset', '100');
+  return el;
+}
+
+function rectOf(el) {
+  const r = el.getBoundingClientRect();
+  return { x: r.left, y: r.top, w: r.width, h: r.height,
+           cx: r.left + r.width / 2, cy: r.top + r.height / 2,
+           right: r.right, bottom: r.bottom };
+}
+
+/* =========================================================================
+   整屏图板（sketch）—— 2026-10-21
+   ─────────────────────────────────────────────────────────────────────────
+   一张图 = 一板（后端 ppt_slides(with_sketch=True) 把带 sketch 的要点摘出来独占一页）。
+   四个原语：flow（流程链）/ compare（左右对比）/ quadrant（两维象限）/ pyramid（层级）。
+   每个原语只吐**笔画 + 标签**，坐标全在这里算 —— 模型只给类型与词，不给几何。
+
+   ⚠️⚠️ 三条纪律，违反就是「看着能动、成片是坏的」：
+     ① 手绘抖动必须**建笔画时一次算定**（整数 hash 伪随机）。
+        用随机数或每帧抖 → 拖进度条看到的图和成片里的不是同一张，
+        而且 render(ms) 就不再是纯函数。
+     ② 笔序即时间序：一笔画完再下一笔，标签紧跟在它所属的那一笔之后擦写 ——
+        同一时刻**只能有一支笔**（与条目书写同一约定）。
+     ③ 笔画用 pathLength=100 + stroke-dashoffset 驱动（与 .mark 同机制）；
+        粉笔头位置靠 getPointAtLength，**只在该笔画书写中的帧**调用（测量开销）。
+   ========================================================================= */
+const FIG_X = 140, FIG_Y = 250, FIG_W = 1640, FIG_H = 690;
+const FIG_CX = FIG_X + FIG_W / 2, FIG_CY = FIG_Y + FIG_H / 2;
+const STROKE_MIN = 160, STROKE_MAX = 620;   /* 单笔书写时长（越界就压缩整页节奏） */
+const LABEL_MIN = 150, LABEL_MAX = 320;     /* 单个标签擦写时长 */
+const FIG_BUDGET = 0.92;                    /* 整张图必须画在「页时长 × 该值」以内 */
+
+const r1 = v => Math.round(v * 10) / 10;
+
+/* 确定性伪随机：同 seed 永远同值（跨帧、跨进程、跨 seek 都一样） */
+function jh(n) {
+  n = n | 0;
+  n = (n ^ 61) ^ (n >>> 16); n = (n + (n << 3)) | 0;
+  n = n ^ (n >>> 4); n = Math.imul(n, 0x27d4eb2d); n = n ^ (n >>> 15);
+  return (n >>> 0) / 4294967295;
+}
+function jit(seed, amp) { return (jh(seed * 7919 + 13) - 0.5) * 2 * amp; }
+
+/* 手绘直线：沿法向做一次 S 形摆动（两个控制点反向偏）——
+   单段 Q（中点外推）在长线上会像「弯香蕉」，S 形更像粉笔快速划过。 */
+function L(x1, y1, x2, y2, seed, bow) {
+  const b = bow === undefined ? 4 : bow;
+  const dx = x2 - x1, dy = y2 - y1;
+  const len = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+  const ux = -dy / len, uy = dx / len;              /* 法向单位向量 */
+  const c1 = jit(seed + 11, b) - b * 0.32;
+  const c2 = jit(seed + 23, b) + b * 0.32;
+  return 'M' + r1(x1) + ' ' + r1(y1) +
+    ' C' + r1(x1 + dx * 0.34 + ux * c1) + ' ' + r1(y1 + dy * 0.34 + uy * c1) +
+    ' ' + r1(x1 + dx * 0.68 + ux * c2) + ' ' + r1(y1 + dy * 0.68 + uy * c2) +
+    ' ' + r1(x2) + ' ' + r1(y2);
+}
+
+/* 箭头 = 线 + 两条回头笔（合成一条 path ⇒ 一笔画完，笔序天然连续） */
+function ARR(x1, y1, x2, y2, seed) {
+  const a = Math.atan2(y2 - y1, x2 - x1), hl = 26, ha = 0.42;
+  const ax = x2 - hl * Math.cos(a - ha), ay = y2 - hl * Math.sin(a - ha);
+  const bx = x2 - hl * Math.cos(a + ha), by = y2 - hl * Math.sin(a + ha);
+  return L(x1, y1, x2, y2, seed) +
+    ' M' + r1(x2) + ' ' + r1(y2) + ' L' + r1(ax) + ' ' + r1(ay) +
+    ' M' + r1(x2) + ' ' + r1(y2) + ' L' + r1(bx) + ' ' + r1(by);
+}
+
+/* 手绘椭圆：四段三次贝塞尔，起止点故意错开 4px（像笔没接上） */
+function ELL(cx, cy, rx, ry, seed) {
+  const k = 0.5523;
+  const ax = Math.max(8, rx + jit(seed, rx * 0.07));
+  const ay = Math.max(8, ry + jit(seed + 1, ry * 0.07));
+  const dx = ax * k, dy = ay * k;
+  const ox = jit(seed + 2, 4), oy = jit(seed + 3, 4);
+  return 'M' + r1(cx - ax + ox) + ' ' + r1(cy + oy) +
+    ' C' + r1(cx - ax) + ' ' + r1(cy - dy) + ' ' + r1(cx - dx) + ' ' + r1(cy - ay) +
+    ' ' + r1(cx) + ' ' + r1(cy - ay) +
+    ' C' + r1(cx + dx) + ' ' + r1(cy - ay) + ' ' + r1(cx + ax) + ' ' + r1(cy - dy) +
+    ' ' + r1(cx + ax) + ' ' + r1(cy) +
+    ' C' + r1(cx + ax) + ' ' + r1(cy + dy) + ' ' + r1(cx + dx) + ' ' + r1(cy + ay) +
+    ' ' + r1(cx) + ' ' + r1(cy + ay) +
+    ' C' + r1(cx - dx) + ' ' + r1(cy + ay) + ' ' + r1(cx - ax) + ' ' + r1(cy + dy) +
+    ' ' + r1(cx - ax + ox) + ' ' + r1(cy + oy);
+}
+
+/* 标签字号：按可用宽度反推（汉字约 1.0em + letter-spacing 2px） */
+function fitSize(t, maxW, maxS, minS) {
+  const n = Math.max(1, String(t).length);
+  return Math.max(minS, Math.min(maxS, Math.floor(maxW / (n * 1.14))));
+}
+
+/* ---- 原语：flow（2-4 个节点横向链，节点椭圆 + 箭头） ---- */
+function figFlow(labels) {
+  const n = labels.length, gap = 120, maxW = 360;
+  const nw = Math.min(maxW, (FIG_W - (n - 1) * gap) / n);
+  let x = FIG_X + (FIG_W - (n * nw + (n - 1) * gap)) / 2;
+  const ry = 96, strokes = [], lab = [];
+  for (let i = 0; i < n; i++) {
+    const cx = x + nw / 2;
+    strokes.push(ELL(cx, FIG_CY, nw / 2, ry, 100 + i * 7));
+    lab.push({ x: cx, y: FIG_CY, t: labels[i], after: strokes.length - 1,
+               size: fitSize(labels[i], nw - 46, 46, 24) });
+    if (i + 1 < n) {
+      strokes.push(ARR(cx + nw / 2 + 14, FIG_CY, cx + nw / 2 + gap - 14, FIG_CY, 200 + i * 7));
+      x += nw + gap;
+    }
+  }
+  return { strokes: strokes, labels: lab };
+}
+
+/* ---- 原语：compare（左右各半，每栏首条是栏标题 + 下划线） ---- */
+function figCompare(labels) {
+  const n = labels.length, h = n / 2, strokes = [], lab = [];
+  const colW = FIG_W * 0.38;
+  const step = Math.min(132, (FIG_H - 240) / Math.max(1, h - 1));
+  const ty = FIG_Y + 78;
+  const lastY = FIG_Y + 172 + Math.max(0, h - 2) * step;
+  /* 中线只覆盖**内容区**（标题上方 52 → 最后一条下方 64）。
+     ⚠️ 早先画到 FIG_Y+FIG_H-26 = 914：内容到 554 就结束了，下半屏是一条空竖线
+        一直拖到字幕上方 —— 数字断言全绿，看画面才发现。 */
+  strokes.push(L(FIG_CX, ty - 52, FIG_CX, lastY + 64, 300, 7));
+  for (let c = 0; c < 2; c++) {
+    const cx = FIG_CX + (c ? 1 : -1) * FIG_W * 0.23;
+    strokes.push(L(cx - colW / 2, ty + 34, cx + colW / 2, ty + 34, 400 + c * 13, 5));
+    lab.push({ x: cx, y: ty, t: labels[c * h], after: strokes.length - 1,
+               size: fitSize(labels[c * h], colW, 52, 28), cls: 'head' });
+    for (let i = 1; i < h; i++) {
+      const y = FIG_Y + 172 + (i - 1) * step;
+      strokes.push(L(cx - colW / 2 + 6, y, cx - colW / 2 + 58, y, 500 + c * 17 + i * 5, 3));
+      lab.push({ x: cx - colW / 2 + 78, y: y, t: labels[c * h + i],
+                 after: strokes.length - 1, align: 'left',
+                 size: fitSize(labels[c * h + i], colW - 100, 40, 22) });
+    }
+  }
+  return { strokes: strokes, labels: lab };
+}
+
+/* ---- 原语：quadrant（两条带箭头的轴 + 4 个象限名，顺序 左上/右上/右下/左下） ---- */
+function figQuadrant(labels, xa, ya) {
+  const strokes = [], lab = [];
+  strokes.push(ARR(FIG_CX, FIG_Y + FIG_H - 30, FIG_CX, FIG_Y + 26, 600));   /* 纵轴 */
+  strokes.push(ARR(FIG_CX - FIG_W / 2 + 40, FIG_CY, FIG_CX + FIG_W / 2 - 40, FIG_CY, 700));
+  const pos = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+  for (let i = 0; i < 4; i++) {
+    lab.push({ x: FIG_CX + pos[i][0] * FIG_W * 0.25,
+               y: FIG_CY + pos[i][1] * FIG_H * 0.25,
+               t: labels[i], after: 1,
+               size: fitSize(labels[i], FIG_W / 2 - 110, 46, 24) });
+  }
+  /* 轴名写在轴末端外侧（不旋转：旋转标签的擦写基准会歪）。
+     ⚠️ 字号要跟象限名同一量级（38 vs 46）：早先 32px 且贴着箭头，
+        远看像「箭头旁边的噪点」，读不出这是轴名。 */
+  lab.push({ x: FIG_CX + 40, y: FIG_Y + 108, t: ya, after: 0, size: 38, align: 'left' });
+  lab.push({ x: FIG_CX + FIG_W / 2 - 92, y: FIG_CY - 58, t: xa, after: 1,
+             size: 38, align: 'right' });
+  return { strokes: strokes, labels: lab };
+}
+
+/* ---- 原语：pyramid（三角形轮廓 + n-1 条分隔线，标签自上而下） ---- */
+function figPyramid(labels) {
+  const n = labels.length, half = FIG_W * 0.31;
+  const topY = FIG_Y + 30, botY = FIG_Y + FIG_H - 34;
+  const strokes = [], lab = [];
+  strokes.push(L(FIG_CX, topY, FIG_CX - half, botY, 800, 4));
+  strokes.push(L(FIG_CX, topY, FIG_CX + half, botY, 810, 4));
+  strokes.push(L(FIG_CX - half, botY, FIG_CX + half, botY, 820, 5));
+  const bh = (botY - topY) / n;
+  for (let i = 1; i < n; i++) {
+    const w = half * i / n;
+    strokes.push(L(FIG_CX - w, topY + i * bh, FIG_CX + w, topY + i * bh, 830 + i, 3));
+  }
+  for (let i = 0; i < n; i++) {
+    const y = topY + (i + 0.5) * bh;
+    const w = half * (i + 1) / n * 2;
+    lab.push({ x: FIG_CX, y: y, t: labels[i], after: 2 + i,
+               size: fitSize(labels[i], w - 36, 44, 22) });
+  }
+  return { strokes: strokes, labels: lab };
+}
+
+function buildFigure(s) {
+  const sk = s.sketch || {};
+  const ls = sk.labels || [];
+  if (sk.type === 'flow') return figFlow(ls);
+  if (sk.type === 'compare') return figCompare(ls);
+  if (sk.type === 'quadrant') return figQuadrant(ls, sk.x || '', sk.y || '');
+  if (sk.type === 'pyramid') return figPyramid(ls);
+  return { strokes: [], labels: [] };   /* 未知类型：画空（后端已校验过，这里是兜底） */
+}
+
+/* 建一页的图：DOM + 测量 + 排布（笔序即时间序，标签插在所属笔画之后） */
+function paintFigure(layer, s) {
+  const g = buildFigure(s);
+  layer.figure.innerHTML = '';
+  layer.flabels.innerHTML = '';
+  const strokes = [], labels = [];
+  for (let i = 0; i < g.strokes.length; i++) {
+    const el = document.createElementNS(NS, 'path');
+    el.setAttribute('d', g.strokes[i]);
+    el.setAttribute('class', 'sk');
+    el.setAttribute('pathLength', '100');
+    el.setAttribute('stroke-dasharray', '100');
+    el.setAttribute('stroke-dashoffset', '100');
+    layer.figure.appendChild(el);
+    strokes.push({ el: el, len: el.getTotalLength() || 1 });
+  }
+  for (let i = 0; i < g.labels.length; i++) {
+    const d = g.labels[i];
+    const el = document.createElement('span');
+    el.className = 'skl' + (d.cls ? ' ' + d.cls : '');
+    el.textContent = d.t;
+    el.style.fontSize = d.size + 'px';
+    el.style.left = d.x + 'px';
+    el.style.top = d.y + 'px';
+    el.style.transform = d.align === 'left' ? 'translate(0,-50%)'
+      : d.align === 'right' ? 'translate(-100%,-50%)' : 'translate(-50%,-50%)';
+    layer.flabels.appendChild(el);
+    labels.push({ el: el, after: d.after, at: 0, dur: 1, doneAt: 0 });
+  }
+  return { strokes: strokes, labels: labels };
+}
+
+/* 排布：标题写完后开始画；整张图压进「页时长 × FIG_BUDGET」，越界等比压缩。
+   ⚠️⚠️ 时刻必须**从上一件的末刻往后推**（at = 上一件 doneAt），不能各自 round：
+      `round(at)` 配 `round(dur)` 会造出 1ms 的重叠 —— 实测探针 A3 抓到 -1ms。
+      而「同一时刻只有一支笔」是硬约束，差 1ms 也意味着两个东西同时在长。 */
+function planFigure(F, s) {
+  const base = s.a + LINE_MIN_DELAY;
+  const room = Math.max(700, s.b - PAGE_TAIL - base);
+  const nS = F.strokes.length, nL = F.labels.length;
+  const avail = room * FIG_BUDGET;
+  const sd = Math.min(STROKE_MAX, Math.max(STROKE_MIN, avail * 0.66 / Math.max(1, nS)));
+  const ld = Math.min(LABEL_MAX, Math.max(LABEL_MIN, avail * 0.30 / Math.max(1, nL)));
+
+  /* ① 先排顺序表：签名为 -1 的标签 → 每笔画 + 挂在它后面的标签 */
+  const seq = [];
+  for (let j = 0; j < nL; j++) if (F.labels[j].after === -1) seq.push({ k: 'l', i: j, d: ld });
+  for (let i = 0; i < nS; i++) {
+    seq.push({ k: 's', i: i, d: sd });
+    for (let j = 0; j < nL; j++) if (F.labels[j].after === i) seq.push({ k: 'l', i: j, d: ld });
+  }
+  const rawTotal = seq.reduce((a, e) => a + e.d, 0);
+  const limit = s.b - 120;
+  const k = base + rawTotal > limit
+    ? Math.max(0.35, (limit - base) / Math.max(1, rawTotal)) : 1;
+
+  /* ② 整数量化：at = 上一件末刻 ⇒ 区间首尾相接，天然不重叠 */
+  let t = base;
+  for (let i = 0; i < seq.length; i++) {
+    const e = seq[i];
+    const at = t, dur = Math.max(120, Math.round(e.d * k));
+    t = at + dur;
+    const tgt = e.k === 's' ? F.strokes[e.i] : F.labels[e.i];
+    tgt.at = at; tgt.dur = dur; tgt.doneAt = t;
+  }
+  F.allDone = t;
+  F.type = (s.sketch || {}).type || '';
+  /* 激光点：整张图画完后停在最后一笔的终点（缓存下来，别每帧测） */
+  const lastS = F.strokes.length ? F.strokes[F.strokes.length - 1] : null;
+  if (lastS) {
+    const p = lastS.el.getPointAtLength(lastS.len);
+    F.laserPt = { x: p.x + 34, y: p.y };
+  }
+  return F;
+}
+
+/* 画一页的图在某个时刻的状态（纯函数）；返回粉笔头位置或 null */
+function drawFigure(F, ms) {
+  let pen = null;
+  for (let i = 0; i < F.strokes.length; i++) {
+    const S0 = F.strokes[i];
+    const p = clamp((ms - S0.at) / S0.dur, 0, 1);
+    S0.el.setAttribute('stroke-dashoffset', (100 * (1 - p)).toFixed(2));
+    if (p > 0 && p < 1) {
+      const pt = S0.el.getPointAtLength(p * S0.len);
+      pen = { x: pt.x, y: pt.y };          /* 只在这一笔书写中才测量 */
+    }
+  }
+  for (let i = 0; i < F.labels.length; i++) {
+    const L0 = F.labels[i];
+    const p = clamp((ms - L0.at) / L0.dur, 0, 1);
+    L0.el.style.clipPath = 'inset(0 ' + ((1 - p) * 100).toFixed(2) + '% 0 0)';
+  }
+  return pen;
+}
+
+/* 收尾置终态（settled 之后不再逐帧写） */
+function settleFigure(F) {
+  for (let i = 0; i < F.strokes.length; i++) F.strokes[i].el.setAttribute('stroke-dashoffset', '0');
+  for (let i = 0; i < F.labels.length; i++) F.labels[i].el.style.clipPath = 'inset(0 0% 0 0)';
+}
+
+/* 条目字号/行距/间距一次写到节点上（降档时整组重写） */
+function applyMetrics(nodes, fs) {
+  const lh = Math.round(fs * 1.8);
+  const gap = Math.round(fs * 0.55);
+  for (let i = 0; i < nodes.length; i++) {
+    const ln = nodes[i].ln;
+    ln.style.fontSize = fs + 'px';
+    ln.style.lineHeight = lh + 'px';
+    ln.style.marginBottom = (i === nodes.length - 1 ? 0 : gap) + 'px';
+  }
+}
+
+function paint(layer, s) {
+  const titleTx = layer.tx, linesBox = layer.lines, marksSvg = layer.marks;
+
+  /* 标题：超宽逐档收（LLM 标题无长度上限；折行会让圆圈变成包两行的怪形） */
+  titleTx.textContent = s.title || '';
+  titleTx.style.clipPath = 'inset(0 100% 0 0)';
+  layer.pt.style.fontSize = TITLE_FS + 'px';
+  let tw = titleTx.getBoundingClientRect().width;
+  for (let fs = TITLE_FS; tw > TITLE_MAXW && fs > 56; ) {
+    fs -= 4;
+    layer.pt.style.fontSize = fs + 'px';
+    tw = titleTx.getBoundingClientRect().width;
+  }
+
+  /* 条目：字号按条数定档 */
+  linesBox.innerHTML = '';
+  marksSvg.innerHTML = '';
+  /* ⚠️⚠️ 图板 DOM 必须**每页都清**：两块页层是交替复用的，上一张图画完之后，
+     若在普通页上不清理，那张画满的旧图会留在底层当「幽灵底影」。
+     按页截图的探针看不见它（只截了图板页），只有「图板页之后紧跟普通页」才暴露。 */
+  layer.figure.innerHTML = '';
+  layer.flabels.innerHTML = '';
+  const els = s.els || [];
+  const n = els.length;
+  let fs = fontFor(n);
+  const nodes = [];
+  for (let i = 0; i < n; i++) {
+    const e = els[i];
+    const ln = document.createElement('div');
+    ln.className = 'ln ' + (e.k === 'good' ? 'good' : e.k === 'cost' ? 'cost' : '');
+    const tx = document.createElement('span');
+    tx.className = 'tx';
+    tx.textContent = e.t;
+    ln.appendChild(tx);
+    linesBox.appendChild(ln);
+    nodes.push({ e, ln, tx });
+  }
+  applyMetrics(nodes, fs);
+
+  /* 纵向护栏：条目区的**视觉**底边（文字 + 圈画外扩）不许越过字幕区，最低降到 30px。
+       PPT_PER_PAGE=6 时正常数据 6 条页文字底边 938、圈画到 958 → 不触发；
+       这是给「行高/条数以后被调大」留的锁，不是给现状调参用的。 */
+  for (let guard = 0; guard < 14; guard++) {
+    if (!nodes.length) break;
+    if (linesBox.getBoundingClientRect().bottom + MARK_PAD <= LINES_BOTTOM) break;
+    if (fs <= 30) break;
+    fs -= 2;
+    applyMetrics(nodes, fs);
+  }
+
+  const out = { no: s.no, a: s.a, b: s.b, settled: false, lines: [] };
+  out.titleRect = rectOf(titleTx);
+  out.circleAt = s.a + TITLE_D + TITLE_MS + 120;
+  out.titleMark = mkEllipse(out.titleRect, 'mark');
+  marksSvg.appendChild(out.titleMark);
+
+  let allDone = out.circleAt + MARK_MS;
+
+  /* ---- 页内书写排布：先按讲稿时刻算原始节奏，再整体后移/压缩到「标题写完 → 页尾」 ---- */
+  const base = s.a + LINE_MIN_DELAY;          /* 最早允许落笔的时刻 */
+  const raw = [];
+  for (let i = 0; i < nodes.length; i++) {
+    const at = +nodes[i].e.at;
+    const nextAt = i + 1 < nodes.length ? +nodes[i + 1].e.at : s.b;
+    raw.push({ at, dur: clamp((nextAt - at) * DUR_R, DUR_MIN, DUR_MAX) });
+  }
+  const rawStart = raw.length ? raw[0].at : base;
+  const rawEnd = raw.length ? raw[raw.length - 1].at + raw[raw.length - 1].dur : base;
+  let k = 1, off = 0;
+  if (rawStart < base) {
+    off = base - rawStart;
+    const limit = s.b - PAGE_TAIL;
+    if (rawEnd + off > limit) {
+      /* 平移后越过页尾 → 等比压缩书写节奏（次序与「不重叠」在缩放后仍然成立） */
+      k = Math.min(1, Math.max(0.45, (limit - base) / Math.max(1, rawEnd - rawStart)));
+    }
+  }
+  const startOf = (i) => (rawStart >= base ? raw[i].at : base + (raw[i].at - rawStart) * k);
+
+  for (let i = 0; i < nodes.length; i++) {
+    const { e, ln, tx } = nodes[i];
+    let r = rectOf(tx);
+    if (r.w > LINE_MAXW) {
+      const shrink = Math.max(30, Math.floor(fs * LINE_MAXW / r.w));
+      ln.style.fontSize = shrink + 'px';
+      r = rectOf(tx);
+    }
+    const startAt = Math.round(startOf(i));
+    const dur = Math.max(240, Math.round(raw[i].dur * (rawStart >= base ? 1 : k)));
+    const doneAt = startAt + dur;
+    const rec = { tx, rect: r, at: startAt, speakAt: +e.at, dur, doneAt,
+                  mark: null, markAt: 0 };
+    if (e.k === 'good' || e.k === 'cost') {
+      rec.markAt = doneAt + MARK_GAP;
+      rec.mark = e.k === 'good' ? mkEllipse(r, 'mark') : mkUnderline(r, 'mark cost');
+      marksSvg.appendChild(rec.mark);
+      if (rec.markAt + MARK_MS > allDone) allDone = rec.markAt + MARK_MS;
+    }
+    if (doneAt > allDone) allDone = doneAt;
+    out.lines.push(rec);
+  }
+
+  /* 整屏图板页：`els` 为空（后端把该要点摘成图板页了），画图而不是写条目。
+     ⚠️ 图板页的标题仍然先写（它是这张图的题），图从「标题写完」开始画。 */
+  if (s.sketch) {
+    out.fig = planFigure(paintFigure(layer, s), s);
+    if (out.fig.allDone > allDone) allDone = out.fig.allDone;
+  }
+  out.allDone = allDone;
+  return out;
+}
+
+/* ---------- 画一页在某个时刻的状态（纯函数） ----------
+   ⚠️ 复位的理由与 PPT 模板同一份：seek 回退到书写中段必须回到中间态，
+      所以 `ms < allDone` 时先清 settled，再逐项写。 */
+function drawPage(layer, P, ms) {
+  const titleTx = layer.tx;
+  let penTitle = null, penLine = null, laserLine = null, laserPt = null;
+  if (!P) return { penTitle, penLine, laserLine, laserPt };
+  if (ms <= P.allDone || !P.settled) {
+    const tp = clamp((ms - (P.a + TITLE_D)) / TITLE_MS, 0, 1);
+    titleTx.style.clipPath = 'inset(0 ' + ((1 - tp) * 100).toFixed(2) + '% 0 0)';
+    if (tp > 0 && tp < 1) {
+      penTitle = { x: P.titleRect.x + tp * P.titleRect.w, y: P.titleRect.cy };
+    }
+    const cp = clamp((ms - P.circleAt) / MARK_MS, 0, 1);
+    P.titleMark.setAttribute('stroke-dashoffset', (100 * (1 - cp)).toFixed(2));
+
+    for (let i = 0; i < P.lines.length; i++) {
+      const L = P.lines[i];
+      const p = clamp((ms - L.at) / L.dur, 0, 1);
+      L.tx.style.clipPath = 'inset(0 ' + ((1 - p) * 100).toFixed(2) + '% 0 0)';
+      if (p > 0 && p < 1) penLine = { x: L.rect.x + p * L.rect.w, y: L.rect.cy };
+      if (p >= 1) laserLine = L;
+      if (L.mark) {
+        const mp = clamp((ms - L.markAt) / MARK_MS, 0, 1);
+        L.mark.setAttribute('stroke-dashoffset', (100 * (1 - mp)).toFixed(2));
+      }
+    }
+    if (P.fig) {
+      /* 图板页没有条目 → 粉笔头挂在笔画端点上，复用 penLine 这条通路 */
+      const fp = drawFigure(P.fig, ms);
+      if (fp) penLine = fp;
+    }
+    if (ms > P.allDone) {
+      /* 收尾：置终态一次，之后不再逐帧写 */
+      titleTx.style.clipPath = 'inset(0 0% 0 0)';
+      P.titleMark.setAttribute('stroke-dashoffset', '0');
+      for (let i = 0; i < P.lines.length; i++) {
+        const L = P.lines[i];
+        L.tx.style.clipPath = 'inset(0 0% 0 0)';
+        if (L.mark) L.mark.setAttribute('stroke-dashoffset', '0');
+      }
+      if (P.fig) settleFigure(P.fig);
+      P.settled = true;
+    }
+  } else {
+    if (P.lines.length) laserLine = P.lines[P.lines.length - 1];
+    else if (P.fig && P.fig.laserPt) laserPt = P.fig.laserPt;
+  }
+  return { penTitle, penLine, laserLine, laserPt };
+}
+
+/* ---------- 字幕：句指针，跨句空隙保留上一句（与主模板口径一致） ---------- */
+let segIdx = 0;
+function segAt(ms) {
+  while (segIdx < SEGS.length - 1 && ms >= SEGS[segIdx + 1].a) segIdx++;
+  while (segIdx > 0 && ms < SEGS[segIdx].a) segIdx--;
+  if (!SEGS.length || ms < SEGS[0].a) return null;
+  return SEGS[segIdx];
+}
+
+/* 字幕自适应：单行装不下就缩字号（最低 20px），仍装不下才折行 */
+function fitSub(txt) {
+  subEl.classList.remove('wrap');
+  subEl.style.fontSize = SUB_FS + 'px';
+  subEl.textContent = txt;
+  if (!txt) return;
+  let w = subEl.scrollWidth - 68;
+  for (let fs = SUB_FS; w > SUB_MAXW && fs > 20; ) {
+    fs -= 1;
+    subEl.style.fontSize = fs + 'px';
+    w = subEl.scrollWidth - 68;
+  }
+  if (w > SUB_MAXW) subEl.classList.add('wrap');
+}
+
+/* ---------- render(ms)：唯一的状态真值入口 ----------
+   纪律与 PPT 模板相同：写完就停手（settled），seek 回退必须复位重算。 */
+let laserFrom = null, laserTo = null, laserT0 = 0;
+let lastSub = null;
+
+function render(ms) {
+  const idx = slideIndexAt(ms);
+  const s = SLIDES[idx];
+  const ai = idx % 2, gi = 1 - ai;
+  const A = layers[ai], G = layers[gi];
+  setActive(ai);
+
+  /* 当前页：换页才重建（节点少，重建比逐页常驻省内存也好缓存） */
+  if (A.no !== s.no) { A.page = paint(A, s); A.no = s.no; }
+  const P = A.page;
+  const t = clamp((ms - s.a) / FADE, 0, 1);
+
+  /* 旧页交叉淡出 [a, a+FADE]：此时旧页状态已冻结在它自己的 b（ms ≥ 旧页 b），
+     只画一次、之后只改整层 opacity。新页前 380ms 是空板 → 不会新旧叠影。 */
+  let ghostOp = 0;
+  if (idx > 0 && t < 1) {
+    const ps = SLIDES[idx - 1];
+    if (G.no !== ps.no) { G.page = paint(G, ps); G.no = ps.no; }
+    drawPage(G, G.page, Math.min(ms, ps.b));
+    ghostOp = 1 - t;
+  }
+  G.root.style.opacity = ghostOp ? ghostOp.toFixed(3) : '0';
+
+  /* 末页片尾淡出（自然收黑），其余页淡入到 1 就停 */
+  const isLast = idx === SLIDES.length - 1;
+  const endT = isLast ? clamp((TOTAL - ms) / FADE, 0, 1) : 1;
+  A.root.style.opacity = Math.min(t, endT).toFixed(3);
+
+  const st = drawPage(A, P, ms);
+
+  /* 粉笔头：**标题优先**。即便有了 LINE_MIN_DELAY，标题圈、以及「节内多页中
+     后一页的标题」仍可能与某条书写重叠；两支笔不能同时写在两处 —— 标题是页面的
+     「头」，先写完它，条目此时不带笔（避免「标题自己长出来」的破绽）。 */
+  const pen = st.penTitle || st.penLine;
+  if (pen) {
+    penEl.style.opacity = '1';
+    penEl.style.left = (pen.x - 7) + 'px';
+    penEl.style.top = (pen.y - 7) + 'px';
+  } else penEl.style.opacity = '0';
+
+  /* 激光点：书写时让位给粉笔头；其余时刻停在最后写完的行 / 图板的最后一笔终点
+     （换目标 260ms 平滑） */
+  if (!pen && (st.laserLine || st.laserPt)) {
+    const tx = st.laserPt ? st.laserPt.x : st.laserLine.rect.right + 26;
+    const ty = st.laserPt ? st.laserPt.y : st.laserLine.rect.cy;
+    if (!laserTo || laserTo.x !== tx || laserTo.y !== ty) {
+      laserFrom = laserTo; laserTo = { x: tx, y: ty }; laserT0 = ms;
+    }
+    let x = tx, y = ty;
+    const k = ease((ms - laserT0) / 260);
+    if (laserFrom && k < 1) {
+      x = laserFrom.x + (tx - laserFrom.x) * k;
+      y = laserFrom.y + (ty - laserFrom.y) * k;
+    }
+    laserEl.style.opacity = '0.92';
+    laserEl.style.left = (x - 10) + 'px';
+    laserEl.style.top = (y - 10) + 'px';
+  } else laserEl.style.opacity = '0';
+
+  /* 字幕 */
+  const sg = segAt(ms);
+  const txt = sg ? (sg.t || '') : '';
+  if (txt !== lastSub) {
+    lastSub = txt;
+    fitSub(txt);
+  }
+  subEl.style.opacity = txt ? '1' : '0';
+
+  /* 进度 */
+  progFill.style.transform = 'scaleX(' + clamp(ms / TOTAL, 0, 1).toFixed(4) + ')';
+}
+
+setActive(0);
+render(0);
+
+/* =========================================================================
+   渲染接口（由 renderer.py 通过 page.evaluate 调用）
+   ⚠️ 自驱动时钟用 performance.now() + rAF，**不依赖页面自身音频**。
+   ⚠️ 与 stage_tpl_ppt.html 的接口**逐字段对齐** —— 渲染器不区分皮肤。
+   `consts` 是给探针用的时序真值：判据若自己抄一份常量，改模板后就会假红/假绿。
+   ========================================================================= */
+window.__stage = {
+  total: TOTAL,
+  skin: 'board',
+  inner: '',
+  ms: 0,
+  t0: 0,
+  done: false,
+  running: false,
+  consts: { FADE, TITLE_D, TITLE_MS, MARK_MS, MARK_GAP, TITLE_FS, LINE_MAXW,
+            LINES_BOTTOM, MARK_PAD, SUB_MAXW, SUB_FS, LINE_MIN_DELAY, PAGE_TAIL,
+            DUR_MIN, DUR_MAX, DUR_R,
+            FIG_X, FIG_Y, FIG_W, FIG_H, STROKE_MIN, STROKE_MAX,
+            LABEL_MIN, LABEL_MAX, FIG_BUDGET },
+  data: { nav: NAV, slides: SLIDES, segs: SEGS },
+  /* 当前页的**图板排布真值**（每笔/每标签的起止）—— 与 schedule() 同一纪律：
+     探针不许自己按笔画数抄一遍分配公式，否则模板一调参判据就假红。 */
+  fig: function () {
+    const P = layers[activeIdx] && layers[activeIdx].page;
+    if (!P || !P.fig) return null;
+    const F = P.fig;
+    return {
+      type: F.type, allDone: F.allDone,
+      box: { x: FIG_X, y: FIG_Y, w: FIG_W, h: FIG_H },
+      strokes: F.strokes.map(function (s) {
+        return { at: s.at, dur: s.dur, doneAt: s.doneAt, len: s.len };
+      }),
+      labels: F.labels.map(function (l) {
+        return { at: l.at, dur: l.dur, doneAt: l.doneAt, after: l.after };
+      })
+    };
+  },
+  /* 当前页的**排布真值**（落笔时刻/时长/圈画时刻）——探针用它做断言，
+     不再自己按 at 抄一遍公式：模板一改排布（平移/压缩），判据自动跟住，
+     不会出现「模板改了、判据还按旧的算」那种假红假绿。 */
+  schedule: function () {
+    const P = layers[activeIdx] && layers[activeIdx].page;
+    if (!P) return null;
+    return {
+      no: P.no, a: P.a, b: P.b, allDone: P.allDone,
+      titleAt: P.a + TITLE_D, titleDoneAt: P.a + TITLE_D + TITLE_MS,
+      circleAt: P.circleAt,
+      lines: P.lines.map(function (L) {
+        return { at: L.at, speakAt: L.speakAt, dur: L.dur, doneAt: L.doneAt,
+                 markAt: L.mark ? L.markAt : null };
+      })
+    };
+  },
+  ready: function () {
+    if (document.fonts && document.fonts.status !== 'loaded') return false;
+    return true;
+  },
+  seek: function (ms) { render(ms); window.__stage.ms = ms; },
+  start: function () {
+    const self = window.__stage;
+    self.t0 = performance.now();
+    self.ms = 0; self.done = false; self.running = true;
+    function tick() {
+      if (!self.running) return;
+      const ms = Math.min(TOTAL, performance.now() - self.t0);
+      self.ms = ms;
+      render(ms);
+      if (ms >= TOTAL) { self.done = true; self.running = false; return; }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  },
+  stop: function () { window.__stage.running = false; },
+  state: function () {
+    const self = window.__stage;
+    return { ms: self.ms, t0: self.t0, done: self.done, running: self.running,
+             clock: performance.now() - self.t0 };
+  }
+};
+window.__stage_ready = true;
+</script>
+</body>
+</html>

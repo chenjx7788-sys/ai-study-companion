@@ -20,7 +20,7 @@ FIELDS = ["llm_base_url", "llm_api_key", "summary_model", "chat_model",
           "auto_extract_entities",
           # 笔记检索权重（默认 1.5，检索打分时生效，改动无需重建索引）
           "note_weight",
-          "prompt_summary", "prompt_keywords", "prompt_explain", "prompt_kb_qa", "prompt_general", "prompt_review", "prompt_suggest", "prompt_quiz", "prompt_recall", "prompt_note_rewrite", "prompt_note_expand", "prompt_note_summarize", "prompt_note_continue", "prompt_stats_report", "prompt_learn_note", "prompt_learn_note_conceptual", "prompt_learn_note_practical", "prompt_learn_note_fragment", "prompt_drill_examiner", "prompt_drill_judge", "kb_hit_threshold",
+          "prompt_summary", "prompt_keywords", "prompt_explain", "prompt_kb_qa", "prompt_general", "prompt_review", "prompt_suggest", "prompt_quiz", "prompt_recall", "prompt_note_rewrite", "prompt_note_expand", "prompt_note_summarize", "prompt_note_continue", "prompt_stats_report", "prompt_learn_note", "prompt_learn_note_conceptual", "prompt_learn_note_practical", "prompt_learn_note_fragment", "prompt_learn_note_chapter", "prompt_drill_examiner", "prompt_drill_judge", "kb_hit_threshold",
           "prompt_podcast_brief", "prompt_podcast_script", "prompt_podcast_script_direct",
           # AI 视频（模块 K）：讲稿 / 结构图内容 / 定位锚点
           "prompt_video_script", "prompt_video_points", "prompt_video_anchor",

@@ -15,6 +15,7 @@ audio_name / duration_sec / audio_sig / status，视频调用它等于把视频�
 import asyncio
 import hashlib
 import json
+import os
 import queue
 import re
 import subprocess
@@ -342,39 +343,67 @@ def _audio_abspath(v: Video):
     return svc.video_abspath(v.id, v.audio_name)
 
 
-def _render_ready() -> bool:
-    """渲染器是否可用（阶段 2）。
+def _render_blocker() -> str:
+    """渲染器不可用的原因键："" 可用 / "playwright" / "chromium" / "pyav"。
 
     ⚠️ 光「模块存在」不够：还必须真有 Chromium 可执行文件 + PyAV。
        否则用户点下渲染、等几十秒才收到一句失败 —— 不如在按钮上直接禁用并说明原因
        （PRD 2.2.7：绝不给一个点了注定失败的按钮）。
-    ⚠️ 能力探测（而不是路由里写死开关）：阶段 2 只新增 `services/renderer.py`
-       即可点亮，不必回来改路由与前端契约。
+    ⚠️ playwright 包本身也要探测：0.1.6 及更早的安装包没收它（2026-10-20 查实：
+       requirements.txt 与 spec 的收集名单都没有）—— 老包装上只查 Chromium 会
+       把真因盖掉。
     """
     try:
-        from ..services import renderer
-        if not renderer.find_chromium():
-            return False
-        import av  # noqa: F401
-        return True
+        from ..services import renderer  # noqa: F401
     except BaseException:
-        return False
+        return "playwright"
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+    except BaseException:
+        return "playwright"
+    try:
+        if not renderer.find_chromium():
+            return "chromium"
+    except BaseException:
+        return "chromium"
+    try:
+        import av  # noqa: F401
+    except BaseException:
+        return "pyav"
+    return ""
+
+
+def _render_ready() -> bool:
+    """渲染器是否可用（阶段 2）。能力探测（不是路由写死开关）。"""
+    return _render_blocker() == ""
+
+
+def _render_source() -> str:
+    """当前生效的渲染内核来源（env/app/user/edge/chrome，空=不可用）。排障用。"""
+    try:
+        from ..services import renderer
+        return renderer.find_chromium_ex()[1]
+    except BaseException:
+        return ""
+
+
+def _render_dl_size_mb() -> int:
+    """渲染组件下载体积（前端按钮文案用）。"""
+    try:
+        from ..services import renderenv
+        return renderenv.size_mb()
+    except BaseException:
+        return 170
 
 
 def _render_reason() -> str:
     """渲染器不可用时的原因（可用时返回空串）。前端直接拿去显示。"""
-    try:
-        from ..services import renderer
-    except BaseException as e:
-        return f"渲染器未就绪（{type(e).__name__}）"
-    try:
-        if not renderer.find_chromium():
-            return "找不到可用的 Chromium，无法出片（渲染器需要本机浏览器内核）"
-    except BaseException:
-        return "无法定位 Chromium"
-    try:
-        import av  # noqa: F401
-    except BaseException:
+    b = _render_blocker()
+    if b == "playwright":
+        return "安装包缺少渲染组件（Playwright），请更新到最新版本"
+    if b == "chromium":
+        return "找不到可用的浏览器内核：点下方「下载渲染组件」即可出片"
+    if b == "pyav":
         return "缺少视频编码组件 PyAV，无法出片"
     return ""
 
@@ -484,26 +513,53 @@ def options(db: Session = Depends(get_db)):
         "length_presets": [{"minutes": k, "label": v["label"], "segments": v["segments"]}
                            for k, v in pod_svc.LENGTH_PRESETS.items()],
         "skins": [
-            {"key": "source", "label": "材料原件", "desc": "画面里是你的资料，讲到哪就框住原文哪一处",
+            {"key": "source", "label": "材料原件", "desc": "画面就是你的资料，讲到哪框到哪，适合逐句对照原文",
              "need": "需要材料有文字层或可识别的页图", "group": "info"},
-            {"key": "graph", "label": "结构图", "desc": "结构图逐层展开，右侧要点栏逐条点亮",
-             "need": "任何来源都能做", "group": "info"},
+            # ⚠️⚠️⚠️ "结构图"（graph）已**暂停入口**（2026-10-21，产品决定）
+            #    —— 用户暂时不能再新建 / 改选这个视觉风格
+            #    （与「数字人口播」talking_head、「氛围」ambient 同款处理）。
+            #    渲染链路（stage.py / stage_tpl.html）与已有作品的播放/重新生成全部保留；
+            #    恢复时把下面两行加回本列表，并**同步恢复 precheck 处**
+            #    （在 precheck 的 skins 列表里搜 graph 可见同款注释，两处必须一起动）。
+            #    注：只隐藏 key=graph 这一条；「结构图 · 纸感 / 清透」（graph_paper /
+            #    graph_clean）是独立选项，本次不动。
+            # {"key": "graph", "label": "结构图", "desc": "结构图逐层展开，右侧要点栏逐条点亮",
+            #  "need": "任何来源都能做", "group": "info"},
             {"key": "graph_paper", "label": "结构图 · 纸感",
-             "desc": "暖白纸张 + 纵向知识条目，图标与手绘笔触逐条显现",
+             "desc": "暖白纸面配手绘图标，知识条目随讲解逐条写下，像翻一本手账",
              "need": "任何来源都能做", "group": "info"},
             {"key": "graph_clean", "label": "结构图 · 清透",
-             "desc": "浅底白卡 + 紫主色：树状 / 紫表头表格 / 时间轴按版式逐条显现",
+             "desc": "白底紫调信息图：树状、表格、时间轴自动排版，要点逐个亮起",
              "need": "任何来源都能做", "group": "info"},
-            # ⚠️⚠️ 「数字人口播」（talking_head）已**暂停入口**（2026-10-14，产品决定：
-            #    方案重想好之后再启动研发与规划）—— 用户暂时不能再新建 / 改选这个视觉风格。
-            #    渲染链路（stage.py / stage_tpl.html / video.py）、已有作品播放与重新生成
-            #    全部保留；恢复时把下面两行加回本列表，并**同步恢复 precheck 处**（在
-            #    precheck 的 skins 列表里搜 talking_head 可见同款注释，两处必须一起动）。
+            # PPT 课件（2026-10-20，方案 A）：左侧深色节导航常驻，主区是**课件页**
+            # （页眉面包屑 + 大页码 01/16 + 底部时间轴）。**第 0 帧起就是内容页** ——
+            # 不做封面/目录，因为实测两份成片 `SEGS[0].a` 都是 0（首句 11.2s 无片头空隙），
+            # 封面只能吃掉真实讲解（完整课件形态要牺牲 18.4% 时长 + 18 条内容）。
+            {"key": "ppt", "label": "PPT 课件",
+             "desc": "自动播放的课件：章节导航、底部进度轴，开口即正文",
+             "need": "任何来源都能做", "group": "info"},
+            # 板书（2026-10-20，方向定案：声音 + 板书）：黑板粉笔字，要点随讲解
+            # 逐行书写、亮点画圈、代价下划线；无人出镜。与 precheck 处必须同加/同注释。
+            {"key": "board", "label": "板书",
+             "desc": "黑板粉笔字逐行写下要点，重点随手圈画，像老师边讲边板书",
+             "need": "任何来源都能做", "group": "info"},
+            # 动效图解（2026-10-21，论文讲解/Vibe 知识形态）：元素随讲解逐个长出、
+            # 换屏时同 id 元素滑动变换（morph）而非硬切、公式逐项点亮、非活跃元素压暗。
+            # 与 board/ppt 同源（同一份讲稿与视觉步点），与 precheck 处必须同加/同注释。
+            {"key": "motion", "label": "动效图解",
+             "desc": "图解随讲解逐个生长、平滑变换，公式逐项点亮，适合论文与硬核内容",
+             "need": "任何来源都能做", "group": "info"},
+            # ⚠️⚠️⚠️ "数字人口播"（talking_head）已**暂停入口**（2026-10-20 晚，产品决定：
+            #    方向定为「声音 + 板书」，数字人放弃 —— 同日板书 Demo 见
+            #    _probe_blackboard_20261020/board_demo.mp4）。
+            #    渲染链路（stage.py::_th_dom、stage_tpl.html、video.py::BUILTIN_AVATARS）
+            #    与形象素材、已有作品的播放/重新生成全部保留（不静默改作品）；
+            #    恢复时把下面两行加回本列表，并**同步恢复 precheck 处**（两处必须一起动）。
             # {"key": "talking_head", "label": "数字人口播", "desc": "有讲述者在场，另一侧同步承载内容层",
             #  "need": "需再选一个内容层（材料原件 / 结构图）", "group": "info"},
-            {"key": "radio", "label": "电台 · 浅色", "desc": "米色底 + 线条插画轮换 + 人声波形，边听边看",
+            {"key": "radio", "label": "电台 · 浅色", "desc": "米色底配线条插画与人声波形，画面跟着声音呼吸，边听边看",
              "need": "任何来源都能做", "group": "relax"},
-            {"key": "night", "label": "电台 · 深色", "desc": "夜景插画 + 旋转唱片 + 人声波形，适合睡前",
+            {"key": "night", "label": "电台 · 深色", "desc": "夜色插画配旋转唱片与人声波形，光线柔和，适合睡前听",
              "need": "任何来源都能做", "group": "relax"},
             # ⚠️⚠️⚠️ "氛围"（ambient）已**暂停入口**（2026-10-14，产品决定）
             #    —— 用户暂时不能再新建 / 改选这个视觉风格
@@ -552,6 +608,9 @@ def options(db: Session = Depends(get_db)):
         # 不能给一个点了必然失败的按钮。
         "render_ready": _render_ready(),
         "render_reason": _render_reason(),
+        "render_blocker": _render_blocker(),
+        "render_source": _render_source(),
+        "render_dl_size_mb": _render_dl_size_mb(),
         "llm_ready": _llm_ready(),
     }
 
@@ -974,16 +1033,26 @@ def precheck(vid: int, db: Session = Depends(get_db)):
     skins = [
         {"key": "source", "ok": bool(loc_info["ok"]), "reason":
             ("本材料 " + (f"{loc_info['pages']} 页，" if loc_info["pages"] else "") + loc_info["reason"])
-            if loc_info["ok"] else (loc_info["reason"] + "，建议改用结构图"),
+            if loc_info["ok"] else (loc_info["reason"] + "，建议改用 PPT 课件 / 板书"),
          "pages": loc_info["pages"], "kind": loc_info["kind"]},
-        {"key": "graph", "ok": True, "reason": "结构图由讲稿产出，任何来源都能做"},
+        # ⚠️⚠️⚠️ "结构图"（graph）已**暂停入口**（2026-10-21，产品决定）
+        #    —— 与 /options 的 skins 列表同步注释（本文件 /options 列表内），
+        #    恢复时两处必须一起加回。只隐藏 key=graph；graph_paper/graph_clean 不动。
+        # {"key": "graph", "ok": True, "reason": "结构图由讲稿产出，任何来源都能做"},
         {"key": "graph_paper", "ok": True,
          "reason": "纸感结构图与结构图同源（暖白纸张 + 纵向知识条目），任何来源都能做"},
         {"key": "graph_clean", "ok": True,
          "reason": "清透结构图与结构图同源（浅底白卡 + 紫主色信息图），任何来源都能做"},
-        # ⚠️⚠️ 「数字人口播」（talking_head）已**暂停入口**（2026-10-14，产品决定：
-        #    方案重想好之后再启动研发与规划）—— 与 /options 的 skins 列表同步注释
-        #    （本文件 491 行附近），恢复时两处必须一起加回。
+        # PPT 课件（2026-10-20）：与结构图同一条生成分支（要 points、不要锚点）
+        {"key": "ppt", "ok": True,
+         "reason": "PPT 课件与结构图同源（同一份讲稿与视觉步点），任何来源都能做"},
+        {"key": "board", "ok": True,
+         "reason": "板书与 PPT 课件同源（同一份讲稿与视觉步点），任何来源都能做"},
+        {"key": "motion", "ok": True,
+         "reason": "动效图解与板书同源（同一份讲稿与视觉步点，元素带变换与公式），任何来源都能做"},
+        # ⚠️⚠️⚠️ "数字人口播"（talking_head）已**暂停入口**（2026-10-20 晚）
+        #    —— 与 /options 的 skins 列表同步注释（本文件 /options 列表内），
+        #    恢复时两处必须一起加回。
         # {"key": "talking_head", "ok": bool(loc_info["ok"]), "reason":
         #     "需要先选一个内容层（材料原件 / 结构图）" if not loc_info["ok"]
         #     else "可叠加在任一内容层之上；口型为**示意动画**，非唇形同步",
@@ -1010,6 +1079,8 @@ def precheck(vid: int, db: Session = Depends(get_db)):
         "audio": {"exists": _audio_exists(v), "duration_ms": dur},
         "render_ready": _render_ready(),
         "render_reason": _render_reason(),
+        "render_blocker": _render_blocker(),
+        "render_source": _render_source(),
         "render_needed": _render_needed(v),
     }
 
@@ -1135,10 +1206,10 @@ def _gen_visuals(db, v: Video, emit, refill: bool = False) -> tuple:
         #    「材料原件」皮肤就等于不可用（见 llm.generate_video_anchors 的 docstring）。
         mid = _first_material_id(v)
         if mid is None:
-            raise HTTPException(400, "这份来源不是材料，无法做原件定位，请改用结构图方案")
+            raise HTTPException(400, "这份来源不是材料，无法做原件定位，请改用 PPT 课件 / 板书方案")
         loc, reason = locate_svc.build_locator(db, mid)
         if loc is None:
-            raise HTTPException(400, f"{reason}，请改用结构图方案")
+            raise HTTPException(400, f"{reason}，请改用 PPT 课件 / 板书方案")
         try:
             excerpt = ""
             try:
@@ -1164,7 +1235,10 @@ def _gen_visuals(db, v: Video, emit, refill: bool = False) -> tuple:
         emit("plan", {"steps": len(hits["steps"])})
         steps = svc.public_steps(hits["steps"])
 
-    elif inner in svc.GRAPH_SKINS:
+    elif inner in svc.POINTS_SKINS:
+        # ⚠️ 用 POINTS_SKINS 而不是 GRAPH_SKINS：PPT 课件（2026-10-20）与结构图三兄弟
+        #    **共用这一条分支**（同一份 points 数据），但它不是「结构图画法」——
+        #    两个语义分开成两个常量，别把 ppt 塞进 GRAPH_SKINS。
         # ⚠️ JSON 里的 `graph_paper`（结构图·纸感）与 `graph` 走**同一条**生成分支：
         #    两者都只要 points（不要锚点），差别只在舞台页怎么画。绝不为纸感另写一份 ——
         #    两份逻辑漂移会让「这次过闸门、下次不过」。
@@ -1186,7 +1260,7 @@ def _gen_visuals(db, v: Video, emit, refill: bool = False) -> tuple:
         shots_hint = svc.shot_seg_ranges(v.script or [], v.shots or [])
         obj = llm.retry_video_call(
             lambda: llm.generate_video_points(lines, len(v.script or []), need,
-                                              shots=shots_hint))
+                                              shots=shots_hint, skin=inner))
         points = svc.build_graph_points(v.script or [], obj.get("elements") or [])
         # 回写镜头标题/分屏（scenes 为空 = 旧格式输出 → shots 原样，行为不变）
         # ⚠️⚠️ **必须把 script 传进去**：分屏的时间区间是「句号 → 毫秒」换算出来的，
@@ -1593,8 +1667,8 @@ def rerun_gate(vid: int, db: Session = Depends(get_db)):
         db.refresh(v)
         conf = _tts_conf()
         # 沿用上一次的「未命中句」——重跑闸门不该把用户已经看到的失败清单洗掉
-        hits = {"tried": 1, "hit": 1,
-                "unlocated": list((v.gate_report or {}).get("unlocated") or [])}
+        # ⚠️ 命中率必须按真实口径重建（2026-10-22 修复）：tried=1/hit=1 会让判据 4 恒绿。
+        hits = svc.locate_hits_from_report(v)
         report = svc.gate_check(v, v.steps or [], v.shots or [], hits, conf)
         v.gate_report = report
         _gate_tally(v, bool(report["passed"]))
@@ -1718,9 +1792,10 @@ def manual_step(vid: int, req: ManualStepReq, db: Session = Depends(get_db)):
         rep = dict(v.gate_report or {})
         rep["unlocated"] = [i for i in (rep.get("unlocated") or []) if int(i) != seg]
         v.gate_report = rep
+        # ⚠️ 命中率按真实口径重建（2026-10-22 修复，原 tried=1/hit=1 恒绿放水）：
+        #    tried 取报告里持久化的定位总句数，hit = tried - 剩余未命中句数。
         report = svc.gate_check(v, steps, v.shots or [],
-                                {"tried": 1, "hit": 1, "unlocated": rep["unlocated"]},
-                                _tts_conf())
+                                svc.locate_hits_from_report(v), _tts_conf())
         return _after_gate_rerun(db, v, report)
 
 
@@ -1735,8 +1810,8 @@ class _RenderJob:
 
     def __init__(self, vid: int):
         self.vid = vid
-        self.status = "queued"        # queued / running / done / failed
-        self.stage = ""               # stage / capture / mux / finalize
+        self.status = "queued"        # queued / running / done / failed / cancelled
+        self.stage = ""               # stage / capture / encode / mux / finalize
         self.pct = 0
         self.detail: dict = {}
         self.error = ""
@@ -1748,6 +1823,9 @@ class _RenderJob:
         self.report: dict = {}
         self.subs: list = []
         self.finished_at = 0.0
+        # 取消标志：POST /render/cancel 置位，渲染线程在检查点读它（泵循环 ≈16ms 一轮）。
+        # ⚠️ 跨线程只能用 Event —— Playwright 同步 API 不能从外部打断，也不需要。
+        self.cancel_event = threading.Event()
 
     def emit(self, stage: str, pct: int | None = None,
              detail: dict | None = None) -> None:
@@ -1849,6 +1927,9 @@ def _render_dispatcher() -> None:
             _RENDER_WAKE.wait(2.0)
             _RENDER_WAKE.clear()
             continue
+        if job.cancel_event.is_set():
+            # 取消与「出队」撞在同一窗口：取消端点已收口，绝不能再跑
+            continue
         try:
             _run_render_job(vid, job)
         except BaseException as e:      # noqa: BLE001 —— 调度线程绝不能死
@@ -1869,6 +1950,94 @@ def _fail_render(db, v, job: _RenderJob, msg: str) -> None:
     job.broadcast("err", {"message": job.error})
 
 
+def _finish_cancelled(db, v, job: _RenderJob) -> None:
+    """取消收口：DB 复用 `failed` + error="已取消渲染"（取消是用户主动行为，
+    不单开状态；界面靠文案区分），内存 job 置 `cancelled`。**终态只写一次**
+    （重复取消 / 与调度器的撞窗都安全）。"""
+    if job.status in ("done", "failed", "cancelled"):
+        return
+    if v is not None and (v.status or "") in ("queued", "rendering"):
+        v.status = "failed"
+        v.progress = 0.0
+        v.error = "已取消渲染"
+        db.commit()
+    job.status, job.error = "cancelled", "已取消渲染"
+    job.finished_at = time.time()
+    _track("video_render", job.vid, 0, {"stage": "cancel"})
+    job.broadcast("err", {"message": job.error})
+
+
+def _cleanup_render_tmp(p: Path) -> None:
+    """删渲染半成品（取消/失败后）。⚠️ 绝不外抛：safe-delete 护栏抛的是 SystemExit。"""
+    try:
+        if p.exists():
+            p.unlink()
+    except BaseException:
+        pass
+
+
+# 抓帧质量类失败的重试次数（2026-10-22）。判据本身不放宽 —— 实测过一次 1.8 s
+# 的卡顿就能让 182 s 的片子 p99 到 502 ms，放宽到 300 ms 也救不回来，
+# 而重试能救：卡顿是偶发的，重来一遍通常就干净了。
+_CAPTURE_RETRY_TIMES = 1
+_CAPTURE_RETRY_WAIT_S = 1.5          # 重试前等一会，给 Chromium / 文件句柄释放时间
+_CAPTURE_RETRY_MARKS = ("渲染对齐异常", "渲染不完整", "帧时间戳乱序")
+
+
+def _capture_retryable(msg: str) -> bool:
+    """这次失败值不值得重试：只认抓帧质量三类（环境问题重试也没用）。"""
+    return any(m in (msg or "") for m in _CAPTURE_RETRY_MARKS)
+
+
+def _render_with_capture_retry(renderer_svc, job, *, html, audio, tmp_mp4,
+                               out_poster, dur):
+    """抓帧质量类失败**自动重试一次**（2026-10-22），返回 `render()` 的 report。
+
+    这三类判据（乱序 / 逐槽对齐 / 断尾）失败都源于「抓帧期间页面卡了一下」，与作品
+    内容无关 —— 实测 182 s 的纸感片因一次约 1.8 s 的卡顿被判 p99 502 ms 作废，用户
+    只能手动重来，等于白赔 6.5 分钟。重试一次的成本 < 让用户重来一次。
+
+    ⚠️ 只重试这三类：「没有抓到任何画面帧」「渲染器不可用」是环境问题，重试只会再赔
+       一遍；`RenderCancelled` 是用户主动取消，必须立刻上抛。
+    ⚠️ 抽成独立函数是为了**可单测** —— `_run_render_job` 里造不出「第一次失败、第二次
+       成功」的场景，这里换一个假 renderer 就能验（见 `_verify_render_retry`）。
+    """
+    job.emit("capture", 1)           # 首次进入抓帧阶段（重试时在循环里再发一次）
+    rep = {}
+    # ⚠️ 阶段名走闭包，不回读 `job.stage`：job 是跨线程共享的、进度回调又会一直改它；
+    #    用局部变量才能保证「这个 pct 配的正是 renderer 亲口报的那个阶段」。
+    cur = {"stage": "capture"}
+
+    def _on_stage(name: str) -> None:
+        cur["stage"] = name
+        job.emit(name, max(1, min(99, job.pct)))
+
+    def _on_pct(p: int) -> None:
+        job.emit(cur["stage"], max(1, min(99, p)))
+
+    for attempt in range(_CAPTURE_RETRY_TIMES + 1):
+        if job.cancel_event.is_set():
+            raise renderer_svc.RenderCancelled("已取消渲染")
+        if attempt:
+            _cleanup_render_tmp(tmp_mp4)
+            cur["stage"] = "capture"   # 重抓 ⇒ 进度真回到起点，必须诚实回退
+            job.emit("capture", 1)
+            time.sleep(_CAPTURE_RETRY_WAIT_S)
+        try:
+            rep = renderer_svc.render(
+                html, audio, tmp_mp4, out_poster, dur,
+                on_progress=_on_pct, on_stage=_on_stage,
+                should_cancel=job.cancel_event.is_set)
+        except renderer_svc.RenderCancelled:
+            raise
+        except RuntimeError as e:
+            if not _capture_retryable(str(e)) or attempt >= _CAPTURE_RETRY_TIMES:
+                raise
+            continue
+        break
+    return rep
+
+
 def _run_render_job(vid: int, job: _RenderJob) -> None:
     """真渲染：**分三段、三个短会话**，渲染期间不持 DB 连接、不持作品锁。
 
@@ -1880,6 +2049,10 @@ def _run_render_job(vid: int, job: _RenderJob) -> None:
     from ..services import renderer as renderer_svc
     from ..services import stage as stage_svc
 
+    if job.cancel_event.is_set():
+        # 排队→开跑之间被取消：取消端点已做收口（终态只写一次），直接退出
+        return
+
     # ---- ① 开工快照（短会话） ----
     db = SessionLocal()
     try:
@@ -1890,7 +2063,7 @@ def _run_render_job(vid: int, job: _RenderJob) -> None:
             job.broadcast("err", {"message": job.error})
             return
         if not _render_ready():
-            _fail_render(db, v, job, "渲染器不可用：缺少 Chromium 或 PyAV 组件")
+            _fail_render(db, v, job, "渲染器不可用：" + (_render_reason() or "缺少渲染组件"))
             return
         audio = _audio_abspath(v)
         if audio is None or not audio.exists():
@@ -1914,6 +2087,9 @@ def _run_render_job(vid: int, job: _RenderJob) -> None:
     job.emit("stage", 1)
     out_mp4 = svc.video_abspath(vid, "video.mp4")
     out_poster = svc.poster_abspath(vid, "poster.jpg")
+    # ⚠️ 半成品先写临时名、成功才改名覆盖：`av.open(w)` 是原地截断写，
+    #    取消/失败直接写真名会把**上一版成片**一起毁掉（取消让这条路径更容易踩到）。
+    tmp_mp4 = svc.video_abspath(vid, ".render-tmp.mp4")
 
     try:
         # ---- ② 舞台页 + 渲染（不碰 DB 的部分） ----
@@ -1925,13 +2101,21 @@ def _run_render_job(vid: int, job: _RenderJob) -> None:
             html = stage_svc.build_stage(db2, v2)
         finally:
             db2.close()
-        job.emit("capture", 1)
-        rep = renderer_svc.render(
-            html, audio, out_mp4, out_poster, dur,
-            on_progress=lambda p: job.emit("capture", max(1, min(99, p))))
+        # 抓帧质量类失败自动重试一次（详见 `_render_with_capture_retry` 的注释）。
+        rep = _render_with_capture_retry(
+            renderer_svc, job, html=html, audio=audio, tmp_mp4=tmp_mp4,
+            out_poster=out_poster, dur=dur)
         job.report = dict(rep or {})
-        job.emit("mux", 99)
+    except renderer_svc.RenderCancelled:
+        _cleanup_render_tmp(tmp_mp4)
+        db3 = SessionLocal()
+        try:
+            _finish_cancelled(db3, db3.get(Video, vid), job)
+        finally:
+            db3.close()
+        return
     except BaseException as e:          # noqa: BLE001
+        _cleanup_render_tmp(tmp_mp4)
         db3 = SessionLocal()
         try:
             v3 = db3.get(Video, vid)
@@ -2078,7 +2262,7 @@ async def _render_events(job: _RenderJob, vid: int):
         if job.status == "done" and job.video:
             yield _sse("done", {"video": job.video, "report": job.report})
             return
-        if job.status == "failed":
+        if job.status in ("failed", "cancelled"):
             yield _sse("error", {"message": job.error})
             return
         last = time.time()
@@ -2107,6 +2291,36 @@ async def _render_events(job: _RenderJob, vid: int):
             job.subs.remove(q)
         except ValueError:
             pass
+
+
+@router.post("/{vid}/render/cancel")
+def cancel_render(vid: int, db: Session = Depends(get_db)):
+    """取消渲染（幂等）：排队中 → 出队并立即收口；渲染中 → 置标志，
+    渲染线程在下一个检查点（泵循环 ≈16ms / 编码逐帧）抛 `RenderCancelled` 后收口。
+
+    ⚠️ DB 复用 `failed` + error="已取消渲染"：取消是用户主动行为，不单开状态；
+       已终态（done/failed/cancelled）重复调用直接返回现状，安全。
+    """
+    v = db.get(Video, vid)
+    if not v:
+        raise HTTPException(404, "视频作品不存在或已删除")
+    with _RENDER_LOCK:
+        job = _RENDER_JOBS.get(vid)
+        if job is None or job.status not in ("queued", "running"):
+            return {"cancelled": False,
+                    "status": job.status if job is not None else "",
+                    "stage": job.stage if job is not None else ""}
+        job.cancel_event.set()
+        queued = job.status == "queued"
+        if queued:
+            try:
+                _RENDER_QUEUE.remove(vid)
+            except ValueError:
+                # 与调度器「出队」撞窗：它那边的守卫会看到 cancel_event 并跳过
+                pass
+    if queued:
+        _finish_cancelled(db, v, job)
+    return {"cancelled": True, "status": job.status, "stage": job.stage}
 
 
 @router.get("/{vid}/render/status")

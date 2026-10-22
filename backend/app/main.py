@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from app_version import __version__ as APP_VERSION
 from .core.config import settings
 from .database import Base, engine
-from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats, podcasts, ephemeral, imgproxy, ext, simple_learn, drill, videos, zipvoice
+from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats, podcasts, ephemeral, imgproxy, ext, simple_learn, drill, videos, zipvoice, update, renderenv
 
 Base.metadata.create_all(bind=engine)
 
@@ -64,6 +64,10 @@ def _migrate_columns():
             if "img_rect" not in cols:
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE material_chunks ADD COLUMN img_rect VARCHAR(64) DEFAULT ''"))
+            # 扫描页/拍照页的整页行框（JSON 文本）：老行空串 → 前端降级页级跳转，重解析才回填
+            if "line_boxes" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE material_chunks ADD COLUMN line_boxes TEXT DEFAULT ''"))
         if "podcasts" in insp.get_table_names():
             cols = {c["name"] for c in insp.get_columns("podcasts")}
             if "audio_sig" not in cols:
@@ -312,7 +316,7 @@ _backfill_material_origin()
 _migrate_source_folder_to_folder()
 _backfill_chunk_kind()
 
-app = FastAPI(title="知萤 - AI知识中枢", version="0.1.6")
+app = FastAPI(title="知萤 - AI知识中枢", version="0.1.7")
 
 # 自动定时备份（启动后延迟 30s 首备，此后每日一次，保留最近 7 份）
 from .services import auto_backup
@@ -481,6 +485,9 @@ app.include_router(asr.router, prefix="/api")
 # 语音合成模型（routers/zipvoice.py）：/api/zipvoice/*（状态 / 按需下载 / 进度 / 音色）
 # 与 asr（Whisper 转写模型）同构 —— 前端复用同一套「下载卡片 + 轮询」交互。
 app.include_router(zipvoice.router, prefix="/api")
+# 渲染组件（routers/renderenv.py）：/api/renderenv/*（Chromium 状态 / 按需下载 / 进度）
+# 与 asr / zipvoice 同构 —— 前端复用同一套「下载 + 轮询」交互。
+app.include_router(renderenv.router, prefix="/api")
 app.include_router(folders.router, prefix="/api")
 app.include_router(stats.router, prefix="/api")
 app.include_router(podcasts.router, prefix="/api")
@@ -503,6 +510,11 @@ app.include_router(imgproxy.router, prefix="/api")
 # ⚠️ 同样必须注册在下方 SPA catch-all 之前。
 app.include_router(ext.router, prefix="/api")
 app.include_router(ext.pairing_router, prefix="/api")
+
+# 客户端更新（routers/update.py）：/api/update/*（检查 / 下载 / 进度 / 定位 / 清空）
+# ⚠️ 没有服务端推送通道，客户端启动时主动拉；三源降级（GitHub 直连 → gh-proxy → 官网）。
+# ⚠️ 必须注册在下方 SPA catch-all 之前，否则接口被吞成 404。
+app.include_router(update.router, prefix="/api")
 
 
 

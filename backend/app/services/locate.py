@@ -367,7 +367,7 @@ def build_locator(db, material_id: int, dpi: int = 150):
     """为一份材料建定位器。返回 `(Locator | None, reason)`。
 
     reason 是给 UI 的**可执行理由**（PRD 3.2.7「置灰并说明原因」），
-    例如「这份材料没有可识别的文字层，建议改用结构图」。
+    例如「这份材料没有可识别的文字层，建议改用 PPT 课件 / 板书」。
     """
     from ..models import Material
     m = db.get(Material, material_id)

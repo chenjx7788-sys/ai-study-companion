@@ -68,7 +68,7 @@
     </section>
 
     <!-- ⑤ 更新日志 -->
-    <section class="help-section">
+    <section class="help-section" ref="changelogRef">
       <h3 class="section-title">更新日志</h3>
       <div class="changelog">
         <div v-for="v in changelog" :key="v.version" class="clog-version">
@@ -89,8 +89,8 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, onMounted, nextTick, watch } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import MarkdownIt from 'markdown-it'
 
 const emit = defineEmits(['tour'])
@@ -98,6 +98,19 @@ const router = useRouter()
 const md = new MarkdownIt({ breaks: true })
 const renderMd = (t) => md.render(t || '')
 const openFaq = ref([])
+const route = useRoute()
+const changelogRef = ref(null)
+
+// 管理中心「查看更新日志」直达：带 ?sec=changelog 时滚动定位到更新日志区
+const scrollToChangelog = () => {
+  if (route.query.sec !== 'changelog') return
+  nextTick(() => {
+    const el = changelogRef.value
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
+}
+onMounted(scrollToChangelog)
+watch(() => route.query.sec, scrollToChangelog)
 
 const go = (path) => (path === '/study' || path === '/study/ai') ? router.push('/') : router.push(path)
 
@@ -203,6 +216,50 @@ const faqs = [
 
 // ---------- 更新日志 ----------
 const changelog = [
+  {
+    version: 'v0.1.7',
+    date: '2026-10-22',
+    groups: [
+      {
+        type: 'add', label: '新增',
+        items: [
+          'AI 视频新皮肤「PPT 课件」：通栏大标题 + 页眉面包屑 + 底部时间轴，条目随讲解逐条入场；版式由数据自动判定（清单 / 数值阶梯 / 闭环 / 流程轨迹），0 秒起就是内容页',
+          'AI 视频新皮肤「板书」：黑板粉笔字，页标题先写、要点按讲解逐行写上黑板，亮点自动画圈、代价画下划线，粉笔头跟随笔锋、激光点停在最后写完的一行；讲到有结构关系的知识点时切到整屏图板，把流程链、左右对比、象限、金字塔一笔一笔画出来',
+          'AI 视频新皮肤「动效图解」：论文讲解式呈现 —— 元素随讲解逐个长出、当前对象高亮其余压暗，换屏相同元素滑动变换而非整屏硬切；公式以数学排版逐项点亮（LaTeX 原生渲染）；数字对比/趋势自动生成柱状/折线图并逐柱生长（数字必须出自讲稿，后端硬校验）；流程横排成链、对比左右分栏、支持中心辐射/层级/网格版式；镜头随讲解焦点平缓推拉；字幕关键词同步点亮',
+          '客户端内检查更新：启动时静默检查新版本，弹窗内看更新说明、应用内下载安装包，可「忽略此版本」；设置页「关于」可手动检查',
+          '扫描版 PDF 章节层级识别：扫描书入库自动识别「第 N 章 / N.N 小节」生成目录（249 页技术书实测召回 98.8%），此前扫描件目录只能为空',
+          '「在原文中查看」精确到行：问答、摘要的来源跳转在扫描件与文字层 PDF 上用闪烁框标出对应那一行（实测精确同行 98.9%），不再只能落到页',
+          '导出结构化 Markdown：学习页「下载文件」导出带完整结构的 .md —— 章节标题层级、页码锚点、图片内文字单独收录，硬折行自动合并成段（含跨页断句），Typora / Obsidian 可直接使用',
+          '学习页统一编辑面：正文编辑从「逐块弹窗」改为整篇连续文档直接改，保存时自动切回逐块落库；删块逐条列清确认，误粘乱序内容拒存兜底',
+          '简单学长材料分章生成：19.9 万字材料讲义不再只覆盖开头 12% —— 按章生成、逐章落库，未生成的章可随时单独补生成，转笔记与出题自动按分章拼装',
+          'EPUB 原文视图阅读优化：版心与行距重排（40 字/行）、插图与表格不再撑破页面横向滚动、插图点击放大、章内链接可点、每章滚动位置记忆、字号三档与宋/黑字体偏好'
+        ]
+      },
+      {
+        type: 'opt', label: '优化',
+        items: [
+          '扫描件 OCR 提速：识别速度提升约 1.4~1.7 倍（250 页约 11~16 分钟），识别质量不变',
+          '学习页目录只显示当前级标题并按层级缩进：不再整条路径挤成一列重复前缀',
+          'AI 视频作品库卡片重排：16:9 封面通栏、无封面按皮肤色渐变占位、质量状态图标化、失败原因收起可展开',
+          'AI 视频画面署名支持两行（50 字内），模板按最长行自动取字号档',
+          'AI 视频·动效图解去框化：元素改「色条 + 文字」，当前元素柔光强调，良方画手绘椭圆圈',
+          'AI 视频·板书与课件页起点对齐镜头起点：章节一开讲就翻到新板，不再讲完半天屏幕还挂上一节'
+        ]
+      },
+      {
+        type: 'fix', label: '修复',
+        items: [
+          'AI 视频：安装版无法渲染出片：0.1.6 安装包缺整条渲染链路，点渲染只提示「找不到可用的 Chromium」—— 现在渲染内核（约 170MB）出片台一键按需下载（国内镜像 + 官方 CDN 双通道），并支持系统 Edge / Chrome 兜底',
+          'Word / 文字层 PDF / EPUB 导出结构错误：表头被误删、表格断成多段、表格行被包成引用块、标题重复输出、章节层级被压平，一并修复',
+          '标题含「/」导致目录被劈成两个半截条目（如「小红书/公众号」），现已正确转义',
+          'Word 原文视图点目录无反应：锚点丢失导致点击静默失效，已修复',
+          '向量索引损坏导致问答检索静默降级：索引损坏时向量召回静默失效（只余全文匹配），现在自动检测、后台重建并重试',
+          'ZipVoice 本地音色试听报「未知音色」：本地合成音色无法试听，AI 播客 / AI 视频一并修复',
+          '扫描件导出时个别版面段落被错误拆开（封面、窄栏页），增加版式校准回退'
+        ]
+      }
+    ]
+  },
   {
     version: 'v0.1.6',
     date: '2026-10-14',

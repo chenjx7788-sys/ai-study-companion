@@ -6,7 +6,7 @@
 所以这里用**指纹**判定：模板（或演示数据 / 取帧参数）一变，示例自动重建。
 
 ⚠️⚠️【但信息型 5 张是刻意的例外：它们用**设计版**静态图，不参与真渲染】
-    即 `SEED_FIRST` 里的 source / graph / graph_paper / graph_clean / talking_head。
+    即 `SEED_FIRST` 里的 source / graph / graph_paper / graph_clean / talking_head / board。
     原因是**显示尺寸**：卡片里示例图只有 **160×90**。真渲染是 1920×1080 舞台 → 640×360
     → 卡片 160×90，累计 12 倍缩小 —— 模板里 20px 的正文显示时不到 2px；再加上 7 张卡片、
     右侧栏、角落徽标一起挤进来，缩略图上就是「一片深灰 + 一堆模糊文字」（用户反馈：不好看）。
@@ -77,12 +77,27 @@ CASES = (
     ("radio", "", 9000, "电台 · 浅色"),
     ("night", "", 9000, "电台 · 深色"),
     ("ambient", "none", 9000, "氛围"),
+    # PPT 课件（2026-10-20）：9600ms 太晚会翻到第 3 页，7600ms 也已经翻到第 2 页
+    # （课件页比结构图页装得少：第 1 节 7 条按均分切成 4+3，第 2 页从 5000ms 起）。
+    # 取 4600 = 第 1 页最后一条（4000ms）之后 600ms，缓动已走完、条目出满，
+    # 缩略图里能看到「课件首屏」的样子。
+    ("ppt", "", 4600, "PPT 课件"),
+    # 板书（2026-10-20）：取 6000 = 首屏 2~3 行已写完、首个圈画已出现
+    # （seed-first 皮肤本行只提供 key/inner/label，取帧时刻是回退成真渲染时才用）。
+    ("board", "", 6000, "板书"),
+    # 动效图解（2026-10-21）：同 seed-first（信息型细文字缩到 160×90 必糊）。
+    ("motion", "", 6000, "动效图解"),
 )
 
-# ⚠️⚠️ 这 5 个皮肤用「设计版」静态图（seed），**不参与真渲染**（见文件头说明）。
+# ⚠️⚠️ 这 6 个皮肤用「设计版」静态图（seed），**不参与真渲染**（见文件头说明）。
 #    卡片里只有 160×90，真渲染帧在小尺寸下全是糊团（用户反馈「不好看」）。
 #    回退：从这里去掉皮肤名，并把 SPEC_REV +1。
-SEED_FIRST = ("source", "graph", "graph_paper", "graph_clean", "talking_head")
+# board（板书，2026-10-20）：同为信息型细文字 —— 26~56px 粉笔字缩到 160×90 同样糊，
+#    设计版血缘脚本 `_fetch_probe/_gen_skin_preview_board_20261020.py`。
+# motion（动效图解，2026-10-21）：同理由（26~46px 文字/MathML 缩到 160×90 糊），
+# 设计版血缘脚本 `_fetch_probe/_gen_skin_preview_motion_20261021.py`。
+SEED_FIRST = ("source", "graph", "graph_paper", "graph_clean", "talking_head", "board",
+              "motion")
 
 # 取帧/渲染方式的版本号。**改了取帧细节（等待时长、注入的样式、缩放算法）必须 +1**，
 # 否则指纹不变 → 老图不会被重建 → 改了等于没改。
@@ -103,11 +118,21 @@ SEED_FIRST = ("source", "graph", "graph_paper", "graph_clean", "talking_head")
 #        `.tag` 的「镜头 1 · 结构图 / 纸感 / 数字人口播 / 清透」→ 去掉「镜头 1 · 」；
 #        清透的 `.kick2`「镜头 · 3 个要点」→「3 个要点」（与模板 `.ckick2` 同口径）。
 #     **必须 +1**：live 目录里躺着 v5 那批真渲染帧，指纹不变不会重建。
-SPEC_REV = "6"
+# v7：+board（板书，2026-10-20），设计版种子图随包分发（`_design.json` 血缘已登记）。
+#     **必须 +1**：CASES/SEED_FIRST 变了，指纹不变 → 老 live 里没有 board.jpg，
+#        选择器卡片就一直空白。
+# v8：+motion（动效图解，2026-10-21），设计版种子图随包分发（血缘已登记）。
+#     **必须 +1**：同 v7 理由 —— CASES/SEED_FIRST 变了。
+SPEC_REV = "8"
 
 _SVC_DIR = Path(__file__).resolve().parent
 _TEMPLATES = (_SVC_DIR / "stage_tpl.html", _SVC_DIR / "stage_tpl_radio.html",
-              _SVC_DIR / "stage_tpl_night.html", _SVC_DIR / "stage_tpl_ambient.html")
+              _SVC_DIR / "stage_tpl_night.html", _SVC_DIR / "stage_tpl_ambient.html",
+              # ⚠️ 新模板必须加进来：`sig()` 只哈希这个元组里的文件，
+              #    漏了它 → 改课件模板后示例图指纹不变 → 永不重建（改了等于没改）。
+              _SVC_DIR / "stage_tpl_ppt.html",
+              _SVC_DIR / "stage_tpl_board.html",
+              _SVC_DIR / "stage_tpl_motion.html")
 
 # ---------------------------------------------------------------- 目录
 

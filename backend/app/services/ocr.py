@@ -9,6 +9,55 @@ import threading
 _engine = None
 _lock = threading.Lock()
 
+# 识别批大小。默认 1，**刻意不攒批**：
+# 实测（A4 200dpi、单页 42 行、Σ宽高比 690）——库默认批 6 需 5.12s，批 1 只需 2.80s。
+# 原因是画布越宽单位像素吞吐越低（合成 48×320 为 0.75 Mpx/s，48×1280 掉到 0.44 Mpx/s），
+# 而 `resize_norm_img` 会把整批补零到批内最宽那行的比例，「攒批省调用开销」被这点完全吃掉。
+# 批 1 的文本与批 6 相似度 0.998~0.999（678 字里差 1 个），可接受。
+_REC_BATCH = 1
+
+
+def _session_opts():
+    """单会话配置：开内存池、单 inter-op 线程、全量图优化。
+
+    ⚠️ 库默认 `enable_cpu_mem_arena=False`，导致每个张量都 malloc/free；
+    这类小模型反复分配很吃亏（实测慢约 10%）。intra-op 留给 ORT 自动（=物理核数），
+    手动指定 16 线程实测反而慢 2.4 倍。
+    """
+    from onnxruntime import GraphOptimizationLevel, SessionOptions
+    so = SessionOptions()
+    so.log_severity_level = 4
+    so.enable_cpu_mem_arena = True
+    so.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.inter_op_num_threads = 1
+    return so
+
+
+def _tune(engine):
+    """用更合适的会话参数原地替换三个模型会话；任何异常都保留原样。"""
+    try:
+        from onnxruntime import InferenceSession
+        holders = [getattr(engine, "text_detector", None),
+                   getattr(engine, "text_cls", None)]
+        for h in holders:
+            iner = getattr(h, "infer", None)
+            if iner is not None:
+                mp = getattr(iner.session, "_model_path", None)
+                if mp:
+                    iner.session = InferenceSession(
+                        mp, sess_options=_session_opts(),
+                        providers=["CPUExecutionProvider"])
+        rec = getattr(engine, "text_recognizer", None)
+        if rec is not None:
+            mp = getattr(rec.session.session, "_model_path", None)
+            if mp:
+                rec.session.session = InferenceSession(
+                    mp, sess_options=_session_opts(),
+                    providers=["CPUExecutionProvider"])
+            rec.rec_batch_num = _REC_BATCH
+    except Exception:
+        pass          # 调优失败不许影响识别：退回库默认配置
+
 
 def is_available() -> bool:
     """OCR 依赖是否已安装。未安装时上层降级为「标记扫描件」而非报错。"""
@@ -26,7 +75,9 @@ def _get_engine():
         with _lock:
             if _engine is None:
                 from rapidocr_onnxruntime import RapidOCR
-                _engine = RapidOCR()
+                eng = RapidOCR()
+                _tune(eng)
+                _engine = eng
     return _engine
 
 

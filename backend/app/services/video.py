@@ -45,9 +45,19 @@ from ..core.config import settings
 # graph_clean 同理（2026-10-13）：结构图的**清透变体**（浅灰白底 + 紫主色白卡片，
 # 参照知识类课件的信息图风格：hub=左根右支树状、compare=紫表头表格），同样只换画法。
 SKINS = ("source", "graph", "talking_head", "radio", "night", "ambient", "graph_paper",
-         "graph_clean")
+         "graph_clean", "ppt", "board", "motion")
 # graph_paper / graph_clean 与 graph 共用同一套知识点生成（都要 points，都不要锚点）。
 GRAPH_SKINS = ("graph", "graph_paper", "graph_clean")
+# 「由 points 出画面」的皮肤族：都要 points、都不要锚点（结构图三兄弟 + PPT 课件）。
+# ⚠️⚠️ ppt **绝不能直接塞进 GRAPH_SKINS**：那个常量还承载「结构图画法」语义
+#    （`stage.py` 用它决定 `graph_svg(wide=…)`，课件根本不是结构图）。
+#    但生成侧必须复用 graph 那条分支（同一份 points 数据），所以单列此族：
+#    `routers/videos._gen_visuals` 按它分派。只改 SKINS 而漏了这里 →
+#    ppt 落进 else 分支抛 500「视觉方案解析失败」，且报错文案会让人以为是配置写错。
+# board（板书）同族：也要 points、不要锚点（同一份数据，画法换成「写上黑板」）。
+# motion（动效图解，2026-10-21）同族：同一份 points，画法换成「画布生长 + 元素变换
+# + 公式逐项点亮」。⚠️ 同样**绝不能塞进 GRAPH_SKINS**（它有自己的独立模板，不是结构图）。
+POINTS_SKINS = GRAPH_SKINS + ("ppt", "board", "motion")
 # talking_head 的「内容层」白名单（叠加层之下真正做画面的那个）。
 INNER_SKINS = ("source", "graph")
 # 口播「内容层」的兜底。⚠️ 为什么是 graph 而不是 source：结构图由讲稿产出，
@@ -61,7 +71,8 @@ AMBIENT_INNER_DEFAULT = "none"
 INNER_LABELS = {"source": "材料原件", "graph": "结构图", "none": "纯氛围"}
 SKIN_LABELS = {"source": "材料原件", "graph": "结构图", "talking_head": "数字人口播",
                "radio": "电台 · 浅色", "night": "电台 · 深色", "ambient": "氛围",
-               "graph_paper": "结构图 · 纸感", "graph_clean": "结构图 · 清透"}
+               "graph_paper": "结构图 · 纸感", "graph_clean": "结构图 · 清透",
+               "ppt": "PPT 课件", "board": "板书", "motion": "动效图解"}
 
 # 电台皮肤的预设变体（2026-10-12）：radio / night 各 3 套，空 key = 默认套（存量零回归）。
 # ⚠️ swatch / ink 只用于生成台的色板胶囊展示；真正的配色写在各舞台模板的
@@ -111,20 +122,55 @@ def variant_label(skin, variant) -> str:
 #   ① 归一化**不按皮肤清空** —— 在电台和别的皮肤之间来回切，不该丢掉用户填的字；
 #   ② 但 visual_sig **只在电台皮肤下**才把它拼进指纹（见该函数）—— 否则全部非电台
 #      历史作品的指纹会无谓变化，集体误报「视觉方案已更换」（与 bg_id 同款纪律）。
-# 上限 20 不是拍的：58px 楷体 + 14px 字距下画面横向约容 26 字，留出缩排后仍清晰的余量。
-# 改这个值必须同步重跑 `_probe_brand_fit_20261013.py`（实测渲染宽度）与前端 maxlength。
-BRAND_TEXT_MAX = 20
+# 上限 50（2026-10-20 起，**含换行符**，与前端 textarea maxlength 同一口径）：支持两行
+# 署名（如「作品名 / 出品方」）。模板按「最长一行的字数」降档排印（单行最长约 26 字仍
+# 清晰）。改这个值必须同步重跑 `_probe_brand_fit_20261020.py`（实测渲染宽度）与前端 maxlength。
+BRAND_TEXT_MAX = 50
+# 署名最多两行（2026-10-20）：radio 皮肤署名到波形条纵向只有 80px，两行封顶 40px 字号
+# 已是极限（标定见 `_probe_brand_fit_20261020.py`）；第三行即使传进来也无处可放 → 归一化丢弃。
+BRAND_TEXT_MAX_LINES = 2
 # 画面里真的有「署名」这个位置的皮肤（口径只此一处，供 stage / 接口 / 探针共用）。
 BRAND_SKINS = ("radio", "night")
 
+# ---------- 渲染倍速（2026-10-20，提速 A）----------
+# 页钟 = 墙钟 × RATE → 抓帧段墙钟 = 时长 / RATE（编码已与抓帧并行，见 renderer）。
+# ⚠️⚠️ 只有「render(ms) 纯函数、无 CSS transition/keyframes 跟墙钟走」的皮肤能开：
+#   三个解压独立模板已纯函数化；stage_tpl.html 系（graph / source / talking_head /
+#   graph_paper / graph_clean）还有 CSS 过渡 → 恒 1.0，否则画面动效与页钟错位。
+# ⚠️ 口径只此一处：stage.py 注入 __RATE__ 用它；renderer 以页面 __stage.rate 自报为准
+#   （注入与合成两套时钟口径绝不会漂移）。
+RENDER_RATE_RELAX = 1.5
+RENDER_RATE_SKINS = ("radio", "night", "ambient")
+# motion（2026-10-21）：模板全纯函数（render p99=0.30ms，余量充足）开倍速，
+# ⚠️ 但**不借 1.5 档**：实测 1.5x 下槽位对齐 p99 在 150ms 红线上下抛硬币
+#    （153/162 交替失败），且 dup_ratio 10-12% 让 morph/相机滑动发涩
+#    （30fps 墙钟抓帧 × 1.5 = 页钟粒度 50ms）→ 单独 1.25x 档（粒度 41ms，
+#    对齐余量与画面顺滑都保住）。
+# ⚠️⚠️ 渲染器侧的 rate→页钟换算 2026-10-21 才补上（提速 A 此前只有模板侧
+#    自报、渲染器从未读 → rate>1 的渲染**必挂**「对齐异常」）——
+#    见 renderer.py on_frame 的 rel 换算与该处注释。
+RENDER_RATE_MAP = {"motion": 1.25}
+
+
+def render_rate_for(skin) -> float:
+    """渲染页钟倍速（约束见上方常量注释）。"""
+    s = str(skin or "").strip().lower()
+    if s in RENDER_RATE_MAP:
+        return RENDER_RATE_MAP[s]
+    return RENDER_RATE_RELAX if s in RENDER_RATE_SKINS else 1.0
+
 
 def norm_brand_text(s) -> str:
-    """画面署名归一化：去首尾空白 + 按 BRAND_TEXT_MAX 截断。
+    """画面署名归一化：换行符归一 + 逐行去首尾空白 + 去空行 + 限两行 + 按 BRAND_TEXT_MAX 截断。
 
     ⚠️ **不按皮肤清空**：皮肤是随时可改的视觉参数，而署名是用户填的内容。
        按皮肤清空会让「电台 → 结构图 → 电台」这个来回把字吃掉（静默改作品）。
+    ⚠️ 计数口径**含换行符**，与前端 textarea maxlength 一致（用户看到的计数就是上屏计数）。
     """
-    return str(s or "").strip()[:BRAND_TEXT_MAX]
+    t = str(s or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [ln.strip() for ln in t.split("\n")]
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines[:BRAND_TEXT_MAX_LINES])[:BRAND_TEXT_MAX].rstrip("\n")
 
 
 def brand_text_for(v) -> str:
@@ -142,7 +188,7 @@ def brand_text_for(v) -> str:
 # 「有效画面生产者」白名单 —— resolve_visual 只返回这里面的值。
 # ⚠️ talking_head 不在其中（它是叠加层，映射到 inner）；ambient 在其中（纯氛围自己产画面）。
 VISUAL_KINDS = ("source", "graph", "radio", "night", "ambient", "graph_paper",
-                "graph_clean")
+                "graph_clean", "ppt", "board", "motion")
 # 支持**自定义背景图**的皮肤（解压型三皮肤）。
 # ⚠️ 为什么只有这三个：它们的画面结构就是「一张铺满的底 + 少量叠加元素」，
 #    换底不影响信息层级；信息型四皮肤的每一寸画面都在承载可读内容（原件 / 卡片 /
@@ -223,6 +269,22 @@ EST_BYTES_PER_SEC_BY_CLASS = {
     "source": 90_000,      # source / graph / talking_head（步点间静止，实测 ≈550kbps）
     "graph_paper": 120_000,  # 纸感结构图：每次显现=一整块纸卡 + 全幅亮底重绘
     "graph_clean": 120_000,  # 清透结构图：同族亮底整卡显现，暂与纸感同档（待实测探针标定）
+    # PPT 课件：逐条显现同 graph_clean（同一套「亮底整卡」画法），但画面底部多一条
+    # **每秒都在变**的时间轴进度条（局部 4px 高、变化面积小）→ 暂借用同档。
+    # ⚠️ 待标定：真渲染 20s 样张后按实测码率改这一格（与 graph_paper 的纪律一样，
+    #    不靠类比定值）。当前值偏保守（宁可高估，拦住一次渲染的代价远小于写满磁盘）。
+    "ppt": 120_000,
+    # 板书：暗底 + 局部书写。2026-10-20 标定：真渲染 24s 样张（书写最密的首屏段）
+    # 实测 4,295,836 B / 24s ≈ 179k B/s → 取 190k 留 ~6% 余量（比「暂借 PPT 档」的
+    # 120k 高 —— 书写期逐行擦出是持续变化，不能像 PPT 整卡显现那样按静止估）。
+    "board": 190_000,
+    # 动效图解：暗底 + 元素 morph/dim/逐项点亮（持续局部变化，与板书同类）。
+    # 2026-10-21 真实作品标定（videos.id=12，《RAG 检索三层拆解》248.3s，25 页 /
+    # 89 元素，真管线出片 21.81MB）：实测 **87.8k B/s**；另合成 9s 高密度样张
+    # 61.5k B/s。取 120k = 实测中密度值 +37% 余量（覆盖 8 元素 + 图表公式的密页）。
+    # ⚠️ 原先暂借 board 档 190k（板书逐行擦出是持续变化，motion 是离散点亮），
+    #    高估 2.2 倍 → 「预计大小」会明显偏大。此格改动必须有新的实测，不靠类比。
+    "motion": 120_000,
     "radio": 64_000,       # 大面积纯色 + 局部动（实测 391kbps ≈ 49k B/s）
     "night": 138_000,      # 静态插画背景 + 局部动（实测 850kbps ≈ 106k B/s）
     "ambient": 256_000,    # 光晕底全屏动（实测 none 1577 / source 1314 kbps）
@@ -245,15 +307,27 @@ AVATAR_POS_LABEL = {"left": "左侧", "right": "右侧", "pip": "画中画"}
 # ⚠️ 诚实边界：形象**不做面部变形**，说话状态由外圈光环 + 头部微摆 + 句首点头表达，
 #    不是音频驱动的真实唇形同步；UI 文案义务不变（见 stage.py::_th_dom）。
 # ⚠️ `tint` 只用于形象背景柔光（.th-glow）的色相，**不参与任何绘制**。
+#
+# ⚠️⚠️ `bg` = 素材的**背景处理口径**（2026-10-20 用户拍板「重新开启数字人 + 保留数字人背景」）：
+#   · "keep"  —— 素材自带**影棚/渐变底**：那是一张有真实布光的照片（有阴影、有暗角、有环境色）。
+#                抠掉它反而丢信息 —— 人像被「贴」到舞台上，边缘要靠假投影补，实测会出现
+#                亮边/绿边描边（2026-10-20 对比图 `_probe_th_bg_20261020/cmp/edge_t62.png`）。
+#                保留背景 + CSS radial 羽化（.th-photo 的 mask）把矩形边缘化开，人物与舞台
+#                暗部自然过渡 → 观感更像「现场拍摄」而不是「贴纸」。
+#                视频用 `{aid}_bg.webm`（带背景版），图片用 `{aid}.jpg`。
+#   · "matte" —— 素材是**绿幕**或已经抠好的透明版：必须去背，保留就是一整块绿。
+#                视频用 `{aid}_matte.webm`（抠像版），图片用 `{aid}_alpha.png`。
+#   ⚠️ 判定依据是**素材本身**，不是「哪种更好看」；绿幕留着就是事故。
+#   ⚠️ 上传形象（u-）与未知形象一律按 "keep"：用户传的是普通照片，羽化边缘是改造前行为（零回归）。
 BUILTIN_AVATARS = [
     {"id": "preset_01", "label": "讲师 · 知性", "tint": 214, "kind": "lecturer",
-     "file": "preset_01.jpg"},
+     "file": "preset_01.jpg", "bg": "keep"},
     {"id": "preset_02", "label": "讲师 · 沉稳", "tint": 222, "kind": "lecturer",
-     "file": "preset_02.jpg"},
+     "file": "preset_02.jpg", "bg": "keep"},
     {"id": "preset_03", "label": "讲师 · 亲和", "tint": 28, "kind": "lecturer",
-     "file": "preset_03.jpg"},
+     "file": "preset_03.jpg", "bg": "keep"},
     {"id": "preset_04", "label": "讲师 · 阳光", "tint": 205, "kind": "lecturer",
-     "file": "preset_04.jpg"},
+     "file": "preset_04.jpg", "bg": "matte"},
 ]
 AVATAR_UPLOAD_MAX_MB = 8
 # 形象清单一次最多列多少个上传图（预置不算）：只影响 UI 列表长度，不删文件
@@ -330,13 +404,48 @@ def preset_video(aid: str) -> Path | None:
        **绝不把 URL 传来的字符串拼进路径**（`../` 穿越在这个接口上同样致命）。
     ⚠️ 动作视频是**可选**的：没有就回落静态图（`stage.py::_avatar_motion` 返回空串），
        所以「只给部分形象配视频」是合法状态，不是错误状态。
-    ⚠️ 与图片同目录（`assets/avatars/preset_01.webm`）：打包靠 `AIStudyCompanion.spec`
+    ⚠️ 与图片同目录（`assets/avatars/{aid}.webm`）：打包靠 `AIStudyCompanion.spec`
        的 datas 收 `app/services/assets` 整目录，新文件自动带上，无需改 spec。
     """
     a = (aid or "").strip()
     for it in BUILTIN_AVATARS:
         if it["id"] == a:
             p = preset_dir() / (a + ".webm")
+            try:
+                return p if p.is_file() else None
+            except BaseException:
+                return None
+    return None
+
+
+def preset_bg_video(aid: str) -> Path | None:
+    """预置形象 id → **保留背景**的动作视频（`{aid}_bg.webm`）；没有返回 None。
+
+    ⚠️ 与 `preset_video()` 的分工：那个是**抠像版**（透明底，`{aid}.webm`），
+       这个是未抠像的原始版。用哪个由 `BUILTIN_AVATARS[].bg` 决定，别在这里猜。
+    ⚠️ 白名单纪律同 `preset_file()`：文件名由 id 推导，绝不拼接外部字符串。
+    """
+    a = (aid or "").strip()
+    for it in BUILTIN_AVATARS:
+        if it["id"] == a:
+            p = preset_dir() / (a + "_bg.webm")
+            try:
+                return p if p.is_file() else None
+            except BaseException:
+                return None
+    return None
+
+
+def preset_matte_video(aid: str) -> Path | None:
+    """预置形象 id → **抠像版**动作视频（`{aid}_matte.webm`）；没有返回 None。
+
+    ⚠️ `bg == "matte"` 的形象（绿幕）**只能**用这个：`{aid}.webm` 是绿幕原始版，
+       当兜底就会渲出一整块绿。没有抠像版时宁可回落静态图，也不能回落到它。
+    """
+    a = (aid or "").strip()
+    for it in BUILTIN_AVATARS:
+        if it["id"] == a:
+            p = preset_dir() / (a + "_matte.webm")
             try:
                 return p if p.is_file() else None
             except BaseException:
@@ -419,7 +528,8 @@ def _volume_class(skin: str) -> str:
     talking_head 落到内层（source/graph，步点间静止）；ambient 不论 inner 都是
     光晕底（全屏动是主成本）；radio / night / ambient 各自一档；未知按 source。"""
     s = (skin or "").strip().lower()
-    if s in ("radio", "night", "ambient", "graph_paper", "graph_clean"):
+    if s in ("radio", "night", "ambient", "graph_paper", "graph_clean", "ppt", "board",
+             "motion"):
         return s
     return "source"          # source / graph / talking_head / 未知 → 静止为主的档
 
@@ -1020,7 +1130,98 @@ def apply_scene_meta(shots: list, scenes: list, script: list | None = None) -> l
     return out
 
 
+def tex_to_mathml(terms) -> "list[str] | None":
+    """LaTeX 逐项 → MathML 字符串列表（动效图解皮肤的公式块用）。
+
+    渲染侧零成本：Chromium MathML Core 原生排版，用系统 Cambria Math 字体 ——
+    不引 KaTeX/MathJax（JS 库 + 字体资产 = 体积与授权两个坑），也没有每帧开销。
+    ⚠️ 缺包或**任何一项**转换失败都返回 None：模板退化为等宽文本块（公式源码
+       照出，绝不白屏）——「当场失败远好于渲出一片黑」的反面：这里是可降级的
+       增强，不是必需画面，降级才是对的。
+    ⚠️ 转换产物只进 stage 页的 JSON 注入（`_j` 序列化），不进 HTML 上下文。
+    """
+    if not isinstance(terms, list) or not terms:
+        return None
+    try:
+        from latex2mathml.converter import convert
+    except Exception:
+        return None
+    out = []
+    for t in terms:
+        try:
+            out.append(convert(str(t)))
+        except Exception:
+            return None
+    return out or None
+
+
 # ---------- 视觉步点：结构图（graph 皮肤） ----------
+
+# ---------- 板书 · 整屏图板（sketch，2026-10-21）----------
+# 一张图 = 一板：带 sketch 的要点会被**摘出条目流、独占一页**画成黑板上的一幅简图。
+# ⚠️ 校验与「接地」都放在这里（与 chart 的 _chart_grounded 同一纪律）：
+#    模型给的草图里任何一个标签都可能是它自己编出来的关系，后端必须能拦。
+SKETCH_TYPES = ("flow", "compare", "quadrant", "pyramid")
+# 每种原语的标签数下限/上限。**硬约束**：数量不对整张降级成普通条目，
+# 绝不「有多少画多少」—— 少一个标签的流程链会画成断头的箭头。
+SKETCH_LABEL_RANGE = {"flow": (2, 4), "compare": (4, 6),
+                      "quadrant": (4, 4), "pyramid": (3, 4)}
+SKETCH_LABEL_MAX = 8          # 单个标签字数上限（图内字号大，超了就挤成一团）
+
+
+def norm_sketch(sk):
+    """校验并归一化模型给的 sketch；不合法返回 None（上游降级成普通条目）。
+
+    ⚠️⚠️ 这是**唯一防线**：坏数据一旦放进模板，产物是一张空白图板页 ——
+       成片里表现为「讲到这儿画面空了几十秒」，而且全程不报错、日志也没有线索。
+    """
+    if not isinstance(sk, dict):
+        return None
+    ty = str(sk.get("type") or "").strip().lower()
+    if ty not in SKETCH_TYPES:
+        return None
+    raw = sk.get("labels")
+    if not isinstance(raw, list):
+        return None
+    labels = [str(x).strip() for x in raw]
+    labels = [x for x in labels if x]
+    lo, hi = SKETCH_LABEL_RANGE[ty]
+    if not (lo <= len(labels) <= hi):
+        return None
+    if any(len(x) > SKETCH_LABEL_MAX for x in labels):
+        return None
+    # 对比图必须左右等分：奇数会让中线两侧不对称，画出来就是歪的
+    if ty == "compare" and len(labels) % 2:
+        return None
+    out = {"type": ty, "labels": labels}
+    if ty == "quadrant":
+        # 象限没有轴名时，四个格子只是四个不知方位的词，图就白画了
+        xa = str(sk.get("x") or "").strip()[:SKETCH_LABEL_MAX]
+        ya = str(sk.get("y") or "").strip()[:SKETCH_LABEL_MAX]
+        if not xa or not ya or xa == ya:
+            return None
+        out["x"], out["y"] = xa, ya
+    elif len(set(labels)) < len(labels):
+        # 同一张图里重复标签 = 模型在凑数，画出来是「同一个词写两遍」
+        return None
+    return out
+
+
+def sketch_grounded(sk, fulltext: str) -> bool:
+    """草图接地：**至少半数标签**在讲稿原文里出现过，否则整张丢弃。
+
+    ⚠️ 为什么是「半数」而不是「全部」：模型常把讲稿里的长句压成短词
+      （「投入与回报的四种组合」→「高回报」），要求全中会把合法草图一起丢掉，
+      功能表面上线、实际永不触发；而一半以上对得上，就排除了「整张凭空编」。
+    ⚠️ 这是硬判据，提示词里那条「不许编造」是软的 —— 用户改讲稿后重生成，
+      旧草图会随新讲稿重新校验（事实口径跟着讲稿走）。
+    """
+    labels = [str(x) for x in (sk.get("labels") or [])]
+    if not labels:
+        return False
+    hit = sum(1 for x in labels if x and x in fulltext)
+    return hit * 2 >= len(labels)
+
 
 def build_graph_points(script: list, elements: list) -> list:
     """结构图元素 → 要点栏点位 `[{t,k,at,group,seg}]`。
@@ -1035,6 +1236,32 @@ def build_graph_points(script: list, elements: list) -> list:
        镜头是「这一屏画什么」，`at` 是「哪一刻长出来」，两者正交。
     """
     n = len(script)
+    # chart 数字硬校验（2026-10-21，禁编造的**后端**判据）：value 的字符串形态
+    # 必须在讲稿原文里出现（"%g" 与整型两种写法都认），否则整条 chart 丢弃
+    # （元素降级为文本块）。提示词约束是软的，这关是硬的 —— 用户改讲稿把数字
+    # 改掉后重生成，旧图表也会被自动丢弃（事实口径随讲稿）。
+    fulltext = "".join(str(s.get("text") or "") for s in script or [])
+
+    def _chart_grounded(chart) -> bool:
+        try:
+            for x in chart.get("items") or []:
+                fv = float(x.get("value"))
+                cand = {"%g" % fv}
+                if fv == int(fv):
+                    cand.add(str(int(fv)))
+                if not any(c and c in fulltext for c in cand):
+                    return False
+            return True
+        except (TypeError, ValueError, AttributeError):
+            return False
+
+    # sketch 数量硬上限（修8，2026-10-21）：提示词说「总屏数÷3」但那是软约束，
+    # LLM 超发没有兜底 —— 满屏都是图反而没人看。屏数按元素给出的 (group, sc)
+    # 组合去重计；超限按出现顺序保留、超出的退回普通条目（静默，不炸片）。
+    _sk_screens = {(int(x.get("group") or 1), max(0, int(x.get("sc") or 0)))
+                   for x in elements or [] if isinstance(x, dict)}
+    _sk_max = max(1, len(_sk_screens) // 3)
+    _sk_used = 0
     by_seg: dict = {}
     for e in elements or []:
         try:
@@ -1048,9 +1275,30 @@ def build_graph_points(script: list, elements: list) -> list:
         k = str(e.get("k") or "concept")
         if k not in ("concept", "good", "cost"):
             k = "concept"
-        by_seg.setdefault(seg, []).append({"t": t[:24], "k": k,
-                                           "group": int(e.get("group") or 1),
-                                           "sc": max(0, int(e.get("sc") or 0))})
+        row = {"t": t[:24], "k": k,
+               "group": int(e.get("group") or 1),
+               "sc": max(0, int(e.get("sc") or 0))}
+        # tex（可选，动效图解）：公式元素的 LaTeX 逐项数组，原样透传到落库 points。
+        # ⚠️ 只透传 list 形态（`_clamp_point` 已规整）；旧皮肤不读此字段。
+        if isinstance(e.get("tex"), list) and e["tex"]:
+            row["tex"] = [str(x)[:120] for x in e["tex"]][:8]
+        # chart（可选，动效图解 P1）：数据图元素，同 tex 的透传纪律（dict 形态）。
+        # ⚠️ 先过数字自验（讲稿原文必须含这些数字），不成立即丢弃（降级文本块）。
+        if (isinstance(e.get("chart"), dict) and e["chart"].get("items")
+                and _chart_grounded(e["chart"])):
+            row["chart"] = e["chart"]
+        # sketch（可选，板书整屏图板）：与 chart 同一纪律 —— 先校验形状，再验接地
+        # （讲稿真的说过这些词），任一不过就整张丢弃、该元素退回普通条目。
+        if isinstance(e.get("sketch"), dict):
+            # 互斥（修8）：同元素已带 tex/chart 就不再挂 sketch —— _expand_sketch
+            # 只取 labels，chart 会被静默丢弃；上限同理，超发的直接退回普通条目。
+            sk0 = (norm_sketch(e["sketch"])
+                   if _sk_used < _sk_max and "tex" not in row and "chart" not in row
+                   else None)
+            if sk0 and sketch_grounded(sk0, fulltext):
+                row["sketch"] = sk0
+                _sk_used += 1
+        by_seg.setdefault(seg, []).append(row)
     # ⚠️⚠️ 必须遍历**全部**句号，不能只遍历 `by_seg`（只有出过元素的句子）：
     #     实测抓到「整句一个元素都没有」——模型对第 3/5/7/9/13/15/17 句一条都没给，
     #     于是该句**整段没有任何点亮**，前后两个事件的间隔直接跨过整句：
@@ -1121,10 +1369,149 @@ def build_graph_points(script: list, elements: list) -> list:
             group = list(group) + fill
             k = len(group)
         for e, at in zip(group, _spread(start, end, k)):
-            pts.append({"t": e["t"], "k": e["k"], "group": e["group"],
-                        "sc": int(e.get("sc") or 0), "seg": seg, "at": int(at)})
+            pt = {"t": e["t"], "k": e["k"], "group": e["group"],
+                  "sc": int(e.get("sc") or 0), "seg": seg, "at": int(at)}
+            # 补点（fill）构造时不带 tex —— 只有模型原始元素可能是公式；
+            # 同一句被复制来填空隙的复制品绝不能复制公式（一屏两个相同公式块）。
+            if isinstance(e.get("tex"), list) and e["tex"]:
+                pt["tex"] = e["tex"]
+            # chart 同理：复制品不带数据图（一屏两个相同图表块同忌）。
+            if isinstance(e.get("chart"), dict) and e["chart"].get("items"):
+                pt["chart"] = e["chart"]
+            # sketch 同理：复制品**绝不复制草图** —— 否则同一张图会在同一节里
+            # 画两遍（而且是两块完全一样的黑板，比两个相同图表块更刺眼）。
+            if isinstance(e.get("sketch"), dict) and e["sketch"].get("type"):
+                pt["sketch"] = e["sketch"]
+            pts.append(pt)
     pts.sort(key=lambda p: (p["at"], p["group"]))
     return pts
+
+
+# ---------- PPT 内容区「形状」（2026-10-21）----------
+# 语义：一页的条目该画成什么**骨架**。注意它**不是皮肤**——皮肤决定整体画风，
+# 形状只决定「右侧内容区内部长什么样」（用户 2026-10-21 拍板「在 ppt 上扩」）。
+#
+# ⚠️⚠️ 判定权必须在**后端规则**，绝不交给模型：实测 v6 是 6/6 全 grid
+#    （汇报型内容模型一律选 grid），`screens.layout` 已因此被判「不值得跟随」。
+#    模型只产条目文案，形状由「条目数 + 文案形态」推。
+# ⚠️ 判不出来必须返回 ""（= 现有单列清单）—— **存量作品一个字节都不变**，
+#    这是「在 ppt 上扩」这条路线全部的安全性来源。
+# ⚠️ 判据刻意保守：误判的代价是「一页好好的内容被画成不合适的形状」，
+#    比漏判（继续用清单）严重得多。宁可少画，不可错画。
+SHAPES = ("path", "ladder", "ring")
+SHAPE_LABELS = {"path": "轨迹", "ladder": "阶梯", "ring": "闭环"}
+
+# 失败步的词面（只用于形状判定 + 轨迹节点配色，不进数据模型）
+_FAIL_WORDS = ("没有", "没找到", "找不到", "失败", "报错", "崩", "不通", "不支持",
+               "无法", "走不通", "过期", "卡住", "不通过", "踩坑")
+# 顺序连接词：轨迹必须有「先后」，否则一串优缺点也会被画成路径
+_SEQ_WORDS = ("先", "再", "然后", "接着", "最后", "之后", "随后", "于是",
+              "第一步", "下一步", "换去", "改用")
+# 循环词：闭环的辅助判据（主判据是「首尾同名」）
+_LOOP_WORDS = ("循环", "反复", "一直", "每次", "轮", "回到", "不断", "持续", "再想")
+
+_NUM_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+# 序号型数字：**不是度量值**。「第1步/第2步/第3步」若被当成阶梯，画出来就是
+# 三根按 1/2/3 比例的高柱 —— 视觉上在暗示「第三步的量是第一步的三倍」。
+# ⚠️ 这条是自测抓到的真实误判（三条指令型文案 100% 命中 ladder）。
+# ⚠️ 单位里**不能有「版」**：「第一版 21 个 / 先校验 39 个 / 接住报错 44 个全过」
+#    是标准的阶梯样本，但「第一版」会被 `第[一]版` 命中 → 阶梯被判掉、退成轨迹
+#    （自测第一轮就是这么错的）。「第1版/第2版」的递进本来就是增长，画成阶梯不算错。
+_ORDINAL_RE = re.compile(
+    r"^\s*(?:第\s*[0-9一二三四五六七八九十百]+\s*(?:步|章|节|条|点|轮|个|阶段|部分)"
+    r"|[vV]\s*\d"
+    r"|(?:\(?[0-9一二三四五六七八九十]{1,2}\)?\s*[、.)）]))")
+
+
+def item_state(t) -> str:
+    """单条条目的状态（fail / ok）。只影响轨迹节点的勾叉与配色。"""
+    s = str(t or "")
+    return "fail" if any(w in s for w in _FAIL_WORDS) else "ok"
+
+
+def item_num(t):
+    """条目里的**最后一个**数字（去千分位）。抽不到返回 None。
+
+    ⚠️ 不能取第一个：「Q1 营收 120 万」的第一个数字是 Q1 的 1 ——
+       阶梯页的柱高和数值全部跟着错（自测截图实证：柱子上写着 1/2/3/4）。
+       度量值几乎总在句尾；编号（Q1/第2章/v3）几乎总在句首。
+    """
+    ms = _NUM_RE.findall(str(t or ""))
+    if not ms:
+        return None
+    try:
+        return float(ms[-1].replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _vlen(t) -> str:
+    """可见字符数（空格 / 全角空格不计）。
+
+    ⚠️ 必须按可见字符算：实测「接住报错 44 个全过」共 11 个字符，但只看得见 10 个
+       —— 按 `len()` 判会把它挡在阶梯之外，于是这一页被错判成轨迹（第一版就栽了）。
+    """
+    return len(str(t or "").replace(" ", "").replace("\u3000", ""))
+
+
+def _lcs(a: str, b: str) -> int:
+    """最长公共子串长度（首尾同名的回环判据，见 pick_shape ③）。"""
+    if not a or not b:
+        return 0
+    best = 0
+    prev = [0] * (len(b) + 1)
+    for ca in a:
+        cur = [0] * (len(b) + 1)
+        for j, cb in enumerate(b, 1):
+            if ca == cb:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best:
+                    best = cur[j]
+        prev = cur
+    return best
+
+
+def pick_shape(els) -> str:
+    """一页条目 → 形状名（"" = 清单，即现状）。
+
+    ① ladder：3–4 级、全是短标签、每个都带数字且**严格递增**（21→39→44）
+    ② path  ：有失败步但不是全失败，且文案里有顺序连接词（翻文档→没有→换搜邮件）
+    ③ ring  ：3–5 条短标签，且首尾同名（"想下一步"/"再想下一步"）或 ≥2 个循环词
+    ⚠️ 三条都不命中就返回 ""：形状是**加分项**，不是标配。
+    """
+    items = [e for e in (els or []) if str(e.get("t") or "").strip()]
+    n = len(items)
+    if n < 3 or n > 6:
+        return ""
+    texts = [str(e.get("t") or "") for e in items]
+    nums = [item_num(t) for t in texts]
+    # 序号/版本号型条目：数字只是编号，不是度量 → 既不构成阶梯，也不构成闭环
+    is_ord = [bool(_ORDINAL_RE.match(t)) for t in texts]
+    fails = sum(1 for e in items
+                if str(e.get("st") or item_state(e.get("t"))) == "fail")
+
+    # ① 阶梯：数字是这一页的**唯一**主角，所以要求全数字 + 严格递增
+    if (3 <= n <= 4 and all(_vlen(t) <= 10 for t in texts)
+            and all(x is not None for x in nums)
+            and not any(is_ord)):
+        vals = [float(x) for x in nums]
+        if all(vals[i] < vals[i + 1] for i in range(n - 1)):
+            return "ladder"
+
+    # ② 轨迹：失败步是内容骨架，但必须「有成功有失败」且讲出了先后
+    if 0 < fails < n and any(w in t for t in texts for w in _SEQ_WORDS):
+        return "path"
+
+    # ③ 闭环：短标签 + 首尾同名（回环感），或两个以上循环词
+    if n <= 5 and all(_vlen(t) <= 8 for t in texts) and not any(is_ord):
+        # ⚠️ 必须数**不同种类**：同一句「每次…」在两条里各出现一次，
+        #    只说明它们在讲频率，不说明它们首尾相接成环（自测抓到：
+        #    「每次都要重试 / 结果不确定 / 每次成本更高」曾被判成闭环）。
+        kinds = {w for t in texts for w in _LOOP_WORDS if w in t}
+        if len(kinds) >= 2 or _lcs(texts[0], texts[-1]) >= 3:
+            return "ring"
+    return ""
 
 
 def graph_steps(points: list) -> list:
@@ -1166,6 +1553,23 @@ def hit_rate(stats: dict) -> float:
     """定位命中率（判据 4）：命中句数 / 有内容的句子数。"""
     tried = int(stats.get("tried") or 0)
     return round(int(stats.get("hit") or 0) / tried, 4) if tried else 0.0
+
+
+def locate_hits_from_report(v) -> dict:
+    """按作品上一次的闸门报告重建**真实**定位口径，供 manual_step / rerun_gate 重跑闸门。
+
+    ⚠️ 为什么不能用 {"tried": 1, "hit": 1}：那会让 hit_rate 恒为 1.0，
+       判据 4 在还欠未命中句时也转绿放行（2026-10-22 探针双路径证实）。
+    口径：生成时 tried == hit + len(unlocated) 恒成立 → hit = tried - len(unlocated)。
+    旧报告没有 locate_tried（存量数据）→ 退回「有内容的句子数」。
+    """
+    rep = getattr(v, "gate_report", None) or {}
+    un = [int(i) for i in (rep.get("unlocated") or [])]
+    tried = int(rep.get("locate_tried") or 0)
+    if tried <= 0:
+        tried = sum(1 for s in (getattr(v, "script", None) or [])
+                    if (s.get("text") or "").strip())
+    return {"tried": tried, "hit": max(0, tried - len(un)), "unlocated": un}
 
 
 def gate_check(v, steps: list, shots: list, hits: dict, tts_conf: dict | None = None) -> dict:
@@ -1264,6 +1668,10 @@ def gate_check(v, steps: list, shots: list, hits: dict, tts_conf: dict | None = 
     return {
         "max_still_ms": d["max_still_ms"], "avg_gap_ms": d["avg_gap_ms"],
         "events": d["events"], "locate_hit_rate": rate, "gaps_fixed": gaps_fixed,
+        # 定位口径持久化（2026-10-22）：manual_step / rerun_gate 重算命中率要靠它，
+        # 否则只能喂 tried=1/hit=1，判据 4 恒绿（已证实的放水 bug）。
+        "locate_tried": int(hits.get("tried") or 0),
+        "locate_hit": int(hits.get("hit") or 0),
         "passed": passed, "checked_at": datetime.utcnow().isoformat(timespec="seconds"),
         "items": items, "unlocated": list(hits.get("unlocated") or []),
     }
@@ -1743,9 +2151,10 @@ def list_avatars() -> list:
         item.pop("file", None)
         # 「这个形象有没有动作视频」：下发供前端与验收探针断言。
         # 前端当前不据此改 UI —— 有视频时舞台自己会播，用户无需额外配置。
-        # 2026-10-13 晚拍板：形象路线回到图生视频（PNG/inner 路线废弃），
-        # motion 标记恢复只看 webm 是否存在。
-        item["motion"] = preset_video(it["id"]) is not None
+        # 2026-10-20 起动作视频按口径分两条命名（`_bg` 保留背景 / `_matte` 抠像），
+        # 旧 `{aid}.webm` 只作兜底 → 标记必须三处都看，否则「有视频的形象被标成没有」。
+        item["motion"] = any(x is not None for x in (
+            preset_bg_video(it["id"]), preset_matte_video(it["id"]), preset_video(it["id"])))
         out.append(item)
     have = {x["id"] for x in out}
     try:
@@ -1764,8 +2173,11 @@ def list_avatars() -> list:
             # ⚠️ 必须带 url：不给缩略图地址的话列表里就是一个空点，
             #    用户认不出自己传了哪张。带 mtime 当版本号，换图后浏览器不会拿旧缓存。
             #    （预置项同样带 url —— 见上方。）
+            # motion=False：上传形象**没有**动作视频（只有预置形象配了 webm）。
+            # ⚠️ 字段必须给全 —— 缺 key 会让取 `x["motion"]` 的调用方直接 KeyError，
+            #    此前就踩过（验收脚本按预置项写，遇到上传项即崩）。
             out.append({"id": aid, "label": avatar_label(aid), "kind": "upload",
-                        "builtin": False, "exists": True,
+                        "builtin": False, "bg": "keep", "motion": False, "exists": True,
                         "url": f"{AVATAR_URL_PREFIX}/{aid}/file?v={ver}"})
     except BaseException:
         pass
@@ -1830,7 +2242,8 @@ def avatar_info(avatar_id: str) -> dict:
     if a.startswith("u-"):
         p = avatars_dir() / f"{a}.img"
         # 标签与 list_avatars() 同源：同一个人在两处必须同名
+        # 上传形象按 keep：用户传的是普通照片（带背景），羽化边缘是改造前行为
         return {"id": a, "label": avatar_label(a), "kind": "upload", "builtin": False,
-                "exists": p.exists()}
+                "bg": "keep", "exists": p.exists()}
     return {"id": a, "label": a or "未选择", "kind": "unknown", "builtin": False,
-            "exists": False}
+            "bg": "keep", "exists": False}

@@ -1,0 +1,1314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<style>
+  /* ==========================================================================
+     动效图解 · motion（2026-10-21，论文讲解/Vibe 知识形态）
+     数据由 stage.py 注入：__NAV__ + __SLIDES__（motion_slides 单一口径：
+     页 = (镜头, 屏)，元素带稳定 id / 可选 mml 公式项）—— 分页与 id 合成
+     **在后端算**，模板只负责画。
+
+     画面语义（全部由数据驱动，无随机）：
+       1) 页 = 一屏画布。元素按各自的 at 逐个「长出来」（opacity+上浮），
+          当前正被讲解的元素（最后满足 at<=ms 者）全亮 + 描边，其余压暗。
+       2) 换屏**不整屏硬切**：同 id 元素从上一屏的位置滑到新位置（morph），
+          新元素淡入、退出的元素淡出 —— 画面是连续变换的，不是翻 PPT。
+       3) 公式元素（mml 非空）：整块先亮相，随后逐项点亮（琥珀色高亮窗口
+          沿项序推进，速率按「到下一元素出现」的时间预算自适应）。
+       4) good 元素画圈、cost 元素下划线（与板书同语义，points 的标注
+          直接变成强调动作）。
+       5) 刻意没有封面/片头：SEGS[0].a 实测都是 0，第 0 帧就在讲内容。
+       6) 版式语义（2026-10-21 P1）：flow=横排 + 箭头描边生长、compare=左右
+          对照 + 中缝；其余版式落回垂直栈。版式来自 shots.screens（不再丢弃）。
+       7) 字幕 karaoke：活跃元素的文案（讲稿原词）在字幕里点亮琥珀色。
+       8) 片尾收黑：末 420ms 整体渐隐（画布常驻没有页淡出，必须专门收）。
+
+     ⚠️⚠️ 全部动效必须是 `ms → 状态` 的纯函数（只写在 render(ms) 里）。
+        合成器时钟不可 seek，任何交给 CSS 自己跑的动效都会让
+        「拖进度条看到的」与「成片里的」不是同一个画面。
+     ⚠️ 帧预算：render(ms) p99 必须 <60ms —— 布局一次性算好存 slot，
+        每帧只写 transform/opacity（不触发 reflow），写完就停手（settled）。
+     ⚠️ 公式走 MathML（后端 latex2mathml 转换）：Chromium MathML Core 原生
+        渲染、用系统 Cambria Math 字体 —— 零 JS 库、零字体资产、无每帧开销。
+        转换失败时 mml=null，退化为等宽文本块（公式源码照出，不白屏）。
+     ⚠️ 字体只用 Windows 自带：微软雅黑 + Cambria Math（打包目标全是 Windows）。
+     ========================================================================== */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; }
+  body {
+    font-family: "Microsoft YaHei", "微软雅黑", sans-serif;
+    background: #0b1020; color: #e8ecf4;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  }
+  :root {
+    --ink: #e8ecf4;
+    --dim: #9aa3b8;
+    --concept: #58c4dd;
+    --good: #83c167;
+    --cost: #ff8a6b;
+    --formula: #f4d35e;
+  }
+
+  #stage { position: relative; width: 1920px; height: 1080px;
+           background: radial-gradient(ellipse 120% 100% at 50% 40%,
+             #1c2547 0%, #131a35 46%, #0e1330 76%, #0b1020 100%); }
+  /* 程序化噪点 + 四角压暗（零资产，与板书同手法） */
+  #grain { position: absolute; inset: 0; opacity: .05; pointer-events: none;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/></filter><rect width='240' height='240' filter='url(%23n)'/></svg>"); }
+  #vig { position: absolute; inset: 0; pointer-events: none;
+         background: radial-gradient(ellipse 105% 90% at 50% 46%,
+           transparent 58%, rgba(0, 0, 0, .40) 100%); }
+
+  /* 页眉：节标题 + 页码（换屏时标题交叉淡变，由 render(ms) 驱动） */
+  #phead { position: absolute; top: 78px; left: 96px; right: 220px; height: 64px; }
+  #phead .bar { position: absolute; left: 0; top: 8px; width: 6px; height: 48px;
+                border-radius: 3px; background: var(--concept); }
+  #ptitleA, #ptitleB { position: absolute; left: 26px; top: 0; height: 64px;
+            font-size: 38px; font-weight: 600; letter-spacing: 2px; color: var(--ink);
+            line-height: 64px; white-space: nowrap; }
+  #ptitleB { opacity: 0; }
+  #pageno { position: absolute; top: 88px; right: 96px; font-size: 26px;
+            letter-spacing: 3px; color: var(--dim); }
+
+  /* 画布：元素全部绝对定位，动画只走 transform/opacity */
+  #canvas { position: absolute; inset: 0; }
+  .el { position: absolute; left: 0; top: 0; opacity: 0; will-change: transform, opacity; }
+  /* 元素形态（2026-10-21 P0-B 去框化）：**不再每个元素都是一个圆角卡片**。
+     concept = 纯文字 + 左侧色条（最轻，承担主体阅读）；
+     good    = 淡绿实心底（良方，有分量）；cost = 淡暖底（代价，下划线由 marks
+     层动画画，这里不重复画线）。
+     ⚠️⚠️ padding / font-size **一律不动**：`stage._motion_el_hw` 的宽度估算
+        （84 + 41*units）按这套 padding 标定过，改了就拆页失真。
+     ⚠️ 色条走 ::before 绝对定位（不占布局宽度），所以去掉 border 与底色
+        不会改变 rectOf 量到的宽高。 */
+  .chip { display: inline-block; position: relative;
+          padding: 18px 34px 18px 36px;
+          font-size: 34px; letter-spacing: 2px; color: var(--ink); white-space: nowrap; }
+  .chip::before { content: ''; position: absolute; left: 10px; top: 14%; bottom: 14%;
+                  width: 5px; border-radius: 3px; background: var(--concept); }
+  .el.k-concept .chip { background: rgba(255, 255, 255, .035); border-radius: 10px; }
+  .el.k-concept .chip::before { background: var(--concept); }
+  .el.k-good .chip { background: rgba(131, 193, 103, .12); border-radius: 10px; }
+  .el.k-good .chip::before { background: var(--good); }
+  .el.k-cost .chip { background: rgba(255, 138, 107, .09); border-radius: 10px; }
+  .el.k-cost .chip::before { background: var(--cost); }
+  .fx { display: inline-block; padding: 20px 40px; border-radius: 16px;
+        background: rgba(244, 211, 94, .07); border: 1px solid rgba(244, 211, 94, .28);
+        font-size: 46px; color: var(--ink); white-space: nowrap; }
+  .fx .term { opacity: .45; }
+  .fx .term math { font-family: "Cambria Math", "STIX Two Math", serif; }
+  .fx .plain { font-family: Consolas, "Cascadia Mono", monospace; font-size: 34px;
+               color: var(--formula); letter-spacing: 1px; }
+  .fx .frow { white-space: nowrap; }
+  .blkcap { font-size: 23px; color: var(--dim); letter-spacing: 1px;
+            margin-bottom: 8px; }
+
+  /* 相机层（2026-10-21 P1）：canvas+marks 一起被推拉，字幕/进度/暗角不动 */
+  #camera { position: absolute; inset: 0; transform-origin: 0 0;
+            will-change: transform; }
+
+  /* 数据图元素（bar/line 生长）：数字只能来自讲稿（schema 层拦编造） */
+  .chart { display: inline-block; padding: 16px 22px 14px; border-radius: 16px;
+           background: rgba(88, 196, 221, .06); border: 1px solid rgba(88, 196, 221, .22); }
+  .cbase { stroke: rgba(232, 236, 244, .25); stroke-width: 2; }
+  .cbar { fill: var(--concept); }
+  .cbar.max { fill: var(--formula); }
+  .cval { font-size: 22px; fill: var(--ink); text-anchor: middle; }
+  .clab { font-size: 20px; fill: var(--dim); text-anchor: middle; }
+  .cline { fill: none; stroke: var(--concept); stroke-width: 4;
+           stroke-linecap: round; stroke-linejoin: round; }
+  .cdot { fill: var(--formula); }
+
+  /* 点阵底纹（P2）：程序化蓝图点阵，零资产，大暗底的设计感来源 */
+  #dots { position: absolute; inset: 0; pointer-events: none; opacity: .6;
+          background-image: radial-gradient(rgba(232, 236, 244, .05) 1.2px,
+            transparent 1.3px);
+          background-size: 46px 46px; }
+  /* 片尾收黑（P0）：末 420ms 渐隐到背景色（最顶层，盖住一切） */
+  #fadeout { position: absolute; inset: 0; background: #0b1020; opacity: 0;
+             pointer-events: none; }
+  /* 字幕关键词高亮（karaoke） */
+  #sub .hl { color: var(--formula); font-weight: 600; }
+  /* flow 横排连接箭头 / compare 中缝（marks 层，随相机一起走） */
+  .flowarr { fill: none; stroke: var(--concept); stroke-width: 3.5;
+             stroke-linecap: round; opacity: .85; }
+  .cdiv { stroke: rgba(232, 236, 244, .18); stroke-width: 2;
+          stroke-dasharray: 6 10; }
+  /* hub 辐射连线 / pyramid 层级轴（D：版式补齐，2026-10-21） */
+  .hubln { fill: none; stroke: rgba(88, 196, 221, .55); stroke-width: 3;
+           stroke-linecap: round; }
+  .pyrAxis { fill: none; stroke: rgba(232, 236, 244, .22); stroke-width: 3;
+             stroke-linecap: round; }
+  .pyrDot { fill: var(--concept); }
+  .pyrTie { stroke: rgba(232, 236, 244, .20); stroke-width: 2; }
+  .qaxis { fill: none; stroke: rgba(232, 236, 244, .26); stroke-width: 2.5;
+           stroke-linecap: round; }
+  .qaxlab { fill: rgba(232, 236, 244, .55); font-size: 24px; }
+
+  /* 图形化 V2（2026-10-21）：版式底板层 —— 包络/VS/序号。under 层压元素下、
+     marks 层在元素上（序号/VS 要可见）。全部 opacity 淡入，render(ms) 驱动。 */
+  .cpL { fill: rgba(88, 196, 221, .055); stroke: rgba(88, 196, 221, .20);
+         stroke-width: 1.5; }
+  .cpR { fill: rgba(255, 171, 138, .055); stroke: rgba(255, 171, 138, .20);
+         stroke-width: 1.5; }
+  .vsbadge { fill: #131a2e; stroke: rgba(232, 236, 244, .35); stroke-width: 2; }
+  .vstext { fill: #e8ecf4; fill-opacity: .62; font-size: 26px; font-weight: 600;
+            text-anchor: middle; letter-spacing: 1px; }
+  .flnum { fill: #131a2e; stroke: var(--concept); stroke-width: 2; }
+  .flnumt { fill: var(--concept); font-size: 21px; font-weight: 600;
+            text-anchor: middle; }
+  .qcellA { fill: rgba(88, 196, 221, .07); }
+  .qcellB { fill: rgba(175, 169, 236, .07); }
+  .qarrow { fill: none; stroke: rgba(232, 236, 244, .40); stroke-width: 2.5;
+            stroke-linecap: round; }
+  .pyrband { fill: rgba(88, 196, 221, .06); stroke: rgba(88, 196, 221, .16);
+             stroke-width: 1.5; }
+
+  /* 强调层：good 圈 / cost 下划线（pathLength=100 描边驱动，与板书同手法） */
+  #under { position: absolute; inset: 0; pointer-events: none; }
+
+  #marks { position: absolute; inset: 0; pointer-events: none; }
+  .mark { fill: none; stroke: var(--good); stroke-width: 5; stroke-linecap: round;
+          filter: drop-shadow(0 0 3px rgba(131, 193, 103, .4)); }
+  .mark.cost { stroke: var(--cost);
+               filter: drop-shadow(0 0 3px rgba(255, 138, 107, .4)); }
+
+  /* 字幕条：26px（与主模板 .subbar / 板书同规格，别再调） */
+  #sub { position: absolute; left: 50%; bottom: 46px; transform: translateX(-50%);
+         max-width: 1560px; padding: 12px 34px; border-radius: 13px;
+         background: rgba(8, 11, 24, .58); border: 1px solid rgba(232, 236, 244, .15);
+         font-size: 26px; letter-spacing: 1.5px; color: var(--ink);
+         white-space: nowrap; opacity: 0; }
+
+  /* 底部进度：scaleX 走合成器 */
+  #prog { position: absolute; left: 0; bottom: 0; width: 100%; height: 4px;
+          background: rgba(232, 236, 244, .08); }
+  #progFill { width: 100%; height: 100%; transform-origin: left center;
+              transform: scaleX(0);
+              background: linear-gradient(90deg,
+                rgba(88, 196, 221, .55), rgba(88, 196, 221, .9)); }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="grain"></div>
+  <div id="dots"></div>
+  <div id="phead"><div class="bar"></div><div id="ptitleA"></div><div id="ptitleB"></div></div>
+  <div id="pageno"></div>
+  <div id="camera">
+    <svg id="under" viewBox="0 0 1920 1080"></svg>
+    <div id="canvas"></div>
+    <div id="canvas"></div>
+    <svg id="marks" viewBox="0 0 1920 1080"></svg>
+  </div>
+  <div id="vig"></div>
+  <div id="sub"></div>
+  <div id="prog"><div id="progFill"></div></div>
+  <div id="fadeout"></div>
+</div>
+
+<script>
+/* NAV=[{no,title,a,b}] · SLIDES=[{no,total,shot,sc,layout,title,a,b,els:[{at,t,k,id,mml,chart}]}]
+   layout = 这一屏的版式（flow/compare/...，grid=垂直栈兜底）；超容量的屏已被
+   后端拆成同 sc 的连续子页（motion_slides 的溢出守卫）
+   mml = [MathML 字符串] | null（公式元素；null 时退化为文本块，t 是口头称呼）
+   chart = {type:'bar'|'line', items:[{label,value}]} | 缺省（数字只来自讲稿）
+   SEGS=[{s,t,a,b}] 讲稿句（毫秒） · TOTAL=全片毫秒 */
+const NAV = __NAV__;
+const SLIDES = __SLIDES__;
+const SEGS = __SEGS__;
+const TOTAL = __TOTAL__;
+/* 渲染倍速（2026-10-21 P1）：页钟 = 墙钟 × RATE → 抓帧段墙钟 = 时长 / RATE。
+   ⚠️ 与 radio/night/ambient 同口径：全纯函数模板才能 >1；
+   RATE 必须随 __stage.rate 自报（renderer 以页面自报为准换算帧时间戳）。 */
+const RATE = __RATE__;
+
+const APPEAR = 460;        /* 元素长出来（opacity + 上浮） */
+const MORPH = 560;         /* 换屏同 id 元素位置插值 */
+const EXIT = 200;          /* 换屏退出元素淡出（B4：420/300 都会与新页元素叠字，200 才干净） */
+const MARK_MS = 560;       /* 圈 / 下划线描边时长 */
+const TITLE_XF = 320;      /* 页眉标题交叉淡变 */
+const DIM = 0.45;          /* 非活跃元素压暗（B2：无硬边后 0.35 会"消失"） */
+const CAM_BLEND = 500;     /* 相机聚焦插值时长 */
+const NS = 'http://www.w3.org/2000/svg';
+/* 数据图画布规格（固定尺寸 → 布局测量零波动） */
+const CH_W = 720, CH_H = 280, CH_BASE = 238, CH_TOP = 26;
+
+const canvasBox = document.getElementById('canvas');
+const cameraEl = document.getElementById('camera');
+const titleA = document.getElementById('ptitleA');
+const titleB = document.getElementById('ptitleB');
+const pagenoEl = document.getElementById('pageno');
+const marksSvg = document.getElementById('marks');
+const underSvg = document.getElementById('under');
+const subEl = document.getElementById('sub');
+const progFill = document.getElementById('progFill');
+const fadeEl = document.getElementById('fadeout');
+
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const ease = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+
+/* ---------- 页查找：页边界首尾相接（motion_slides 保证），线性扫即可 ---------- */
+function slideAt(ms) {
+  let s = SLIDES[0];
+  for (let i = 0; i < SLIDES.length; i++) if (ms >= SLIDES[i].a) s = SLIDES[i];
+  return s;
+}
+
+/* ---------- 强调图形 ---------- */
+function mkRing(rect, cls) {
+  /* 手绘圈（B3）：**不能再用 rect** —— 圆角矩形贴着元素外扩 14/12，与元素自身的
+     圆角块几乎重合，看起来就是「又一个绿色边框」，画圈重点的语义完全没出来。
+     改成不闭合的椭圆弧：从右上起笔、绕 340°、末端留 20° 缺口内收（笔没闭合才像手画）。
+     ⚠️ 外扩 rx+16 / ry+13 是给相机 bbox 的已知量（bbox 按 ±16 留边），别单独加大。 */
+  const cx = rect.x + rect.w / 2, cy = rect.y + rect.h / 2;
+  const rx = rect.w / 2 + 16, ry = rect.h / 2 + 13;
+  const a0 = -0.32, a1 = a0 + 340 * Math.PI / 180;
+  const px0 = cx + rx * Math.cos(a0), py0 = cy + ry * Math.sin(a0);
+  const px1 = cx + rx * Math.cos(a1), py1 = cy + ry * Math.sin(a1);
+  const el = document.createElementNS(NS, 'path');
+  el.setAttribute('d', 'M ' + px0.toFixed(1) + ' ' + py0.toFixed(1) +
+    ' A ' + rx.toFixed(1) + ' ' + ry.toFixed(1) + ' 0 1 1 ' +
+    px1.toFixed(1) + ' ' + py1.toFixed(1));
+  el.setAttribute('class', cls);
+  el.setAttribute('pathLength', '100');
+  el.setAttribute('stroke-dasharray', '100');
+  el.setAttribute('stroke-dashoffset', '100');
+  /* ⚠️ 圆角线帽 + dash 描边的怪癖：offset=100（全隐藏）时仍会在起点渲出
+     一个**圆点**（2026-10-21 真渲染帧实测漏出）→ 未开画前整体 hidden。 */
+  el.setAttribute('visibility', 'hidden');
+  return el;
+}
+function mkUnderline(rect, cls) {
+  const el = document.createElementNS(NS, 'path');
+  const y = rect.y + rect.h + 10;
+  el.setAttribute('d', 'M ' + (rect.x - 8) + ' ' + y +
+    ' Q ' + (rect.x + rect.w / 2) + ' ' + (y + 9) + ' ' + (rect.x + rect.w + 8) + ' ' + (y - 3));
+  el.setAttribute('class', cls);
+  el.setAttribute('pathLength', '100');
+  el.setAttribute('stroke-dasharray', '100');
+  el.setAttribute('stroke-dashoffset', '100');
+  el.setAttribute('visibility', 'hidden');   /* 同 mkRing 的圆点怪癖 */
+  return el;
+}
+
+/* grid 列数（D）：2 列（n<=4）/ 3 列；列宽按该列最宽元素算，
+   总宽装不下（>1800）返回 0 → 调用方落回垂直栈（与改前逐字节等价，绝不出画）。 */
+function gridColsFor(sizes, n) {
+  const cols = n <= 4 ? 2 : 3;
+  const cm = new Array(cols).fill(0);
+  for (let i = 0; i < n; i++) cm[i % cols] = Math.max(cm[i % cols], sizes[i].w);
+  const tot = cm.reduce((a, b) => a + b, 0) + 64 * (cols - 1);
+  return tot > 1800 ? 0 : cols;
+}
+
+function rectOf(el) {
+  const r = el.getBoundingClientRect();
+  return { x: r.left, y: r.top, w: r.width, h: r.height };
+}
+
+/* ---------- 建一屏：DOM + 一次性布局（slot）+ 测量 ----------
+   cur = {no,a,b,els:[{node,inner,id,k,at,slot,dur,terms[],mark,markAt,morph}],
+          exits:[{node,from,op}],titleSwap,settled,allDone}
+   prev = 上一屏的 paint 记录（取 exits）；prevSlots = {id:{x,y}}（morph 起点） */
+let cur = null;
+
+function paint(s, prev, prevSlots) {
+  canvasBox.innerHTML = '';
+  marksSvg.innerHTML = '';
+  underSvg.innerHTML = '';
+  /* ⚠️⚠️ 布局测量必须先摘掉相机变换：paint 发生在页首，此时 #camera 还带着
+     上一页末尾的 scale(1.06) —— getBoundingClientRect 是变换后坐标，量出的
+     宽高虚高 6%，容量判断/缩字号/居中全被污染（真实作品实测：flow 页算出
+     fx=-57 直接压出左边框）。同一帧后面（render 末尾）会重设相机，这里只管归零。 */
+  cameraEl.style.transform = 'none';
+  const els = s.els || [];
+  const n = els.length;
+
+  /* 第一遍：建节点、量尺寸（字号超宽收缩，每屏一次） */
+  const items = [];
+  for (let i = 0; i < n; i++) {
+    const e = els[i];
+    const box = document.createElement('div');
+    box.className = 'el k-' + (e.k === 'good' ? 'good' : e.k === 'cost' ? 'cost' : 'concept');
+    box.setAttribute('data-id', e.id || '');
+    box.setAttribute('data-at', String(+e.at));
+    let inner, terms = null, chartRef = null;
+    if (e.mml && e.mml.length) {
+      inner = document.createElement('div');
+      inner.className = 'fx';
+      /* 公式的口头称呼（t）显示为小字 caption —— 公式本身不带语义标签 */
+      const cap = document.createElement('div');
+      cap.className = 'blkcap';
+      cap.textContent = e.t;
+      inner.appendChild(cap);
+      const frow = document.createElement('div');
+      frow.className = 'frow';
+      inner.appendChild(frow);
+      terms = [];
+      for (let j = 0; j < e.mml.length; j++) {
+        const sp = document.createElement('span');
+        sp.className = 'term';
+        sp.innerHTML = e.mml[j];
+        frow.appendChild(sp);
+        terms.push(sp);
+      }
+    } else if (e.chart && e.chart.items && e.chart.items.length >= 2) {
+      inner = document.createElement('div');
+      inner.className = 'chart';
+      const cap = document.createElement('div');
+      cap.className = 'blkcap';
+      cap.textContent = e.t;
+      inner.appendChild(cap);
+      chartRef = buildChart(inner, e.chart);
+    } else {
+      inner = document.createElement('div');
+      inner.className = 'chip';
+      inner.textContent = e.t;
+    }
+    box.appendChild(inner);
+    canvasBox.appendChild(box);
+    items.push({ e, node: box, inner, terms, chartRef });
+  }
+
+  /* 布局：按版式分派（flow=横排箭头链 / compare=左右对照 / 其余=垂直栈居中）。
+     超容量拆分已在后端 motion_slides 做完（这里拿到的必然装得下）。 */
+  const lay = s.layout || 'grid';
+  /* 字号档：真实作品标定（id=12，25 页：15 页 4 个元素、7 页 3 个、其余更少）——
+     真实 LLM 产出**每屏只有 3-4 个短元素**，38px 在 1920 宽下画面发空（截图确认）。
+     改为按元素数反比放大：少则字大（撑住画面）、多则字小（仍装得下）。 */
+  const fsChip = n <= 2 ? 54 : n === 3 ? 48 : n === 4 ? 44
+               : n === 5 ? 40 : n === 6 ? 36 : 32;
+  const sizes = [];
+  let totalH = 0;
+  for (const it of items) {
+    if (!it.terms && !it.chartRef) it.inner.style.fontSize = fsChip + 'px';
+    let r = rectOf(it.inner);
+    if (r.w > 1240) {
+      const shrink = Math.max(24, Math.floor(fsChip * 1240 / r.w));
+      it.inner.style.fontSize = shrink + 'px';
+      r = rectOf(it.inner);
+    }
+    sizes.push(r);
+    totalH += r.h;
+  }
+  const slots = [];
+  const flowArrows = [];   // flow：{x0,x1,y,at}（slot 定好后建 path）
+  let dividerBox = null;   // compare：{x,y0,y1}
+  let hubLinks = [];       // hub：分支下标 + 出现时刻（连线在 slot 定好后建）
+  let pyramidAxis = null;  // pyramid：{x,y0,y1,ties[],at}
+  let quadrantAxes = null; // quadrant（修3）：{gx,gy,bx0,bx1,by0,by1,xn,yn,at}
+  const panelSpecs = [];   // V2 底板：{kind, ...} —— 绘制区统一建节点
+  /* flow 一行的可用宽（1920 - 两侧 65 边距）。真实作品实测过「4 个长句相加
+     2150px」直接把末端算出画（右端 1947 > 1920）—— 必须在这里兜住：后端容量
+     估算按文本长度推宽，实测比真实窄 ~23%，只能保证「大方向不塞太满」。 */
+  const FLOW_AVAIL = 1790;
+  let layEff = lay;
+  if (layEff === 'flow' && n >= 2) {
+    const arrowW = 44;
+    let totW = sizes.reduce((a, r) => a + r.w, 0) + arrowW * (n - 1);
+    if (totW > FLOW_AVAIL) {
+      /* 公式 / 图表块的字号不受 chip 字号控制（自有排版），缩字号救不回来 */
+      const fancy = items.some(it => it.terms || it.chartRef);
+      if (!fancy) {
+        /* ⚠️⚠️ 一次按比例缩必然不够：padding / 左侧竖线不随字号缩（实测 4 个
+           8 字标签按比例只缩 2% 仍超宽 → 静默退 grid，箭头链语义消失）。
+           迭代实测：每轮按缺口比例再乘 0.98 缩字号、重测总宽，最多 6 轮；
+           字号撞 26px 下限即停（仍超才退 grid）。 */
+        for (let iter = 0; iter < 6 && totW > FLOW_AVAIL; iter++) {
+          const k = FLOW_AVAIL / totW * 0.98;
+          let hitFloor = false;
+          for (let i2 = 0; i2 < n; i2++) {
+            const base = parseFloat(items[i2].inner.style.fontSize) || fsChip;
+            const nxt = Math.floor(base * k);
+            if (nxt <= 26) { items[i2].inner.style.fontSize = '26px'; hitFloor = true; }
+            else items[i2].inner.style.fontSize = nxt + 'px';
+            sizes[i2] = rectOf(items[i2].inner);
+          }
+          totW = sizes.reduce((a, r) => a + r.w, 0) + arrowW * (n - 1);
+          if (hitFloor) break;
+        }
+      }
+      /* 仍装不下（极长文本 / 含公式图表）→ 退回垂直栈：宁可不横排，决不出画 */
+      if (totW > FLOW_AVAIL) layEff = 'grid';
+    }
+  }
+  if (layEff === 'compare' && n >= 2) {
+    /* 对照版式也必须有出画兜底：两列最宽 + 最小内缘间隙超过可用宽、或单列最宽
+       超过半屏（长句 / 公式 / 图表），两列根本摆不开 → 退回垂直栈。 */
+    const cHalf = Math.ceil(n / 2);
+    let cL = 0, cR = 0;
+    for (let i = 0; i < n; i++) {
+      if (i < cHalf) cL = Math.max(cL, sizes[i].w);
+      else cR = Math.max(cR, sizes[i].w);
+    }
+    if (cL + cR + 24 > 1800 || Math.max(cL, cR) > 820) layEff = 'grid';
+  }
+  if (layEff === 'flow' && n >= 2) {
+    const arrowW = 44;
+    const totW = sizes.reduce((a, r) => a + r.w, 0) + arrowW * (n - 1);
+    let fx = Math.max(60, (1920 - totW) / 2);
+    for (let i = 0; i < n; i++) {
+      const r = sizes[i];
+      slots.push({ x: Math.round(fx), y: Math.round(540 - r.h / 2), w: r.w, h: r.h });
+      /* V2：序号圆标压元素左上（SVG 层不计 rectOf → 不影响容量估算），
+         与本元素同刻淡入（链条的「第几步」一眼可见） */
+      panelSpecs.push({ kind: 'flnum', x: Math.round(fx) - 6,
+                        y: Math.round(540 - r.h / 2) - 6, n: i + 1, at: +items[i].e.at });
+      if (i > 0) flowArrows.push({ x0: slots[i - 1].x + slots[i - 1].w + 6,
+                                   x1: slots[i].x - 6, y: 540, at: +items[i].e.at });
+      fx += r.w + arrowW;
+    }
+  } else if (layEff === 'compare' && n >= 2) {
+    /* 前一半左列、后一半右列（提示词契约；与后端 _motion_split 同口径） */
+    const half = Math.ceil(n / 2);
+    /* 列心自适应：固定 470/1450 时，真实作品的短元素（实测宽 ~250-360）之间会
+       空出 700px，两列像各自漂在画角（id=12 截图确认）。改为「两列内缘留 80px」，
+       同时夹紧总宽（两列最宽相加 + 间距 ≤ 1800，否则缩间距）。 */
+    let wL = 0, wR = 0;
+    for (let i = 0; i < n; i++) {
+      if (i < half) wL = Math.max(wL, sizes[i].w);
+      else wR = Math.max(wR, sizes[i].w);
+    }
+    let innerGap = 160;                       // 两列内缘总间隙
+    if (wL + wR + innerGap > 1800) {
+      innerGap = Math.max(24, 1800 - wL - wR);
+    }
+    const colX = [Math.round(960 - innerGap / 2 - wL / 2),
+                  Math.round(960 + innerGap / 2 + wR / 2)];
+    const colH = [0, 0], gapC = 18;
+    for (let i = 0; i < n; i++) colH[i < half ? 0 : 1] += sizes[i].h;
+    colH[0] += gapC * Math.max(0, half - 1);
+    colH[1] += gapC * Math.max(0, n - half - 1);
+    const ys = [Math.max(196, (1080 - colH[0]) / 2 + 30),
+                Math.max(196, (1080 - colH[1]) / 2 + 30)];
+    for (let i = 0; i < n; i++) {
+      const side = i < half ? 0 : 1;
+      const r = sizes[i];
+      slots.push({ x: Math.round(colX[side] - r.w / 2), y: Math.round(ys[side]),
+                   w: r.w, h: r.h });
+      ys[side] += r.h + gapC;
+    }
+    /* V2：左右包络底板（列 bbox 外扩 44/34）+ 中缝 VS 圆标。底板在 under 层
+       （压元素下），页首淡入；VS 在 marks 层（压元素上），晚 200ms 浮现。 */
+    const bboxOf = (ss) => {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const q of ss) { x0 = Math.min(x0, q.x); y0 = Math.min(y0, q.y);
+                            x1 = Math.max(x1, q.x + q.w); y1 = Math.max(y1, q.y + q.h); }
+      return { x0, y0, x1, y1 };
+    };
+    const lb = bboxOf(slots.slice(0, half)), rb = bboxOf(slots.slice(half));
+    panelSpecs.push({ kind: 'cpL', x: lb.x0 - 44, y: lb.y0 - 34,
+                      w: lb.x1 - lb.x0 + 88, h: lb.y1 - lb.y0 + 68, at: s.a });
+    panelSpecs.push({ kind: 'cpR', x: rb.x0 - 44, y: rb.y0 - 34,
+                      w: rb.x1 - rb.x0 + 88, h: rb.y1 - rb.y0 + 68, at: s.a });
+    panelSpecs.push({ kind: 'vs', x: 960,
+                      y: Math.round((Math.min(lb.y0, rb.y0) + Math.max(lb.y1, rb.y1)) / 2),
+                      at: s.a + 200 });
+    dividerBox = { x: 960, y0: 250, y1: 830 };
+  } else if (layEff === 'grid' && n >= 3 && gridColsFor(sizes, n) > 0) {
+    /* 网格（D）：模型说 grid 时 2-3 个元素竖排就是列表，不像"图解"。
+       列心对齐（列宽取该列最宽元素），整块水平居中；行高取该行最高元素。 */
+    const cols = gridColsFor(sizes, n);
+    const rows = Math.ceil(n / cols);
+    const colMax = new Array(cols).fill(0);
+    const rowH = new Array(rows).fill(0);
+    for (let i = 0; i < n; i++) {
+      const c = i % cols, rw = Math.floor(i / cols);
+      colMax[c] = Math.max(colMax[c], sizes[i].w);
+      rowH[rw] = Math.max(rowH[rw], sizes[i].h);
+    }
+    const gapX = 64;
+    const totW = colMax.reduce((a, b) => a + b, 0) + gapX * (cols - 1);
+    const sumH = rowH.reduce((a, b) => a + b, 0);
+    const gapY = clamp((820 - sumH) / Math.max(1, rows - 1), 24, 58);
+    const allH = sumH + gapY * (rows - 1);
+    const y0 = Math.max(196, (1080 - allH) / 2 + 26);
+    const colX = [];
+    let accX = 960 - totW / 2;
+    for (let c = 0; c < cols; c++) { colX.push(accX + colMax[c] / 2); accX += colMax[c] + gapX; }
+    const rowY = [];
+    let accY = y0;
+    for (let rw = 0; rw < rows; rw++) { rowY.push(accY); accY += rowH[rw] + gapY; }
+    for (let i = 0; i < n; i++) {
+      const c = i % cols, rw = Math.floor(i / cols);
+      const r = sizes[i];
+      slots.push({ x: Math.round(colX[c] - r.w / 2),
+                   y: Math.round(rowY[rw] + (rowH[rw] - r.h) / 2),
+                   w: r.w, h: r.h });
+    }
+    /* 象限十字轴（修3，2026-10-21）：norm_sketch 强制 quadrant 给 x/y 轴名，
+       但 A 接入时只把 labels 摆成 2x2 —— 轴名通过校验却从不上屏，四宫格
+       退化成四个孤立词。这里兑现：列间隙中点 gx、行间隙中点 gy 画十字轴，
+       轴名贴轴端（x=横轴右端上方 end 对齐；y=纵轴顶端右侧）。 */
+    if (s.qaxes && cols === 2 && rows === 2) {
+      const gxQ = Math.round(((colX[0] + colMax[0] / 2) + (colX[1] - colMax[1] / 2)) / 2);
+      const gyQ = Math.round(((rowY[0] + rowH[0]) + rowY[1]) / 2);
+      const bx0 = Math.round(960 - totW / 2) - 56, bx1 = Math.round(960 + totW / 2) + 56;
+      const by0 = Math.round(y0) - 56, by1 = Math.round(y0 + allH) + 56;
+      quadrantAxes = { gx: gxQ, gy: gyQ, bx0, bx1, by0: Math.max(by0, 204), by1,
+                       xn: String(s.qaxes.x || ''), yn: String(s.qaxes.y || ''),
+                       at: +items[0].e.at };
+      /* V2：四象限淡色块（青/紫交替），内缩 12px 留轴缝。under 层页首淡入。 */
+      const qx0 = Math.round(960 - totW / 2) - 44, qx1 = Math.round(960 + totW / 2) + 44;
+      const qy0 = Math.max(by0, 204) - 12, qy1 = by1 + 12;
+      panelSpecs.push({ kind: 'qcellA', x: qx0, y: qy0, w: gxQ - 12 - qx0, h: gyQ - 12 - qy0, at: s.a });
+      panelSpecs.push({ kind: 'qcellB', x: gxQ + 12, y: qy0, w: qx1 - gxQ - 12, h: gyQ - 12 - qy0, at: s.a });
+      panelSpecs.push({ kind: 'qcellB', x: qx0, y: gyQ + 12, w: gxQ - 12 - qx0, h: qy1 - gyQ - 12, at: s.a });
+      panelSpecs.push({ kind: 'qcellA', x: gxQ + 12, y: gyQ + 12, w: qx1 - gxQ - 12, h: qy1 - gyQ - 12, at: s.a });
+    }
+  } else if (layEff === 'hub' && n >= 3 && n <= 6) {
+    /* 中心辐射（D）：els[0] 是中心主题，其余按角度均分环绕。
+       半径由「中心半宽 + 分支半宽 + 78」推出保证不重叠，再夹紧到 470/250；
+       元素贴边时逐项 clamp（40 边距 / 190 页眉下 / 966 字幕上）。 */
+    const k = n - 1;
+    const cW = sizes[0].w, cH = sizes[0].h;
+    let bw = 0, bh = 0;
+    for (let i = 1; i < n; i++) { bw = Math.max(bw, sizes[i].w); bh = Math.max(bh, sizes[i].h); }
+    let rx = Math.max(cW / 2 + bw / 2 + 78, 420);
+    let ry = Math.max(cH / 2 + bh / 2 + 74, 236);
+    rx = Math.min(rx, 470); ry = Math.min(ry, 250);
+    const cx0 = 960, cy0 = 540;
+    slots.push({ x: Math.round(cx0 - cW / 2), y: Math.round(cy0 - cH / 2), w: cW, h: cH });
+    hubLinks = [];
+    for (let i = 1; i < n; i++) {
+      const ang = -Math.PI / 2 + (2 * Math.PI) * (i - 1) / k;
+      const r = sizes[i];
+      let x = Math.round(cx0 + rx * Math.cos(ang) - r.w / 2);
+      let y = Math.round(cy0 + ry * Math.sin(ang) - r.h / 2);
+      x = clamp(x, 40, 1920 - 40 - r.w);
+      y = clamp(y, 190, 966 - r.h);
+      slots.push({ x, y, w: r.w, h: r.h });
+      hubLinks.push({ i, at: +items[i].e.at });
+    }
+    /* 分支上下不对称（k=3 是 1 上 2 下）→ 按内容 bbox 垂直居中，
+       否则「中心主题」看着压在下半屏。偏移夹紧 ±60：中心别离开画面中心太远。 */
+    let hy0 = Infinity, hy1 = -Infinity;
+    for (const s2 of slots) { hy0 = Math.min(hy0, s2.y); hy1 = Math.max(hy1, s2.y + s2.h); }
+    const dyC = clamp(Math.round(540 - (hy0 + hy1) / 2), -60, 60);
+    if (dyC) for (const s2 of slots) s2.y += dyC;
+  } else if (layEff === 'pyramid' && n >= 2) {
+    /* 分层递进（D）：居中堆叠 + 左侧层级轴（竖线 + 圆点 + 连到元素的短横）。
+       层距 46~86；轴画在「最左元素左边 46」，贴边下限 70。 */
+    const gapP = clamp((880 - totalH) / Math.max(1, n - 1), 46, 86);
+    const totAll = totalH + gapP * (n - 1);
+    let vy = Math.max(196, (1080 - totAll) / 2 + 26);
+    let leftMost = Infinity;
+    for (let i = 0; i < n; i++) {
+      const r = sizes[i];
+      const x = Math.round((1920 - r.w) / 2);
+      slots.push({ x, y: Math.round(vy), w: r.w, h: r.h });
+      leftMost = Math.min(leftMost, x);
+      vy += r.h + gapP;
+    }
+    const ax = Math.max(70, Math.round(leftMost - 46));
+    pyramidAxis = { x: ax, y0: slots[0].y + slots[0].h / 2,
+                    y1: slots[n - 1].y + slots[n - 1].h / 2,
+                    ties: slots.map(s => ({ y: s.y + s.h / 2, x2: s.x - 10 })),
+                    at: +items[0].e.at };
+    /* V2：真金字塔 —— 每层一条宽度递增的色带（顶层窄、底层宽），under 层，
+       随该层元素同刻淡入。层级轴保留（竖线圆点是「生长」的载体，色带是「形」）。 */
+    for (let i = 0; i < n; i++) {
+      const bw = Math.min(1460, Math.round(sizes[i].w) + 180 + i * 150);
+      panelSpecs.push({ kind: 'pyrband', x: Math.round(960 - bw / 2),
+                        y: slots[i].y - 20, w: bw, h: slots[i].h + 40,
+                        at: +items[i].e.at });
+    }
+  } else {
+    const gap = clamp((940 - totalH) / Math.max(1, n - 1), 18, 34);
+    const totAll = totalH + gap * Math.max(0, n - 1);
+    let vy = Math.max(196, (1080 - totAll) / 2 + 30);
+    for (let i = 0; i < n; i++) {
+      const r = sizes[i];
+      slots.push({ x: Math.round((1920 - r.w) / 2), y: Math.round(vy), w: r.w, h: r.h });
+      vy += r.h + gap;
+    }
+  }
+
+  const out = { no: s.no, a: s.a, b: s.b, els: [], exits: [], titleSwap: s.a,
+                arrows: [], panels: [], divider: null, settled: false, allDone: s.a + TITLE_XF };
+  /* 本页内容并集（相机夹紧用）：聚焦位移不许把任何元素推出画面。
+     圈画/下划线会外扩 ~14px，一并计入，避免「文字在、圈画被切」。 */
+  if (slots.length) {
+    let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+    for (const sl of slots) {
+      bx0 = Math.min(bx0, sl.x - 16); by0 = Math.min(by0, sl.y - 16);
+      bx1 = Math.max(bx1, sl.x + sl.w + 16); by1 = Math.max(by1, sl.y + sl.h + 16);
+    }
+    out.bbox = { x0: bx0, y0: by0, x1: bx1, y1: by1 };
+  }
+  /* 相机来处：上一屏末尾的焦点（其最后元素的 slot）。⚠️ 必须在 paint 期固化 ——
+     camAt 是纯 ms 函数，seek 到屏中任意点都要拿到同一个 camFrom。 */
+  out.camFrom = (prev && prev.els && prev.els.length)
+    ? camTargetFor(prev.els[prev.els.length - 1]) : CAM_ID;
+  const prevMap = prevSlots || {};
+  for (let i = 0; i < items.length; i++) {
+    const { e, node, inner, terms, chartRef } = items[i];
+    const slot = slots[i];
+    node.style.transform = 'translate(' + slot.x + 'px,' + slot.y + 'px)';
+    const nextAt = i + 1 < items.length ? +items[i + 1].e.at : s.b;
+    const dur = clamp((nextAt - +e.at) * 0.6, 700, 3600);
+    const rec = { node, inner, id: e.id || ('#' + i), k: e.k, at: +e.at, slot,
+                  t: String(e.t || ''), dur, terms, chart: chartRef, mark: null, markAt: 0,
+                  enter: (terms && terms.length) ? 'grow' : 'rise',
+                  morph: prevMap[e.id] || null, termWin: 0 };
+    if (terms && terms.length) {
+      rec.termWin = clamp((dur - APPEAR) / terms.length, 240, 1400);
+      /* ⚠️ 逐项点亮的总窗必须计入 allDone：否则「页内最后一个公式」的活跃期
+         尾部会被 settled 终态提前压平（实测：换页前 240ms 逐项高亮丢失）。
+         allDone 超过页尾无害 —— 换页即重建。 */
+      const termAll = +e.at + APPEAR + rec.termWin * terms.length;
+      if (termAll > out.allDone) out.allDone = termAll;
+    }
+    if (chartRef) {
+      /* 生长窗：bar = 逐柱 170ms 间隔 + 430ms 单柱；line = 描边 180ms/段 + 末点 240ms。
+         ⚠️⚠️ 两个实测教训：
+         ① **生长从 at 起算，不等 APPEAR**（柱子长出来本身就是入场；等 700ms 入场
+            再加 770ms 生长 = 1470ms，比真实数据的一页（~1000ms）还长）；
+         ② 仍按「距换页的可用时间」压一道（k<1 只收紧节奏，终态照样长满）——
+            真实作品存在两元素一页的短页，不压就会被换页切掉。 */
+      const growRaw = chartRef.type === 'bar'
+        ? (chartRef.n - 1) * 170 + 430 : 180 * Math.max(1, chartRef.n - 1) + 240;
+      const avail = Math.max(320, s.b - (+e.at) - 100);
+      chartRef.k = Math.min(1, avail / growRaw);
+      const grow = growRaw * chartRef.k;
+      if (+e.at + grow > out.allDone) out.allDone = +e.at + grow;
+    }
+    if (e.k === 'good' || e.k === 'cost') {
+      rec.markAt = +e.at + APPEAR + 100;
+      rec.mark = e.k === 'good' ? mkRing(slot, 'mark') : mkUnderline(slot, 'mark cost');
+      marksSvg.appendChild(rec.mark);
+      if (rec.markAt + MARK_MS > out.allDone) out.allDone = rec.markAt + MARK_MS;
+    }
+    if (+e.at + APPEAR > out.allDone) out.allDone = +e.at + APPEAR;
+    out.els.push(rec);
+  }
+
+  /* flow 连接箭头（下一元素出现时描边生长）+ compare 中缝（页首淡入） */
+  for (const a of flowArrows) {
+    const ln = document.createElementNS(NS, 'path');
+    ln.setAttribute('d', 'M ' + a.x0 + ' ' + a.y + ' L ' + a.x1 + ' ' + a.y);
+    ln.setAttribute('class', 'flowarr');
+    ln.setAttribute('pathLength', '100');
+    ln.setAttribute('stroke-dasharray', '100');
+    ln.setAttribute('stroke-dashoffset', '100');
+    ln.setAttribute('visibility', 'hidden');   // 圆点怪癖同 mkRing
+    const head = document.createElementNS(NS, 'path');
+    head.setAttribute('d', 'M ' + (a.x1 - 10) + ' ' + (a.y - 7) + ' L ' + a.x1 +
+                      ' ' + a.y + ' L ' + (a.x1 - 10) + ' ' + (a.y + 7));
+    head.setAttribute('class', 'flowarr');
+    head.setAttribute('opacity', '0');
+    marksSvg.appendChild(ln);
+    marksSvg.appendChild(head);
+    out.arrows.push({ line: ln, head, at: a.at });
+    if (a.at + APPEAR > out.allDone) out.allDone = a.at + APPEAR;
+  }
+  /* hub 辐射连线（D）：中心盒子边缘 → 分支盒子边缘，随分支出现时刻生长 */
+  for (const h of hubLinks) {
+    const cs = slots[0], bs = slots[h.i];
+    const cxA = cs.x + cs.w / 2, cyA = cs.y + cs.h / 2;
+    const cxB = bs.x + bs.w / 2, cyB = bs.y + bs.h / 2;
+    const dx = cxB - cxA, dy = cyB - cyA;
+    const ts = Math.min(dx !== 0 ? (cs.w / 2) / Math.abs(dx) : Infinity,
+                        dy !== 0 ? (cs.h / 2) / Math.abs(dy) : Infinity);
+    const x0 = cxA + dx * ts, y0 = cyA + dy * ts;
+    const te = Math.min(dx !== 0 ? (bs.w / 2 + 8) / Math.abs(dx) : Infinity,
+                        dy !== 0 ? (bs.h / 2 + 8) / Math.abs(dy) : Infinity);
+    const x1 = cxB - dx * te, y1 = cyB - dy * te;
+    const ln = document.createElementNS(NS, 'path');
+    ln.setAttribute('d', 'M ' + x0.toFixed(1) + ' ' + y0.toFixed(1) +
+                    ' L ' + x1.toFixed(1) + ' ' + y1.toFixed(1));
+    ln.setAttribute('class', 'hubln');
+    ln.setAttribute('pathLength', '100');
+    ln.setAttribute('stroke-dasharray', '100');
+    ln.setAttribute('stroke-dashoffset', '100');
+    ln.setAttribute('visibility', 'hidden');
+    marksSvg.appendChild(ln);
+    out.arrows.push({ line: ln, head: null, at: h.at });
+    if (h.at + APPEAR > out.allDone) out.allDone = h.at + APPEAR;
+  }
+  /* pyramid 层级轴（D）：竖线 + 每层圆点 + 短横，页首起 120ms 错峰生长。
+     ⚠️ 圆点挂在 arrows 的 head 位置上（head 允许是任意 SVG 节点）→ 收尾段统一显形。 */
+  if (pyramidAxis) {
+    const ax = pyramidAxis;
+    const vln = document.createElementNS(NS, 'path');
+    vln.setAttribute('d', 'M ' + ax.x + ' ' + ax.y0.toFixed(1) +
+                    ' L ' + ax.x + ' ' + ax.y1.toFixed(1));
+    vln.setAttribute('class', 'pyrAxis');
+    vln.setAttribute('pathLength', '100');
+    vln.setAttribute('stroke-dasharray', '100');
+    vln.setAttribute('stroke-dashoffset', '100');
+    vln.setAttribute('visibility', 'hidden');
+    marksSvg.appendChild(vln);
+    out.arrows.push({ line: vln, head: null, at: ax.at });
+    for (const t of ax.ties) {
+      const d = document.createElementNS(NS, 'circle');
+      d.setAttribute('cx', ax.x); d.setAttribute('cy', t.y.toFixed(1));
+      d.setAttribute('r', '5'); d.setAttribute('class', 'pyrDot');
+      d.setAttribute('opacity', '0');
+      marksSvg.appendChild(d);
+      const tl = document.createElementNS(NS, 'path');
+      tl.setAttribute('d', 'M ' + (ax.x + 5) + ' ' + t.y.toFixed(1) +
+                     ' L ' + t.x2.toFixed(1) + ' ' + t.y.toFixed(1));
+      tl.setAttribute('class', 'pyrTie');
+      tl.setAttribute('pathLength', '100');
+      tl.setAttribute('stroke-dasharray', '100');
+      tl.setAttribute('stroke-dashoffset', '100');
+      tl.setAttribute('visibility', 'hidden');
+      marksSvg.appendChild(tl);
+      out.arrows.push({ line: tl, head: d, at: ax.at + 120 });
+    }
+    if (ax.at + 520 > out.allDone) out.allDone = ax.at + 520;
+  }
+  /* 象限十字轴 + 轴名（修3）：与 pyramid 层级轴同一手法（pathLength 描边生长、
+     轴名挂 head 在轴画完后显形）。横轴 at=页首，纵轴错峰 140ms。 */
+  if (quadrantAxes) {
+    const q = quadrantAxes;
+    const hln = document.createElementNS(NS, 'path');
+    hln.setAttribute('d', 'M ' + q.bx0 + ' ' + q.gy + ' L ' + q.bx1 + ' ' + q.gy);
+    hln.setAttribute('class', 'qaxis');
+    hln.setAttribute('pathLength', '100');
+    hln.setAttribute('stroke-dasharray', '100');
+    hln.setAttribute('stroke-dashoffset', '100');
+    hln.setAttribute('visibility', 'hidden');
+    marksSvg.appendChild(hln);
+    const xt = document.createElementNS(NS, 'text');
+    xt.setAttribute('x', q.bx1 - 4); xt.setAttribute('y', q.gy - 14);
+    xt.setAttribute('text-anchor', 'end');
+    xt.setAttribute('class', 'qaxlab'); xt.setAttribute('opacity', '0');
+    xt.textContent = q.xn;
+    marksSvg.appendChild(xt);
+    out.arrows.push({ line: hln, head: xt, at: q.at });
+    const vln = document.createElementNS(NS, 'path');
+    vln.setAttribute('d', 'M ' + q.gx + ' ' + q.by0 + ' L ' + q.gx + ' ' + q.by1);
+    vln.setAttribute('class', 'qaxis');
+    vln.setAttribute('pathLength', '100');
+    vln.setAttribute('stroke-dasharray', '100');
+    vln.setAttribute('stroke-dashoffset', '100');
+    vln.setAttribute('visibility', 'hidden');
+    marksSvg.appendChild(vln);
+    const yt = document.createElementNS(NS, 'text');
+    yt.setAttribute('x', q.gx + 10); yt.setAttribute('y', q.by0 + 22);
+    yt.setAttribute('class', 'qaxlab'); yt.setAttribute('opacity', '0');
+    yt.textContent = q.yn;
+    marksSvg.appendChild(yt);
+    out.arrows.push({ line: vln, head: yt, at: q.at + 140 });
+    /* V2：轴端箭头 —— 横轴右端 + 纵轴顶端的小三角，随轴画完显形 */
+    const ah = document.createElementNS(NS, 'path');
+    ah.setAttribute('d', 'M ' + (q.bx1 - 12) + ' ' + (q.gy - 7) + ' L ' + q.bx1 +
+                    ' ' + q.gy + ' L ' + (q.bx1 - 12) + ' ' + (q.gy + 7));
+    ah.setAttribute('class', 'qarrow'); ah.setAttribute('opacity', '0');
+    marksSvg.appendChild(ah);
+    out.arrows.push({ line: hln, head: ah, at: q.at });
+    const av = document.createElementNS(NS, 'path');
+    av.setAttribute('d', 'M ' + (q.gx - 7) + ' ' + (q.by0 + 12) + ' L ' + q.gx +
+                    ' ' + q.by0 + ' L ' + (q.gx + 7) + ' ' + (q.by0 + 12));
+    av.setAttribute('class', 'qarrow'); av.setAttribute('opacity', '0');
+    marksSvg.appendChild(av);
+    out.arrows.push({ line: vln, head: av, at: q.at + 140 });
+    if (q.at + 620 > out.allDone) out.allDone = q.at + 620;
+  }
+  /* 图形化 V2 底板层：包络挂 underSvg（压元素下），序号/VS 挂 marksSvg */
+  for (const p of panelSpecs) {
+    let node, under = false;
+    if (p.kind === 'cpL' || p.kind === 'cpR' ||
+        p.kind === 'qcellA' || p.kind === 'qcellB' || p.kind === 'pyrband') {
+      node = document.createElementNS(NS, 'rect');
+      node.setAttribute('x', p.x); node.setAttribute('y', p.y);
+      node.setAttribute('width', p.w); node.setAttribute('height', p.h);
+      node.setAttribute('rx', p.kind === 'pyrband' ? 12 : 22);
+      node.setAttribute('class', p.kind);
+      under = true;
+      node = document.createElementNS(NS, 'rect');
+      node.setAttribute('x', p.x); node.setAttribute('y', p.y);
+      node.setAttribute('width', p.w); node.setAttribute('height', p.h);
+      node.setAttribute('rx', 22);
+      node.setAttribute('class', p.kind);
+      under = true;
+    } else if (p.kind === 'vs' || p.kind === 'flnum') {
+      node = document.createElementNS(NS, 'g');
+      const c = document.createElementNS(NS, 'circle');
+      c.setAttribute('cx', p.x); c.setAttribute('cy', p.y);
+      c.setAttribute('r', p.kind === 'vs' ? 34 : 17);
+      c.setAttribute('class', p.kind === 'vs' ? 'vsbadge' : 'flnum');
+      const tx = document.createElementNS(NS, 'text');
+      tx.setAttribute('x', p.x); tx.setAttribute('y', p.y + (p.kind === 'vs' ? 9 : 7));
+      tx.setAttribute('class', p.kind === 'vs' ? 'vstext' : 'flnumt');
+      tx.textContent = p.kind === 'vs' ? 'VS' : String(p.n);
+      node.appendChild(c); node.appendChild(tx);
+    }
+    if (!node) continue;
+    node.setAttribute('opacity', '0');
+    (under ? underSvg : marksSvg).appendChild(node);
+    out.panels.push({ node, at: p.at });
+    if (p.at + 420 > out.allDone) out.allDone = p.at + 420;
+  }
+  if (dividerBox) {
+    const dv = document.createElementNS(NS, 'line');
+    dv.setAttribute('x1', dividerBox.x); dv.setAttribute('x2', dividerBox.x);
+    dv.setAttribute('y1', dividerBox.y0); dv.setAttribute('y2', dividerBox.y1);
+    dv.setAttribute('class', 'cdiv');
+    dv.setAttribute('opacity', '0');
+    marksSvg.appendChild(dv);
+    out.divider = dv;
+  }
+
+  /* 退出元素：上一屏有、这一屏没有 → 从旧位置淡出 */
+  if (prev && prev.els) {
+    for (const pe of prev.els) {
+      if (out.els.some(r => r.id === pe.id)) continue;
+      const ghost = document.createElement('div');
+      ghost.className = pe.node.className + ' ghost';
+      ghost.innerHTML = pe.inner.outerHTML;
+      ghost.style.transform = 'translate(' + pe.slot.x + 'px,' + pe.slot.y + 'px)';
+      /* B4：封顶 0.35 —— 退出元素若上一页正亮着（op=1），直接压在刚入场的新字上，
+         成片里就是两段文字糊在一起。 */
+      ghost.style.opacity = String(Math.min(pe.lastOp != null ? pe.lastOp : DIM, 0.35));
+      canvasBox.appendChild(ghost);
+      /* ⚠️ 这里的 op 是 render(ms) 每帧算 g.op*(1-gp) 的**基准值** —— B4 若只封顶
+         节点的初始 style 而漏了这里，第 0 帧就被写回 1.0（实测 +150ms 仍 0.50）。 */
+      out.exits.push({ node: ghost, from: pe.slot,
+                       op: Math.min(pe.lastOp != null ? pe.lastOp : DIM, 0.35) });
+    }
+    if (out.exits.length) out.allDone = Math.max(out.allDone, s.a + EXIT);
+  }
+  /* morph 也占时间窗 */
+  if (out.els.some(r => r.morph)) out.allDone = Math.max(out.allDone, s.a + MORPH);
+  return out;
+}
+
+/* ---------- 相机（Ken Burns 式聚焦） ----------
+   ⚠️ 克制是三原则：缩放上限 1.06、只往画面中心带 25%、切换窗 500ms ——
+      推拉的目的是「视线引导」，不是炫技；幅度再大就会晕（1.08/0.3 实测
+      把页首元素推出上沿，已标定收紧）。 */
+const CAM_ID = { s: 1, x: 0, y: 0 };
+/* 相机夹紧：聚焦位移不得把**本页内容**推出画面。
+   ⚠️ 真实作品实测（id=12 页6）：聚焦最右元素时 tx=-226，最左元素（x=154）
+   被推出左边框，成片里「文字被切一半」。推拉只做视线引导，不能损坏内容 ——
+   位移夹紧到「内容并集在画面内」，缩放保留（效果仍在，只是不过冲）。 */
+function clampCamToBox(cam, box) {
+  if (!box) return cam;
+  const s = cam.s, PAD = 18;      /* 留一点呼吸，别让内容贴死边框 */
+  let lo = -box.x0 * s + PAD, hi = 1920 - box.x1 * s - PAD;
+  const tx = lo > hi ? (lo + hi) / 2 : Math.min(Math.max(cam.x, lo), hi);
+  lo = -box.y0 * s + PAD; hi = 1080 - box.y1 * s - PAD;
+  const ty = lo > hi ? (lo + hi) / 2 : Math.min(Math.max(cam.y, lo), hi);
+  return { s: s, x: tx, y: ty };
+}
+function camTargetFor(el) {
+  if (!el) return CAM_ID;
+  const cx = el.slot.x + el.slot.w / 2, cy = el.slot.y + el.slot.h / 2;
+  /* ⚠️ 幅度实测标定（2026-10-21）：1.08 + 0.3 会把页首元素推出画面上沿
+     （6 元素页聚焦底部元素时顶行被切 40%）→ 收到 1.06 + 0.25，推拉仍在、
+     顶行完整。改这两个数必须重跑探针的相机判据。 */
+  const s = 1.06;
+  /* transform-origin 0 0：渲染后 cx*s + tx；目标 = 把 cx 往 960 带 25% */
+  return { s: s, x: cx * (1 - s) + (960 - cx) * 0.25, y: cy * (1 - s) + (540 - cy) * 0.25 };
+}
+function lerpCam(a, b, k) {
+  return { s: a.s + (b.s - a.s) * k, x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k };
+}
+function camAt(ms, s, cur) {
+  const els = cur.els;
+  let ai = -1;
+  for (let i = 0; i < els.length; i++) if (ms >= els[i].at) ai = i;
+  if (ai < 0) return clampCamToBox(cur.camFrom || CAM_ID, cur.bbox);
+  const t0 = ai === 0 ? s.a : els[ai].at;
+  const from = ai === 0 ? (cur.camFrom || CAM_ID) : camTargetFor(els[ai - 1]);
+  return clampCamToBox(lerpCam(from, camTargetFor(els[ai]),
+                               ease((ms - t0) / CAM_BLEND)), cur.bbox);
+}
+
+/* ---------- 数据图（bar/line；生长动画由 render(ms) 驱动） ---------- */
+function escHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function fmtVal(v) {
+  return (Math.abs(v) >= 100 || Number.isInteger(v)) ? String(Math.round(v))
+    : String(+v.toFixed(1));
+}
+
+function buildChart(inner, chart) {
+  const items = chart.items;
+  const n = items.length;
+  /* 标签防重叠（P0）：n≥5 字号降档 + 奇偶两行错峰（实测 8 项标签 8 处重叠）；
+     画布高度随错峰行 +24 */
+  const labFs = n <= 4 ? 20 : n <= 6 ? 17 : 14;
+  const chH = n >= 5 ? CH_H + 24 : CH_H;
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 ' + CH_W + ' ' + chH);
+  svg.setAttribute('width', CH_W); svg.setAttribute('height', chH);
+  inner.appendChild(svg);
+  let vmax = 0;
+  for (const it of items) if (it.value > vmax) vmax = it.value;
+  if (vmax <= 0) vmax = 1;
+  const bl = document.createElementNS(NS, 'line');
+  bl.setAttribute('x1', 30); bl.setAttribute('x2', CH_W - 12);
+  bl.setAttribute('y1', CH_BASE); bl.setAttribute('y2', CH_BASE);
+  bl.setAttribute('class', 'cbase');
+  svg.appendChild(bl);
+  const ref = { type: chart.type, n, bars: [], dots: [], vals: [], path: null };
+  const hmax = CH_BASE - CH_TOP - 26;
+  if (chart.type === 'bar') {
+    const slotW = (CH_W - 56) / n;
+    const bw = Math.min(96, slotW * 0.56);
+    for (let i = 0; i < n; i++) {
+      const it = items[i];
+      const x = 34 + slotW * i + (slotW - bw) / 2;
+      const h = Math.max(2, it.value / vmax * hmax);
+      const r = document.createElementNS(NS, 'rect');
+      r.setAttribute('x', x.toFixed(1)); r.setAttribute('width', bw.toFixed(1));
+      r.setAttribute('y', CH_BASE); r.setAttribute('height', '0');
+      r.setAttribute('rx', 6);
+      r.setAttribute('class', 'cbar' + (it.value === vmax ? ' max' : ''));
+      svg.appendChild(r);
+      const val = document.createElementNS(NS, 'text');
+      val.setAttribute('x', (x + bw / 2).toFixed(1));
+      val.setAttribute('y', (CH_BASE - h - 8).toFixed(1));
+      val.setAttribute('class', 'cval');
+      val.setAttribute('opacity', '0');
+      val.textContent = fmtVal(it.value);
+      svg.appendChild(val);
+      const lab = document.createElementNS(NS, 'text');
+      lab.setAttribute('x', (x + bw / 2).toFixed(1));
+      lab.setAttribute('y', CH_BASE + 26 + (n >= 5 ? (i % 2) * 22 : 0));
+      lab.setAttribute('class', 'clab');
+      lab.style.fontSize = labFs + 'px';
+      lab.textContent = it.label;
+      svg.appendChild(lab);
+      ref.bars.push({ r, val, h });
+    }
+  } else {
+    const xs = [], ys = [];
+    for (let i = 0; i < n; i++) {
+      xs.push(56 + i * (CH_W - 116) / Math.max(1, n - 1));
+      ys.push(CH_BASE - items[i].value / vmax * hmax);
+    }
+    let d = 'M ' + xs[0].toFixed(1) + ' ' + ys[0].toFixed(1);
+    for (let i = 1; i < n; i++) d += ' L ' + xs[i].toFixed(1) + ' ' + ys[i].toFixed(1);
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', d);
+    path.setAttribute('class', 'cline');
+    path.setAttribute('pathLength', '100');
+    path.setAttribute('stroke-dasharray', '100');
+    path.setAttribute('stroke-dashoffset', '100');
+    svg.appendChild(path);
+    ref.path = path;
+    for (let i = 0; i < n; i++) {
+      const c = document.createElementNS(NS, 'circle');
+      c.setAttribute('cx', xs[i].toFixed(1)); c.setAttribute('cy', ys[i].toFixed(1));
+      c.setAttribute('r', '5'); c.setAttribute('class', 'cdot');
+      c.setAttribute('opacity', '0');
+      svg.appendChild(c);
+      ref.dots.push(c);
+      const val = document.createElementNS(NS, 'text');
+      val.setAttribute('x', xs[i].toFixed(1));
+      val.setAttribute('y', (ys[i] - 12).toFixed(1));
+      val.setAttribute('class', 'cval');
+      val.setAttribute('opacity', '0');
+      val.textContent = fmtVal(items[i].value);
+      svg.appendChild(val);
+      ref.vals.push(val);
+      const lab = document.createElementNS(NS, 'text');
+      lab.setAttribute('x', xs[i].toFixed(1));
+      lab.setAttribute('y', CH_BASE + 26 + (n >= 5 ? (i % 2) * 22 : 0));
+      lab.setAttribute('class', 'clab');
+      lab.style.fontSize = labFs + 'px';
+      lab.textContent = items[i].label;
+      svg.appendChild(lab);
+    }
+  }
+  return ref;
+}
+
+/* ---------- 字幕：句指针，跨句空隙保留上一句（与板书/主模板口径一致） ---------- */
+let segIdx = 0;
+function segAt(ms) {
+  while (segIdx < SEGS.length - 1 && ms >= SEGS[segIdx + 1].a) segIdx++;
+  while (segIdx > 0 && ms < SEGS[segIdx].a) segIdx--;
+  if (!SEGS.length || ms < SEGS[0].a) return null;
+  return SEGS[segIdx];
+}
+
+/* ---------- render(ms)：唯一的状态真值入口 ----------
+   纪律与板书/PPT 相同：写完就停手（settled），seek 回退必须复位重算。 */
+let lastSub = null;
+let lastHl = null;
+
+function render(ms) {
+  const s = slideAt(ms);
+  if (!cur || cur.no !== s.no) {
+    const prev = cur;
+    let pslots = null;
+    if (prev) {
+      pslots = {};
+      for (const r of prev.els) pslots[r.id] = { x: r.slot.x, y: r.slot.y };
+    }
+    cur = paint(s, prev, pslots);
+  }
+
+  /* 标题：换屏**串行**擦换 —— 先把旧标题擦掉，再擦入新标题。
+     ⚠️ 原来是「A 纯淡出 + B 同时擦入」：过渡中点两段文字各 50% 叠在同一行，
+     成片里是明显的**双影**（真实作品 t=199s 帧抓到「索引选型组合」与上一页
+     标题叠成一片）。串行后任一瞬间只有一行字，中间留 ~150ms 空白。 */
+  const tOut = clamp((ms - cur.titleSwap) / 150, 0, 1);          /* 旧标题右擦出 */
+  const tIn = clamp((ms - cur.titleSwap - 150) / (TITLE_XF - 150), 0, 1); /* 新标题右擦入 */
+  if (titleA.textContent !== (s.title || '') && tOut === 0) {
+    titleB.textContent = s.title || '';
+  }
+  if (tOut > 0 && tIn < 1) {
+    if (titleB.textContent !== (s.title || '')) titleB.textContent = s.title || '';
+    /* 旧标题整段淡出（不做裁切：裁切会在 150ms 里留下「半个字」），
+       新标题随后从左往右擦入 —— 两者在时间上不重叠，画面里永远只有一行字 */
+    titleA.style.opacity = (1 - tOut).toFixed(3);
+    titleA.style.clipPath = 'none';
+    titleB.style.opacity = '1';
+    titleB.style.clipPath = 'inset(0 ' + ((1 - tIn) * 100).toFixed(2) + '% 0 0)';
+  } else if (tIn >= 1 && titleA.textContent !== (s.title || '')) {
+    titleA.textContent = s.title || '';
+    titleA.style.opacity = '1';
+    titleA.style.clipPath = 'none';
+    titleB.style.opacity = '0';
+  }
+  const pageno = (s.no || 1) + ' / ' + (s.total || 1);
+  if (pagenoEl.textContent !== pageno) pagenoEl.textContent = pageno;
+
+  /* 活跃元素：最后满足 at<=ms 者 */
+  let active = null;
+  for (let i = 0; i < cur.els.length; i++) {
+    if (ms >= cur.els[i].at) active = cur.els[i];
+  }
+
+  if (!cur.settled || ms <= cur.allDone) {
+    for (let i = 0; i < cur.els.length; i++) {
+      const r = cur.els[i];
+      /* 位置：morph 插值（换屏后从旧位置滑来） */
+      let dx = r.slot.x, dy = r.slot.y;
+      if (r.morph) {
+        const mp = ease((ms - cur.a) / MORPH);
+        dx = r.morph.x + (r.slot.x - r.morph.x) * mp;
+        dy = r.morph.y + (r.slot.y - r.morph.y) * mp;
+      }
+      /* 出现：at 起 APPEAR 内 opacity 0→1 + 上浮 26px；
+         morph 来的元素上一屏已在场 → 跳过出现延迟 */
+      let p = r.morph ? 1 : clamp((ms - r.at) / APPEAR, 0, 1);
+      const rise = (1 - ease(p)) * 26;
+      /* 压暗/高亮 */
+      let op = p;
+      if (p >= 1) op = (r === active) ? 1 : (active ? DIM : 0.9);
+      else op = p * 0.9;
+      const sc = (r === active && p >= 1) ? 1.04 : 1;
+      /* 入场差异化（P2）：公式块 grow（0.94→1），其余 rise；morph 来的已入场 */
+      const es = (r.enter === 'grow' && !r.morph && p < 1) ? 0.94 + 0.06 * ease(p) : 1;
+      r.node.style.transform = 'translate(' + dx.toFixed(1) + 'px,' +
+        (dy + rise).toFixed(1) + 'px) scale(' + (sc * es) + ')';
+      r.node.style.opacity = op.toFixed(3);
+      r.lastOp = op;
+      /* 活跃强调（box-shadow 直接写，无 CSS 过渡）：**柔光，不是描边**。
+         B2 实测：2px 实边（原写法）会把刚去掉的卡片框又画回来，观众看到的
+         仍是一排框 → 改成大半径柔光（无实边），焦点靠「亮 + 柔光 + scale 1.04」
+         三重表达；三色 glow 用内联 rgba（CSS 变量没法拼 alpha）。 */
+      r.inner.style.boxShadow = (r === active && p >= 1)
+        ? '0 0 34px 5px ' + (r.k === 'good' ? 'rgba(131,193,103,.24)'
+            : r.k === 'cost' ? 'rgba(255,138,107,.24)'
+            : 'rgba(88,196,221,.24)') : 'none';
+      /* 公式逐项点亮：只在活跃期推进，窗口按 dur 自适应 */
+      if (r.terms && r.terms.length) {
+        if (r === active) {
+          const ti = Math.floor((ms - r.at - APPEAR) / r.termWin);
+          for (let j = 0; j < r.terms.length; j++) {
+            const on = j <= ti;
+            r.terms[j].style.opacity = on ? '1' : '0.45';
+            r.terms[j].style.color = on ? 'var(--formula)' : 'inherit';
+          }
+        } else if (ms < r.at + APPEAR) {
+          for (let j = 0; j < r.terms.length; j++) {
+            r.terms[j].style.opacity = '0.45';
+            r.terms[j].style.color = 'inherit';
+          }
+        } else {
+          for (let j = 0; j < r.terms.length; j++) {
+            r.terms[j].style.opacity = '0.9';
+            r.terms[j].style.color = 'inherit';
+          }
+        }
+      }
+      /* 圈 / 下划线（未开画前 visibility hidden —— 圆角线帽在 offset=100 时
+         仍会漏一个圆点，见 mkRing 注释） */
+      if (r.mark) {
+        const mp2 = clamp((ms - r.markAt) / MARK_MS, 0, 1);
+        r.mark.setAttribute('visibility', mp2 > 0 ? 'visible' : 'hidden');
+        r.mark.setAttribute('stroke-dashoffset', (100 * (1 - mp2)).toFixed(2));
+      }
+      /* 数据图生长：bar 逐柱拔高 / line 描边 + 逐点现身（节点引用 paint 期缓存，
+         每帧只写 attr，不查 DOM） */
+      if (r.chart) {
+        const g0 = ms - r.at;              /* 生长从 at 起（不等 APPEAR） */
+        const K = r.chart.k || 1;          /* 生长节奏压缩系数（页时间不够时 <1） */
+        if (r.chart.type === 'bar') {
+          for (let j = 0; j < r.chart.bars.length; j++) {
+            const b = r.chart.bars[j];
+            const bp = ease(clamp((g0 - j * 170 * K) / (430 * K), 0, 1));
+            b.r.setAttribute('y', (CH_BASE - b.h * bp).toFixed(1));
+            b.r.setAttribute('height', (b.h * bp).toFixed(1));
+            b.val.setAttribute('opacity', bp >= 1 ? '1' : '0');
+          }
+        } else {
+          const nn = r.chart.n;
+          const lp = ease(clamp(g0 / (180 * K * Math.max(1, nn - 1)), 0, 1));
+          r.chart.path.setAttribute('stroke-dashoffset', (100 * (1 - lp)).toFixed(2));
+          for (let j = 0; j < nn; j++) {
+            const dp = clamp((g0 - j * 180 * K) / (240 * K), 0, 1);
+            r.chart.dots[j].setAttribute('opacity', dp >= 0.6 ? '1' : '0');
+            r.chart.vals[j].setAttribute('opacity', dp >= 1 ? '1' : '0');
+          }
+        }
+      }
+    }
+    /* 退出元素淡出（B4）：边淡边下沉 10px + 缩 3%，与新页元素在位置上分开 */
+    for (let i = 0; i < cur.exits.length; i++) {
+      const g = cur.exits[i];
+      const gp = ease((ms - cur.a) / EXIT);
+      g.node.style.opacity = (g.op * (1 - gp)).toFixed(3);
+      if (g.from) {
+        g.node.style.transform = 'translate(' + g.from.x + 'px,' +
+          (g.from.y + 18 * gp).toFixed(1) + 'px) scale(' + (1 - 0.04 * gp).toFixed(3) + ')';
+      }
+    }
+    /* flow 箭头生长 + compare 中缝淡入 */
+    for (let i = 0; i < cur.arrows.length; i++) {
+      const a = cur.arrows[i];
+      const ap = clamp((ms - a.at) / APPEAR, 0, 1);
+      a.line.setAttribute('visibility', ap > 0 ? 'visible' : 'hidden');
+      a.line.setAttribute('stroke-dashoffset', (100 * (1 - ease(ap))).toFixed(2));
+      if (a.head) a.head.setAttribute('opacity', ap >= 1 ? '1' : '0');
+    }
+    if (cur.divider) {
+      cur.divider.setAttribute('opacity',
+        (0.6 * clamp((ms - cur.a) / 400, 0, 1)).toFixed(3));
+    }
+    /* V2 底板层淡入（页首 / 元素同刻，380ms） */
+    for (let i = 0; i < cur.panels.length; i++) {
+      const p = cur.panels[i];
+      p.node.setAttribute('opacity', (0.92 * clamp((ms - p.at) / 380, 0, 1)).toFixed(3));
+    }
+    if (ms > cur.allDone) {
+      /* 收尾：置终态一次，之后不再逐帧写画布（字幕/进度仍每帧走） */
+      for (let i = 0; i < cur.els.length; i++) {
+        const r = cur.els[i];
+        const op = (r === active) ? 1 : (active ? DIM : 0.9);
+        r.node.style.transform = 'translate(' + r.slot.x + 'px,' + r.slot.y +
+          'px) scale(' + ((r === active) ? 1.04 : 1) + ')';
+        r.node.style.opacity = String(op);
+        r.lastOp = op;
+        if (r.mark) {
+          r.mark.setAttribute('stroke-dashoffset', '0');
+          r.mark.setAttribute('visibility', 'visible');
+        }
+        if (r.terms) for (const tm of r.terms) { tm.style.opacity = '0.9'; tm.style.color = 'inherit'; }
+        if (r.chart) {
+          if (r.chart.type === 'bar') {
+            for (const b of r.chart.bars) {
+              b.r.setAttribute('y', (CH_BASE - b.h).toFixed(1));
+              b.r.setAttribute('height', b.h.toFixed(1));
+              b.val.setAttribute('opacity', '1');
+            }
+          } else {
+            r.chart.path.setAttribute('stroke-dashoffset', '0');
+            for (const c of r.chart.dots) c.setAttribute('opacity', '1');
+            for (const t2 of r.chart.vals) t2.setAttribute('opacity', '1');
+          }
+        }
+      }
+      for (const g of cur.exits) g.node.style.opacity = '0';
+      for (const a of cur.arrows) {
+        a.line.setAttribute('visibility', 'visible');
+        a.line.setAttribute('stroke-dashoffset', '0');
+        if (a.head) a.head.setAttribute('opacity', '1');
+      }
+      if (cur.divider) cur.divider.setAttribute('opacity', '0.6');
+      for (const p of cur.panels) p.node.setAttribute('opacity', '0.92');
+      cur.settled = true;
+    }
+  }
+  /* settled 后画布不再逐帧写（allDone 覆盖全部 els 的 at+APPEAR 与 mark/morph/exit） */
+
+  /* 相机推拉：纯 ms 函数（活跃元素切换 → 500ms 插值；页首从上一屏焦点过渡） */
+  const cam = camAt(ms, s, cur);
+  cameraEl.style.transform = 'translate(' + cam.x.toFixed(1) + 'px,' +
+    cam.y.toFixed(1) + 'px) scale(' + cam.s.toFixed(4) + ')';
+
+  /* 字幕 + karaoke 关键词高亮：活跃元素的文案是讲稿原词（提示词契约），
+     在当前句子里点亮琥珀色；不在句中（换句空隙/改写）则不亮，静默容错 */
+  const sg = segAt(ms);
+  const txt = sg ? (sg.t || '') : '';
+  const hl = active ? (active.t || '') : '';
+  if (txt !== lastSub || hl !== lastHl) {
+    lastSub = txt; lastHl = hl;
+    let h = escHtml(txt);
+    if (hl && txt.indexOf(hl) >= 0) {
+      h = h.replace(escHtml(hl), '<span class="hl">' + escHtml(hl) + '</span>');
+    }
+    subEl.innerHTML = h;
+  }
+  subEl.style.opacity = txt ? '1' : '0';
+
+  /* 进度 */
+  progFill.style.transform = 'scaleX(' + clamp(ms / TOTAL, 0, 1).toFixed(4) + ')';
+
+  /* 片尾收黑（P0）：末 420ms 渐隐到背景色 —— 画布常驻没有页淡出可用，
+     必须专门收（实测末帧 opacity=1 戛然而止）。 */
+  fadeEl.style.opacity = clamp((ms - (TOTAL - 420)) / 420, 0, 1).toFixed(3);
+}
+
+render(0);
+
+/* =========================================================================
+   渲染接口（由 renderer.py 通过 page.evaluate 调用）
+   ⚠️ 自驱动时钟用 performance.now() + rAF，**不依赖页面自身音频**。
+   ⚠️ 与 stage_tpl_ppt.html / stage_tpl_board.html 的接口**逐字段对齐** ——
+      渲染器不区分皮肤。
+   ========================================================================= */
+window.__stage = {
+  total: TOTAL,
+  rate: RATE,
+  skin: 'motion',
+  inner: '',
+  ms: 0,
+  t0: 0,
+  done: false,
+  running: false,
+  data: { nav: NAV, slides: SLIDES, segs: SEGS },
+  ready: function () {
+    if (document.fonts && document.fonts.status !== 'loaded') return false;
+    return true;
+  },
+  seek: function (ms) { render(ms); window.__stage.ms = ms; },
+  start: function () {
+    const self = window.__stage;
+    self.t0 = performance.now();
+    self.ms = 0; self.done = false; self.running = true;
+    function tick() {
+      if (!self.running) return;
+      const ms = Math.min(TOTAL, (performance.now() - self.t0) * RATE);
+      self.ms = ms;
+      render(ms);
+      if (ms >= TOTAL) { self.done = true; self.running = false; return; }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  },
+  stop: function () { window.__stage.running = false; },
+  state: function () {
+    const self = window.__stage;
+    return { ms: self.ms, t0: self.t0, done: self.done, running: self.running,
+             clock: Math.min(TOTAL, (performance.now() - self.t0) * RATE) };
+  }
+};
+window.__stage_ready = true;
+</script>
+</body>
+</html>

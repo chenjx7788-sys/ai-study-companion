@@ -9,7 +9,7 @@ from ..core.config import settings
 BACKUP_DIR = settings.data_dir.parent / "backups"
 KEEP = 7            # 保留最近 7 份
 INTERVAL = 24 * 3600   # 每天一次
-EXCLUDE_DIRS = {"models"}   # whisper/BGE 模型可重新下载，不打进备份（省 ~600MB）
+EXCLUDE_DIRS = {"models", "browsers"}   # whisper/BGE 模型可重新下载，不打进备份（省 ~600MB）
 
 _lock = threading.Lock()
 

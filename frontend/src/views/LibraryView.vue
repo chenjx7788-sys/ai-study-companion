@@ -94,11 +94,17 @@
       </el-radio-group>
     </div>
 
-    <!-- 标签筛选：仅「全部材料」模式（按文件夹浏览时层级即筛选，标签不参与过滤） -->
+    <!-- 类型 + 标签筛选：仅「全部材料」模式（按文件夹浏览时层级即筛选，类型/标签均不参与过滤） -->
     <div v-if="viewMode === 'flat'" class="filter-bar">
+      <div v-if="typeFilters.length" class="type-bar">
+        <span class="tag-chip" :class="{ on: !activeType }" @click="activeType = ''">全部</span>
+        <span v-for="t in typeFilters" :key="t.key" class="tag-chip type-chip"
+          :class="['t-' + t.key, { on: activeType === t.key }]" @click="activeType = t.key">{{ t.label }}</span>
+        <span class="type-tag-divider" aria-hidden="true"></span>
+      </div>
       <div class="tag-bar">
         <template v-if="allTags.length">
-          <span class="tag-chip" :class="{ on: !activeTag }" @click="activeTag = ''">全部</span>
+          <span class="tag-chip" :class="{ on: !activeTag }" @click="activeTag = ''">全部标签</span>
           <span v-for="tag in allTags" :key="tag" class="tag-chip"
             :class="{ on: activeTag === tag }" @click="activeTag = tag">
             {{ tag }}<el-icon v-if="presetTags.includes(tag)" class="tag-del" title="删除标签" @click.stop="removePresetTag(tag)"><Close /></el-icon>
@@ -125,8 +131,10 @@
 
     <!-- 空状态 -->
     <template v-if="searchMode === 'title'">
-      <el-empty v-if="!loading && filtered.length === 0 && !search" :image="mascot" :image-size="120"
+      <el-empty v-if="!loading && filtered.length === 0 && !search && !activeTag && !activeType" :image="mascot" :image-size="120"
         description="还没有学习材料，点击右上角「上传材料」导入第一份吧" />
+      <el-empty v-else-if="!loading && filtered.length === 0 && !search" :image="mascot" :image-size="120"
+        description="没有符合筛选条件的材料，换个类型或标签试试" />
       <el-empty v-else-if="!loading && filtered.length === 0" :image="mascot" :image-size="120"
         :description="`没有找到「${search}」相关材料`" />
     </template>
@@ -164,8 +172,22 @@
           </div>
         </div>
       </div>
+      <!-- 首次加载骨架屏：loading 期间空态被 !loading 抑制、文件区为空，纯白=「卡了」的感知来源 -->
+      <div v-if="loading" class="card-grid">
+        <div v-for="i in 6" :key="'sk' + i" class="material-card sk-card">
+          <div class="sk-top">
+            <div class="sk-block sk-icon"></div>
+            <div class="sk-head">
+              <div class="sk-block sk-line" style="width: 72%"></div>
+              <div class="sk-block sk-line" style="width: 45%"></div>
+            </div>
+          </div>
+          <div class="sk-block sk-line" style="width: 92%"></div>
+          <div class="sk-block sk-line" style="width: 60%"></div>
+        </div>
+      </div>
       <!-- 文件区（平铺视图，或 folder 视图进入文件夹后；列表页不显示文件） -->
-      <div v-if="viewMode === 'flat' || activeFolderId != null" class="card-grid">
+      <div v-else-if="viewMode === 'flat' || activeFolderId != null" class="card-grid">
         <div v-for="(m, i) in displayFiles" :key="m.id" class="material-card card-in"
           :style="{ animationDelay: (i % 12) * 35 + 'ms' }" @click="openStudy(m)">
         <div class="card-top">
@@ -213,7 +235,8 @@
             </el-dropdown>
             <!-- 标签块：「+ 标签」默认紧随状态标签，添加标签后自动跟到标签之后 -->
             <div v-if="m.tags?.length" class="card-tags">
-              <span v-for="t in m.tags" :key="t" class="mini-tag">{{ t }}</span>
+              <!-- mini-tag 悬停出 ×：单击取消「该材料 ↔ 该标签」的关联（不删预设标签本身；删预设走筛选行的 ×） -->
+              <span v-for="t in m.tags" :key="t" class="mini-tag">{{ t }}<el-icon class="mini-tag-del" title="取消标签关联" @click.stop="removeTagLink(m, t)"><Close /></el-icon></span>
             </div>
             <el-popover trigger="click" width="260" @click.stop>
               <template #reference>
@@ -323,7 +346,7 @@ import mascot from '../assets/mascot.png'
 const router = useRouter()
 const materials = ref([])
 const search = ref('')
-const loading = ref(false)
+const loading = ref(true)   // 初值 true：onMounted 前置帧不闪「还没有学习材料」空态，由骨架屏接管
 const dragging = ref(false)
 const uploads = reactive([])   // 上传队列：{ key, name, progress, status }
 let uploadSeq = 0
@@ -422,8 +445,40 @@ async function removePresetTag(tag) {
   }
 }
 
+// ---------- 格式类型筛选（flat 视图） ----------
+// ⚠️ computed getter 注册即同步执行：isMediaFmt/isImageFmt/fmtGroup 必须声明在 filtered/typeFilters 之前（TDZ 红线）
+const isMediaFmt = (f) => ['mp3', 'wav', 'm4a', 'mp4'].includes(f)
+const isImageFmt = (f) => ['jpg', 'jpeg', 'png', 'webp', 'bmp'].includes(f)
+// 格式 → 图标分组（决定图标与徽章配色；兼作类型筛选的分组键）
+const fmtGroup = (f) => {
+  if (isImageFmt(f)) return 'img'
+  if (isMediaFmt(f)) return f === 'mp4' ? 'video' : 'audio'
+  if (['ppt', 'pptx'].includes(f)) return 'ppt'
+  if (['doc', 'docx'].includes(f)) return 'doc'
+  if (['md', 'markdown'].includes(f)) return 'md'
+  if (f === 'epub') return 'epub'
+  return 'pdf'
+}
+
+const activeType = ref('')
+const TYPE_GROUP_META = [
+  { key: 'pdf', label: 'PDF' }, { key: 'ppt', label: 'PPT' }, { key: 'doc', label: 'Word' },
+  { key: 'md', label: 'MD' }, { key: 'epub', label: 'EPUB' },
+  { key: 'img', label: '图片' }, { key: 'audio', label: '音频' }, { key: 'video', label: '视频' },
+]
+// 只列出材料中真实存在的格式组（固定顺序），避免渲染出「点了必空」的 chip
+const typeFilters = computed(() => {
+  const present = new Set(materials.value.map(m => fmtGroup(m.format)))
+  return TYPE_GROUP_META.filter(g => present.has(g.key))
+})
+// 选中类型随材料删除而消失时复位，避免「看不见的筛选条件」仍在过滤
+watch(typeFilters, (list) => {
+  if (activeType.value && !list.some(g => g.key === activeType.value)) activeType.value = ''
+})
+
 const filtered = computed(() => {
   let list = materials.value
+  if (activeType.value) list = list.filter(m => fmtGroup(m.format) === activeType.value)
   if (activeTag.value) list = list.filter(m => (m.tags || []).includes(activeTag.value))
   if (search.value) list = list.filter(m => m.title.includes(search.value))
   return list
@@ -634,10 +689,15 @@ async function confirmMove(targetId) {
   }
 }
 
-async function saveTags(m, tags) {
+async function saveTags(m, tags, msg = '标签已保存') {
   await materialApi.update(m.id, { tags })
   m.tags = tags
-  ElMessage.success('标签已保存')
+  ElMessage.success(msg)
+}
+
+// 取消单个标签与材料的关联：只摘关联、不动预设标签库；摘到空数组也照常落库
+async function removeTagLink(m, tag) {
+  await saveTags(m, (m.tags || []).filter(t => t !== tag), '已取消标签关联')
 }
 
 // 内容类型（P0 工艺分流）：决定「简单学」讲义走哪套工艺。
@@ -668,8 +728,6 @@ async function saveDocKind(m, k) {
     : '内容类型已恢复自动判定，重新生成讲义后生效')
 }
 
-const isMediaFmt = (f) => ['mp3', 'wav', 'm4a', 'mp4'].includes(f)
-const isImageFmt = (f) => ['jpg', 'jpeg', 'png', 'webp', 'bmp'].includes(f)
 const isSlowFmt = (f) => isMediaFmt(f) || isImageFmt(f) || f === 'pdf' || f === 'epub'
 // 慢格式状态文案：图片 OCR 是单块调用拿不到真实进度，只显示阶段不给假百分比
 const slowLabel = (f, pct) => {
@@ -691,16 +749,7 @@ function statusTag(m) {
 }
 const fmtLabel = (f) => ({ pdf: 'PDF', ppt: 'PPT', pptx: 'PPT', doc: 'WORD', docx: 'WORD', epub: 'EPUB', md: 'MD', markdown: 'MD', mp3: '音频', wav: '音频', m4a: '音频', mp4: '视频', jpg: '图片', jpeg: '图片', png: '图片', webp: '图片', bmp: '图片' }[f] || (f || '').toUpperCase())
 
-// 格式 → 图标分组（决定图标与徽章配色）
-const fmtGroup = (f) => {
-  if (isImageFmt(f)) return 'img'
-  if (isMediaFmt(f)) return f === 'mp4' ? 'video' : 'audio'
-  if (['ppt', 'pptx'].includes(f)) return 'ppt'
-  if (['doc', 'docx'].includes(f)) return 'doc'
-  if (['md', 'markdown'].includes(f)) return 'md'
-  if (f === 'epub') return 'epub'
-  return 'pdf'
-}
+
 // EPUB 的计数单位是「章」（章节序号即 page_no），其余格式仍是「页」
 const countUnit = (f) => (f === 'epub' ? ' 章' : ' 页')
 const fmtIcon = (f) => ({ img: Picture, audio: Headset, video: VideoPlay, epub: Reading }[fmtGroup(f)] || Document)
@@ -1037,6 +1086,35 @@ onUnmounted(() => pollTimer && clearInterval(pollTimer))
 }
 .tag-bar::-webkit-scrollbar { height: 0; display: none; }
 .tag-bar-empty { font-size: 12px; color: var(--asc-text-3); margin-right: 4px; }
+/* 类型筛选区：固定在行首不参与压缩，标签区继续 min-width:0 横向滚动 */
+.type-bar { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.type-tag-divider { width: 1px; height: 16px; background: var(--asc-border); margin: 0 2px; }
+/* 类型筛选 chip 配色：与卡片格式徽章（.fmt-* 与 .ftn-*）同源——rest=徽章软底彩字，hover=自身色描边，on=实底反白 */
+/* ⚠️ epub 软底 #e8f6ec 是本族新色：卡片侧只有 .ftn-epub 文字色、无 .fmt-epub 软底可复用 */
+.type-chip.t-pdf { background: #fdeee7; color: #d85a30; }
+.type-chip.t-ppt { background: #fdf1dd; color: #ba7517; }
+.type-chip.t-doc { background: #e9f1fc; color: #378add; }
+.type-chip.t-md { background: #eef1f5; color: #64748b; }
+.type-chip.t-epub { background: #e8f6ec; color: #15803d; }
+.type-chip.t-img { background: #e6f7fb; color: #0891b2; }
+.type-chip.t-audio { background: #e5f6f3; color: #0f9488; }
+.type-chip.t-video { background: #f1ebfd; color: #7c5cfc; }
+.type-chip.t-pdf:hover { border-color: #d85a30; color: #d85a30; }
+.type-chip.t-ppt:hover { border-color: #ba7517; color: #ba7517; }
+.type-chip.t-doc:hover { border-color: #378add; color: #378add; }
+.type-chip.t-md:hover { border-color: #64748b; color: #64748b; }
+.type-chip.t-epub:hover { border-color: #15803d; color: #15803d; }
+.type-chip.t-img:hover { border-color: #0891b2; color: #0891b2; }
+.type-chip.t-audio:hover { border-color: #0f9488; color: #0f9488; }
+.type-chip.t-video:hover { border-color: #7c5cfc; color: #7c5cfc; }
+.type-chip.t-pdf.on, .type-chip.t-pdf.on:hover { background: #d85a30; border-color: #d85a30; color: #fff; }
+.type-chip.t-ppt.on, .type-chip.t-ppt.on:hover { background: #ba7517; border-color: #ba7517; color: #fff; }
+.type-chip.t-doc.on, .type-chip.t-doc.on:hover { background: #378add; border-color: #378add; color: #fff; }
+.type-chip.t-md.on, .type-chip.t-md.on:hover { background: #64748b; border-color: #64748b; color: #fff; }
+.type-chip.t-epub.on, .type-chip.t-epub.on:hover { background: #15803d; border-color: #15803d; color: #fff; }
+.type-chip.t-img.on, .type-chip.t-img.on:hover { background: #0891b2; border-color: #0891b2; color: #fff; }
+.type-chip.t-audio.on, .type-chip.t-audio.on:hover { background: #0f9488; border-color: #0f9488; color: #fff; }
+.type-chip.t-video.on, .type-chip.t-video.on:hover { background: #7c5cfc; border-color: #7c5cfc; color: #fff; }
 /* 行高统一 28px（与 .view-toggle 一致）：高度写死，避免不同环境字体度量把 chip 撑高导致两行不等高 */
 .tag-chip {
   height: 28px; display: inline-flex; align-items: center; padding: 0 12px;
@@ -1165,6 +1243,17 @@ onUnmounted(() => pollTimer && clearInterval(pollTimer))
 .folder-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .card-body { padding: 10px 16px 12px; display: flex; flex-direction: column; flex: 1; }
+
+/* ===== 首次加载骨架屏：复用 .material-card 外壳（边框/圆角/白底），内容换成呼吸灰块 ===== */
+.sk-card { padding: 16px; cursor: default; pointer-events: none; }
+.sk-card:hover { transform: none; box-shadow: none; border-color: var(--asc-border); }
+.sk-top { display: flex; gap: 12px; margin-bottom: 14px; }
+.sk-head { flex: 1; display: flex; flex-direction: column; gap: 10px; padding-top: 3px; }
+.sk-block { background: var(--asc-border); border-radius: 6px; animation: sk-pulse 1.2s ease-in-out infinite; }
+.sk-icon { width: 42px; height: 42px; border-radius: 11px; flex-shrink: 0; }
+.sk-line { height: 12px; }
+.sk-card > .sk-line + .sk-line { margin-top: 10px; }
+@keyframes sk-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
 .card-tags-row {
   display: flex; align-items: center; gap: 8px;
   min-height: 22px; margin-bottom: 8px;
@@ -1172,9 +1261,14 @@ onUnmounted(() => pollTimer && clearInterval(pollTimer))
 /* 标签块按内容宽度排列（不撑满整行）：无标签时「+ 标签」紧贴状态标签，有标签时跟在标签之后 */
 .card-tags { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
 .mini-tag {
+  display: inline-flex; align-items: center; gap: 3px;
   font-size: 11px; color: var(--asc-primary); background: var(--asc-primary-soft);
   border-radius: 4px; padding: 1px 7px;
 }
+/* 取消关联 ×：默认收起、悬停该标签时显现（与 .card-ops 的悬停语言一致）；hover 实底反白 */
+.mini-tag-del { width: 12px; height: 12px; border-radius: 50%; cursor: pointer; opacity: 0; transition: opacity .15s; }
+.mini-tag:hover .mini-tag-del { opacity: 1; }
+.mini-tag-del:hover { background: var(--asc-primary); color: #fff; }
 .tag-edit {
   font-size: 11px; color: var(--asc-text-3); cursor: pointer; flex-shrink: 0;
   transition: color .15s;

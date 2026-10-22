@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<style>
+  /* ==========================================================================
+     PPT 课件 · 通栏版（2026-10-21 方案 B：撤掉 448px 侧栏；0ms 起就是内容页）
+     数据由 stage.py 注入：__NAV__（每节）+ __SLIDES__（每页，含条目与时间区间）
+     —— 分页与页标题**在后端算**，模板只负责画。这样导出 .pptx 时不会出现
+     「视频 16 页、课件 15 页」的两份口径。
+
+     设计要点：
+       1) 通栏：内容区 1920 全宽（原 1472）。侧栏的信息（第几节 / 节名 /
+          几节几页）分别由页眉面包屑与页脚行内承担，不占画面。
+       2) 主区字号整体偏大（标题 78/72、条目 33~56 按实测高度自适应），留白比例大。
+       3) 底部时间轴：既是装饰，又回答「这是第几秒 / 还剩多少」。课件缺这个，
+          而它恰恰是复习时最在意的信息。
+       4) 刻意**没有**封面 / 目录 / 章节过渡页：实测两份成片 SEGS[0].a 都是 0，
+          第 0 帧就在讲内容，任何片头都只能吃掉真实讲解时间。
+
+     ⚠️⚠️ 全部动效必须是 `ms → 状态` 的纯函数（只写在 render(ms) 里）。
+        合成器时钟不可 seek，任何交给 CSS 自己跑的动效都会让
+        「拖进度条看到的」与「成片里的」不是同一个画面。
+     ========================================================================== */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; }
+  body {
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
+                 "Hiragino Sans GB", "Source Han Sans SC", "Noto Sans CJK SC", sans-serif;
+    background: #fff; color: #141026;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  }
+  :root {
+    --ink: #141026;
+    --ink-2: #4a4460;
+    --ink-3: #8d87a3;
+    --line: #eeecf4;
+    --acc: #7c5cfc;
+    --acc-2: #b98cff;
+  }
+
+  #stage { position: relative; width: 1920px; height: 1080px; background: #fff; }
+  /* 主区极淡的顶部渐层：让页眉区有「纸面」的温度，而不是纯白 */
+  #stage::before {
+    content: ''; position: absolute; left: 0; top: 0; right: 0; height: 300px;
+    background: linear-gradient(180deg, #fbfaff 0%, #ffffff 100%); pointer-events: none;
+  }
+
+  /* ---------- 通栏主区（2026-10-21 方案 B：撤掉 448px 侧栏） ----------
+     侧栏给了「现在讲第几节」，但页眉面包屑本来就有；而它吃掉 23.3% 画面、
+     正文还是碎片节名。撤掉后：「节名」进页眉，「几节/几页/总长」进页脚。 */
+  #main { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; }
+
+  #head {
+    height: 116px; padding: 0 154px 0 172px;
+    display: flex; align-items: center; justify-content: space-between;
+    border-bottom: 1px solid var(--line); position: relative;
+  }
+  /* 通栏后节名也在这里（侧栏撤了），单行截断防止长节名顶掉页码 */
+  #crumb { font-size: 16px; letter-spacing: 3px; color: var(--ink-3);
+           font-variant-numeric: tabular-nums; max-width: 1280px; overflow: hidden;
+           white-space: nowrap; text-overflow: ellipsis; }
+  #pgno { font-size: 18px; color: var(--ink-3); font-variant-numeric: tabular-nums;
+          letter-spacing: 1.5px; }
+  #pgno b { font-size: 32px; font-weight: 700; color: var(--ink); letter-spacing: 0;
+            margin-right: 6px; }
+
+  /* ⚠️ bottom 必须让出时间轴那 88px：#foot 是 absolute 压在底部的，
+     若这里写 bottom:0，#list（flex:1）会撑到 1080，把条目顶到进度条上（实测溢出 88px）。 */
+  #content { position: absolute; left: 0; top: 116px; right: 0; bottom: 88px;
+             padding: 54px 154px 24px 172px; display: flex; flex-direction: column; }
+
+  #h1 { font-size: 72px; font-weight: 700; line-height: 1.2; color: var(--ink);
+        letter-spacing: -.6px; max-width: 1530px; }
+  #rule { width: 76px; height: 7px; border-radius: 4px; margin: 26px 0 0;
+          background: linear-gradient(90deg, var(--acc), var(--acc-2)); }
+
+  /* ⚠️ 必须顶部对齐，不能用 center：条目是**逐条**出现的，居中意味着
+     每多一条，已有条目就整体上移一次（实测 3 条时首条 top=488、4 条时 431）。
+     在成片里表现成「每出现一条，上面的字往上跳」—— 比底部留白难看得多。
+     顶部对齐后条目位置只取决于自己是第几条，与后面还有几条无关（画面稳定）。 */
+  #list { flex: 1; display: flex; flex-direction: column; justify-content: flex-start;
+          padding: 40px 0 22px; min-height: 0; }
+  /* 语义（优点 / 代价）只落成一条 3px 竖条：序号统一走主色，
+     否则一屏会同时出现紫标题 + 绿序号 + 橙序号，画面碎。 */
+  .item { display: flex; align-items: baseline; gap: 30px; padding: 0; position: relative;
+          border-bottom: 1px solid var(--line); margin-bottom: 24px; }
+  .item:last-child { border-bottom: 0; margin-bottom: 0; }
+  .item[data-k="good"]::before, .item[data-k="cost"]::before {
+    content: ''; position: absolute; left: -26px; top: 12%; bottom: 12%; width: 3px;
+    border-radius: 2px;
+  }
+  .item[data-k="good"]::before { background: rgba(29, 158, 117, .48); }
+  .item[data-k="cost"]::before { background: rgba(216, 90, 48, .48); }
+  .item .no {
+    flex: 0 0 58px; font-size: 34px; font-weight: 700; letter-spacing: 1px;
+    font-variant-numeric: tabular-nums; color: rgba(124, 92, 252, .30);
+  }
+  .item .tx { flex: 1; font-weight: 500; letter-spacing: .2px; color: var(--ink); }
+
+  /* ---------- 内容区形状：path / ladder / ring（2026-10-21） ----------
+     语义：只换**右侧内容区内部**的骨架，左栏 / 标题 / 页脚 / 时间轴一概不动。
+     ⚠️ 形状页是「整页常驻」：全部条目先以浅态出现，讲到哪深到哪。
+        清单页仍是逐条入场（存量行为一字节不变）—— 两条入场路径在 render 里分流。
+     ⚠️ 状态只有三种颜色语义：主色（当前）/ 墨（已讲）/ 浅灰（未讲），
+        失败步额外用 cost 橙红（与 .item[data-k="cost"] 同一口径）。 */
+  .shp { position: relative; }
+
+  /* —— 轨迹：竖线 + 状态节点 —— */
+  /* ⚠️ 轨道线原用 --line(#eeecf4)：对比度 **1.17:1**（节点描边 1.27、环箭头 1.44），
+     成片里「轨迹」读出来只是一列带圆圈的条目 —— 连线等于不存在。改用 #9791a8
+     （3.03:1，WCAG 2.1 非文本对比度门槛 3:1）。
+     ⚠️ 不写死 bottom：42px 是按「大约半个行高」猜的，实测线比最后一步多拖 130px
+        （流程看着没走完）→ 由 paintShape 量完节点圆心再设。 */
+  .shp-path .track { position: absolute; left: 32px; top: 42px; height: 0;
+                     width: 2px; background: #9791a8; border-radius: 1px; }
+  /* ⚠️ 别用整行 opacity 表达「未讲」：.28 会把本来就 1.17:1 的线压到 1.05:1，
+     连文字一起消失。改成**分级颜色**：未讲 ink-3(#8d87a3, 3.43:1) → 已讲墨黑 →
+     当前主色。层次照样在，但每个状态都读得出来。 */
+  .pstep { position: relative; display: flex; align-items: center; gap: 34px;
+           padding: 13px 0; }
+  .pstep .pdot { flex: 0 0 64px; height: 64px; border-radius: 50%; background: #fff;
+                 border: 2.5px solid #c8c2d8; color: var(--ink-3);
+                 display: flex; align-items: center; justify-content: center;
+                 font-size: 26px; font-weight: 700; position: relative; z-index: 1;
+                 font-variant-numeric: tabular-nums; }
+  .pstep .ptx { flex: 1; font-weight: 500; color: #8d87a3; letter-spacing: .2px; }
+  .pstep[data-st="fail"] .pdot { border-color: rgba(216, 90, 48, .34);
+                                 color: rgba(216, 90, 48, .72); }
+  /* 失败步的 ✕ 角标：只靠描边色不够，「此路不通」必须一眼可辨。
+     ⚠️ 纯 CSS 静态内容（不走 render），所以不违反「动效必须纯函数」。 */
+  .pstep[data-st="fail"] .pdot::after {
+    content: '\2715'; position: absolute; right: -7px; top: -7px; width: 26px; height: 26px;
+    border-radius: 50%; background: #d85a30; color: #fff; font-size: 14px;
+    line-height: 26px; text-align: center; font-weight: 700;
+    box-shadow: 0 0 0 4px #fff;
+  }
+  .pstep[data-done="1"] { opacity: 1; }
+  .pstep[data-done="1"] .pdot { border-color: rgba(124, 92, 252, .48); color: var(--acc); }
+  .pstep[data-done="1"] .ptx { color: var(--ink); }
+  .pstep[data-done="1"][data-st="fail"] .pdot { border-color: rgba(216, 90, 48, .66);
+                                                color: #c2500f; }
+  .pstep[data-cur="1"] .pdot { background: var(--acc); border-color: var(--acc); color: #fff;
+                               transform: scale(1.1); }
+  /* ⚠️ 必须显式给 color：#fff —— `.pstep[data-done="1"][data-st="fail"] .pdot` 的
+     color:#c2500f 属性选择器更多、优先级更高，会盖掉 data-cur 的白字 → 当前失败步的
+     序号变成「深橙字压橙底」，实测 **1.22:1**（05 号在成片里几乎读不出来）。 */
+  .pstep[data-cur="1"][data-st="fail"] .pdot { background: #d85a30; border-color: #d85a30;
+                                               color: #fff; }
+  .pstep[data-cur="1"] .ptx { font-weight: 700; color: #0f0a20; }
+
+  /* —— 阶梯：数字在顶（齐平）、柱从底长、标签在底 ——
+     ⚠️⚠️ 必须写 `#list.shp-ladder`：#list 自带 display:flex + flex-direction:column
+        （清单布局用），ID 选择器类名压不过 → 第一版阶梯被竖排成一列（截图实测），
+        柱高百分比也全部失效。ID + 类并写才压得住。 */
+  #list.shp-ladder { flex-direction: row; align-items: stretch; gap: 34px; }
+  .lstep { position: relative; flex: 1; height: 100%; display: flex;
+           flex-direction: column; justify-content: flex-end; align-items: center; }
+  /* ⚠️ 数字必须在**流内**、紧贴柱顶：原来 absolute top:2 把它钉在页顶，柱子却
+     从底部往上长 → 实测「数字底 → 柱顶」间距 302 / 153 / 112px，数值标签和柱子
+     各说各话。进流后（.lstep 已是 flex-column + flex-end）数字自然落在所属柱子
+     正上方，柱高不同则数字高低不同 —— 这才是阶梯该有的样子。
+     ⚠️ 柱高动画走 scaleY，不改布局高度 → 数字不会跟着逐帧抖。 */
+  .lstep .lnum { margin: 0 0 16px; text-align: center;
+                 font-size: 82px; font-weight: 700; line-height: 1; color: #b8b2c8;
+                 letter-spacing: -2px; font-variant-numeric: tabular-nums; }
+  .lstep .lbar { width: 100%; max-width: 210px; height: 100%; max-height: 350px;
+                 border-radius: 10px 10px 3px 3px; background: #e2dcf2;
+                 transform-origin: 50% 100%; transform: scaleY(.12); }
+  .lstep .ltx { font-size: 34px; line-height: 1.3; text-align: center; color: var(--ink-3);
+                margin-top: 20px; max-width: 300px; }
+  .lstep[data-done="1"] .lnum { color: var(--ink); }
+  .lstep[data-done="1"] .lbar { background: linear-gradient(180deg, var(--acc-2), var(--acc)); }
+  .lstep[data-done="1"] .ltx { color: var(--ink-2); }
+  .lstep[data-cur="1"] .lnum { color: var(--acc); }
+  .lstep[data-cur="1"] .ltx { color: var(--ink); font-weight: 700; }
+
+  /* —— 闭环：内联 SVG（唯一不是列表的几何） —— */
+  #list > svg { width: 100%; height: 100%; display: block; }
+  .rnode[data-done="1"] rect { stroke: rgba(124, 92, 252, .48); }
+  .rnode[data-done="1"] text { fill: #141026; }
+  .rnode[data-cur="1"] rect { fill: #f5f2ff; stroke: #7c5cfc; stroke-width: 2.5; }
+  .rnode[data-cur="1"] text { fill: #3b2a80; font-weight: 700; }
+
+  /* ---------- 底：时间轴 ---------- */
+  #foot { position: absolute; left: 0; right: 0; bottom: 0; height: 88px;
+          padding: 0 154px 0 172px; display: flex; align-items: center; gap: 26px; }
+  /* 通栏后这里要放「标题 · 5 节 · 12 页 · 全片 3:02」——侧栏撤掉后它没有别处可放 */
+  #foot .fname { font-size: 13.5px; color: var(--ink-3); letter-spacing: 1.2px;
+                 max-width: 760px; overflow: hidden; white-space: nowrap;
+                 text-overflow: ellipsis; }
+  /* ⚠️ 进度条用 scaleX 而不是改 width：
+     改 width 每帧都触发布局（footer 区重排），实测会让渲染器的帧时序判据超标
+     （24s 样张 p99 秩位移 110ms > 60ms，直接判失败）。scaleX 只走合成器。 */
+  .bar { flex: 1; height: 4px; border-radius: 2px; background: #eeecf6; position: relative; }
+  .bar i { position: absolute; left: 0; top: 0; height: 100%; width: 100%; border-radius: 2px;
+           background: linear-gradient(90deg, var(--acc), var(--acc-2));
+           transform-origin: 0 50%; transform: scaleX(0); }
+  .bar u { position: absolute; top: -3px; width: 2px; height: 10px;
+           background: #d9d4ea; border-radius: 1px; }
+  #foot .time { font-size: 14px; color: var(--ink-3); letter-spacing: 1.2px;
+                font-variant-numeric: tabular-nums; min-width: 118px; text-align: right; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <main id="main">
+    <div id="head"><div id="crumb"></div><div id="pgno"></div></div>
+    <div id="content"></div>
+    <div id="foot">
+      <div class="fname" id="fname"></div>
+      <div class="bar" id="bar"><i id="barFill"></i></div>
+      <div class="time" id="ftime"></div>
+    </div>
+  </main>
+</div>
+<script>
+/* 页结构与标题由后端算好（stage.py::ppt_slides），此处只做渲染。 */
+const TITLE = __TITLE_JS__;
+const NAV = __NAV__;
+const SLIDES = __SLIDES__;
+const SEGS = __SEGS__;
+const TOTAL = __TOTAL__;
+const LAND_MS = 420;          /* 条目入场缓动时长（纯函数，不是 CSS 过渡） */
+
+const mmss = (ms) => {
+  const s = Math.round(ms / 1000);
+  return String(Math.floor(s / 60)) + ':' + String(s % 60).padStart(2, '0');
+};
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+/* ---------- 1. 当前页 ---------- */
+/* 后端保证了 SLIDES 非空（全片步点超时也会给一页空页）；这里再兜一层，
+   因为「拿到 undefined 然后抛错」的后果是整片白屏，代价远大于一行防御。 */
+const S0 = SLIDES[0] || { no: 1, total: 1, shot: 0, a: 0, b: TOTAL, title: '', els: [] };
+
+function slideAt(ms) {
+  /* 页区间首尾相接且升序 → 线性回扫最省事，16~40 页量级无需二分 */
+  for (let i = SLIDES.length - 1; i >= 0; i--) {
+    if (ms >= SLIDES[i].a) return SLIDES[i];
+  }
+  return S0;
+}
+
+/* ---------- 2. 页脚元信息 / 刻度 ---------- */
+/* 侧栏撤掉后「几节 / 几页 / 全片多长」没有别处可放 → 并入页脚左侧同一行。
+   ⚠️ 不再有 navEls：原来每帧要给侧栏写 cur/done，现在连查询都省了。 */
+function buildMeta() {
+  document.getElementById('fname').textContent =
+    TITLE + ' · ' + NAV.length + ' 节 · ' + SLIDES.length + ' 页 · 全片 ' + mmss(TOTAL);
+}
+
+function buildTicks() {
+  const bar = document.getElementById('bar');
+  NAV.forEach((it, i) => {
+    if (i === 0 || !TOTAL) return;
+    const u = document.createElement('u');
+    u.style.left = ((it.a / TOTAL) * 100).toFixed(3) + '%';
+    bar.appendChild(u);
+  });
+}
+
+/* ---------- 3. 排一页 ---------- */
+const content = document.getElementById('content');
+
+/* 字号自适应：**先量出这一页真正剩下多少高度**，再从大到小挑第一个装得下的档。
+   ⚠️ 不能按「条数 / 总字数」查表：实测带 6 条短句的一页比 5 条长句更高，
+      查表法在那一页溢出 7px（第一版就撞了）。这里按「单行可容字数 → 估行数」逐档试装，
+      误差来自中英混排字宽，已由档位间的余量吸收。 */
+/* 通栏：1920 - 172 - 154 - 58（序号）- 30（间距） */
+const LIST_W = 1920 - 172 - 154 - 58 - 30;
+/* 档位整体上调一档：内容宽 +30% → 同一条目的折行变少，同样的高度能撑更大字号。
+   ⚠️ 上限不是「看着够大」，而是 `typeScale` 实测装得下——档位只是候选池。 */
+const SCALES = [
+  { fs: 64, gap: 34 }, { fs: 58, gap: 31 }, { fs: 53, gap: 28 },
+  { fs: 48, gap: 26 }, { fs: 43, gap: 24 }, { fs: 38, gap: 22 },
+];
+
+function typeScale(els, avail, width) {
+  const n = els.length;
+  /* ⚠️ width 只给形状页用（轨迹的正文列比清单窄：扣掉节点列与间距）；
+     清单页不传 → 与改造前逐字一致。 */
+  const W = width || LIST_W;
+  for (const c of SCALES) {
+    const per = Math.floor(W / c.fs);               /* 单行可容字数 */
+    let h = 0;
+    for (const e of els) {
+      h += Math.max(1, Math.ceil(String(e.t).length / per)) * c.fs * 1.42;
+    }
+    h += (n - 1) * (c.gap + 1);                     /* 条目间距 + 分隔线 */
+    if (h <= avail) return c;
+  }
+  return SCALES[SCALES.length - 1];
+}
+
+/* 标题排版：**不要交给浏览器自动折行**。
+   实测「培训班要加直播，第一反应往往是自建」在 72px 下会断成
+   「……往往是」/「自建」—— 末行只剩两个字，很难看。
+   这里：能一行就一行；否则优先在标点后断（中文标题的自然断点），
+   并按最长半句反推字号，保证两行都不溢出。 */
+const H1_W = 1530;
+
+function titleLayout(t) {
+  const n = [...t].length;
+  const fs0 = n <= 11 ? 84 : 78;
+  const per = Math.floor(H1_W / fs0);
+  if (n <= per) return { fs: fs0, html: esc(t) };
+
+  let best = -1;
+  for (const sp of ['，', '：', '；', '、']) {
+    const i = t.indexOf(sp);
+    if (i > 0 && i < n - 1 && i >= n * 0.28 && i <= n * 0.72) {
+      if (best < 0 || Math.abs(i - n / 2) < Math.abs(best - n / 2)) best = i;
+    }
+  }
+  if (best > 0) {
+    const l1 = t.slice(0, best + 1), l2 = t.slice(best + 1);
+    const longest = Math.max([...l1].length, [...l2].length);
+    const fs = Math.min(fs0, Math.floor(H1_W / longest * 0.97));
+    return { fs, html: esc(l1) + '<br>' + esc(l2) };
+  }
+  /* 无标点：降字号硬塞进一行，最低 54px（再小就不像标题了） */
+  return { fs: Math.max(Math.min(fs0, Math.floor(H1_W / n * 0.97)), 54), html: esc(t) };
+}
+
+function paintSlide(s) {
+  const shotNo = String((s.shot || 0) + 1).padStart(2, '0');
+  const totalShot = String(NAV.length).padStart(2, '0');
+  /* ⚠️ 侧栏撤掉后「这一节叫什么」只有这里能说 —— 去掉它就是信息丢失。
+     用**节标题**（NAV[shot]），不是页标题（s.title）：后者是每页一句主张，
+     放进面包屑会与下面的大标题重复。 */
+  const secName = (NAV[s.shot || 0] || {}).title || '';
+  document.getElementById('crumb').textContent =
+    '第 ' + shotNo + ' 节 / 共 ' + totalShot + ' 节' + (secName ? ' · ' + secName : '');
+  document.getElementById('pgno').innerHTML = '<b>' + String(s.no).padStart(2, '0') +
+    '</b>/ ' + String(s.total).padStart(2, '0');
+
+  /* 刻意没有 kicker（「02 / 节标题」那种小标签）：第一版做过，结果它与 h1 是
+     同一句话，等于把标题写了两遍。「换节了」这个信号由左侧导航的高亮 + 光条承担。 */
+  const tl = titleLayout(s.title || '');
+  /* ⚠️ 标题 / 横线**不与本节首条一起入场**：原来是 data-at = s.a，而首页 s.a = 0
+     → 成片第 0 帧（ms=0）标题 opacity 也是 0，整页只剩页眉页脚（实测非白像素
+     0.44%）；每次翻页同样先白一下。把起点提前 LAND_MS 后，切页那一帧标题就是
+     终态：观感是「翻到新页，标题已在，条目依次出现」—— PPT 的正常节奏。
+     ⚠️ 提交前不能真做「标题先淡入」：paintSlide 只在切页时跑，无法在上一页里
+        提前把它画出来，强行淡入就等于每页开头都空一拍。 */
+  const headAt = (s.a || 0) - LAND_MS;
+  content.innerHTML =
+    '<h1 id="h1" data-at="' + headAt + '" data-dy="0" style="font-size:' + tl.fs + 'px">' +
+    tl.html + '</h1>' +
+    '<div id="rule" data-at="' + headAt + '" data-dy="0"></div>' +
+    '<div id="list"></div>';
+
+  /* 两趟渲染：先量出 #list 的真实剩余高度（由 flex:1 决定，与内容多少无关），
+     再据此选字号。一趟渲染只能靠估算，上一版就在「节首屏 + 6 条」溢出了 7px。 */
+  const list = content.querySelector('#list');
+  /* ⚠️ 这两个数必须与 CSS 的 `#list { padding: 40px 0 22px }` 一致：
+     对不上就会算错可用高度 → 字号选大一档 → 条目溢出到时间轴上。 */
+  const avail = list.clientHeight - 40 - 22;
+
+  /* 形状页 = 另一条入场路径（整页常驻），直接交给 paintShape 后返回。
+     ⚠️ 清单分支必须**原样保留在后面**：没有 shape 的页（= 全部存量作品）
+        走的还是这段代码，一个像素都不许变。 */
+  if (s.shape) {
+    list.className = 'shp shp-' + s.shape;
+    paintShape(list, s, avail);
+    return;
+  }
+
+  const sc = typeScale(s.els, avail);
+
+  /* ⚠️ 色条只在**真有对比**时才画：v14 第 4 页 5 条全是 good → 一屏 5 条同色
+     绿条既无图例也无反差，读不出任何信息（v13 第 1 页更只剩 1 条），是纯噪点。
+     口径：good 与 cost 同时出现才启用色条，否则整页不画。 */
+  const ks = {};
+  s.els.forEach((e) => { if (e.k === 'good' || e.k === 'cost') ks[e.k] = 1; });
+  const useK = (ks.good && ks.cost) ? 1 : 0;
+
+  let rows = '';
+  s.els.forEach((e, i) => {
+    rows += '<div class="item" data-at="' + e.at + '" data-dy="14" data-k="' +
+      (useK ? (e.k || '') : '') + '">' +
+      '<div class="no">' + String(i + 1).padStart(2, '0') + '</div>' +
+      '<div class="tx" style="font-size:' + sc.fs + 'px;line-height:1.42">' + esc(e.t) + '</div></div>';
+  });
+  list.innerHTML = rows;
+  const kids = list.querySelectorAll('.item');
+  kids.forEach((el, i) => {
+    el.style.marginBottom = (i === kids.length - 1) ? '0' : sc.gap + 'px';
+  });
+}
+
+
+/* ---------- 3b. 形状骨架 ----------
+   ⚠️ 三种形状都按「全部条目一次建好 + 只切 data-done/data-cur」实现：
+      换页时建一次 DOM，之后每帧最多改两组属性，绝不逐帧重建节点。
+   ⚠️ 判据来自后端（`video.pick_shape`）：形状是数据推出来的，不是模板猜的。 */
+const fmtNum = (v) => {
+  const n = Number(v);
+  if (!isFinite(n)) return '';
+  return Math.abs(n) >= 10000 ? n.toLocaleString('en-US') : String(n);
+};
+
+function ladderFS(els) {
+  let m = 1;
+  els.forEach((e) => { m = Math.max(m, [...String(e.t)].length); });
+  return m <= 5 ? 40 : m <= 7 ? 36 : m <= 9 ? 32 : 28;
+}
+
+function paintShape(list, s, avail) {
+  if (s.shape === 'ladder') {
+    const fs = ladderFS(s.els);
+    /* 柱高按数值比例：21→39→44 画成 96/177/200px，阶梯感来自高度差本身。
+       ⚠️ 全部等高（第一版）就不是阶梯了，只是三根柱子。 */
+    const vals = s.els.map((e) => (e.num === null || e.num === undefined) ? null : Number(e.num));
+    const real = vals.filter((v) => v !== null);
+    const mx = real.length ? Math.max.apply(null, real) : 0;
+    const mn = real.length ? Math.min.apply(null, real) : 0;
+    let h = '';
+    s.els.forEach((e, i) => {
+      /* ⚠️ 必须**从 0 起**按真实比例：原式 160 + 190*(v-mn)/(mx-mn) 把最低值抬到
+         160px 再映射，100 / 105 / 110 这种 10% 的差会被画成 2.19 倍高度差 ——
+         柱状图最忌这个：读者量的是柱高。24px 地板只防极小值变成不可见的发丝。 */
+      const v = vals[i];
+      const hh = (v === null || !(mx > 0)) ? 240
+        : Math.max(24, Math.round(350 * Math.max(0, v) / mx));
+      h += '<div class="lstep" data-i="' + i + '" data-done="0" data-cur="0">' +
+        '<div class="lnum">' + esc(fmtNum(e.num)) + '</div>' +
+        '<div class="lbar" style="height:' + hh + 'px"></div>' +
+        '<div class="ltx" style="font-size:' + fs + 'px">' + esc(e.t) + '</div></div>';
+    });
+    list.innerHTML = h;
+    return;
+  }
+  if (s.shape === 'ring') {
+    list.innerHTML = ringHTML(s);
+    return;
+  }
+  /* 轨迹：正文列宽 = 内容宽 1594 − 节点 64 − 间距 34 */
+  const sc = typeScale(s.els, avail, 1496);
+  let h = '<div class="track"></div>';
+  s.els.forEach((e, i) => {
+    h += '<div class="pstep" data-i="' + i + '" data-at="' + e.at + '"' +
+      ' data-st="' + (e.st || 'ok') + '" data-done="0" data-cur="0">' +
+      '<div class="pdot">' + String(i + 1).padStart(2, '0') + '</div>' +
+      '<div class="ptx" style="font-size:' + sc.fs + 'px;line-height:1.36">' +
+      esc(e.t) + '</div></div>';
+  });
+  list.innerHTML = h;
+  /* ⚠️ 轨道线首尾必须**正好**落在首/末节点圆心。这里量一次（换页才量，
+     不进逐帧路径）—— 与「绝不逐帧 querySelector」的帧预算纪律不冲突。 */
+  const psteps = list.querySelectorAll('.pstep');
+  if (psteps.length) {
+    const f0 = psteps[0], fN = psteps[psteps.length - 1];
+    const c0 = f0.offsetTop + f0.offsetHeight / 2;
+    const cN = fN.offsetTop + fN.offsetHeight / 2;
+    const tk = list.querySelector('.track');
+    if (tk) {
+      tk.style.top = c0.toFixed(1) + 'px';
+      tk.style.height = Math.max(0, cN - c0).toFixed(1) + 'px';
+    }
+  }
+}
+
+/* 闭环：节点沿圆周均布。⚠️ SVG 里文字不折行，所以 ring 的判定要求每条 ≤8 字
+   （见 video.pick_shape ③）—— 宽 252 的胶囊在 23px 下装得下 10 字。 */
+function ringHTML(s) {
+  /* 通栏后画布宽 1594（原 1222），环可以画得更大。
+     ⚠️ 半径上限由**高度**决定，不是宽度：r=250 时顶点 y=50、胶囊上沿 16px，
+        再大就出血（H=600，bh=68）。5 节点时底部两胶囊中心距 1.1756·r=294px，
+        bw 必须 < 294 —— 取 280 留 14px 缝；4 节点中心距 1.414·r=353，可取 320。 */
+  const W = 1594, H = 600, cx = 797, cy = 300;
+  const n = s.els.length;
+  const r = 250;
+  const bw = n >= 5 ? 280 : 320;
+  const bh = 68;
+  let h = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet">' +
+    '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="none"' +
+    ' stroke="#9791a8" stroke-width="2.5"/>';
+  /* 方向箭头：顺时针 chevron，放在相邻两节点的中点角上 —— 环没有方向就不成环 */
+  for (let i = 0; i < n; i++) {
+    const a = -Math.PI / 2 + (i + 0.5) * 2 * Math.PI / n;
+    const px = cx + r * Math.cos(a);
+    const py = cy + r * Math.sin(a);
+    const dx = -Math.sin(a), dy = Math.cos(a);            /* 顺时针切向 */
+    const qx = -dy, qy = dx;                              /* 法向 */
+    const tip = [px + dx * 9, py + dy * 9];
+    const b1 = [px + qx * 6, py + qy * 6];
+    const b2 = [px - qx * 6, py - qy * 6];
+    h += '<path d="M' + b1[0].toFixed(1) + ' ' + b1[1].toFixed(1) +
+      'L' + tip[0].toFixed(1) + ' ' + tip[1].toFixed(1) +
+      'L' + b2[0].toFixed(1) + ' ' + b2[1].toFixed(1) +
+      '" fill="none" stroke="#9791a8" stroke-width="2.5" stroke-linecap="round"' +
+      ' stroke-linejoin="round"/>';
+  }
+  for (let i = 0; i < n; i++) {
+    const ang = -Math.PI / 2 + i * 2 * Math.PI / n;
+    const x = cx + r * Math.cos(ang);
+    const y = cy + r * Math.sin(ang);
+    h += '<g class="rnode" data-i="' + i + '" data-done="0" data-cur="0">' +
+      '<rect x="' + (x - bw / 2).toFixed(1) + '" y="' + (y - bh / 2).toFixed(1) +
+      '" width="' + bw + '" height="' + bh + '" rx="34" fill="#fff"' +
+      ' stroke="#c8c2d8" stroke-width="2"/>' +
+      '<text x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" text-anchor="middle"' +
+      ' dominant-baseline="central" font-size="26" font-weight="500" fill="#8d87a3">' +
+      esc(s.els[i].t) + '</text></g>';
+  }
+  return h + '</svg>';
+}
+
+/* ---------- 4. render(ms)：唯一的状态真值入口 ----------
+   ⚠️⚠️ 这里每一处「省掉的工作」都是为了渲染器能出片，不是微优化：
+      第一版每帧都 querySelectorAll 两遍 + 无条件给 8 个元素写 opacity/transform
+      + 用 width 改进度条 + 每帧改时间文本 —— 结果是渲染器的帧时序判据直接判失败
+      （24 秒样张 p99 秩位移 110ms，阈值 60ms；同条件 graph 皮肤 66 秒渲完、0 报警）。
+      所以：节点引用缓存起来、入场走完就停手、进度条走 scaleX、时间文本按整秒更新。 */
+let curKey = null;
+let curMs = 0;
+let curSlide = S0;
+let curEls = [];          /* 当前页的 [data-at] 节点（换页时重建一次） */
+let curDoneAt = 0;        /* 本页全部条目入场完成的时刻 */
+let settled = false;      /* 本页条目已收尾 → 之后不再逐帧写样式 */
+let lastSec = -1;
+/* 形状页状态（与 curEls 互斥）：nodes 顺序 == s.els 顺序 */
+let shapeNodes = [];
+let shapeBars = [];
+/* 阶梯：数字节点 + 该柱的**布局高度**（offsetHeight 不受 transform 影响 → 一次缓存够用） */
+let shapeNums = [];
+let shapeDone = -1;        /* **已讲条数**；-1 = 本页还没算过（换页复位） */
+let barSettled = false;    /* 阶梯的柱高已全部落地 → 之后不再逐帧写 */
+
+const barFill = document.getElementById('barFill');
+const ftime = document.getElementById('ftime');
+
+function render(ms) {
+  curMs = ms;
+  const s = slideAt(ms);
+  curSlide = s;
+  if (s.no !== curKey) {
+    paintSlide(s);
+    curKey = s.no;
+    /* ⚠️ 形状页与清单页的入场机制**互斥**：形状页整页常驻（节点一次建好、
+       只有「已讲条数」变化时改属性），清单页仍逐条入场。
+       两套同时跑会互相写 opacity，画面表现成「抖」。 */
+    if (s.shape) {
+      curEls = [];
+      shapeNodes = Array.prototype.slice.call(content.querySelectorAll('[data-i]'));
+      shapeBars = Array.prototype.slice.call(content.querySelectorAll('.lbar'));
+      shapeNums = Array.prototype.slice.call(content.querySelectorAll('.lstep')).map(function (el) {
+        const bar = el.querySelector('.lbar');
+        const num = el.querySelector('.lnum');
+        return (bar && num) ? { num: num, hh: bar.offsetHeight } : null;
+      }).filter(Boolean);
+      shapeDone = -1;
+      barSettled = false;
+      curDoneAt = LAND_MS;
+    } else {
+      shapeNodes = [];
+      shapeBars = [];
+      shapeNums = [];
+      curEls = Array.prototype.slice.call(content.querySelectorAll('[data-at]'));
+    }
+    let maxAt = 0;
+    for (let i = 0; i < curEls.length; i++) {
+      const at = +curEls[i].dataset.at;
+      if (at > maxAt) maxAt = at;
+    }
+    curDoneAt = maxAt + LAND_MS;
+    settled = false;
+  }
+
+  /* 逐元素入场：仍是 ms 的纯函数（可任意 seek），只是走完后一次性置终态。
+     ⚠️ `ms < curDoneAt` 时**必须**把 settled 复位：探针会 seek 回退到入场中段，
+        不复位就会停在终态 1 —— 「拖回去看到的」与「成片里的」不是同一画面，
+        这正是本项目所有动效都必须 ms 纯函数的理由。 */
+  if (ms < curDoneAt) {
+    settled = false;
+    for (let i = 0; i < curEls.length; i++) {
+      const el = curEls[i];
+      const at = +el.dataset.at;
+      const dy = +(el.dataset.dy || 12);
+      const t = (ms - at) / LAND_MS;
+      if (t <= 0) { el.style.opacity = '0'; continue; }
+      const e = t >= 1 ? 1 : 1 - Math.pow(1 - t, 3);
+      el.style.opacity = e.toFixed(3);
+      if (dy) el.style.transform = 'translateY(' + (dy * (1 - e)).toFixed(2) + 'px)';
+    }
+  } else if (!settled) {
+    for (let i = 0; i < curEls.length; i++) {
+      curEls[i].style.opacity = '1';
+      curEls[i].style.transform = 'none';
+    }
+    settled = true;
+  }
+
+  /* 形状页：整页常驻 —— 只在「已讲条数」变化时写属性，其余帧零写入 */
+  if (curSlide.shape && shapeNodes.length) renderShape(ms);
+
+  /* 时间轴：scaleX 走合成器；时间文本只在整秒变化时写（每帧改 textContent 会重排） */
+  const p = TOTAL > 0 ? Math.max(0, Math.min(1, ms / TOTAL)) : 0;
+  barFill.style.transform = 'scaleX(' + p.toFixed(4) + ')';
+  const sec = Math.floor(ms / 1000);
+  if (sec !== lastSec) {
+    lastSec = sec;
+    ftime.textContent = mmss(ms) + ' / ' + mmss(TOTAL);
+  }
+}
+
+
+/* 形状页状态机。
+   ⚠️⚠️ `done` 必须是**已讲条数**，不能是「最后一个满足条件的下标」：
+      清单序 == 时间序时两者等价，一旦骨架按几何重排 DOM（环/阶梯）就会错 ——
+      下标恒为 n-1 → 收尾态指纹变常数 → 收尾永不重写、seek 回早时刻会停在上一状态。
+   ⚠️ 阶梯柱高只在 420ms 落地窗口内逐帧写（纯函数，可任意 seek）；
+      窗口外一次性置终态。轨道 / 闭环完全不做逐帧写（属性切换即可）。 */
+function renderShape(ms) {
+  const els = curSlide.els || [];
+  let done = 0;
+  for (let i = 0; i < els.length; i++) if (ms >= els[i].at) done = i + 1;
+  if (done !== shapeDone) {
+    shapeDone = done;
+    for (let i = 0; i < shapeNodes.length; i++) {
+      shapeNodes[i].dataset.done = i < done ? '1' : '0';
+      shapeNodes[i].dataset.cur = (i === done - 1) ? '1' : '0';
+    }
+  }
+  if (curSlide.shape !== 'ladder' || !shapeBars.length) return;
+  const lastAt = els.length ? els[els.length - 1].at : 0;
+  if (ms < lastAt + LAND_MS) {
+    barSettled = false;
+    for (let i = 0; i < shapeBars.length; i++) {
+      const t = (ms - els[i].at) / LAND_MS;
+      const e = t <= 0 ? 0 : t >= 1 ? 1 : 1 - Math.pow(1 - t, 3);
+      const sc = 0.12 + 0.88 * e;
+      shapeBars[i].style.transform = 'scaleY(' + sc.toFixed(3) + ')';
+      /* 数字跟着柱顶走：柱是 scaleY 从底部长，视觉顶 = 布局顶 + hh*(1-sc) 往下，
+         数字要补上同样的位移才贴得住。只写 transform（合成器），零布局。 */
+      const n = shapeNums[i];
+      if (n) n.num.style.transform = 'translateY(' + (n.hh * (1 - sc)).toFixed(1) + 'px)';
+    }
+  } else if (!barSettled) {
+    for (let i = 0; i < shapeBars.length; i++) shapeBars[i].style.transform = 'scaleY(1)';
+    for (let i = 0; i < shapeNums.length; i++) shapeNums[i].num.style.transform = 'none';
+    barSettled = true;
+  }
+}
+
+buildMeta();
+buildTicks();
+render(0);
+
+/* =========================================================================
+   渲染接口（由 renderer.py 通过 page.evaluate 调用）
+   ⚠️ 自驱动时钟用 performance.now() + rAF，**不依赖页面自身音频**：
+      音轨是渲染器独立解码再合流的，页面出声只会有害（缓冲抖动）。
+   ⚠️ 与 stage_tpl_radio.html 的接口**逐字段对齐** —— 渲染器不区分皮肤，
+      少一个字段（如 state().done / clock）就会卡到超时才失败。
+   ========================================================================= */
+window.__stage = {
+  total: TOTAL,
+  skin: 'ppt',
+  inner: '',
+  ms: 0,
+  t0: 0,
+  done: false,
+  running: false,
+  /* 只读数据引用：渲染器与验收探针据此算「某时刻应该是什么画面」，不必再解析 HTML */
+  data: { nav: NAV, slides: SLIDES, segs: SEGS },
+  /* 时序真值自曝：标题 data-at = 页 a − LAND_MS（见 headAt 那段的注释）。
+     探针必须读这里，不许自己抄 420 —— 抄了就变成「模板一改、判据假红/假绿」。
+     与 stage_tpl_board.html 的 __stage.consts 同一纪律。 */
+  consts: { LAND_MS: LAND_MS },
+  /* 资源就绪：课件页无外部图，只需字体就绪（否则第一帧可能抓到回退字体） */
+  ready: function () {
+    if (document.fonts && document.fonts.status !== 'loaded') return false;
+    return true;
+  },
+  seek: function (ms) { render(ms); window.__stage.ms = ms; },
+  start: function () {
+    const self = window.__stage;
+    self.t0 = performance.now();
+    self.ms = 0; self.done = false; self.running = true;
+    function tick() {
+      if (!self.running) return;
+      const ms = Math.min(TOTAL, performance.now() - self.t0);
+      self.ms = ms;
+      render(ms);
+      if (ms >= TOTAL) { self.done = true; self.running = false; return; }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  },
+  stop: function () { window.__stage.running = false; },
+  state: function () {
+    const self = window.__stage;
+    return { ms: self.ms, t0: self.t0, done: self.done, running: self.running,
+             clock: performance.now() - self.t0 };
+  }
+};
+window.__stage_ready = true;
+</script>
+</body>
+</html>

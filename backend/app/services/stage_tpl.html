@@ -208,17 +208,35 @@ text { font-family: inherit; }
 /* 形象照片（矩形原图，背景抠不掉）：四周羽化融进舞台 —— 否则浅色的照片底会与深色
    舞台形成一条硬边矩形（2026-10-11 四方案实测的结论）。
    **预置真人照与用户上传走的是同一套**（2026-10-12 起预置也是图片）。
-   ⚠️ 用 mask 而不是 blur：mask 不额外吃性能，也不会把 drop-shadow 轮廓糊掉。 */
+   ⚠️ 用 mask 而不是 blur：mask 不额外吃性能，也不会把 drop-shadow 轮廓糊掉。
+   ⚠️⚠️ 2026-10-20 加入**四边线性羽化**（原为单一 radial）：
+       radial 的椭圆在素材**上边缘**没有衰减到 transparent（y=0 处 r≈0.47，仍在 56% 实心区内），
+       保留背景后顶部会露出一条明显的硬线（实测相邻像素跳变 22.2、spread 0）。
+       改成「横向线性 ∩ 纵向线性 ∩ 椭圆」后，四条边都在 6% 宽度内渐变到透明，
+       实测跳变降到 顶 1.1 / 左 1.0 / 右 1.7 / 底 5.8。
+       ⚠️ 必须用 `mask-composite: intersect`（Chromium 支持；-webkit 侧对应 source-in）——
+          缺了它三层默认叠加，等于放大可显示区域，硬边会回来。 */
 .th-photo {
-  -webkit-mask-image: radial-gradient(ellipse 86% 80% at 50% 38%,
+  -webkit-mask-image:
+      linear-gradient(to bottom, transparent 0, #000 6%, #000 94%, transparent 100%),
+      linear-gradient(to right, transparent 0, #000 6%, #000 94%, transparent 100%),
+      radial-gradient(ellipse 86% 80% at 50% 38%,
       #000 56%, rgba(0,0,0,.45) 78%, transparent 100%);
-          mask-image: radial-gradient(ellipse 86% 80% at 50% 38%,
+  -webkit-mask-composite: source-in;
+          mask-image:
+      linear-gradient(to bottom, transparent 0, #000 6%, #000 94%, transparent 100%),
+      linear-gradient(to right, transparent 0, #000 6%, #000 94%, transparent 100%),
+      radial-gradient(ellipse 86% 80% at 50% 38%,
       #000 56%, rgba(0,0,0,.45) 78%, transparent 100%);
+          mask-composite: intersect;
 }
-/* 动作视频形象（2026-10-13 起 preset_01.webm 为离线 MODNet 抠像版，自带 VP9 alpha）：
-   人物已从原背景里分离，**再叠 radial-gradient mask 会把发丝细节又削掉一层** →
-   视频免 mask、照片保留。`<video>` 与 `<img>` 的分野由 stage.py::_th_dom 天然保证。 */
-video.th-photo {
+/* 动作视频形象分两种口径（2026-10-20 起由 stage.py::_th_dom 打 class 区分）：
+   · `.th-alpha`（抠像版，VP9 alpha / 透明 PNG）：人物已从原背景分离，
+     **再叠 radial-gradient mask 会把发丝细节又削掉一层** → 免 mask；
+   · 无 `.th-alpha`（保留背景版）：矩形素材必须靠 mask 羽化融进舞台，
+     否则会看到一条硬边矩形（实测 `_probe_th_bg_20261020/cmp/edge_t62.png`）。
+   ⚠️ 判据从「是不是 <video>」改成「带不带 th-alpha」—— 素材路线换了，判据必须跟着换。 */
+video.th-photo.th-alpha {
   -webkit-mask-image: none;
           mask-image: none;
 }
@@ -392,8 +410,7 @@ img.th-photo.th-alpha {
 /* ⚠️ 位移只发生在**内层**：外层（.pwrap）与内层若都吃到 .el 的 9px 位移，
       两级叠加成 18px，条目看起来是「跳」上来而不是「滑」上来。 */
 .screen[data-skin="graph_paper"] .pwrap,
-.screen[data-skin="graph_paper"] .p-hl-static,
-.screen[data-skin="graph_paper"] .pfigwrap { transform: none; }
+.screen[data-skin="graph_paper"] .p-hl-static { transform: none; }
 .screen[data-skin="graph_paper"] .el { transition: opacity .46s ease, transform .46s ease; }
 
 /* =========================================================================
@@ -435,7 +452,11 @@ img.th-photo.th-alpha {
 .screen[data-skin="graph_clean"] .citem { fill: #FFFFFF; stroke: #E6E6F2; stroke-width: 1.2; }
 .screen[data-skin="graph_clean"] .ctitle { fill: #1B1B2A; font-weight: 600; }
 .screen[data-skin="graph_clean"] .csub { fill: #6E6E86; }
-.screen[data-skin="graph_clean"] .croot { fill: #6B5CE7; }
+/* ⚠️ 根卡底色用**紫深色** #5747C9 而不是主色 #6B5CE7（2026-10-22）：
+      主色上的副标题 rgba(255,255,255,.82) 只有 3.84:1，过不了 AA（14px 需 4.5:1）。
+      换 #5747C9 后白标题 6.58:1、82% 白副标题 4.89:1，两行同时达标，且不新增色值
+      （#5747C9 就是既有的 _C_PRI_D，与 .scenetag / 右栏标题同源）。 */
+.screen[data-skin="graph_clean"] .croot { fill: #5747C9; }
 .screen[data-skin="graph_clean"] .croott { fill: #FFFFFF; font-weight: 600; }
 .screen[data-skin="graph_clean"] .croots { fill: rgba(255,255,255,.82); }
 .screen[data-skin="graph_clean"] .clink { fill: none; stroke: #C8C3EF; stroke-width: 2;
@@ -446,6 +467,10 @@ img.th-photo.th-alpha {
 .screen[data-skin="graph_clean"] .ctabt { fill: #FFFFFF; font-weight: 600; }
 .screen[data-skin="graph_clean"] .crows { fill: #FFFFFF; stroke: #E6E6F2; stroke-width: 1.2; }
 .screen[data-skin="graph_clean"] .csep { fill: none; stroke: #ECECF4; stroke-width: 1; }
+/* ⚠️ pyramid 最底层是 #EFEDFC、页面底是 #F5F6FA —— 两者几乎同色，层级边界会消失
+      （2026-10-22 截图实证：最后一层像融进背景）。补 1px 描边兜住边界；
+      深紫层上这条描边与底色色差极小，视觉上只在浅层起作用。 */
+.screen[data-skin="graph_clean"] .cpyr { stroke: #D9D3F2; stroke-width: 1; }
 .screen[data-skin="graph_clean"] .cvs { fill: #FFFFFF; stroke: #6B5CE7; stroke-width: 1.6; }
 .screen[data-skin="graph_clean"] .cvst { font-size: 14px; fill: #6B5CE7; font-weight: 600; }
 /* ⚠️ 位移只发生在**内层**（与纸感 .pwrap 同一原因：两级叠加会让卡片「跳」上来）。 */
@@ -926,8 +951,12 @@ function render(ms) {
    ⚠️ aspect 的口径是 **w/h**（原型 SRC.aspect=0.75 对应 1080×1440 的竖版图）。 */
 function syncPagewrap() {
   if (!pagewrap || !srcarea) return;
-  const a = SRC.aspect || (pageImg.naturalWidth && pageImg.naturalHeight
-        ? pageImg.naturalWidth / pageImg.naturalHeight : 0.75);
+  /* ⚠️ 优先按**当前页图**的自然宽高比（2026-10-22 修复混合方向材料变形）：
+     SRC.aspect 是单一值（首页比例），横竖混排材料按它撑 pagewrap 会把异向页
+     拉伸变形（img 是 width/height:100% 无 object-fit）。换页 load 事件会重进
+     本函数 → pagewrap 跟着当前页走。SRC.aspect 仅作图片未加载时的兜底。 */
+  const a = (pageImg && pageImg.naturalWidth && pageImg.naturalHeight)
+        ? pageImg.naturalWidth / pageImg.naturalHeight : (SRC.aspect || 0.75);
   if (!(a > 0)) return;
   const boxH = srcarea.clientHeight, boxW = srcarea.clientWidth;
   let w, h;

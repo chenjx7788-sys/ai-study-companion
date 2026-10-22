@@ -53,6 +53,13 @@ import time
 from fractions import Fraction
 from pathlib import Path
 
+
+class RenderCancelled(Exception):
+    """用户在渲染期间主动取消（不是失败：非质量/环境/数据问题）。
+
+    ⚠️ 必须与 RuntimeError 区分：调用方按「用户主动行为」收口（文案、埋点不同）。
+    """
+
 OUT_W, OUT_H, OUT_FPS = 1920, 1080, 30
 JPEG_QUALITY = 78
 # 逐槽位对齐误差上限（PRD 3.8.6 的 150 ms 判据，逐槽位形式）。
@@ -96,6 +103,25 @@ DRAIN_S = 0.45
 # 断流判据：连续这么久没抓到任何新帧就判中断（页面在连续播放，帧流不该静默）
 STALL_S = 4.0
 
+# ---------- 进度预算 ----------
+# ⚠️ 为什么必须分段：进度**原来只在抓帧泵里算**（`clock/dur`，封顶 99）。抓帧一结束
+#    它就冻在 99%，而后面还有 x264 逐帧编码、音频编码、交错合流、`+faststart` 重写。
+#    2026-10-22 实测（`_probe_encode_faithful_20261022.py`，走的是与 `make_writer`
+#    完全相同的路径 JPEG→PIL→VideoFrame→x264）：**36.3 ms/帧**（中位，1920×1080
+#    / veryfast / crf20），30 fps 下 ≈ **1.1× 片长**。于是 166 s 的片子：抓帧 166 s
+#    把进度冲到 99%，然后再卡 181 s 一个字不动 —— 用户报的就是这个。
+#    改成一条从抓帧贯通到合流的 0–100 尺子，任何阶段都不再停住。
+PROGRESS_ENCODE_END = 94     # 抓帧 + 视频编码的合计封顶
+PROGRESS_AUDIO_END = 96      # 音轨编码
+PROGRESS_MUX_END = 99        # 交错合流（99 之后由调用方的 finalize 接管）
+# 抓帧在总进度里占的比例先验：抓帧 ≈ 1× 片长、编码 ≈ 1.1× 片长 → 约 0.48。
+# 上下限只防荒谬取值（改 fps / 改编码档位后仍要合理）。
+PROGRESS_CAPTURE_MIN = 0.30
+PROGRESS_CAPTURE_MAX = 0.72
+# 单帧编码成本的先验（秒）。**只用于估算进度节奏**，真跑起来会用本次实测值自校正
+# （见 `_encode_pct`）—— 慢机器上进度走得慢，而不是冲到 94 再卡住。
+ENCODE_SEC_PER_FRAME = 0.036
+
 # ⚠️ `--disable-features=CalculateNativeWinOcclusion` 是必需的：
 #    否则被系统判定「遮挡」的页面 **CSS 过渡不推进**（表现：截图停在旧状态，
 #    看起来像视频内容错了）。`--hide-scrollbars` 干净取景；
@@ -117,13 +143,64 @@ _CHROME_HINTS = [
 ]
 
 
-def find_chromium() -> str | None:
-    """找一个已安装的 Chromium 可执行文件（**不现下载**：浏览器版本会漂移）。"""
+def _system_browser_hints() -> list:
+    """系统级浏览器（Edge / Chrome）候选 —— 兜底，优先级最低。
+
+    ⚠️ 版本漂移风险：系统浏览器随系统自动更新，CDP 抓帧行为未经逐版本验证；
+       只在找不到 playwright 系内核时才用它（用户也可点「下载渲染组件」拿到
+       版本锁定的内核）。返回 [(路径, "edge"|"chrome")]。
+    """
+    import os
+    import shutil
+    import sys
+    cands = []
+    if sys.platform.startswith("win"):
+        for var in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
+            root = os.environ.get(var)
+            if root:
+                cands.append((Path(root) / "Microsoft" / "Edge" / "Application"
+                              / "msedge.exe", "edge"))
+        for var in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+            root = os.environ.get(var)
+            if root:
+                cands.append((Path(root) / "Google" / "Chrome" / "Application"
+                              / "chrome.exe", "chrome"))
+    elif sys.platform == "darwin":
+        cands.append((Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                      "edge"))
+        cands.append((Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                      "chrome"))
+    else:
+        for name, tag in (("microsoft-edge", "edge"), ("google-chrome", "chrome"),
+                          ("chromium", "chrome"), ("chromium-browser", "chrome")):
+            p = shutil.which(name)
+            if p:
+                cands.append((Path(p), tag))
+    return cands
+
+
+def find_chromium_ex() -> tuple:
+    """找一个可用的 Chromium 系可执行文件，返回 (路径字符串, 来源)。
+
+    来源（优先级高 → 低）：
+      env    —— ASC_CHROME_PATH 显式指定
+      app    —— 应用按需下载的组件（data/browsers/，版本锁定 chromium-1200，最可靠）
+      user   —— 用户 playwright 缓存（ms-playwright）
+      edge / chrome —— 系统浏览器兜底（版本随系统漂移，见 _system_browser_hints）
+    找不到返回 (None, "")。**不现下载**：下载是 renderenv 里的显式用户动作。
+    """
     import os
     env = os.environ.get("ASC_CHROME_PATH")
     if env and Path(env).exists():
-        return env
-    for base in _CHROME_HINTS:
+        return env, "env"
+    pairs = []
+    try:
+        from .renderenv import browsers_dir
+        pairs.append((browsers_dir(), "app"))
+    except Exception:
+        pass
+    pairs += [(b, "user") for b in _CHROME_HINTS]
+    for base, tag in pairs:
         if not base.is_dir():
             continue
         cands = sorted(base.glob("chromium-*/chrome-win64/chrome.exe"), reverse=True)
@@ -131,9 +208,33 @@ def find_chromium() -> str | None:
         cands += sorted(base.glob("chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium"),
                         reverse=True)
         for c in cands:
+            if not c.exists():
+                continue
+            if tag == "app":
+                # 应用自管组件必须有完成标记：渲染绝不用「下载/解压中断的半成品」
+                # （组件根 = chromium-XXX/，用相对首段定位，兼容 win/mac 不同层级深度）
+                try:
+                    comp_root = base / c.relative_to(base).parts[0]
+                except Exception:
+                    continue
+                if not (comp_root / "INSTALLATION_COMPLETE").exists():
+                    continue
+            return str(c), tag
+    for c, tag in _system_browser_hints():
+        try:
             if c.exists():
-                return str(c)
-    return None
+                return str(c), tag
+        except Exception:
+            continue
+    return None, ""
+
+
+def find_chromium() -> str | None:
+    """找一个已安装的 Chromium 可执行文件（**不现下载**：浏览器版本会漂移）。
+
+    兼容旧签名（只回路径）；需要来源时用 find_chromium_ex()。
+    """
+    return find_chromium_ex()[0]
 
 
 # ---------- 重采样（CFR） ----------
@@ -363,14 +464,45 @@ def _with_notes(msg: str, state: dict) -> str:
     return msg + ("（" + "，".join(bits)[:140] + "）" if bits else "")
 
 
+# ---------- 进度 ----------
+
+def _encode_pct(done: int, total: int, t0: float, base: int) -> int:
+    """编码阶段的进度（`base` .. `PROGRESS_ENCODE_END`）。
+
+    ⚠️ 不能简单用 `done/total`：那是「每帧成本相同」的假设，而实测差几倍
+       （板书静止帧的 P 帧极便宜，换页那一刻的 I 帧极贵）。按帧数算会让进度
+       先冲到 94 再爬。这里用「已用时间 /（已用时间 + 剩余帧 × 本次实测单帧
+       成本）」—— 单帧成本取**本次自己的**（前 20 帧样本太少、含编码器初始化，
+       先用先验 `ENCODE_SEC_PER_FRAME`）。于是慢机器上进度走得慢，但**一路在动**，
+       不会出现「94% 卡三分钟」。
+    """
+    span = PROGRESS_ENCODE_END - base
+    if span <= 0:
+        return PROGRESS_ENCODE_END
+    if total <= 0 or done >= total:
+        return PROGRESS_ENCODE_END
+    elapsed = max(0.0, time.time() - t0)
+    per = (elapsed / done) if done >= 20 else ENCODE_SEC_PER_FRAME
+    left = (total - done) * max(per, 1e-4)
+    frac = elapsed / (elapsed + left) if (elapsed + left) > 0 else 1.0
+    return base + int(max(0.0, min(1.0, frac)) * span)
+
+
 # ---------- 主流程 ----------
 
 def render(stage_html: Path, audio_path: Path, out_mp4: Path, out_poster: Path,
            duration_ms: int, *, width: int = OUT_W, height: int = OUT_H,
-           fps: int = OUT_FPS, on_progress=None) -> dict:
+           fps: int = OUT_FPS, on_progress=None, on_stage=None,
+           should_cancel=None) -> dict:
     """渲染一条成片。返回渲染报告 dict（含 skew / 帧数 / 重复帧占比）。
 
     失败一律抛 `RuntimeError`（带上可读原因），由调用方置 `failed`。
+    取消：调用方传 `should_cancel`（callable，True = 用户点了取消）。检查点 =
+    泵循环每轮（≈16ms）+ 编码逐帧 + 音频编码前；触发抛 `RenderCancelled`，
+    浏览器由 finally 关闭，半成品**临时文件**由调用方清理（句柄已 close）。
+    进度：`on_progress(pct)` 报的是**整条管线**的 0–100（抓帧 → 编码 → 合流），
+    不再只覆盖抓帧（原因见顶部「进度预算」）；`on_stage(name)` 报阶段切换
+    （capture / encode / mux）。⚠️ 调用方不要再自己给 pct 封顶或缩放。
     """
     import av
     from PIL import Image
@@ -379,6 +511,19 @@ def render(stage_html: Path, audio_path: Path, out_mp4: Path, out_poster: Path,
     dur_s = max(0.1, int(duration_ms or 0) / 1000.0)
     n_frames = int(round(dur_s * fps))
     timeout_s = dur_s * TIMEOUT_FACTOR + TIMEOUT_EXTRA_S
+
+    # ---- 进度预算：抓帧 / 编码两段按预估耗时切分，进度速率才一致 ----
+    est_capture = dur_s
+    est_encode = max(1.0, n_frames * ENCODE_SEC_PER_FRAME)
+    cap_ratio = est_capture / (est_capture + est_encode)
+    cap_ratio = min(PROGRESS_CAPTURE_MAX, max(PROGRESS_CAPTURE_MIN, cap_ratio))
+    cap_end = int(round(cap_ratio * PROGRESS_ENCODE_END))
+
+    def _stage(name: str) -> None:
+        """报阶段切换。百分比不在这里动 —— 阶段与 pct 分开报，调用方才能把
+        「已经走到 45%」和「现在是编码阶段」两个信息各自显示出来。"""
+        if on_stage:
+            on_stage(name)
 
     exe = find_chromium()
     if not exe:
@@ -456,6 +601,20 @@ def render(stage_html: Path, audio_path: Path, out_mp4: Path, out_poster: Path,
 
             cdp = ctx.new_cdp_session(page)
 
+            # 渲染倍速（2026-10-21 补全）：页面自报 `__stage.rate`（页钟 = 墙钟 × rate）。
+            # ⚠️⚠️ 此前模板侧（radio/night/ambient，提速 A）已按 ×RATE 播放，但**渲染器
+            #    从未读这个值**：帧时间戳是墙钟、槽位是页钟，rate>1 时尾部整段对不上
+            #    → 槽位自检必然报「对齐异常」（motion 皮肤 2026-10-21 实测：
+            #    8s 片 p99 偏差 2534ms ≈ 8s − 8s/1.5 的尾巴）。换算必须在这里做：
+            #    rel 一律转**页钟秒**再喂重采样器，rate=1 时乘 1 恒等（存量零回归）。
+            try:
+                play_rate = float(page.evaluate(
+                    "window.__stage && window.__stage.rate || 1") or 1)
+            except BaseException:
+                play_rate = 1.0
+            if not (0.2 <= play_rate <= 4.0):
+                play_rate = 1.0
+
             def on_frame(ev):
                 # ⚠️⚠️ 事件回调里**任何**异常都**不会**冒泡到我们这里：Playwright 会把它
                 #     交给监听器错误处理器，只往 stderr 打一行 "Error occurred in event listener"
@@ -493,7 +652,9 @@ def render(stage_html: Path, audio_path: Path, out_mp4: Path, out_poster: Path,
                         #    绝不能写在别处。踩过的坑：把锚点写在 try 外面，一旦这一帧喂失败，
                         #    锚点已写死而这一帧从没进过重采样器 → 第一帧真正入队的 rel 变成
                         #    几百 ms → 现象是「第 0 槽偏差 317 ms」（槽位 0 在数学上只会是 0）。
-                        rel = 0.0 if state["anchor_ts"] is None else ts - state["anchor_ts"]
+                        # rel 用**页钟秒**（墙钟差 × play_rate）：槽位 k/fps 是页钟口径
+                        rel = 0.0 if state["anchor_ts"] is None \
+                            else (ts - state["anchor_ts"]) * play_rate
                         f.feed(rel, payload)
                         if state["anchor_ts"] is None:
                             state["anchor_ts"] = ts
@@ -533,6 +694,10 @@ def render(stage_html: Path, audio_path: Path, out_mp4: Path, out_poster: Path,
                 state["armed"] = True
 
             # ---- 泵：等页面跑完 + 及时 ack + 上报进度 ----
+            # ⚠️ 这里显式报一次 `capture`：它是默认初始态，但只有调用方在外面
+            #    `job.emit("capture", 1)` 过 —— 订阅方拿不到「抓帧真的开始了」。
+            #    三个阶段都由 renderer 亲口报，on_stage 的契约才完整。
+            _stage("capture")
             t0 = time.time()
             last_pct = -1
             # 断流看门狗：页面在连续播放，帧流不该长时间静默。
@@ -544,6 +709,8 @@ def render(stage_html: Path, audio_path: Path, out_mp4: Path, out_poster: Path,
             st = {"done": False}
             while True:
                 n_pump += 1
+                if should_cancel and should_cancel():
+                    raise RenderCancelled("已取消渲染")
                 page.wait_for_timeout(PUMP_MS)   # 让事件回调有机会跑
                 while pending_sids:              # 及时回 ack，否则停流
                     sid = pending_sids.pop(0)
@@ -567,7 +734,8 @@ def render(stage_html: Path, audio_path: Path, out_mp4: Path, out_poster: Path,
                     if (state["first_skew_ms"] is None and ts_abs
                             and state["anchor_ts"] is not None):
                         with frame_lock:
-                            newest = ts_abs[-1] - state["anchor_ts"]
+                            # 页钟秒（与 st.clock 同口径）：墙钟差 × play_rate
+                            newest = (ts_abs[-1] - state["anchor_ts"]) * play_rate
                         state["first_skew_ms"] = round(
                             (float(st.get("clock") or 0.0) / 1000.0 - newest) * 1000.0, 1)
                 if st.get("done"):
@@ -578,7 +746,10 @@ def render(stage_html: Path, audio_path: Path, out_mp4: Path, out_poster: Path,
                     raise RuntimeError(
                         f"渲染超时（超过 {int(timeout_s)} 秒），请重试或缩短时长")
                 if on_progress:
-                    pct = int(min(99, (st.get("clock") or 0.0) / max(1.0, dur_s * 1000) * 100))
+                    # ⚠️ 不再封顶 99：抓帧只占预算的前 `cap_end` 个百分点（约 45），
+                    #    剩下的留给后面的编码/合流，否则 99% 之后又是一段死区。
+                    frac = min(1.0, (st.get("clock") or 0.0) / max(1.0, dur_s * 1000))
+                    pct = int(frac * cap_end)
                     if pct != last_pct:
                         last_pct = pct
                         on_progress(pct)
@@ -643,31 +814,73 @@ def render(stage_html: Path, audio_path: Path, out_mp4: Path, out_poster: Path,
             big_gaps = sum(1 for g in gaps if g > 100.0)
 
             # 以下两项**只作诊断**：排水帧会把它们推过 TOTAL，不能当判据用。
-            recorded_s = rel_all[-1] if rel_all else 0.0
+            # ⚠️ recorded_s 转页钟再比 clock（clock_ms 是页钟毫秒）：墙钟 × play_rate。
+            recorded_s = rel_all[-1] * play_rate if rel_all else 0.0
             tail_skew_ms = (recorded_s * 1000.0 - state["clock_ms"]) \
                 if rel_all else 0.0
 
             # ---- 编码 ----
+            # ⚠️ 取消检查点 = 逐帧 + 音频编码前。半成品是**临时文件**（调用方成功才改名），
+            #    取消/失败都不伤上一版成片；container 必须 close 才放句柄，否则 Windows 上
+            #    调用方删半成品会撞「文件被占用」。
             container = av.open(str(out_mp4), mode="w",
                                 options={"movflags": "+faststart"})
-            vst = _video_stream(container, fps, width, height)
-            put = make_writer(container, vst)
-            n_dup = 0
-            for k, (_rel, payload) in enumerate(chosen):
-                if k > 0 and payload is chosen[k - 1][1]:
-                    n_dup += 1
-                put(payload, k)
-            for pkt in vst.encode(None):
-                vpackets.append(pkt)
+            try:
+                # ⚠️ 编码阶段**必须换 stage 名**：抓帧结束后进度条还要走四十多个百分点
+                #    （编码 ≈ 1.1× 片长），界面若仍显示「录制画面 45%」用户会以为卡死。
+                _stage("encode")
+                vst = _video_stream(container, fps, width, height)
+                put = make_writer(container, vst)
+                n_dup = 0
+                n_all = max(1, len(chosen))
+                enc_t0 = time.time()
+                last_enc_pct = -1
+                for k, (_rel, payload) in enumerate(chosen):
+                    if should_cancel and should_cancel():
+                        raise RenderCancelled("已取消渲染")
+                    if k > 0 and payload is chosen[k - 1][1]:
+                        n_dup += 1
+                    put(payload, k)
+                    # 每 8 帧报一次：单帧 36 ms，逐帧 emit 会变成 28 次/秒的广播风暴。
+                    if on_progress and (k & 7) == 0:
+                        p = _encode_pct(k + 1, n_all, enc_t0, cap_end)
+                        if p != last_enc_pct:
+                            last_enc_pct = p
+                            on_progress(p)
+                for pkt in vst.encode(None):
+                    vpackets.append(pkt)
+                if on_progress:
+                    on_progress(PROGRESS_ENCODE_END)
+                if should_cancel and should_cancel():
+                    raise RenderCancelled("已取消渲染")
 
-            _, apackets, audio_s = encode_audio(container, audio_path)
-            if audio_s < dur_s - 0.5:
-                # 音轨比讲稿短：成片尾部会静音。这不是致命错，但必须可见。
-                state["errs"].append(f"audio_short: {audio_s:.2f}s < {dur_s:.2f}s")
+                if on_progress:
+                    on_progress(PROGRESS_ENCODE_END + 1)
+                _, apackets, audio_s = encode_audio(container, audio_path)
+                if on_progress:
+                    on_progress(PROGRESS_AUDIO_END)
+                if audio_s < dur_s - 0.5:
+                    # 音轨比讲稿短：成片尾部会静音。这不是致命错，但必须可见。
+                    state["errs"].append(f"audio_short: {audio_s:.2f}s < {dur_s:.2f}s")
 
-            # ---- 交错 mux（按**秒**排序，两个流的 time_base 不同，pts 不能直接比） ----
-            mux_interleaved(container, vpackets, vst, apackets, container.streams.audio[0])
-            container.close()
+                # ---- 交错 mux（按**秒**排序，两个流的 time_base 不同，pts 不能直接比） ----
+                _stage("mux")
+
+                def _mux_pct(frac: float) -> None:
+                    if on_progress:
+                        span = PROGRESS_MUX_END - PROGRESS_AUDIO_END
+                        on_progress(PROGRESS_AUDIO_END
+                                    + int(max(0.0, min(1.0, frac)) * span))
+
+                mux_interleaved(container, vpackets, vst, apackets,
+                                container.streams.audio[0], on_frac=_mux_pct)
+                if on_progress:
+                    on_progress(PROGRESS_MUX_END)
+            finally:
+                try:
+                    container.close()
+                except BaseException:
+                    pass
 
             # ---- 封面帧：取 8% 处（避开开场黑场/静止） ----
             poster_ok = False
@@ -741,7 +954,7 @@ def _pkt_sec(pkt, stream) -> float:
 
 
 def mux_interleaved(container, vpacks: list, vstream, apacks: list,
-                    astream) -> int:
+                    astream, on_frac=None) -> int:
     """把视频包与音频包**按秒**交错写入容器，返回写入的包数。
 
     ⚠️ 必须按「秒」排，不能按 `pkt.pts` 数值排：两个流的 `time_base` 不同
@@ -755,11 +968,21 @@ def mux_interleaved(container, vpacks: list, vstream, apacks: list,
     for pkt in apacks:
         merged.append((_pkt_sec(pkt, astream), 1, pkt))
     merged.sort(key=lambda x: (x[0], x[1]))
-    for _, _, pkt in merged:
+    n = len(merged)
+    # ⚠️ 分部上报（每 128 个包一次）：一条 166 s 的片子约有 1.3 万个包，
+    #    逐包回调会让 emit 次数超过抓帧阶段的帧数。
+    for i, (_, _, pkt) in enumerate(merged):
         container.mux(pkt)
-    return len(merged)
+        if on_frac is not None and (i & 127) == 0:
+            on_frac(i / float(n) if n else 1.0)
+    return n
 
 
 def estimate_seconds(duration_ms: int) -> float:
-    """预计渲染耗时 ≈ 视频时长 × 1.5（screencast 是实时抓帧，1× 起步）。"""
-    return max(1.0, int(duration_ms or 0) / 1000.0 * 1.5)
+    """预计渲染耗时 ≈ 视频时长 × 2.1。
+
+    ⚠️ 原来是 ×1.5 —— 只算了「screencast 实时抓帧 1× 起步」，漏了抓帧之后的 x264
+       编码（2026-10-22 实测 36.3 ms/帧，30 fps ≈ 1.1× 片长）。11 部作品的实测
+       倍率是 2.07–2.74，旧的 1.5 让「预计耗时」系统性偏乐观将近一半。
+    """
+    return max(1.0, int(duration_ms or 0) / 1000.0 * 2.1)

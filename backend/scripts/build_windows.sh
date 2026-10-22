@@ -30,7 +30,7 @@ RELEASE_DIR="$OUT_ROOT/release"
 DIST_DIR_WIN="$OUT_ROOT_WIN/dist"
 BUILD_DIR_WIN="$OUT_ROOT_WIN/build"
 RELEASE_DIR_WIN="$OUT_ROOT_WIN/release"
-VERSION="${VERSION:-0.1.6}"
+VERSION="${VERSION:-0.1.7}"
 PY="${PY:-C:/Users/陈锦祥/.workbuddy/binaries/python/envs/default/Scripts/python.exe}"
 MGR_PY="${MGR_PY:-C:/Users/陈锦祥/.workbuddy/binaries/python/versions/3.13.12/python.exe}"
 
