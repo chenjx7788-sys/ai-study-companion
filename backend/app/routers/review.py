@@ -326,6 +326,9 @@ def review_filters(db: Session = Depends(get_db)):
     # ⚠️ 必须与 _apply_filters 的 `is not None` 修正同批，否则点该筛选会返回全部卡。
     if any(r[0] == -1 for r in mid_rows):
         materials.append({"id": -1, "title": "AI 陪练"})
+    # AI 视频（material_id=-2 哨兵）：视频讲稿走「转笔记 → 笔记出题」进复习队列的卡
+    if any(r[0] == -2 for r in mid_rows):
+        materials.append({"id": -2, "title": "AI 视频"})
     tags = sorted({t for m in mats for t in (m.tags or [])})
     return {"materials": materials, "tags": tags}
 

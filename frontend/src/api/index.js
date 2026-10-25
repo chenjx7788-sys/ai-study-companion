@@ -243,6 +243,8 @@ export const drillApi = {
   remove: (sid) => http.delete(`/drill/sessions/${sid}`),
   // 跨场次趋势（优化 3）：服务端聚合已落库的漏点，看短板是否在收敛
   trend: (limit) => http.get('/drill/trend', { params: { limit } }),
+  // 薄弱点 → 定向复述卡（学习闭环 B8）：给 session_id 聚合单场，不给聚合跨场趋势
+  fromWeak: (payload) => http.post('/drill/cards/from-weak', payload || {}),
   startStreamUrl: (sid) => `/api/drill/sessions/${sid}/start/stream`,
   answerStreamUrl: (sid) => `/api/drill/sessions/${sid}/answer/stream`,
   finish: (sid, reason) => http.post(`/drill/sessions/${sid}/finish`, { reason }),
@@ -305,6 +307,9 @@ export const videoApi = {
     http.post(`/videos/${id}/to-note${noteId ? `?note_id=${noteId}` : ''}`),
   // 转笔记状态 {exists, note_id, stale}：详情页按钮三态的唯一来源（口径在后端算）
   noteState: (id) => http.get(`/videos/${id}/note-state`),
+  // 转复习卡（学习闭环 B7）：确保讲稿笔记存在 → 对笔记出题；force=true 删旧卡重建
+  toCards: (id, force) => http.post(`/videos/${id}/to-cards`, force ? { force: true } : {}, { timeout: 180000 }),
+  cardsState: (id) => http.get(`/videos/${id}/cards-state`),
   // 数字人形象上传（竖版 ≥3:4 且短边 ≥512px）
   uploadAvatar: (formData) => http.post('/videos/avatar/upload', formData, { timeout: 120000 }),
   // 删除一个用户上传的形象（预置形象后端会拒）。返回带 used_by：

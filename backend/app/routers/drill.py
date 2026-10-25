@@ -8,6 +8,7 @@
 """
 import os
 import tempfile
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -16,7 +17,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..database import SessionLocal, get_db
-from ..models import DrillSession, DrillTurn
+from ..models import DrillSession, DrillTurn, ReviewCard
 from ..services import drill as drill_svc
 
 router = APIRouter(prefix="/drill", tags=["drill"])
@@ -350,3 +351,79 @@ def finish_session(sid: int, req: FinishReq, db: Session = Depends(get_db)):
     """结束陪练（提前结束或补结算）：出总分 + 薄弱点 + 错题回写（幂等）。"""
     reason = req.reason if req.reason in ("complete", "abort") else "abort"
     return drill_svc.finalize_session(db, sid, reason)
+
+
+# ---------- 薄弱点 → 定向复习卡（学习闭环 B8） ----------
+
+class FromWeakReq(BaseModel):
+    session_id: int | None = None     # 给 = 聚合该场；不给 = 聚合最近 20 场（与 /trend 同窗口）
+    limit: int = 5
+
+
+@router.post("/cards/from-weak")
+def cards_from_weak(req: FromWeakReq, db: Session = Depends(get_db)):
+    """薄弱点 → 定向复述卡（type=recall，source="drill"）。
+
+    ⚠️ 零 LLM：question 用固定模板「【陪练薄弱点】<要点>」，answer 直接拼装考点与期望要点
+       （都在库里，拼装即真值；LLM 出题对碎片要点有幻觉风险，且要多轮调用）。
+    ⚠️ 幂等：模板固定 → question 精确匹配即判重，已有卡跳过计 skipped。
+    """
+    limit = max(1, min(req.limit or 5, 10))
+    if req.session_id is not None:
+        s = db.get(DrillSession, req.session_id)
+        if not s:
+            raise HTTPException(404, "陪练场次不存在")
+        session_ids = [s.id]
+    else:
+        rows = (db.query(DrillSession.id)
+                .order_by(DrillSession.created_at.desc()).limit(20).all())
+        session_ids = [r[0] for r in rows]
+        if len(session_ids) < 2:
+            raise HTTPException(400, "陪练场次不足，多完成几场后再生成定向复习卡")
+
+    turns = (db.query(DrillTurn).filter(DrillTurn.session_id.in_(session_ids))
+             .order_by(DrillTurn.id).all())
+    agg = {}
+    for t in turns:
+        for p in (t.missing_points or []):
+            raw = str(p).strip()
+            if not raw:
+                continue
+            k = drill_svc.point_key(raw)
+            rec = agg.get(k)
+            if rec is None:
+                rec = agg[k] = {"text": raw, "count": 0, "turn": t}
+            if len(raw) < len(rec["text"]):
+                rec["text"] = raw          # 展示最短的原始写法（与趋势卡同口径）
+            rec["count"] += 1
+            rec["turn"] = t                # 考点上下文取最近一次出现
+    points = sorted(agg.values(), key=lambda r: (-r["count"], r["text"]))[:limit]
+    if not points:
+        return {"created": 0, "skipped": 0, "cards": []}
+
+    created, skipped, out = 0, 0, []
+    now = datetime.utcnow()
+    for rec in points:
+        t = rec["turn"]
+        question = "【陪练薄弱点】" + rec["text"]
+        dup = (db.query(ReviewCard)
+               .filter(ReviewCard.source == "drill", ReviewCard.type == "recall",
+                       ReviewCard.question == question).first())
+        if dup:
+            skipped += 1
+            continue
+        expected = "\n".join("- " + str(p) for p in (t.expected_points or []) if str(p).strip())
+        answer = ("出自考点：%s\n\n期望要点：\n%s"
+                  % (t.question or "", expected or "- （该考点未记录期望要点）"))
+        mid = t.source_material_id if t.source_material_id is not None else drill_svc.SENTINEL_MATERIAL_ID
+        title = ("陪练 · " + (t.source_title or "")).strip()
+        card = ReviewCard(
+            note_id=None, material_id=mid, material_title=title[:255],
+            question=question, answer=answer, type="recall", source="drill",
+            level=0, ease=2.5, next_review_at=now)
+        db.add(card)
+        db.flush()
+        created += 1
+        out.append({"id": card.id, "question": question, "material_title": title})
+    db.commit()
+    return {"created": created, "skipped": skipped, "cards": out}

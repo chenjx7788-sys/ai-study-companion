@@ -28,6 +28,7 @@
       <div v-if="!sessionSearch && trend && trend.n_sessions >= 3" class="td-card">
         <div class="td-head">
           <span class="td-title">跨场次趋势</span>
+          <el-button class="td-act" size="small" text type="primary" :loading="weakBusy" @click.stop="weakToCards(null)">薄弱点出题</el-button>
           <span class="td-sub">最近 {{ trend.n_sessions }} 场</span>
         </div>
         <div class="td-body">
@@ -416,6 +417,7 @@
           {{ drillNote ? '更新笔记' : '转成笔记' }}
         </el-button>
         <el-button v-if="drillNote" @click="openDrillNote">查看笔记</el-button>
+        <el-button :loading="weakBusy" :disabled="!weakPoints.length" @click="weakToCards(current?.id)">薄弱点生成复习卡</el-button>
         <el-button type="primary" @click="againSameConfig">按此范围再练一场</el-button>
       </div>
     </template>
@@ -1250,6 +1252,21 @@ async function finishEarly() {
   }
 }
 
+
+// ---------- 薄弱点 → 定向复习卡（学习闭环 B8） ----------
+const weakBusy = ref(false)
+async function weakToCards(sid) {
+  weakBusy.value = true
+  try {
+    const { data } = await drillApi.fromWeak(sid ? { session_id : sid } : {})
+    if (data.created > 0) ElMessage.success('已生成 ' + data.created + ' 张定向复习卡' + (data.skipped ? '，' + data.skipped + ' 个要点已有卡跳过' : '') + '，去「复习巩固」查看')
+    else ElMessage.info(data.skipped ? '这些薄弱点都已有复习卡' : '暂无可出题的薄弱点')
+  } catch (e) {
+    ElMessage.error(errMsg(e, '生成复习卡失败'))
+  } finally {
+    weakBusy.value = false
+  }
+}
 
 // ---------- 成绩单转笔记（C 档） ----------
 
@@ -2102,6 +2119,7 @@ onUnmounted(() => {
   border-radius: 14px; padding: 14px 18px; margin: 0 0 16px;
 }
 .td-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.td-act { margin-left: auto; }
 .td-title { font-size: 13.5px; font-weight: 600; color: var(--asc-text); }
 .td-sub { font-size: 12px; color: var(--asc-text-2); }
 .td-body { display: flex; gap: 22px; align-items: flex-start; flex-wrap: wrap; }

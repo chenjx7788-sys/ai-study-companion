@@ -33,7 +33,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..database import get_db, SessionLocal
-from ..models import Video, Podcast, Material, Note, ActivityLog
+from ..models import Video, Podcast, Material, Note, ActivityLog, ReviewCard
 from ..services import video as svc
 from ..services import backgrounds as bg_svc
 from ..services import bgm as bgm_svc
@@ -2634,6 +2634,87 @@ def note_state(vid: int, db: Session = Depends(get_db)):
             continue
         return {"exists": True, "note_id": n.id, "stale": a.get("key") != key}
     return {"exists": False, "note_id": None, "stale": False}
+
+
+# ---------- 转复习卡（学习闭环 B7） ----------
+
+# ⚠️ 复习卡「AI 视频」哨兵：-1 已被陪练占用、0 是「AI 问答」；筛选口径见 review.py::review_filters。
+SENTINEL_VIDEO_MATERIAL_ID = -2
+
+
+class ToCardsReq(BaseModel):
+    force: bool = False
+
+
+@router.post("/{vid}/to-cards")
+def to_cards(vid: int, req: ToCardsReq, db: Session = Depends(get_db)):
+    """转复习卡：确保讲稿笔记存在（复用 to_note 的内容指纹幂等）→ 对笔记出题（选择题 1-3 张）。
+
+    ⚠️ PRD 2.1 硬约束 3：视频**不新增 review_cards.source 枚举** —— 本端点出的卡 source 仍是
+       "note"（笔记出题链路），视频只是借「转笔记」把内容带进复习队列。
+    ⚠️ 已有卡且不 force → 直接返回现有（保住用户校对内容与复习进度）；force 重建时
+       **先拿到合格题目再删旧卡、删除与插入同一事务**（纪律同 review.py::create_quiz）。
+    """
+    from ..services import llm
+
+    v = db.get(Video, vid)
+    if not v:
+        raise HTTPException(404, "视频作品不存在或已删除")
+    if not (v.script or []):
+        # ⚠️ 判空必须落在讲稿上：to_note_payload 对空讲稿也会产出「标题+小节头」骨架文本，
+        #    判 note.content 拦不住，会一路走到 LLM 才 500。
+        raise HTTPException(400, "该作品还没有讲稿内容，请先生成讲稿")
+    note_res = to_note(vid, None, db)      # 复用幂等：同一内容指纹只一篇笔记
+    note = db.get(Note, note_res["note_id"])
+    if not note or not (note.content or "").strip():
+        raise HTTPException(400, "讲稿内容为空，无法出题")
+
+    existing = db.query(ReviewCard).filter(ReviewCard.note_id == note.id).all()
+    if existing and not req.force:
+        return {"ok": True, "note_id": note.id, "created": 0, "existing": len(existing)}
+
+    content_len = len(note.content or "")
+    count = 3 if content_len > 500 else (2 if content_len > 200 else 1)
+    qas = llm.generate_review_questions(note.title, note.content, count)
+
+    for c in existing:
+        db.delete(c)
+    now = datetime.utcnow()
+    cards = [
+        ReviewCard(
+            note_id=note.id, material_id=SENTINEL_VIDEO_MATERIAL_ID,
+            material_title=("视频 · " + (v.title or ""))[:255],
+            question=qa["question"], answer=qa["explanation"],
+            type="choice", options=qa["options"], correct_index=qa["correct_index"],
+            source="note", level=0, next_review_at=now)
+        for qa in qas
+    ]
+    db.add_all(cards)
+    db.commit()
+    _track("video_to_cards", v.id, 0, {"created": len(cards)})
+    return {"ok": True, "note_id": note.id, "created": len(cards),
+            "recreated": bool(existing)}
+
+
+@router.get("/{vid}/cards-state")
+def cards_state(vid: int, db: Session = Depends(get_db)):
+    """转复习卡状态：讲稿笔记有没有 / 卡有几张（详情页按钮三态的数据源）。
+
+    「哪篇笔记」与 note_state 同口径：取本作品最近更新的那篇 video_script 笔记。
+    """
+    v = db.get(Video, vid)
+    if not v:
+        raise HTTPException(404, "视频作品不存在或已删除")
+    note_id = None
+    for n in db.query(Note).order_by(Note.updated_at.desc()).all():
+        a = n.anchor or {}
+        if isinstance(a, dict) and a.get("kind") == "video_script" and a.get("video_id") == v.id:
+            note_id = n.id
+            break
+    n_cards = 0
+    if note_id is not None:
+        n_cards = db.query(ReviewCard).filter(ReviewCard.note_id == note_id).count()
+    return {"note_id": note_id, "cards": n_cards}
 
 
 # ---------- 形象上传（talking_head 用） ----------

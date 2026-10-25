@@ -561,6 +561,8 @@
             <el-button v-if="!videoNoteId" :disabled="noteBusy" @click="toNote"><svg class="btn-ic" viewBox="0 0 14 14" fill="none"><path d="M3.4 1.8h5l3.2 3.2v7.4H3.4z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M8.4 1.8v3.2h3.2" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>转笔记</el-button>
             <el-button v-else type="success" plain @click="openVideoNote(videoNoteId)"><svg class="btn-ic" viewBox="0 0 14 14" fill="none"><path d="M1.3 7s2.3-3.6 5.7-3.6S12.7 7 12.7 7s-2.3 3.6-5.7 3.6S1.3 7 1.3 7z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><circle cx="7" cy="7" r="1.7" stroke="currentColor" stroke-width="1.4"/></svg>✓ 已转笔记 · 查看</el-button>
             <el-button v-if="videoNoteStale" type="warning" plain :disabled="noteBusy" @click="toNote"><svg class="btn-ic" viewBox="0 0 14 14" fill="none"><path d="M11.9 7A4.9 4.9 0 1 1 10.4 3.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M12 1.6v2.3H9.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>文稿已更新 · 更新笔记</el-button>
+            <!-- 转复习卡（学习闭环 B7）：讲稿 →（复用转笔记幂等）→ 出题入复习队列 -->
+            <el-button :loading="cardsBusy" @click="toCards"><svg class="btn-ic" viewBox="0 0 14 14" fill="none"><rect x="2" y="1.6" width="10" height="11" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M4.4 5h5.2M4.4 7.6h5.2M4.4 10.2h3.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>{{ cardsState.cards > 0 ? '复习卡 · 已生成 ' + cardsState.cards + ' 张' : '转复习卡' }}</el-button>
             <el-button v-if="cur.has_video" @click="openExport"><svg class="btn-ic" viewBox="0 0 14 14" fill="none"><path d="M7 1.8v6.6M4.3 6.1 7 8.8l2.7-2.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M2.2 11.6h9.6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>导出成片</el-button>
             <el-button @click="revealInFolder"><svg class="btn-ic" viewBox="0 0 14 14" fill="none"><path d="M1.8 3.6h3.3l1.3 1.5h5.8v6.5a.9.9 0 0 1-.9.9H2.7a.9.9 0 0 1-.9-.9z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>在文件夹中定位</el-button>
             <el-button type="danger" plain class="danger-end" @click="removeWork">删除作品</el-button>
@@ -1175,6 +1177,7 @@ async function loadDetail(id, { quiet = false } = {}) {
     const { data } = await videoApi.detail(id)
     applyVideo(data)
     await loadNoteState()
+    await loadCardsState()
   } catch (e) {
     if (!quiet) ElMessage.error(errMsg(e, '作品详情加载失败'))
     if (route.params.id) router.replace('/video')
@@ -1868,6 +1871,45 @@ async function loadNoteState() {
   }
 }
 
+// ---------- 转复习卡（学习闭环 B7：讲稿 → 笔记 → 出题；卡来源哨兵 -2「AI 视频」） ----------
+const cardsBusy = ref(false)
+const cardsState = ref({ note_id: null, cards: 0 })
+
+async function loadCardsState() {
+  const id = cur.value?.id
+  if (!id) { cardsState.value = { note_id: null, cards: 0 }; return }
+  try {
+    const { data } = await videoApi.cardsState(id)
+    // 与 loadNoteState 同理：切作品期间回来的旧响应必须丢掉
+    if (cur.value?.id === id) cardsState.value = data
+  } catch {
+    // 拿不到状态只影响按钮文案 → 不打扰用户
+    if (cur.value?.id === id) cardsState.value = { note_id: null, cards: 0 }
+  }
+}
+
+async function toCards() {
+  const c = cur.value
+  if (!c) return
+  cardsBusy.value = true
+  try {
+    const recreate = cardsState.value.cards > 0
+    if (recreate) {
+      await ElMessageBox.confirm(
+        '已生成过 ' + cardsState.value.cards + ' 张复习卡。重新生成将删除这些卡（含复习进度）再重出，讲稿笔记保留。',
+        '重新生成复习卡', { type: 'warning', confirmButtonText: '重新生成', cancelButtonText: '取消' })
+    }
+    const { data } = await videoApi.toCards(c.id, recreate)
+    if (data?.created > 0) ElMessage.success('已生成 ' + data.created + ' 张复习卡，去「复习巩固」开始复习')
+    else ElMessage.info('这一版讲稿已有复习卡，未重复生成')
+    await loadCardsState()
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(errMsg(e, '转复习卡失败'))
+  } finally {
+    cardsBusy.value = false
+  }
+}
+
 function openVideoNote(id) {
   videoNoteView.id = Number(id)
   videoNoteView.show = true
@@ -1889,6 +1931,7 @@ async function toNote() {
     if (data?.updated) ElMessage.success('笔记已更新')
     else ElMessage.success(data?.created ? '已生成笔记' : '这个版本的讲稿已经有一篇笔记了（同一版本只生成一篇）')
     await loadNoteState()
+    await loadCardsState()
   } catch (e) {
     if (e !== 'cancel' && e !== 'close') ElMessage.error(errMsg(e, '转笔记失败'))
   } finally {
