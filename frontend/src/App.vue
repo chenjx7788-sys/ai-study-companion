@@ -92,7 +92,12 @@
           在学习页做 AI 总结、划线解读，或随时打开 AI 问答向你的知识库提问。
         </template>
       </el-tour-step>
-      <el-tour-step target="[data-nav='/review']" placement="right" :title="(needSetup ? '④' : '③') + ' 沉淀 & 抗遗忘'">
+      <el-tour-step target="[data-nav='/skills']" placement="right" :title="(needSetup ? '④' : '③') + ' 技能：让 AI 按方法回答'">
+        <template #default>
+          每个技能是一份「怎么做好这件事」的说明（如统一术语译法、检查论证漏洞）。提问时模型会判断哪个技能合用、先给你建议，由你决定用不用；也可以随时用「＋技能」手动挂载。
+        </template>
+      </el-tour-step>
+      <el-tour-step target="[data-nav='/review']" placement="right" :title="(needSetup ? '⑤' : '④') + ' 沉淀 & 抗遗忘'">
         <template #default>
           把重点转成笔记进知识库，用复习巩固翻卡，让学过的内容不遗忘。
         </template>
@@ -106,6 +111,8 @@
 
     <!-- 引导可随时跳过：遮罩会拦截其余区域点击，若无显式出口，用户会误以为「界面点不动」 -->
     <div v-if="!isBare && tourOpen" class="tour-skip" title="关闭引导，直接开始使用" @click="skipTour">跳过引导</div>
+  <!-- AI 回答图片查看器（全局单例，点击 .md-body/.ep-block 内图片时打开） -->
+  <MdImageViewer />
   </el-container>
 </template>
 
@@ -117,6 +124,7 @@ import { reviewApi, settingsApi, materialApi, updateApi } from './api'
 import { ElMessage } from 'element-plus'
 import { storeToRefs } from 'pinia'
 import UpdateDialog from './components/UpdateDialog.vue'
+import MdImageViewer from './components/MdImageViewer.vue'
 import { useUpdateStore } from './stores/update'
 
 const route = useRoute()
@@ -204,6 +212,7 @@ const navItems = [
   { path: '/', label: '材料库', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="2" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="2" y="9" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="9" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/></svg>' },
   { path: '/knowledge', label: '知识库', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2.5c-1.2-.9-3-1.2-5-.8v10.6c2-.4 3.8-.1 5 .8 1.2-.9 3-1.2 5-.8V1.7c-2-.4-3.8-.1-5 .8z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 2.5v10.6" stroke="currentColor" stroke-width="1.3"/></svg>' },
   { path: '/chat', label: 'AI 问答', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v6a1.5 1.5 0 0 1-1.5 1.5H8l-3.5 3v-3h-1A1.5 1.5 0 0 1 2 9.5v-6z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>' },
+  { path: '/skills', label: '技能', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2.4" y="3.2" width="11.2" height="9.6" rx="2" stroke="currentColor" stroke-width="1.3"/><path d="M5 6.4h6M5 8.8h6M5 11.2h3.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>' },
   { path: '/drill', label: 'AI 陪练', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.6" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="2.6" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r=".9" fill="currentColor"/></svg>' },
   { path: '/podcast', label: 'AI 播客', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.6 9.4V8a5.4 5.4 0 0 1 10.8 0v1.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><rect x="1.7" y="8.7" width="3.1" height="4.5" rx="1.55" stroke="currentColor" stroke-width="1.3"/><rect x="11.2" y="8.7" width="3.1" height="4.5" rx="1.55" stroke="currentColor" stroke-width="1.3"/></svg>' },
   { path: '/video', label: 'AI 视频', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.8" y="3.1" width="12.4" height="9.8" rx="2" stroke="currentColor" stroke-width="1.3"/><path d="M6.7 6.2l3.6 2.1-3.6 2.1V6.2z" fill="currentColor"/></svg>' },

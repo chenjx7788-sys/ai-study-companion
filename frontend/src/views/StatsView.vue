@@ -204,14 +204,14 @@
 <script setup>
 import { ref, reactive, computed, onMounted, h } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import MarkdownIt from 'markdown-it'
+import { createMd, renderMd as renderMdSafe } from '../utils/md'
 import { statsApi, reviewApi, noteApi } from '../api'
 import { errMsg } from '../api/http'
 import NoteEditorDialog from '../components/NoteEditorDialog.vue'
 import { streamSSE } from '../utils/sse'
 import PageHead from '../components/PageHead.vue'
 
-const md = new MarkdownIt({ breaks: true })
+const md = createMd({ breaks: true })
 
 // ---------- 子组件：折线图 / 柱状图 / 环形图 ----------
 const LineChart = {
@@ -454,7 +454,7 @@ const gradePct = computed(() => {
 
 const renderedReport = computed(() => {
   const content = displayReport.value?.content || ''
-  return content ? md.render(content) : ''
+  return content ? renderMdSafe(md, content) : ''
 })
 
 // ---------- 报告转笔记 ----------

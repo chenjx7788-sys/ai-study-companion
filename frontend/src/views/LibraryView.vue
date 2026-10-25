@@ -11,6 +11,8 @@
       </div>
     </div>
 
+    <!-- 吸顶区：页头 + 视图切换 + 筛选/面包屑（滚动时筛选条件与主操作保持在手边） -->
+    <div class="sticky-head">
     <!-- 页头：标题 + 统计 / 搜索 + 主操作 -->
     <div class="page-header">
       <div class="header-left">
@@ -70,18 +72,6 @@
       </div>
     </div>
 
-    <!-- 上传队列（进度反馈） -->
-    <div v-if="uploads.length" class="upload-list">
-      <div v-for="u in uploads" :key="u.key" class="upload-item">
-        <el-icon class="upload-icon" :class="{ 'is-loading': u.status === 'uploading' }">
-          <Loading v-if="u.status === 'uploading'" /><Document v-else />
-        </el-icon>
-        <span class="upload-name" :title="u.name">{{ u.name }}</span>
-        <el-progress :percentage="u.progress" :stroke-width="6" style="flex: 1"
-          :status="u.status === 'error' ? 'exception' : (u.status === 'done' ? 'success' : '')" />
-      </div>
-    </div>
-
     <!-- 视图切换：页头下方第一行，与标签行左对齐（用户反馈「不知道在哪切换浏览方式」，故提到标签之前） -->
     <div v-if="materials.length || folders.length" class="view-bar">
       <el-radio-group v-model="viewMode" size="small" class="view-toggle">
@@ -127,6 +117,19 @@
         </template>
       </span>
       <el-button size="small" :icon="FolderAdd" @click="createFolder">新建文件夹</el-button>
+    </div>
+    </div><!-- /sticky-head -->
+
+    <!-- 上传队列（进度反馈；瞬时态，放吸顶区外，不占吸顶高度） -->
+    <div v-if="uploads.length" class="upload-list">
+      <div v-for="u in uploads" :key="u.key" class="upload-item">
+        <el-icon class="upload-icon" :class="{ 'is-loading': u.status === 'uploading' }">
+          <Loading v-if="u.status === 'uploading'" /><Document v-else />
+        </el-icon>
+        <span class="upload-name" :title="u.name">{{ u.name }}</span>
+        <el-progress :percentage="u.progress" :stroke-width="6" style="flex: 1"
+          :status="u.status === 'error' ? 'exception' : (u.status === 'done' ? 'success' : '')" />
+      </div>
     </div>
 
     <!-- 空状态 -->
@@ -995,6 +998,15 @@ onUnmounted(() => pollTimer && clearInterval(pollTimer))
 
 <style scoped>
 .library { position: relative; min-height: 100%; }
+
+/* ===== 吸顶区：页头 + 视图切换 + 筛选/面包屑 =====
+   负 margin + 等值 padding：背景延展盖住 .page 的 28/32 内边距，吸顶时不透出滚动内容；
+   padding-bottom:1px 让末尾子块的 margin-bottom 收进背景内（否则吸顶后下方留一条透明缝，卡片会穿过去） */
+.sticky-head {
+  position: sticky; top: 0; z-index: 20;
+  margin: -28px -32px 0; padding: 28px 32px 1px;
+  background: var(--asc-bg);
+}
 
 /* ===== 拖拽上传遮罩 ===== */
 .drop-mask {

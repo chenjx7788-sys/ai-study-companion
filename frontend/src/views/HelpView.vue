@@ -91,12 +91,12 @@
 <script setup>
 import { ref, onMounted, nextTick, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import MarkdownIt from 'markdown-it'
+import { createMd, renderMd as renderMdSafe } from '../utils/md'
 
 const emit = defineEmits(['tour'])
 const router = useRouter()
-const md = new MarkdownIt({ breaks: true })
-const renderMd = (t) => md.render(t || '')
+const md = createMd({ breaks: true })
+const renderMd = (t) => renderMdSafe(md, t || '')
 const openFaq = ref([])
 const route = useRoute()
 const changelogRef = ref(null)

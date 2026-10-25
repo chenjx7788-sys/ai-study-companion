@@ -9,6 +9,7 @@ const routes = [
   { path: '/read', name: 'read', component: () => import('../views/EphemeralView.vue'), meta: { title: '临时阅读' } },
   { path: '/knowledge', name: 'knowledge', component: () => import('../views/KnowledgeView.vue'), meta: { title: '知识库' } },
   { path: '/chat', name: 'chat', component: () => import('../views/ChatView.vue'), meta: { title: 'AI 问答' } },
+  { path: '/skills', name: 'skills', component: () => import('../views/SkillsView.vue'), meta: { title: '技能' } },
   { path: '/drill', name: 'drill', component: () => import('../views/DrillView.vue'), meta: { title: 'AI 陪练' } },
   { path: '/review', name: 'review', component: () => import('../views/ReviewView.vue'), meta: { title: '复习巩固' } },
   { path: '/podcast', name: 'podcast', component: () => import('../views/PodcastView.vue'), meta: { title: 'AI 播客' } },

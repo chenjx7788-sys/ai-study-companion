@@ -503,17 +503,25 @@ onMounted(async () => {
 .kb-stat.pending b { color: var(--asc-primary); }
 .kb-stat.pending:hover { transform: translateY(-2px); border-color: rgba(124, 92, 252, .45); box-shadow: var(--asc-shadow-hover); }
 
-/* ===== 工具条：tabs（吸顶） ===== */
+/* ===== 工具条：tabs + 筛选行（整组吸顶） ===== */
 .kb-tabs-wrap { position: relative; }
-/* 搜索框：已从 tab 栏右侧下移到各 tab 内容区顶部（见 .kb-pane-head），
-   因此不再 sticky —— 它只服务「按材料 / 按笔记」，切到知识图谱就不该出现。 */
 .kb-search { width: 240px; flex-shrink: 0; }
 /* 「按材料 / 按笔记」内容区顶部：左筛选 chips + 右搜索框，两端对齐；
    chips 为空（暂无数据）时搜索框仍靠右（margin-left:auto 兜底）；
-   窄屏时搜索框自动折到下一行。—— 两个 tab 共用同一结构，改一处两边同步。 */
+   窄屏时搜索框自动折到下一行。—— 两个 tab 共用同一结构，改一处两边同步。
+   吸顶：top 41px = tabs 栏实测高（el-tabs 项高 40px + 组件 header 上 padding 1px）；
+   z-index 比 tabs 栏（6）低一层，滚动时内容从两层下面穿过、互不遮挡；
+   下间距做成 padding 而非 margin —— margin 区域背景盖不到，滚动上来的内容会从缝里透出。
+   ⚠️ 与 tabs 栏的间距必须全部放在本元素自己的 padding-top 里（14px），
+   不能靠 el-tabs__content 的 padding —— 吸顶时 content 的间距会滚走，
+   间距从「流式 18px」被挤成「吸顶 2px」，视觉上筛选行猛然贴住 tabs 栏；
+   间距收进本元素后，静止态与吸顶态完全一致，滚动过程无挤压跳变。 */
 .kb-pane-head {
   display: flex; flex-wrap: wrap; align-items: flex-start; gap: 12px;
-  justify-content: space-between; margin-bottom: 14px;
+  justify-content: space-between;
+  position: sticky; top: 41px; z-index: 5;
+  padding: 14px 0 12px; margin-bottom: 2px;
+  background: var(--asc-bg);
 }
 .kb-pane-head .kb-type-chips { flex: 1; min-width: 0; margin-bottom: 0; }
 .kb-pane-head .kb-search { margin-left: auto; }
@@ -525,7 +533,11 @@ onMounted(async () => {
   box-shadow: 0 1px 0 var(--asc-border);
 }
 .kb-tabs :deep(.el-tabs__item) { font-size: 14px; padding: 0 18px; }
-.kb-tabs :deep(.el-tabs__content) { padding-top: 16px; }
+/* ⚠️ content 的 padding-top 必须为 0：「按材料/按笔记」与 tabs 栏的间距已收进
+   .kb-pane-head 自己的 padding-top（保证吸顶前后间距一致、无挤压跳变）；
+   「知识图谱」tab 没有 pane-head，单独在 #pane-graph 上补回同样的顶距。 */
+.kb-tabs :deep(.el-tabs__content) { padding-top: 0; }
+.kb-tabs :deep(#pane-graph) { padding-top: 14px; }
 /* ⚠️ el-tabs 默认 content overflow:hidden 会建立滚动上下文，打断内部（知识图谱头）的
    position:sticky → 改为 visible（活动 pane 用 v-show 隐藏，无需靠 overflow 裁剪）。 */
 .kb-tabs :deep(.el-tabs__content) { overflow: visible; }

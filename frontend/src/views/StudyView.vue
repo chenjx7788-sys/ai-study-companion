@@ -598,7 +598,7 @@ import { ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } from
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown } from '@element-plus/icons-vue'
-import { createMd } from '../utils/md'
+import { createMd, renderMd as renderMdSafe } from '../utils/md'
 import { normPath, sectionKeyForPage } from '../utils/toc'
 import { materialApi, aiApi, noteApi, reviewApi, kbApi, statsApi, simpleLearnApi } from '../api'
 import { errMsg } from '../api/http'
@@ -614,7 +614,7 @@ import { streamSSE } from '../utils/sse'
 // 实测：同一个 md 实例开 linkify 后该行即渲染成 <a href>。
 // ⚠️ 外链新窗口由 createMd 统一负责（桌面端会交给系统浏览器，同标签会把应用导航走）。
 const md = createMd({ breaks: true, linkify: true })
-const renderMd = (text) => md.render(text || '')
+const renderMd = (text) => renderMdSafe(md, text || '')
 
 // ---------- 摘要 / 讲义：按结构适配的线性图标（只作用于渲染，不入库） ----------
 // ⚠️ 为什么必须另建实例：上面的 `md` 被材料正文（transcript）/ 题目解析 / 片段弹窗共用，
@@ -626,8 +626,8 @@ const mdSummary = createMd({ breaks: true, linkify: true })
 const mdLearn = createMd({ breaks: true, linkify: true })
 headingNumRule(mdSummary)
 headingIconRule(mdLearn)
-const renderSummaryMd = (text) => mdSummary.render(text || '')
-const renderLearnMd = (text) => mdLearn.render(text || '')
+const renderSummaryMd = (text) => renderMdSafe(mdSummary, text || '')
+const renderLearnMd = (text) => renderMdSafe(mdLearn, text || '')
 
 // 讲义骨架标签 → 图标名。骨架由 prompt_learn_note 写死，实测 5 篇讲义命中率 100%
 // （### C{n} 78 / ## B{n} 24 / ### 引入 24 / ### 本节小结 24 / ## 必记要点 5 / ## 探索历程 5）。
@@ -1580,7 +1580,7 @@ function renderChunk(c) {
       html = renderBlock(c, blocks[0].text)
     } else {
       html = blocks.map(b => (b.table
-        ? `<div class="md-table">${md.render(b.text)}</div>`
+        ? `<div class="md-table">${renderMdSafe(md, b.text)}</div>`
         : renderBlock(c, b.text))).join('')
     }
   }
@@ -1675,10 +1675,10 @@ function renderChunkRich(c) {
   const content = c.content || ''
   const fl = flashLocate.value
   if (fl && fl.page === c.page_no && !fl.text) {
-    return `<div class="hl-flash-temp">${md.render(content)}</div>`
+    return `<div class="hl-flash-temp">${renderMdSafe(md, content)}</div>`
   }
   const segs = segmentHighlightRanges(content, collectChunkMarks(c))
-  if (!segs.length) return md.render(content)
+  if (!segs.length) return renderMdSafe(md, content)
   let src = ''
   let cursor = 0
   segs.forEach((seg, i) => {
@@ -1687,7 +1687,7 @@ function renderChunkRich(c) {
     cursor = seg.e
   })
   src += content.slice(cursor)
-  let html = md.render(src)
+  let html = renderMdSafe(md, src)
   segs.forEach((seg, i) => {
     html = html.split(`\uE000${i}\uE001`).join(hlSpanOpen(seg.kind, seg.refId))
     html = html.split(`\uE002${i}\uE003`).join('</span>')

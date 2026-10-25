@@ -329,3 +329,25 @@ export const updateApi = {
   reveal: (path = '') => http.post('/update/reveal', { path }),
   clear: () => http.post('/update/clear'),
 }
+
+// 技能（对话中可挂载的方法层）
+// ⚠️ 列表**不含 instructions**（常驻清单只吃 name+description）；要全文走 detail。
+export const skillApi = {
+  list: () => http.get('/skills'),
+  detail: (id) => http.get(`/skills/${id}`),
+  match: (question, scope = 'all') => http.post('/skills/match', { question, scope }),
+  // ---- P2 管理能力 ----
+  create: (fields) => http.post('/skills', fields),
+  // ⚠️ 只传改动字段：后端用 exclude_unset 合并，整份传会把未填项写成空串
+  update: (id, fields) => http.put(`/skills/${id}`, fields),
+  remove: (id) => http.delete(`/skills/${id}`),
+  setEnabled: (id, enabled) => http.put(`/skills/${id}/enabled`, { enabled }),
+  importText: (text, overwrite = false) => http.post('/skills/import', { text, overwrite }),
+  validate: (text) => http.post('/skills/validate', { text }),
+  // 导出拿的是文件原文（text/markdown），responseType 必须声明，否则 axios 会尝试按 JSON 解析
+  exportText: (id) => http.get(`/skills/${id}/export`, { responseType: 'text' }),
+  // ---- P3 语义预判开关：规则没命中时是否再调一次 LLM 判断 ----
+  // ⚠️ 关闭状态必须真的 0 次调用（后端按状态文件判断），不是前端不发请求就完事
+  getSemantic: () => http.get('/skills/semantic'),
+  setSemantic: (enabled) => http.put('/skills/semantic', { enabled }),
+}

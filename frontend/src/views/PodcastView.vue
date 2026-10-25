@@ -556,7 +556,7 @@
 import { ref, computed, reactive, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import MarkdownIt from 'markdown-it'
+import { createMd, renderMd as renderMdSafe } from '../utils/md'
 import mascot from '../assets/mascot.png'
 import { podcastApi, noteApi } from '../api'
 import { errMsg } from '../api/http'
@@ -565,7 +565,7 @@ import { streamSSE } from '../utils/sse'
 import NoteEditorDialog from '../components/NoteEditorDialog.vue'
 import PageHead from '../components/PageHead.vue'
 
-const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
+const md = createMd({ linkify: true, breaks: true })
 
 const loading = ref(true)
 const generating = ref(false)
@@ -843,7 +843,7 @@ const sourceMissing = computed(() => current.value?.source_missing === true)
 
 const scriptChars = computed(() => script.value.reduce((n, s) => n + (s.text || '').length, 0))
 const estimateSec = computed(() => Math.round((scriptChars.value / 250) * 60))
-const renderedBrief = computed(() => md.render(brief.value || ''))
+const renderedBrief = computed(() => renderMdSafe(md, brief.value || ''))
 
 // 音频与当前脚本是否不一致。两个来源缺一不可：
 //   · current.audio_stale —— 后端指纹比对，覆盖「已保存脚本但还没重新合成」

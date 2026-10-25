@@ -383,14 +383,14 @@
 <script setup>
 import { ref, computed, reactive, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import MarkdownIt from 'markdown-it'
+import { createMd, renderMd as renderMdSafe } from '../utils/md'
 import mascot from '../assets/mascot.png'
 import { reviewApi } from '../api'
 import { errMsg } from '../api/http'
 import PageHead from '../components/PageHead.vue'
 
-const md = new MarkdownIt({ breaks: true })
-const renderMd = (t) => md.render(t || '')
+const md = createMd({ breaks: true })
+const renderMd = (t) => renderMdSafe(md, t || '')
 
 const loading = ref(true)
 const queue = ref([])          // 今日待复习

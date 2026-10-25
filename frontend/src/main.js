@@ -7,9 +7,12 @@ import 'element-plus/theme-chalk/dark/css-vars.css'
 import App from './App.vue'
 import router from './router'
 import './styles/global.css'
+import 'highlight.js/styles/github.css'
+import { installMdEnhancements } from './utils/md'
 
 const app = createApp(App)
 app.use(createPinia())
 app.use(router)
 app.use(ElementPlus, { locale: zhCn })
+installMdEnhancements()
 app.mount('#app')

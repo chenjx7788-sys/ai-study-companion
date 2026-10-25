@@ -110,7 +110,7 @@
           <div v-else class="msg-row">
             <img :src="mascot" class="ai-avatar" :class="{ thinking: m._streaming && !m.content }" alt="" />
             <div class="bubble ai">
-              <div v-if="m._streaming && !m.content" class="thinking-row">
+              <div v-if="m._streaming && !m.content && !(m._tools && m._tools.length)" class="thinking-row">
                 <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
                 <span class="thinking-text">伴伴正在思考…</span>
               </div>
@@ -129,10 +129,48 @@
                     stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
                 </div>
                 <div v-if="m._showReasoning" class="reasoning-body md-body"
-                  v-html="renderMd(m._reasoning || m.reasoning)"></div>
+                  v-html="renderMd(m._reasoning || m.reasoning, m._streaming)"></div>
               </div>
-              <div v-if="!m.kb_hit && m.content" class="kb-miss-bar">
-                知识库中未找到相关内容，以下为通用回答
+              <!-- 工具步骤（P4）：模型调用了技能授权的工具。这是**过程**记录，不落库 ——
+                   刷新后消失。理由：写进正文会污染回答，加库字段要迁移，两者都不划算。 -->
+              <div v-if="m._tools && m._tools.length" class="tool-steps">
+                <div v-for="(s, i) in m._tools" :key="i" class="tool-step"
+                  :class="{ running: !s.done, failed: s.done && !s.ok }">
+                  <span class="tool-step-ic">
+                    <svg v-if="!s.done" class="tool-spin" viewBox="0 0 24 24" width="12" height="12"
+                      fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+                      <path d="M12 3a9 9 0 1 0 9 9" />
+                    </svg>
+                    <svg v-else-if="s.ok" viewBox="0 0 24 24" width="12" height="12" fill="none"
+                      stroke="currentColor" stroke-width="2.6" stroke-linecap="round"
+                      stroke-linejoin="round"><path d="M4 12.5l5 5L20 6" /></svg>
+                    <svg v-else viewBox="0 0 24 24" width="12" height="12" fill="none"
+                      stroke="currentColor" stroke-width="2.6" stroke-linecap="round">
+                      <path d="M6 6l12 12M18 6L6 18" /></svg>
+                  </span>
+                  <span class="tool-step-lb">{{ s.label }}</span>
+                  <!-- 读了哪份 / 检索了什么（P1-①）。原来只有「读材料原文」四个字，
+                       用户不知道读的是哪一份，得再问一遍。 -->
+                  <span v-if="s.brief" class="tool-step-bf" :title="s.brief">{{ s.brief }}</span>
+                  <!-- 耗时 / 复用（P3-②）：完成后才出现；复用的步骤没真跑，不显示耗时 -->
+                  <span v-if="s.done && s.reused" class="tool-step-ms">复用</span>
+                  <span v-else-if="s.done && s.ms != null" class="tool-step-ms">
+                    {{ s.ms >= 1000 ? (s.ms / 1000).toFixed(1) + 's' : s.ms + 'ms' }}</span>
+                  <!-- 撤销（仅 save_note 成功且有 note_id）：一键删掉这条刚写的笔记。
+                       服务端会校验：非 chat_note / 用户已编辑过 → 409，前端如实提示 -->
+                  <button v-if="s.name === 'save_note' && s.done && s.ok && s.note_id && !s.undone"
+                    class="tool-undo" @click.stop="undoChatNote(s)">撤销</button>
+                  <span v-if="s.undone" class="tool-step-ms">已撤销</span>
+                </div>
+              </div>
+              <!-- 口径提示条（三档问答）：general=中性徽章；general_fallback/kb_miss=灰条；旧数据按 kb_hit 回落 -->
+              <div v-if="missBarText(m)" class="kb-miss-bar" :class="{ neutral: m.answer_kind === 'general' }">
+                {{ missBarText(m) }}
+              </div>
+              <!-- 生成中断/失败（含刷新后从库恢复的错误消息）：气泡内错误态 + 重试 -->
+              <div v-if="m.error" class="err-bar" :class="{ stopped: m.error === '用户中断生成' }">
+                <span>{{ m.error === '用户中断生成' ? '已停止' : ('⚠ 生成中断：' + friendlyErr(m.error)) }}</span>
+                <button v-if="!asking" class="err-retry" @click="retryError(m)">重试</button>
               </div>
               <!-- 未配置模型：气泡内错误态（重试 + 去配置） -->
               <div v-if="m._error" class="ai-config-error">
@@ -170,7 +208,7 @@
                     <div class="source-head">
                       <el-tag size="small" effect="plain"
                         :type="s.ref_type === 'note' ? 'success' : (s.ref_type === 'summary' ? 'warning' : 'primary')">
-                        {{ { note: '笔记', summary: '摘要' }[s.ref_type] || '原文' }}
+                        {{ { note: '笔记', summary: '摘要', tool_read: '已读' }[s.ref_type] || '原文' }}
                       </el-tag>
                       <span class="source-title">{{ s.title }}</span>
                       <span v-if="s.page_no" class="source-page">P{{ s.page_no }}</span>
@@ -217,26 +255,78 @@
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg>
           </div>
-          <div v-show="!atBottom" class="scroll-btn" title="回到底部" @click="scrollBottom">
+          <div v-show="!atBottom" class="scroll-btn" title="回到底部" @click="scrollBottom(true)">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
           </div>
         </div>
         <div class="input-inner">
         <div class="input-col">
-          <!-- 检索范围（置于输入框上方，避免挤压底部）——已抽成组件（F1） -->
-          <ScopePicker
-            v-model:scope="scope"
-            v-model:material-ids="selectedMaterialIds"
-            v-model:note-ids="selectedNoteIds"
-            v-model:folder-ids="selectedFolderIds"
-            :material-options="materialOptions"
-            :note-options="noteOptions"
-            :folder-options="folderOptions" />
+          <div class="ask-mode-row">
+            <!-- 回答口径三档（2026-10-25）：自动=先查库、未命中兜底通用；知识库=只按库答、未命中如实说；通用=不查库 -->
+            <el-radio-group v-model="askMode" size="small"
+              title="回答口径：自动 = 先查知识库，未命中用通用回答兜底；知识库 = 只按库内内容回答，未找到会如实告知；通用 = 不查知识库，大模型直接回答">
+              <el-radio-button value="auto">自动</el-radio-button>
+              <el-radio-button value="kb">知识库</el-radio-button>
+              <el-radio-button value="general">通用</el-radio-button>
+            </el-radio-group>
+            <!-- 检索范围（F1 抽出的组件）；通用档不查库 → 禁用 -->
+            <div class="scope-wrap" :class="{ off: askMode === 'general' }">
+              <ScopePicker
+                v-model:scope="scope"
+                v-model:material-ids="selectedMaterialIds"
+                v-model:note-ids="selectedNoteIds"
+                v-model:folder-ids="selectedFolderIds"
+                :material-options="materialOptions"
+                :note-options="noteOptions"
+                :folder-options="folderOptions" />
+            </div>
+          </div>
+          <!-- P1 建议卡 / P3 备选：发送之前给出，不弹模态、不阻塞输入、不重复追问 -->
+          <div v-if="suggest" class="sk-sugg">
+            <div class="sk-sugg-hd">
+              <span class="sk-sugg-ic">{{ iconOf(suggest.id) }}</span>
+              <span class="sk-sugg-nm">{{ suggest.name }}</span>
+              <!-- 来源如实标注：命中关键词 vs 模型判断，可信度不是一回事 -->
+              <span class="sk-sugg-tag" :class="{ ai: suggest.via === 'semantic' }">
+                {{ suggest.via === 'semantic' ? 'AI 判断' : '建议使用' }}
+              </span>
+              <span v-if="suggest.ambiguous" class="sk-sugg-amb">多个技能都沾边</span>
+              <span class="sk-sugg-x" title="关闭建议" @click="cancelSuggest">×</span>
+            </div>
+            <div class="sk-sugg-why">{{ suggest.why }} —— 它会按一套固定方法回答这个问题，比通用回答更贴近这件事该怎么做。</div>
+            <!-- 备选：规则一次命中多个时，不假装很确定，让用户直接换 -->
+            <div v-if="suggest.alternatives && suggest.alternatives.length" class="sk-sugg-alts">
+              <span class="sk-sugg-alts-lb">换个技能：</span>
+              <span v-for="a in suggest.alternatives" :key="a.id" class="sk-sugg-alt"
+                    :title="a.why" @click="switchSuggest(a)">{{ a.name }}</span>
+            </div>
+            <div class="sk-sugg-ft">
+              <el-button size="small" type="primary" @click="useSkill">用它回答</el-button>
+              <el-button size="small" @click="skipSkill">直接回答</el-button>
+              <span class="sk-sugg-off" @click="turnOffSuggest">本会话不再提示</span>
+            </div>
+          </div>
+          <!-- 语义判断中：延迟 250ms 才出现（规则命中 <5ms，不该闪一下） -->
+          <div v-if="matching" class="sk-matching">正在看这问题适合用哪个技能…</div>
+
+          <!-- P1 已加载技能：让用户知道本轮回答被哪个方法影响，可随时卸载 -->
+          <div v-if="mountedSkill" class="skill-bar">
+            <span class="skill-bar-ic">{{ iconOf(mountedSkill.id) }}</span>
+            <span class="skill-bar-tx">已加载技能 <b>{{ mountedSkill.name }}</b></span>
+            <span class="skill-bar-hint">· 本轮及后续提问按这个方法回答</span>
+            <span class="skill-bar-x" title="卸载技能" @click="unmountSkill">卸载</span>
+          </div>
           <div class="composer-row">
             <el-input v-model="question" type="textarea" :rows="2" resize="none"
               :placeholder="scopePlaceholder" @keydown.enter.exact.prevent="send" />
-            <el-button type="primary" class="send-btn" circle :loading="asking" :disabled="!question.trim()"
+            <el-button v-if="asking" type="danger" class="send-btn" circle plain
+              title="停止生成" @click="stopAsk">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                <rect x="6" y="6" width="12" height="12" rx="2" />
+              </svg>
+            </el-button>
+            <el-button v-else type="primary" class="send-btn" circle :disabled="!question.trim()"
               title="发送（Enter）" @click="send">
               <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -247,8 +337,26 @@
           </div>
           <!-- 模型工具栏：推理强度 + 模型切换（左下角） -->
           <div class="model-toolbar">
+            <!-- P1 手动挂载：跳过模型判断，用户强制指定一个方法 -->
+            <el-popover v-model:visible="skillPickerOpen" placement="top-start" :width="286" trigger="click">
+              <template #reference>
+                <button type="button" class="skill-add" :class="{ on: !!mountedSkill }">
+                  ＋ 技能<template v-if="mountedSkill"> · {{ mountedSkill.name }}</template>
+                </button>
+              </template>
+              <div class="sk-pick">
+                <div class="sk-pick-hd">选一个方法，本轮及后续提问都按它回答</div>
+                <div v-for="s in chatSkills" :key="s.id" class="sk-pick-row"
+                  :class="{ on: mountedSkill && mountedSkill.id === s.id }" @click="mountSkill(s)">
+                  <span class="sk-pick-ic">{{ iconOf(s.id) }}</span>
+                  <span class="sk-pick-nm">{{ s.name }}</span>
+                  <span class="sk-pick-ds">{{ s.description }}</span>
+                </div>
+                <div v-if="!chatSkills.length" class="sk-pick-empty">暂无可用技能</div>
+              </div>
+            </el-popover>
             <el-select v-model="reasoningEffort" size="small"
-              class="reason-select" title="推理模式（默认关闭）">
+              class="reason-select" title="推理模式（默认快速）">
               <el-option label="关闭" value="" />
               <el-option label="快速" value="low" />
               <el-option label="标准" value="high" />
@@ -398,23 +506,26 @@
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick, h } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import mascot from '../assets/mascot.png'
-import { ElMessage, ElNotification } from 'element-plus'
-import MarkdownIt from 'markdown-it'
-import { chatApi, materialApi, kbApi, settingsApi, foldersApi, noteApi, reviewApi } from '../api'
+import { ElMessage, ElNotification, ElMessageBox } from 'element-plus'
+import { createMd, renderMd as renderMdSafe } from '../utils/md'
+import { chatApi, materialApi, kbApi, settingsApi, foldersApi, noteApi, reviewApi, skillApi } from '../api'
 import http, { errMsg } from '../api/http'
 // SSE 统一走共享 util（此前内联副本硬编码 127.0.0.1:8000，换端口即静默失效）
 import { streamSSE } from '../utils/sse'
 import ScopePicker from '../components/ScopePicker.vue'
 
-const md = new MarkdownIt({ breaks: true })
-const renderMd = (t) => md.render(t || '')
+const md = createMd({ breaks: true })
+const renderMd = (t, streaming) => renderMdSafe(md, t || '', { streaming: !!streaming })
 
 // 渲染回答：把 [n] 引用编号替换成可点击角标（n 对应 sources 序号）
 function renderAnswer(m) {
-  let html = md.render(m.content || '')
+  // skillImport：对话里出现技能文件草稿（````skill 围栏）时，代码块头部出「导入为技能」按钮
+  let html = renderMdSafe(md, m.content || '', { streaming: m._streaming, skillImport: true })
   const sources = m.sources || []
   if (sources.length) {
-    html = html.replace(/\[(\d+)\]/g, (full, n) => {
+    // 第三期：角标只在「句末/标点前」才渲染——普通文本里的 [1]（文献编号、数组下标）
+    // 在句首或后接文字时保持原样，不再误变成可点角标
+    html = html.replace(/\[(1?\d)\](?=[，。；、：！？,.;:!?\s<]|$)/g, (full, n) => {
       const idx = parseInt(n, 10)
       if (idx >= 1 && idx <= sources.length) {
         return `<span class="cite" data-idx="${idx}" title="查看引用来源">[${n}]</span>`
@@ -425,11 +536,49 @@ function renderAnswer(m) {
   return html
 }
 
+// 从代码块导入技能（P5）。确认框里先本地粗读 manifest 展示名称/id；读不出来也没关系，
+// 后端的 import 校验会给出字段级原因。
+async function importSkillFromBlock(btn) {
+  const code = b64decodeForBtn(btn)
+  let nm = '', sid = ''
+  try {
+    const m = code.match(/```skill\s*([\s\S]*?)```/)
+    const man = JSON.parse(m[1])
+    nm = man.name || ''; sid = man.id || ''
+  } catch { /* 解析不出就靠后端校验兜底 */ }
+  try {
+    await ElMessageBox.confirm(
+      `将安装技能「${nm || '未命名'}」${sid ? '（' + sid + '）' : ''}。安装后到「技能」页可查看、可挂载。`,
+      '导入这个技能？',
+      { confirmButtonText: '安装', cancelButtonText: '再想想', type: 'info' })
+  } catch { return }   // 用户点了取消
+  try {
+    const { data } = await skillApi.importText(code)
+    ElMessage.success(`已安装技能「${data.skill?.name || nm}」，到「技能」页可挂载使用`)
+    btn.textContent = '已安装'
+    btn.disabled = true
+  } catch (e) {
+    ElMessage.error(errMsg(e, '导入失败'))
+  }
+}
+
+// 代码块按钮上的内容是 base64（含中文直接 atob 会炸），与 md.js 的复制按钮同一套解
+function b64decodeForBtn(btn) {
+  const bin = atob(btn.getAttribute('data-code') || '')
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return new TextDecoder().decode(bytes)
+}
+
 // 引用来源气泡（点击角标弹出，显示来源详情，点击跳转）
 const citePop = reactive({ show: false, x: 0, y: 0, source: null })
 
 // 点击引用角标：弹出气泡显示来源详情
 function onMdClick(m, e) {
+  // 「导入为技能」按钮（P5）：技能草稿代码块头部的按钮。点击 ≠ 落盘——
+  // 先确认框，确认后走 POST /skills/import（后端有全套字段校验）。
+  const impBtn = e.target.closest('.md-code-import-skill')
+  if (impBtn) { importSkillFromBlock(impBtn); return }
   const cite = e.target.closest('.cite')
   if (!cite) { citePop.show = false; return }
   const idx = parseInt(cite.dataset.idx, 10)
@@ -458,6 +607,8 @@ const messages = ref([])
 const question = ref('')
 const asking = ref(false)
 const scope = ref('all')
+// 回答口径（三档问答）：auto 自动 / kb 仅知识库 / general 通用
+const askMode = ref('auto')
 const selectedMaterialIds = ref([])
 const selectedNoteIds = ref([])
 const selectedFolderIds = ref([])
@@ -522,14 +673,28 @@ const noteOptions = ref([])
 const folderOptions = ref([])
 const msgAreaRef = ref(null)
 
-const scopePlaceholder = computed(() => ({
-  all: '基于整个知识库提问（资料原文 + 笔记）…',
-  material: selectedMaterialIds.value.length ? `在指定的 ${selectedMaterialIds.value.length} 份资料中检索回答…` : '在全部资料原文中检索回答…',
-  note: selectedNoteIds.value.length ? `在指定的 ${selectedNoteIds.value.length} 条笔记中检索回答…` : '在全部笔记中检索回答…',
-  folder: selectedFolderIds.value.length ? `在选中的 ${selectedFolderIds.value.length} 个文件夹（含子文件夹）中检索回答…` : '选择文件夹后，在其（含子文件夹）范围内检索回答…',
-}[scope.value]))
+const scopePlaceholder = computed(() => {
+  if (askMode.value === 'general') return '通用模式：不查知识库，由大模型直接回答…'
+  if (askMode.value === 'kb') return '知识库模式：只在库内找答案，找不到会如实告知…'
+  return ({
+    all: '基于整个知识库提问（资料原文 + 笔记）…',
+    material: selectedMaterialIds.value.length ? `在指定的 ${selectedMaterialIds.value.length} 份资料中检索回答…` : '在全部资料原文中检索回答…',
+    note: selectedNoteIds.value.length ? `在指定的 ${selectedNoteIds.value.length} 条笔记中检索回答…` : '在全部笔记中检索回答…',
+    folder: selectedFolderIds.value.length ? `在选中的 ${selectedFolderIds.value.length} 个文件夹（含子文件夹）中检索回答…` : '选择文件夹后，在其（含子文件夹）范围内检索回答…',
+  })[scope.value]
+})
 
 const examples = ['用户价值公式怎么理解？', '需求管理的流程包含哪些环节？', 'RICE 模型怎么用？']
+
+// 口径提示条文案（三档问答）：answer_kind 为空 = 旧数据，按 kb_hit 回落到原灰条逻辑
+function missBarText(m) {
+  if (!m.content || m.role !== 'assistant') return ''
+  if (m.answer_kind === 'kb') return ''
+  if (m.answer_kind === 'general') return '通用回答（未查询知识库）'
+  if (m.answer_kind === 'kb_miss') return '知识库中未找到相关内容'
+  if (m.answer_kind === 'general_fallback') return '知识库中未找到相关内容，以下为通用回答'
+  return m.kb_hit ? '' : '知识库中未找到相关内容，以下为通用回答'
+}
 
 async function loadSessions() {
   const { data } = await chatApi.sessions()
@@ -537,10 +702,18 @@ async function loadSessions() {
 }
 
 async function openSession(id) {
+  abortCtrl?.abort()          // 切换会话时中断进行中的流（后端检测断连落库半截回答）
+  asking.value = false
   currentId.value = id
+  restoreSkillState(id)        // 每个会话各自记住挂了哪个技能
   const { data } = await chatApi.messages(id)
-  messages.value = (data || []).map(m => ({ ...m, _showReasoning: false }))
-  scrollBottom()
+  messages.value = (data || []).map(m => ({
+    ...m, _showReasoning: false,
+    // 工具步骤落库回填（P1-②）：历史消息里的步骤都已经跑完，done 恒为 true。
+    // 不回填的话，刷新后回答看起来像凭空出现——用户看不出它是读了材料才答的。
+    _tools: (m.tool_steps || []).map(s => ({ ...s, done: true, ok: !!s.ok })),
+  }))
+  scrollBottom(true)
 }
 
 function toggleReasoning(m) {
@@ -550,6 +723,7 @@ function toggleReasoning(m) {
 // 新会话：仅前端清空，不立即建库（提问时才由后端自动创建，避免留下空会话）
 function newSession() {
   currentId.value = null
+  restoreSkillState(null)
   messages.value = []
   renamingId.value = null
 }
@@ -607,7 +781,11 @@ async function togglePin(s) {
   }
 }
 
-function scrollBottom() {
+// O1：仅当用户停留在底部时才跟随滚动（此前每个 token 强制回底，上翻阅读会被拽回）；
+// force=true 用于发送新消息/打开会话等必须回底的场景
+function scrollBottom(force = false) {
+  if (!force && !atBottom.value) return
+  if (force) atBottom.value = true
   nextTick(() => {
     if (msgAreaRef.value) msgAreaRef.value.scrollTop = msgAreaRef.value.scrollHeight
   })
@@ -617,9 +795,9 @@ function scrollToTop() {
   if (msgAreaRef.value) msgAreaRef.value.scrollTop = 0
 }
 
-// 滚动位置状态（控制回顶/回底按钮显隐）
+// 滚动位置状态（控制回顶/回底按钮显隐 + 流式跟随闸门）
 const atTop = ref(true)
-const atBottom = ref(false)
+const atBottom = ref(true)   // 初始视为在底部：新会话/未滚动时流式应跟随
 function onMsgScroll() {
   const el = msgAreaRef.value
   if (!el) return
@@ -673,6 +851,27 @@ async function copyAnswer(m) {
 }
 
 // AI 回答转笔记：标题=该回答对应的最近一条用户问题，内容=回答正文（引用来源快照一并存档）
+// 撤销「对话里 AI 写入」的笔记（P3-②）：点步骤行上的「撤销」。
+// 404 = 已经被删过了，直接标记已撤销；409 = 用户编辑过 / 不是 chat_note，如实提示。
+async function undoChatNote(s) {
+  if (s._undoing) return
+  s._undoing = true
+  try {
+    await http.post(`/notes/${s.note_id}/undo`)
+    s.undone = true
+    ElMessage.success('已撤销这条笔记')
+  } catch (e) {
+    if (e?.response?.status === 404) {
+      s.undone = true
+      ElMessage.info('笔记已不存在，无需撤销')
+    } else {
+      ElMessage.warning(errMsg(e, '撤销失败'))
+    }
+  } finally {
+    s._undoing = false
+  }
+}
+
 async function saveAnswerToNote(m, i) {
   // 防连点：请求发出后置 busy，避免两次并发同时通过幂等检查建出重复笔记
   if (asking.value || m._savedNote || m._savingNote) return
@@ -902,32 +1101,209 @@ async function confirmEdit(m, index) {
   send()
 }
 
+// ---------------- P1 对话技能（方法层，不是产物） ----------------
+// 三件事都在这里：建议卡（模型判断 + 用户点头）、手动挂载（跳过判断）、本会话常驻。
+const chatSkills = ref([])
+const mountedSkill = ref(null)        // {id, name} 当前会话挂载的技能
+const pendingSkill = ref(null)        // 首问时 session_id 还没有 → 先暂存，收到 sources 再回填
+const suggest = ref(null)             // {id, name, why, question}
+const matching = ref(false)          // 语义判断中（延迟显示，避免规则命中时闪一下）
+let matchTimer = null                // 上面那个延迟的定时器
+const suggestOff = ref(false)         // 本会话不再提示
+const suggestOffPending = ref(false)  // 同上：首问的时序兜底
+const skillPickerOpen = ref(false)
+
+const SKILL_MAP_KEY = 'asc_chat_skill_map'    // { sessionId: {id,name} }
+const SKILL_OFF_KEY = 'asc_chat_skill_off'    // { sessionId: true }
+const SKILL_ICON = { term: '译', argue: '证', law: '法' }
+
+function _lsObj(key) {
+  try { return JSON.parse(localStorage.getItem(key) || '{}') || {} } catch { return {} }
+}
+function _lsPut(key, obj) {
+  try { localStorage.setItem(key, JSON.stringify(obj)) } catch { /* 存不下不影响本轮 */ }
+}
+
+function iconOf(id) {
+  const s = chatSkills.value.find(x => x.id === id)
+  return SKILL_ICON[s?.icon] || '技'
+}
+
+async function loadChatSkills() {
+  try {
+    const { data } = await skillApi.list()
+    // 只列能挂在对话里的（kind=chat）；材料工艺不走这个入口
+    chatSkills.value = (data.items || []).filter(s => s.kind === 'chat' && s.enabled !== false)
+  } catch { chatSkills.value = [] }
+}
+
+// 切会话 / 新会话时，恢复该会话各自的挂载状态与「不再提示」标记
+function restoreSkillState(sid) {
+  if (sid == null) {
+    mountedSkill.value = pendingSkill.value || null
+    suggestOff.value = suggestOffPending.value
+    return
+  }
+  mountedSkill.value = _lsObj(SKILL_MAP_KEY)[String(sid)] || null
+  suggestOff.value = !!_lsObj(SKILL_OFF_KEY)[String(sid)]
+}
+
+function persistMountedSkill() {
+  const sid = currentId.value
+  if (sid == null) { pendingSkill.value = mountedSkill.value; return }
+  const m = _lsObj(SKILL_MAP_KEY)
+  if (mountedSkill.value) m[String(sid)] = mountedSkill.value
+  else delete m[String(sid)]
+  _lsPut(SKILL_MAP_KEY, m)
+}
+
+// ⚠️ 首问时 session_id 还不存在：直接按键存会存成 "null"，用户点了「不再提示」第二轮又弹。
+//    处置：先记 pending，收到 sources 事件的 session_id 后回填绑定。
+function bindPendingToSession(sid) {
+  if (pendingSkill.value) {
+    const m = _lsObj(SKILL_MAP_KEY)
+    m[String(sid)] = pendingSkill.value
+    _lsPut(SKILL_MAP_KEY, m)
+    pendingSkill.value = null
+  }
+  if (suggestOffPending.value) {
+    const off = _lsObj(SKILL_OFF_KEY)
+    off[String(sid)] = true
+    _lsPut(SKILL_OFF_KEY, off)
+    suggestOffPending.value = false
+  }
+}
+
+function mountSkill(s) {
+  mountedSkill.value = { id: s.id, name: s.name }
+  skillPickerOpen.value = false
+  suggest.value = null          // 手动挂载后不需要再建议
+  persistMountedSkill()
+}
+
+function unmountSkill() {
+  mountedSkill.value = null
+  pendingSkill.value = null
+  persistMountedSkill()
+}
+
+function useSkill() {
+  const s = suggest.value
+  if (!s) return
+  mountedSkill.value = { id: s.id, name: s.name }
+  persistMountedSkill()
+  suggest.value = null
+  doSend(s.question, s.id)
+}
+
+function skipSkill() {
+  const s = suggest.value
+  if (!s) return
+  suggest.value = null
+  doSend(s.question, null)
+}
+
+function turnOffSuggest() {
+  const s = suggest.value
+  if (!s) return
+  if (currentId.value == null) suggestOffPending.value = true
+  else {
+    const off = _lsObj(SKILL_OFF_KEY)
+    off[String(currentId.value)] = true
+    _lsPut(SKILL_OFF_KEY, off)
+  }
+  suggestOff.value = true
+  suggest.value = null
+  doSend(s.question, null)
+}
+
+// P3：规则一次命中多个技能时，直接在卡片上换（不重新请求后端）
+function switchSuggest(alt) {
+  const cur = suggest.value
+  if (!cur || !alt) return
+  const old = { id: cur.id, name: cur.name, why: cur.why }
+  const rest = (cur.alternatives || []).filter((x) => x.id !== alt.id)
+  suggest.value = {
+    ...cur,
+    id: alt.id,
+    name: alt.name,
+    why: alt.why,
+    // 备选全部来自规则命中，来源如实改回「规则」，不能继续挂着「AI 判断」
+    via: 'rule',
+    alternatives: [old, ...rest].slice(0, 2),
+  }
+}
+
+// 关掉建议卡：把问题还回输入框，不让用户重打一遍
+function cancelSuggest() {
+  const s = suggest.value
+  suggest.value = null
+  if (s && !question.value.trim()) question.value = s.question
+}
+
+let abortCtrl = null   // 流式请求的中断控制器（停止按钮 / 切会话 / 组件卸载）
+
 async function send() {
   const q = question.value.trim()
   if (!q || asking.value) return
+  // 建议卡还开着时用户又发了新问题 → 旧建议作废
+  if (suggest.value) suggest.value = null
+  // 已挂载技能 / 本会话已关提示 → 不需要再问，直接发
+  if (mountedSkill.value || suggestOff.value) {
+    return doSend(q, mountedSkill.value ? mountedSkill.value.id : null)
+  }
+  // 先问一次建议：规则命中 <5ms；语义开关开着且规则没命中时，会多等一次模型调用。
+  // 「正在判断」提示延迟 250ms 才出 —— 正常路径（规则命中）不该闪一下。
+  matchTimer = setTimeout(() => { matching.value = true }, 250)
+  try {
+    const { data } = await skillApi.match(q, scope.value)
+    if (data && data.suggest) {
+      suggest.value = {
+        ...data.suggest,
+        // P3：备选与并列标记一起带进卡片，切换时不必再请求后端
+        alternatives: data.alternatives || [],
+        ambiguous: !!data.ambiguous,
+        question: q,
+      }
+      question.value = ''      // 问题已存进卡片，避免用户再按发送重复问
+      nextTick(() => scrollBottom())
+      return
+    }
+  } catch { /* 匹配失败按普通问答走 */ } finally {
+    clearTimeout(matchTimer)
+    matching.value = false
+  }
+  return doSend(q, null)
+}
+
+async function doSend(q, skillId) {
   question.value = ''
   asking.value = true
 
   const userMsg = { _tmp: 'u' + Date.now(), role: 'user', content: q }
   messages.value.push(userMsg)
-  const aiMsg = reactive({ _tmp: 'a' + Date.now(), role: 'assistant', content: '', _reasoning: '', _showReasoning: false, kb_hit: true, sources: [], suggestions: [], _streaming: true })
+  const aiMsg = reactive({ _tmp: 'a' + Date.now(), role: 'assistant', content: '', _reasoning: '', _showReasoning: false, kb_hit: true, answer_kind: '', sources: [], suggestions: [], _streaming: true, error: '', _tools: [] })
   messages.value.push(aiMsg)
-  scrollBottom()
+  scrollBottom(true)
 
   try {
     // 同源请求：dev 走 vite proxy，生产由后端单端口托管（不要硬编码 127.0.0.1:8000，换端口即失效）
+    abortCtrl = new AbortController()
     const resp = await fetch('/api/chat/ask/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: abortCtrl.signal,
       body: JSON.stringify({
         question: q,
         session_id: currentId.value,
         scope: scope.value,
+        mode: askMode.value,
         material_ids: scope.value === 'material' && selectedMaterialIds.value.length ? selectedMaterialIds.value : null,
         note_ids: scope.value === 'note' && selectedNoteIds.value.length ? selectedNoteIds.value : null,
         folder_ids: scope.value === 'folder' && selectedFolderIds.value.length ? selectedFolderIds.value : null,
         model_id: selectedModelId.value || null,
         reasoning_effort: reasoningEffort.value || null,
+        skill_id: skillId || null,
       }),
     })
     if (!resp.ok) {
@@ -951,9 +1327,44 @@ async function send() {
         const payload = JSON.parse(dataLine)
         if (ev === 'sources') {
           currentId.value = payload.session_id
+          bindPendingToSession(payload.session_id)   // 首问的挂载/关闭标记回填到真实会话
           userMsg.id = payload.user_message_id   // 记录后端消息 id（编辑时截断用）
           aiMsg.kb_hit = payload.kb_hit
+          aiMsg.answer_kind = payload.answer_kind || ''
           aiMsg.sources = payload.sources
+        } else if (ev === 'tool') {
+          // 工具步骤（P4）。start/done 成对；⚠️ done 找不到对应 start 时要**补一条**，
+          // 否则丢了 start 的那一条会让界面永远停在转圈上（看起来像卡死）。
+          if (!aiMsg._tools) aiMsg._tools = []
+          if (payload.state === 'start') {
+            aiMsg._tools.push({ name: payload.name, label: payload.label, brief: payload.brief || '',
+              round: payload.round, done: false, ok: true })
+          } else {
+            let hit = null
+            for (let i = aiMsg._tools.length - 1; i >= 0; i--) {
+              const s = aiMsg._tools[i]
+              if (s.round === payload.round && s.name === payload.name && !s.done) { hit = s; break }
+            }
+            if (hit) {
+              hit.done = true; hit.ok = !!payload.ok
+              if (payload.label) hit.label = payload.label
+              // 结果级 brief（含真实标题与页码）覆盖参数级的「材料38」
+              if (payload.brief) hit.brief = payload.brief
+              hit.ms = payload.ms            // P3-② 耗时
+              hit.reused = !!payload.reused  // P2-① 复用标记
+              if (payload.note_id) hit.note_id = payload.note_id   // P3-② 撤销按钮定位
+            } else aiMsg._tools.push({ name: payload.name, label: payload.label,
+              brief: payload.brief || '', round: payload.round, done: true, ok: !!payload.ok,
+              ms: payload.ms, reused: !!payload.reused, note_id: payload.note_id })
+
+          }
+          scrollBottom()
+        } else if (ev === 'source_add') {
+          // 工具补充来源（P1-③）：追加在**尾部**，正文里的 [n] 编号不受影响。
+          aiMsg.sources = (aiMsg.sources || []).concat(payload.sources || [])
+          // 读到过知识库内容就不该再显示「未找到相关内容」灰条
+          if (payload.kb_hit) aiMsg.kb_hit = true
+          if (payload.answer_kind) aiMsg.answer_kind = payload.answer_kind
         } else if (ev === 'reasoning') {
           aiMsg._reasoning += payload.t
           scrollBottom()
@@ -962,16 +1373,44 @@ async function send() {
         } else if (ev === 'token') {
           aiMsg.content += payload.t
           scrollBottom()
+        } else if (ev === 'done') {
+          aiMsg.id = payload.message_id
+          aiMsg._streaming = false   // 第三期：done 即收光标（suggestions 随后到，不等它）
         } else if (ev === 'error') {
-          throw new Error(payload.message)
+          const emsg = payload.message || '生成失败'
+          if (emsg.includes('[NEED_SETUP]')) {
+            throw new Error(emsg)   // 走原有配置引导路径
+          }
+          // P1-3：错误已随半截回答落库 → 气泡内错误态，不弹全局提示、不移除气泡
+          aiMsg.error = emsg
+          if (payload.message_id) aiMsg.id = payload.message_id
+          aiMsg._streaming = false
+          await loadSessions()
+          return
         }
       }
     }
     aiMsg._streaming = false
     await loadSessions()
   } catch (e) {
+    if (e.name === 'AbortError') {
+      // 用户主动停止：后端检测断连会把半截回答落库（标记「用户中断生成」）
+      aiMsg._streaming = false
+      aiMsg.error = '用户中断生成'
+      loadSessions()
+      return
+    }
     aiMsg._streaming = false
     aiMsg.content = aiMsg.content || ''
+    // 技能在别处被停用 / 删除：后端会明确报错。这里自动取消挂载并回填问题，
+    // 否则用户只看到一句报错，下一次发问还会拿同一个失效 id 再撞一次。
+    if (/已停用|技能不存在/.test(e.message || '') && mountedSkill.value) {
+      ElMessage.warning((e.message || '') + '（已自动取消挂载，请重新发送）')
+      unmountSkill()
+      question.value = q
+      messages.value = messages.value.filter(m => m !== aiMsg)
+      return
+    }
     // 未配置模型：气泡内展示错误态（含「重试」「去配置」按钮），不弹全局引导，也不移除气泡
     if ((e.message || '').includes('[NEED_SETUP]')) {
       aiMsg._error = (e.message || '').replace('[NEED_SETUP]', '').replace(/^\d{3}:\s*/, '') || '尚未配置可用的 AI 模型'
@@ -979,11 +1418,42 @@ async function send() {
       scrollBottom()
     } else {
       ElMessage.error(e.message || '问答失败')
+      // P1-5：失败回填问题文本（此前输入框已清空，问题直接丢失）
+      question.value = q
       if (!aiMsg.content) messages.value = messages.value.filter(m => m !== aiMsg)
     }
   } finally {
     asking.value = false
+    abortCtrl = null
   }
+}
+
+function stopAsk() {
+  abortCtrl?.abort()
+}
+
+// 错误消息重试（P1-3）：截断掉「问题 + 错误回答」后重新发问，不制造重复消息
+async function retryError(m) {
+  if (asking.value) return
+  const idx = messages.value.indexOf(m)
+  if (idx < 0) return
+  let uIdx = -1
+  for (let i = idx - 1; i >= 0; i--) {
+    if (messages.value[i].role === 'user') { uIdx = i; break }
+  }
+  if (uIdx < 0) return
+  const q = messages.value[uIdx].content
+  const uid = messages.value[uIdx].id
+  if (currentId.value && uid) {
+    try { await chatApi.truncateMessages(currentId.value, uid) } catch { /* 忽略 */ }
+  }
+  messages.value.splice(uIdx)
+  question.value = q
+  send()
+}
+
+function friendlyErr(e) {
+  return (e || '').replace('[NEED_SETUP]', '').trim()
 }
 
 onMounted(async () => {
@@ -991,6 +1461,7 @@ onMounted(async () => {
   currentId.value = null
   messages.value = []
   await loadSessions()
+  loadChatSkills()      // P1：可挂载的对话技能（失败则空列表，不影响问答）
   // 范围选择的条目选项
   const [{ data: mats }, { data: kb }, { data: folders }] = await Promise.all([
     materialApi.list(), kbApi.overview(), foldersApi.list(),
@@ -1018,6 +1489,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  abortCtrl?.abort()   // 离开问答页时中断进行中的流
   document.removeEventListener('mousedown', closeCitePop)
 })
 
@@ -1198,6 +1670,55 @@ function closeCitePop(e) {
   font-size: 12px; color: var(--asc-text-2); background: var(--asc-surface-2); border-radius: 8px;
   padding: 6px 12px; margin-bottom: 10px;
 }
+/* 通用档回答的中性徽章：不是「失败灰」，是用户主动选择的口径 */
+.kb-miss-bar.neutral { color: var(--el-color-primary); background: var(--el-color-primary-light-9); }
+
+/* 三档口径开关行（自动/知识库/通用）+ 通用档下禁用范围选择 */
+.ask-mode-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.scope-wrap.off { opacity: .45; pointer-events: none; }
+
+/* 工具步骤（P4）：模型调用技能授权工具时的过程记录。
+   刻意做得很轻（一行一个胶囊）—— 它是过程，不该比答案更抢眼。
+   ⚠️ 转圈用 animation：这是 UI，不是视频模板（模板里禁用 animation 是渲染确定性要求）。 */
+.tool-steps { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.tool-step {
+  display: flex; align-items: center; gap: 6px; align-self: flex-start;
+  font-size: 12px; color: var(--asc-text-2);
+  padding: 3px 10px 3px 8px; border-radius: 999px; background: var(--asc-surface-2);
+}
+.tool-step-ic { display: inline-flex; align-items: center; color: var(--asc-text-2); }
+/* 动作摘要是**次要**信息：靠字号与位置区分，不靠调浅颜色 ——
+   调浅会掉到 4.5:1 以下（白底 #a0a0a0 只有 2.6:1）。 */
+.tool-step-bf {
+  max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11.5px; letter-spacing: -.1px;
+}
+.tool-step-bf::before { content: "·"; margin-right: 4px; }
+/* 耗时 / 复用 / 已撤销（P3-②）：比 brief 更弱一级的次要信息 */
+.tool-step-ms { font-size: 11px; }
+.tool-undo {
+  border: none; background: transparent; padding: 0 2px; cursor: pointer;
+  font-size: 11.5px; color: var(--asc-primary);
+}
+.tool-undo:hover { text-decoration: underline; }
+.tool-step.failed { color: #c4564f; background: #fdf0ef; }
+.tool-step.failed .tool-step-ic { color: #c4564f; }
+.tool-spin { animation: tool-spin 1s linear infinite; }
+@keyframes tool-spin { to { transform: rotate(360deg); } }
+/* 生成中断/失败条（错误落库口径 A：气泡内错误态 + 重试） */
+.err-bar {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: #c4564f; background: #fdf0ef; border: 1px solid #f5d5d2;
+  border-radius: 8px; padding: 6px 12px; margin-bottom: 10px;
+}
+.err-bar.stopped {
+  color: var(--asc-text-2); background: var(--asc-surface-2); border-color: transparent;
+}
+.err-retry {
+  border: none; background: none; cursor: pointer; font-size: 12px;
+  color: #7c5cfc; font-weight: 600; padding: 0;
+}
+.err-retry:hover { text-decoration: underline; }
 /* 未配置模型：「重试 + 去配置」气泡内错误态 */
 .ai-config-error {
   font-size: 13px; color: var(--asc-text-2); background: var(--asc-surface-2); border-radius: 8px;
@@ -1324,6 +1845,75 @@ function closeCitePop(e) {
 .input-col :deep(.el-textarea__inner) {
   background: transparent; box-shadow: none !important; padding: 10px 0 10px 10px; font-size: 14.5px; line-height: 1.7;
 }
+/* ---- P1 对话技能：建议卡 / 已加载条 / ＋技能选择器 ---- */
+.sk-sugg {
+  border: 1px solid #d6e4ff; background: #f5f9ff; border-radius: 10px;
+  padding: 10px 12px; margin-bottom: 8px;
+}
+.sk-sugg-hd { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
+.sk-sugg-ic {
+  width: 20px; height: 20px; border-radius: 6px; background: #2563eb; color: #fff;
+  font-size: 11px; display: flex; align-items: center; justify-content: center; flex: 0 0 20px;
+}
+.sk-sugg-nm { font-size: 13px; font-weight: 600; color: #1f2328; }
+.sk-sugg-tag { font-size: 11px; color: #2563eb; background: #e8f0ff; border-radius: 4px; padding: 1px 6px; }
+.sk-sugg-x { margin-left: auto; cursor: pointer; color: #6e6e6e; font-size: 15px; line-height: 1; padding: 0 2px; }
+.sk-sugg-x:hover { color: #1f2328; }
+.sk-sugg-why { font-size: 12px; color: #4a4a4a; line-height: 1.65; margin-bottom: 9px; }
+.sk-sugg-ft { display: flex; align-items: center; gap: 8px; }
+.sk-sugg-off { font-size: 12px; color: #6e6e6e; cursor: pointer; }
+.sk-sugg-off:hover { color: #2563eb; text-decoration: underline; }
+
+/* P3：模型判断出来的建议与关键词命中的，颜色区分开（来源影响可信度判断） */
+.sk-sugg-tag.ai { color: #7c3aed; background: #f2ecff; }
+/* 并列提示：命中多个、规则分不出高下时如实说，不假装确定 */
+.sk-sugg-amb { font-size: 11px; color: #8a5a00; background: #fff4e0; border-radius: 4px; padding: 1px 6px; }
+.sk-sugg-alts { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 9px; }
+.sk-sugg-alts-lb { font-size: 12px; color: #6e6e6e; }
+.sk-sugg-alt {
+  font-size: 12px; color: #2563eb; background: #fff; border: 1px solid #d6e4ff;
+  border-radius: 5px; padding: 1px 8px; cursor: pointer;
+}
+.sk-sugg-alt:hover { background: #e8f0ff; }
+/* 语义判断中的轻提示：内联在输入区上方，不遮挡输入 */
+.sk-matching { font-size: 12px; color: #6e6e6e; padding: 4px 2px 8px; }
+
+.skill-bar {
+  display: flex; align-items: center; gap: 7px; margin-bottom: 8px;
+  padding: 6px 10px; border-radius: 8px;
+  background: #f2f7ff; border: 1px solid #dce8fb; font-size: 12px; color: #3d4b5c;
+}
+.skill-bar-ic {
+  width: 17px; height: 17px; border-radius: 5px; background: #2563eb; color: #fff;
+  font-size: 10px; display: flex; align-items: center; justify-content: center; flex: 0 0 17px;
+}
+.skill-bar b { color: #1f2328; font-weight: 600; }
+.skill-bar-hint { color: #6e6e6e; }
+.skill-bar-x { margin-left: auto; cursor: pointer; color: #6e6e6e; }
+.skill-bar-x:hover { color: #c45656; }
+
+.skill-add {
+  font-family: inherit; font-size: 12px; color: #4a4a4a; cursor: pointer;
+  background: #fff; border: 1px solid #dcdfe6; border-radius: 6px;
+  padding: 3px 9px; display: inline-flex; align-items: center; gap: 2px;
+  white-space: nowrap; transition: none;
+}
+.skill-add:hover { border-color: #2563eb; color: #2563eb; }
+.skill-add.on { border-color: #2563eb; color: #2563eb; background: #f2f7ff; }
+
+.sk-pick-hd { font-size: 12px; color: #6e6e6e; margin-bottom: 8px; }
+.sk-pick-row { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: 7px; cursor: pointer; }
+.sk-pick-row:hover { background: #f5f7fa; }
+.sk-pick-row.on { background: #f2f7ff; }
+.sk-pick-ic {
+  width: 20px; height: 20px; border-radius: 6px; background: #eef2f7; color: #4a5568;
+  font-size: 11px; display: flex; align-items: center; justify-content: center; flex: 0 0 20px;
+}
+.sk-pick-row.on .sk-pick-ic { background: #2563eb; color: #fff; }
+.sk-pick-nm { font-size: 13px; color: #1f2328; font-weight: 500; flex: 0 0 auto; }
+.sk-pick-ds { font-size: 11px; color: #6e6e6e; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.sk-pick-empty { font-size: 12px; color: #6e6e6e; padding: 6px 8px; }
+
 /* 输入行：textarea + 发送按钮 */
 .composer-row { display: flex; align-items: flex-end; gap: 10px; }
 .composer-row .el-input { flex: 1; }

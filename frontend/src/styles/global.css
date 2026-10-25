@@ -130,3 +130,47 @@ body {
   color: var(--asc-text-2);
 }
 .md-preview hr { border: none; border-top: 1px solid var(--asc-divider); margin: 16px 0; }
+
+/* ===== AI 回答 Markdown 增强（2026-10-23 · P0/P1/P2） ===== */
+/* 代码块：外层卡片 + 头部条（语言标签 + 复制按钮） */
+.md-code { margin: 10px 0; border-radius: 8px; overflow: hidden; background: var(--asc-surface-2); }
+.md-code-head { display: flex; justify-content: space-between; align-items: center; padding: 4px 12px; font-size: 12px; color: var(--asc-text-2); background: rgba(0, 0, 0, .04); }
+.md-code-lang { font-family: Consolas, Monaco, monospace; }
+.md-code-copy { border: none; background: transparent; cursor: pointer; color: var(--asc-text-2); font-size: 12px; padding: 2px 8px; border-radius: 4px; }
+/* 「导入为技能」（P5）：比复制更显眼一点（它是动作，复制是工具） */
+.md-code-import-skill { border: 1px solid rgba(124, 92, 252, .4); background: rgba(124, 92, 252, .1); cursor: pointer; color: var(--asc-primary); font-size: 12px; padding: 1px 8px; border-radius: 4px; margin-right: 2px; }
+.md-code-import-skill:hover { background: rgba(124, 92, 252, .2); }
+.md-code-import-skill:disabled { opacity: .55; cursor: default; }
+.md-code-copy:hover { color: var(--asc-primary); background: rgba(0, 0, 0, .06); }
+/* 预提级压过各视图 scoped 的 .md-body :deep(pre)（等优先级时后加载的 scoped 会赢） */
+.md-body .md-code pre.md-code-pre, .ep-block .md-code pre.md-code-pre, .md-preview .md-code pre.md-code-pre { margin: 0; padding: 12px 14px; background: transparent; overflow-x: auto; }
+.md-body .md-code pre.md-code-pre code, .ep-block .md-code pre.md-code-pre code, .md-preview .md-code pre.md-code-pre code { background: transparent; padding: 0; }
+/* 正文图片：点击放大 */
+.md-body img, .ep-block img, .md-preview img { max-width: 100%; height: auto; cursor: zoom-in; }
+/* mermaid 占位与降级 */
+.mermaid-pending { margin: 10px 0; overflow-x: auto; }
+.mermaid-pending .mermaid-hint { padding: 12px; color: var(--asc-text-2); font-size: 12px; text-align: center; }
+.mermaid-pending.mermaid-done svg { max-width: 100%; height: auto; }
+.mermaid-error { padding: 6px 12px; color: #b91c1c; font-size: 12px; }
+/* 宽图横向滚动：滚动条常显（overlay 滚动条不 hover 不可见，会被误认成图被截断） */
+.mermaid-pending { scrollbar-width: thin; scrollbar-color: #c9c9d4 transparent; }
+.mermaid-pending::-webkit-scrollbar { height: 8px; }
+.mermaid-pending::-webkit-scrollbar-thumb { background: #c9c9d4; border-radius: 4px; }
+.mermaid-pending::-webkit-scrollbar-thumb:hover { background: #a8a8b8; }
+.mermaid-pending::-webkit-scrollbar-track { background: transparent; }
+.mermaid-scroll-hint { margin: -2px 0 10px; font-size: 12px; line-height: 1.5; color: #6e6e6e; }
+
+/* mermaid 图：保存为图片（2026-10-23）
+   常显但半透明（可发现性），hover 到图区域才完全不透明，避免 8 张图满屏按钮。 */
+.mermaid-pending.mermaid-done { position: relative; }
+.mermaid-save {
+  position: absolute; top: 6px; right: 8px;
+  padding: 3px 9px; font-size: 12px; line-height: 1.5;
+  font-family: inherit;
+  color: #555; background: rgba(255, 255, 255, .94);
+  border: 1px solid #d6d6e0; border-radius: 6px;
+  cursor: pointer; opacity: .55;
+}
+.mermaid-pending.mermaid-done:hover .mermaid-save,
+.mermaid-save:focus-visible { opacity: 1; }
+.mermaid-save:hover { color: #1f6feb; border-color: #1f6feb; }

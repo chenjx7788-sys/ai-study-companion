@@ -86,7 +86,7 @@
               <div v-if="doc.images" class="sec-note">
                 正文含 {{ doc.images }} 张图片，AI 摘要只基于文字部分。
               </div>
-              <div v-if="summary.text" class="md-preview sec-md" v-html="md.render(summary.text)"></div>
+              <div v-if="summary.text" class="md-preview sec-md" v-html="renderMd(summary.text)"></div>
               <div v-else-if="!summary.loading" class="sec-empty">
                 长文会先分组提炼再汇总，请稍候。点上方「AI 摘要」开始。
               </div>
@@ -103,7 +103,7 @@
               </div>
               <div v-for="(a, i) in ask.items" :key="i" class="ask-item">
                 <div class="ask-q">{{ a.q }}</div>
-                <div class="md-preview sec-md" v-html="md.render(a.a)"></div>
+                <div class="md-preview sec-md" v-html="renderMd(a.a)"></div>
                 <div class="ask-ops">
                   <el-button text size="small" :loading="noteBusy['ask' + i]"
                     @click="noteFromAsk(a, i)">转笔记</el-button>
@@ -125,7 +125,7 @@
               </div>
               <div v-for="(it, ii) in ch.items" :key="ii" class="chain-turn">
                 <div v-if="it.q" class="chain-q">问：{{ it.q }}</div>
-                <div class="md-preview sec-md" v-html="md.render(it.a || '…')"></div>
+                <div class="md-preview sec-md" v-html="renderMd(it.a || '…')"></div>
                 <div v-if="!it.q" class="chain-ops">
                   <el-button text size="small" :loading="noteBusy['ex' + ci]"
                     @click="noteFromExplain(ch, ci)">转笔记</el-button>
@@ -188,7 +188,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'v
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowLeft, Clock, CircleCheck, Link, MagicStick } from '@element-plus/icons-vue'
-import { createMd } from '../utils/md'
+import { createMd, renderMd as renderMdSafe } from '../utils/md'
 import { clipApi, ephemeralApi, noteApi } from '../api'
 import { streamSSE } from '../utils/sse'
 import { useReadingStore } from '../stores/reading'
@@ -198,6 +198,7 @@ const router = useRouter()
 const reading = useReadingStore()
 
 const md = createMd({ linkify: true, breaks: false })
+const renderMd = (t) => renderMdSafe(md, t || '')
 const contentEl = ref(null)
 
 // 「视频笔记」提示文案。⚠️ 与 components/CandidateList.vue 里那处必须**逐字一致**
@@ -233,7 +234,7 @@ const toolbar = reactive({ show: false, x: 0, y: 0, text: '', page: 1, busy: fal
 
 // ───────────────────────── 打开 ─────────────────────────
 
-function renderChunk(c) { return md.render(c.content || '') }
+function renderChunk(c) { return renderMd(c.content || '') }
 
 function applyDoc(d) {
   Object.assign(doc, {
