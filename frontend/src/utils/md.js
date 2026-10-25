@@ -103,6 +103,10 @@ function codeBlockHtml(lang, code, env) {
   const isSkillFile = lang === 'skill' && code.indexOf('```skill') !== -1
   const importBtn = (isSkillFile && env && env.skillImport)
     ? '<button type="button" class="md-code-import-skill" data-code="' + b64encode(code) + '">导入为技能</button>' : ''
+  // 代码运行（一期 A4）：仅 HTML/JS，sandbox iframe srcdoc（只 allow-scripts，绝不加 same-origin）
+  const runnable = lang === 'html' || lang === 'javascript' || lang === 'js'
+  const runBtn = runnable
+    ? '<button type="button" class="md-code-run" data-code="' + b64encode(code) + '" data-lang="' + lang + '">运行</button>' : ''
   let inner
   if (lang && hljs.getLanguage(lang)) {
     inner = hljs.highlight(code, { language: lang, ignoreIllegals: true }).value
@@ -112,6 +116,7 @@ function codeBlockHtml(lang, code, env) {
   return '<div class="md-code">'
     + '<div class="md-code-head">' + (lang ? '<span class="md-code-lang">' + lang + '</span>' : '<span></span>')
     + importBtn
+    + runBtn
     + '<button type="button" class="md-code-copy" data-code="' + b64encode(code) + '">复制</button></div>'
     + '<pre class="md-code-pre"><code class="hljs' + (lang ? ' language-' + lang : '') + '">' + inner + '</code></pre></div>'
 }
@@ -146,6 +151,7 @@ export function installMdEnhancements() {
   if (installed || typeof document === 'undefined') return
   installed = true
   document.addEventListener('click', onDocClick)
+  window.addEventListener('message', onRunMessage)
   startMermaidObserver()
   window.addEventListener('resize', () => {
     clearTimeout(resizeTimer)
@@ -156,6 +162,8 @@ export function installMdEnhancements() {
 function onDocClick(e) {
   const t = e.target
   if (!t || !t.closest) return
+  const runBtn = t.closest('.md-code-run')
+  if (runBtn) { runCode(runBtn); return }
   const copyBtn = t.closest('.md-code-copy')
   if (copyBtn) { copyCode(copyBtn); return }
   const saveBtn = t.closest('[data-mmd-save]')
@@ -165,6 +173,69 @@ function onDocClick(e) {
     const container = img.closest('.md-body, .ep-block, .md-preview')
     if (container) openImgViewer(container, img)
   }
+}
+
+// ---------- 代码运行（一期 A4：仅 HTML/JS · sandbox iframe srcdoc） ----------
+// ⚠️ sandbox 只给 allow-scripts、绝不加 allow-same-origin：iframe 跑在 opaque origin，
+//    读不到父页面的 DOM / cookie / localStorage。console 输出经 postMessage 回传面板。
+const RUN_BRIDGE = '<' + 'script>window.addEventListener("load",function(){setTimeout(function(){'
+  + 'var o=document.getElementById("__out");'
+  + 'parent.postMessage({__ascRun:"done",out:o?o.textContent:""},"*")},50)})<' + '/script>'
+const RUN_CONSOLE_TAP = 'function __log(s){var o=document.getElementById("__out");if(o)o.textContent+=s+"\\n"}'
+  + ';["log","info","warn","error"].forEach(function(k){console[k]=function(){'
+  + '__log(Array.prototype.map.call(arguments,String).join(" "));}});'
+
+function runCode(btn) {
+  const code = b64decode(btn.getAttribute('data-code') || '')
+  const lang = btn.getAttribute('data-lang') || ''
+  const box = btn.closest('.md-code')
+  if (!box || !box.parentNode) return
+  const next = box.nextElementSibling
+  if (next && next.classList && next.classList.contains('md-code-run-panel')) {
+    next.remove()
+    btn.textContent = '运行'
+    return
+  }
+  const panel = document.createElement('div')
+  panel.className = 'md-code-run-panel'
+  const head = document.createElement('div')
+  head.className = 'md-code-run-head'
+  head.textContent = '运行结果（沙箱隔离：代码无法访问本应用数据）'
+  const out = document.createElement('pre')
+  out.className = 'md-code-run-out'
+  out.style.display = 'none'
+  const frame = document.createElement('iframe')
+  frame.className = 'md-code-run-frame'
+  frame.setAttribute('sandbox', 'allow-scripts')
+  if (lang === 'html') {
+    frame.srcdoc = code + RUN_BRIDGE
+  } else {
+    frame.srcdoc = '<!doctype html><html><head><meta charset="utf-8"></head><body>'
+      + '<pre id="__out"></pre>'
+      + '<' + 'script>' + RUN_CONSOLE_TAP + '\ntry {\n' + code
+      + '\n} catch (e) { __log("运行出错: " + e) }\n<' + '/script>'
+      + RUN_BRIDGE + '</body></html>'
+  }
+  panel.appendChild(head)
+  panel.appendChild(out)
+  panel.appendChild(frame)
+  box.parentNode.insertBefore(panel, box.nextSibling)
+  btn.textContent = '关闭'
+}
+
+function onRunMessage(e) {
+  const d = e && e.data
+  if (!d || d.__ascRun !== 'done') return
+  // 只写 textContent（不碰 innerHTML）——回传内容永不成 HTML，无二次污染面
+  document.querySelectorAll('.md-code-run-frame').forEach((f) => {
+    if (f.contentWindow === e.source) {
+      const out = f.parentElement && f.parentElement.querySelector('.md-code-run-out')
+      if (out && typeof d.out === 'string' && d.out.trim()) {
+        out.textContent = d.out
+        out.style.display = ''
+      }
+    }
+  })
 }
 
 function copyCode(btn) {

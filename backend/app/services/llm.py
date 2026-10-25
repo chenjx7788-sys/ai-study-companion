@@ -374,6 +374,13 @@ DEFAULT_PROMPTS = {
     "prompt_quiz": """你是一名测评出题助手。根据资料的核心内容生成 {count} 道单选题，严格输出 JSON 数组（不要输出其他内容）：
 [{"question": "题干（≤50字，考察理解）", "options": ["选项A", "选项B", "选项C", "选项D"], "correct_index": 0, "explanation": "解析（≤80字）"}]
 要求：覆盖资料最重要的知识点，难度递进；每个选项似是而非（常见误区/易混淆概念），正确项位置随机。""",
+    # ---- 边界测试题（P2）：专考「材料没讲」的识别，正确项固定为「材料未涉及」类 ----
+    "prompt_quiz_boundary": """你是一名测评出题助手，专出「边界识别题」：考察学习者能否分清材料**没有讲**的内容。
+根据资料的核心内容，选择它**明确未覆盖**的相邻领域/相关概念，生成 {count} 道单选题，严格输出 JSON 数组（不要输出其他内容）：
+[{"question": "题干（≤50字，就材料未涉及的知识点提问）", "options": ["选项A", "选项B", "选项C", "选项D"], "correct_index": 0, "explanation": "解析（≤80字）"}]
+要求：1. 提问的知识点必须是材料**没有讲**的（相邻领域、易误以为讲了的概念最佳），绝不能拿材料里有的内容出题；
+2. 每题正确项固定为「材料未涉及该内容」类表述，位置随机；干扰项写「材料已支持某说法/材料主张…」等似是而非的表述；
+3. 解析必须点明「本题考察边界识别：材料未涉及该知识点」。""",
     "prompt_recall": """你是一名学习教练，擅长用费曼学习法帮人巩固知识。根据用户的学习笔记生成一道「复述题」，严格输出 JSON（不要输出其他内容）：
 {"question": "复述指令（如「请用自己的话解释：XXX」，考察能否讲清核心概念）", "answer": "参考答案要点（≤120字，列出应涵盖的关键点，供用户对照）"}
 要求：聚焦一个核心概念，引导用户主动组织语言复述，而非简单回忆定义。""",
@@ -1405,14 +1412,12 @@ def generate_review_questions(note_title: str, note_content: str, count: int = 3
     return qas
 
 
-def generate_quiz(material_title: str, core_text: str, count: int = 8, kind: str = "quiz") -> list[dict]:
-    """基于资料核心内容生成 count 道单选题
-
-    kind 决定 token 统计归口：默认 "quiz"（测一测）；「简单学」入口传 "learn_note"，
-    让该入口的讲义与出题两段消耗都归到「简单学」名下（提示词模板仍是共用的 prompt_quiz）。
-    """
+def _quiz_call(material_title: str, core_text: str, count: int, kind: str, tmpl: str) -> list[dict]:
+    """单次出题调用 + 解析（原 generate_quiz 的解析与「空数组 500」纪律原样保留）"""
+    if count <= 0:
+        return []
     raw = summary_chat([
-        {"role": "system", "content": get_prompt("prompt_quiz").replace("{count}", str(count))},
+        {"role": "system", "content": tmpl.replace("{count}", str(count))},
         {"role": "user", "content": "资料标题：" + material_title + "\n\n核心内容：\n" + core_text[:6000]},
     ], kind=kind)
     start, end = raw.find("["), raw.rfind("]")
@@ -1429,6 +1434,36 @@ def generate_quiz(material_title: str, core_text: str, count: int = 8, kind: str
         #     模型回了合法 JSON 但字段名不合规时就会走到这里——长材料下并不罕见。
         raise HTTPException(500, "出题失败：模型未返回可用题目，请重试")
     return qas
+
+
+def generate_quiz(material_title: str, core_text: str, count: int = 8, kind: str = "quiz") -> list[dict]:
+    """基于资料核心内容生成 count 道单选题（P2：按比例混入边界识别题）
+
+    kind 决定 token 统计归口：默认 "quiz"（测一测）；「简单学」入口传 "learn_note"，
+    让该入口的讲义与出题两段消耗都归到「简单学」名下（提示词模板仍是共用的 prompt_quiz）。
+
+    混题口径（P2 设计 §2.2，已拍板 I）：边界题数 = max(1, count//4)，主体题 = count - 边界数，
+    **总题数不变**；边界题正确项固定为「材料未涉及」类选项（位置随机）。
+    边界题出题失败 → 静默降级只返回主体题（不断链）；主体失败仍走 500。
+    """
+    if count <= 0:
+        return []
+    boundary_n = max(1, count // 4)
+    main_n = count - boundary_n   # =0 时 _quiz_call 短路返回 []，不空调用（count=1 → 全边界题 1 道）
+    qas = _quiz_call(material_title, core_text, main_n, kind, get_prompt("prompt_quiz"))
+    try:
+        boundary = _quiz_call(material_title, core_text, boundary_n, kind,
+                              get_prompt("prompt_quiz_boundary"))
+    except Exception:
+        boundary = []      # 边界题失败静默降级：只少边界题，主体不断链
+    # 交错混入（位置错开，避免「最后几道必是边界题」的模式化）
+    out = list(qas)
+    step = max(1, len(out) // max(1, len(boundary)))
+    pos = step
+    for b in boundary:
+        out.insert(min(pos, len(out)), b)
+        pos += step + 1
+    return out
 
 
 # ---------- 数据统计面板 · AI 分析报告（模块 H） ----------

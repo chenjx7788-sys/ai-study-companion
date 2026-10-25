@@ -174,3 +174,8 @@ body {
 .mermaid-pending.mermaid-done:hover .mermaid-save,
 .mermaid-save:focus-visible { opacity: 1; }
 .mermaid-save:hover { color: #1f6feb; border-color: #1f6feb; }
+/* ===== 代码运行面板（A4 · sandbox iframe） ===== */
+.md-code-run-panel { margin: 6px 0 10px; border: 1px solid var(--asc-border, #e5e5ea); border-radius: 8px; overflow: hidden; }
+.md-code-run-head { font-size: 12px; color: #6e6e6e; padding: 6px 10px; background: var(--asc-surface-2, #f7f7f9); }
+.md-code-run-out { margin: 0; padding: 8px 10px; font-size: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; max-height: 140px; overflow: auto; border-top: 1px solid var(--asc-border, #e5e5ea); background: var(--asc-surface, #fff); white-space: pre-wrap; word-break: break-word; }
+.md-code-run-frame { display: block; width: 100%; height: 220px; border: 0; background: #fff; }

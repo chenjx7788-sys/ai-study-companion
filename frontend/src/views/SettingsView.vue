@@ -867,6 +867,7 @@ const promptFields = [
   { key: 'prompt_review', label: '复习出题', desc: '从笔记生成自测卡片（保留 JSON 输出格式说明）', category: 'study' },
   { key: 'prompt_suggest', label: '相关问题推荐', desc: '问答回答后生成 3 个追问建议（保留 JSON 数组格式）', category: 'study' },
   { key: 'prompt_quiz', label: '测一测出题', desc: '基于资料核心内容生成测试题（保留 JSON 数组格式）', category: 'study' },
+  { key: 'prompt_quiz_boundary', label: '边界测试题（P2）', desc: '测一测/简单学出题时按比例混入「材料未涉及」的边界识别题（占比 max(1,题数/4)）', category: 'study' },
   { key: 'prompt_learn_note', label: '简单学 · 讲义（叙事类）', desc: '叙事类材料（电子书 / 传记 / 小说）的讲义工艺：必记要点 / 探索历程 / 逐章转译 / ◆三点小结。⚠️ 未判定内容性质的老材料也走这套（默认工艺）', category: 'study' },
   { key: 'prompt_learn_note_conceptual', label: '简单学 · 讲义（认知思维类）', desc: '认知类材料（心理 / 商业 / 理论）的讲义工艺：核心问题 / 底层假设 / 思维框架 / 适用边界；有清晰章节时沿用章回体', category: 'study' },
   { key: 'prompt_learn_note_practical', label: '简单学 · 讲义（工具实用类）', desc: '工具类材料（技术手册 / 操作指南 / 规范）的讲义工艺：操作流程 S{n} / 判断标准 / 禁忌坑点 / 适用边界；不套场景比喻', category: 'study' },
@@ -891,7 +892,7 @@ const promptFields = [
 ]
 const prompts = reactive({
   prompt_summary: '', prompt_keywords: '', prompt_explain: '',
-  prompt_kb_qa: '', prompt_general: '', prompt_review: '', prompt_suggest: '', prompt_quiz: '', prompt_learn_note: '',
+  prompt_kb_qa: '', prompt_general: '', prompt_review: '', prompt_suggest: '', prompt_quiz: '', prompt_quiz_boundary: '', prompt_learn_note: '',
   prompt_learn_note_conceptual: '', prompt_learn_note_practical: '', prompt_learn_note_fragment: '',
   prompt_learn_note_chapter: '',
   prompt_note_rewrite: '', prompt_note_expand: '', prompt_note_summarize: '', prompt_note_continue: '',
