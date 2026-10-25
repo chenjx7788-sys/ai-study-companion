@@ -169,8 +169,11 @@ class ChatMessage(Base):
     content = Column(Text)
     reasoning = Column(Text, default="")         # 思维链内容（reasoning_content，展示/多轮回传用）
     kb_hit = Column(Boolean, default=False)
+    answer_kind = Column(String(16), default="")     # 回答口径（三档问答）：kb / general / general_fallback / kb_miss；空 = 旧数据（前端按 kb_hit 回落）
+    error = Column(String(255), default="")        # 生成中断/失败标记（半截回答落库，前端错误态+重试；「用户中断生成」为用户主动停止）
     sources = Column(JSON, default=list)         # [{material_id, title, page_no, snippet}]
     suggestions = Column(JSON, default=list)     # 回答后推荐的 3 个相关问题
+    tool_steps = Column(JSON, default=list)     # 工具调用步骤（P1-②）：[{round, name, label, brief, ok}]，刷新后回填界面
     created_at = Column(DateTime, default=datetime.utcnow)
 
     session = relationship("ChatSession", back_populates="messages")

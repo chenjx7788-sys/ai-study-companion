@@ -62,29 +62,41 @@ def _llm_error(e: Exception) -> HTTPException:
     return HTTPException(502, f"LLM 调用失败：{msg[:200]}")
 
 
-def _chat_create(client, model, messages, temperature=0.3, stream=False, reasoning_effort=None, thinking=None):
+def _chat_create(client, model, messages, temperature=0.3, stream=False, reasoning_effort=None,
+                 thinking=None, tools=None, tool_choice=None):
     """发起 chat.completions 调用，带参数降级兜底（循环逐级降级）：
     - temperature 不支持（如 kimi-for-coding 仅允许 1）→ 改 1 重试；
-    - reasoning_effort / thinking 不支持（部分服务商/中转）→ 去掉重试。
+    - reasoning_effort / thinking 不支持（部分服务商/中转）→ 去掉重试；
+    - tools 不支持（部分中转不认 function calling）→ 去掉 tools 重试。
+      ⚠️ 去掉 tools 后模型不会再调工具，但这轮至少能正常回答；
+        「中转不支持工具就让整个问答 500」是更差的结果。
     thinking ∈ {None 不干预, 'enabled', 'disabled'}，经 extra_body 传给 DeepSeek 等支持方。"""
-    def call(temp, effort, think):
+    def call(temp, effort, think, tls, tch):
         kwargs = dict(model=model, messages=messages, temperature=temp, stream=stream)
         if effort:
             kwargs["reasoning_effort"] = effort
         if think:
             kwargs["extra_body"] = {"thinking": {"type": think}}
+        if tls:
+            kwargs["tools"] = tls
+            if tch:
+                kwargs["tool_choice"] = tch
         return client.chat.completions.create(**kwargs)
 
-    temp, effort, think = temperature, reasoning_effort, thinking
+    temp, effort, think, tls, tch = temperature, reasoning_effort, thinking, tools, tool_choice
     while True:
         try:
-            return call(temp, effort, think)
+            return call(temp, effort, think, tls, tch)
         except Exception as e:
             s = str(e).lower()
             # temperature 限制：从错误信息解析允许值（如「only 0.6/1 is allowed」）
             m = re.search(r"only\s+([\d.]+)\s+is allowed", s)
             if "temperature" in s and m and temp != float(m.group(1)):
                 temp = float(m.group(1))
+                continue
+            # 工具不被支持：只降级工具，不降级思考参数（用户选的思考深度仍生效）
+            if tls and ("tool" in s or "function" in s or "tools" in s):
+                tls, tch = None, None
                 continue
             if (effort or think) and ("reasoning" in s or "effort" in s or "thinking" in s):
                 effort, think = None, None
@@ -182,6 +194,80 @@ def chat_stream(messages: list[dict], model_id: str | None = None, reasoning_eff
     log_usage(kind, use_model, int(total_in / 1.6), int(total_out / 1.6), estimated=True)
 
 
+def chat_stream_tools(messages: list[dict], tools: list[dict], model_id: str | None = None,
+                      reasoning_effort: str | None = None, kind: str = "chat",
+                      tool_choice: str | None = None):
+    """带工具声明的流式调用（P4）。逐 (kind, payload) yield：
+       ('reasoning', str)            思考增量
+       ('content',   str)            正文增量
+       ("tool_calls", [{'id','name','arguments'}])  **轮末一次性**给出（已拼装完整）
+
+    ⚠️ 为什么不改 chat_stream：它产出 (kind, text) 二元组，有十几处调用方
+       （摘要/讲义/播客/视频/练习）。改它的返回形状等于全项目一起改，
+       而其中绝大多数场景根本不需要工具。
+    ⚠️ tool_calls 的增量是**按 index 分片**的：id 只在第一片出现，name 可能只出现
+       一次，arguments 是逐片 JSON 片段。必须按 index 累积，直接取最后一片会拿到
+       '{"query":' 这种半截 JSON。
+    """
+    conf = settings_store.load()
+    if model_id:
+        r = settings_store.resolve_model_strict(model_id)
+        if r is None:
+            raise HTTPException(400, "[NEED_SETUP]该模型未配置完整（缺少 API Key 或模型名），请到「管理中心」检查")
+        base_url, api_key, model = r
+    else:
+        r = settings_store.resolve_usage("chat")
+        if r is None:
+            raise HTTPException(400, "[NEED_SETUP]请先在「管理中心」为问答模型指定用途")
+        base_url, api_key, model = r
+    use_model = model
+    thinking = "enabled" if reasoning_effort else "disabled"
+    try:
+        resp = _chat_create(get_client(base_url, api_key), use_model, messages,
+                            stream=True, reasoning_effort=reasoning_effort,
+                            thinking=thinking, tools=tools, tool_choice=tool_choice)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _llm_error(e)
+
+    total_in = sum(len(str(m.get("content") or "")) for m in messages)
+    total_out = 0
+    acc: dict[int, dict] = {}
+    for chunk in resp:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        rc = getattr(delta, "reasoning_content", None)
+        c = getattr(delta, "content", None)
+        if rc:
+            total_out += len(rc)
+            yield "reasoning", rc
+        if c:
+            total_out += len(c)
+            yield "content", c
+        for tc in (getattr(delta, "tool_calls", None) or []):
+            idx = getattr(tc, "index", None)
+            idx = 0 if idx is None else idx
+            cur = acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+            tid = getattr(tc, "id", None)
+            if tid:
+                cur["id"] = tid
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                nm = getattr(fn, "name", None)
+                if nm:
+                    cur["name"] = nm
+                ar = getattr(fn, "arguments", None)
+                if ar:
+                    cur["arguments"] += ar
+    log_usage(kind, use_model, int(total_in / 1.6), int(total_out / 1.6), estimated=True)
+    if acc:
+        out = [acc[k] for k in sorted(acc) if acc[k]["name"]]
+        if out:
+            yield "tool_calls", out
+
+
 def summary_chat(messages: list[dict], kind: str = "summary") -> str:
     """总结/解读/出题等非问答场景：用配置的总结模型（summary_model_id）。
     ⚠️ 多模型模式下「总结模型」未选 = 未配置，直接报 NEED_SETUP（不回退旧字段）。"""
@@ -274,9 +360,11 @@ DEFAULT_PROMPTS = {
 2. 必要时结合它所在的上下文补充背景；
 3. 如果涉及专业概念，给出例子帮助理解；
 4. 回答简洁聚焦，不要偏离所选内容。追问时保持同一主题。""",
-    "prompt_kb_qa": "你是伴学助手。优先基于给定的知识库内容回答。引用知识库内容时，在相关句末用 [1]、[2] 等编号标注来源（编号对应【知识库相关内容】中的 [1][2] 标记）；知识库未覆盖的部分可补充通用知识并注明，不要编造不存在的编号。",
-    "prompt_general": "你是一名学习助手。用户的个人知识库中没有找到与问题相关的内容，请基于通用知识回答，保持简洁准确。",
+    "prompt_kb_qa": "你是伴学助手。优先基于给定的知识库内容回答。引用知识库内容时，在相关句末用 [1]、[2] 等编号标注来源（编号对应【知识库相关内容】中的 [1][2] 标记）；知识库未覆盖的部分可补充通用知识并注明，不要编造不存在的编号。当回答涉及流程、步骤、时序、架构或状态转换时，用 ```mermaid 代码块输出图表，并与文字说明配合；顺序/步骤类优先用 flowchart TD（纵向排布，在窄栏里字号更大更易读），只有分支对照等场景才用 LR；节点控制在 8 个以内，避免图过大。",
+    "prompt_general": "你是一名学习助手。请基于通用知识回答用户的问题，保持简洁准确；不要声称回答出自用户的个人知识库。当回答涉及流程、步骤、时序、架构或状态转换时，用 ```mermaid 代码块输出图表，并与文字说明配合；顺序/步骤类优先用 flowchart TD（纵向排布，在窄栏里字号更大更易读），只有分支对照等场景才用 LR；节点控制在 8 个以内，避免图过大。",
+    "prompt_kb_miss": "你是伴学助手。用户指定了「仅在个人知识库中查找答案」，但知识库中没有找到与问题相关的内容。请如实告知未找到（一两句即可），不得编造内容、不得改用通用知识作答；然后给出简短可操作的引导，例如：换个问法或关键词再试、在上方「范围」里指定某份资料重查、把相关资料导入知识库、或切换到「通用」模式获取基于通用知识的回答。建议不超过 4 条，保持简洁。",
     "prompt_kb_overview": """你是一名学习助手。用户问的是「知识库整体有什么内容」这类概览问题。下面给你的是该知识库的完整目录（资料清单 + 笔记清单）。请基于目录如实、清晰地回答用户，列出知识库包含的资料和笔记，可按主题适当归类；目录里没有的内容不要编造。""",
+    "prompt_kb_meta": """你是一名学习助手。下面给你的是知识库的统计信息或材料清单（来自数据库实时查询，准确可靠）。请基于这些信息如实、简洁地回答用户问题；数字与条目以给定信息为准，不要编造；信息未覆盖的方面明确说明不知道。""",
     "prompt_review": """你是一名记忆教练。根据用户的学习笔记生成一道自测选择题，严格输出 JSON（不要输出其他内容）：
 {"question": "题干（≤50字，考察理解）", "options": ["选项A", "选项B", "选项C", "选项D"], "correct_index": 0, "explanation": "解析（≤80字，说明正确项为何对）"}
 要求：4 个选项中只有 1 个正确，正确项位置随机；3 个干扰项要似是而非（常见误区/易混淆概念），不能是明显错误。""",
@@ -1225,11 +1313,18 @@ def ask_material(question: str, context: str, material_title: str) -> str:
 
 # ---------- 全局问答 prompt（M4） ----------
 
-def build_kb_qa_prompt(question: str, hits: list[dict]) -> list[dict]:
-    ctx = "\n\n".join(f"[{i}] {h['title']} P{h['page_no']}\n{h['text']}" for i, h in enumerate(hits, 1))
+def build_kb_qa_prompt(question: str, hits: list[dict], extra: str = "") -> list[dict]:
+    parts = []
+    for i, h in enumerate(hits, 1):
+        total = h.get("total_chunks")
+        # 块位置语境：让 LLM 知道所见只是片段，不得据片段断言材料全貌（P0-3）
+        pos = f"（全文共 {total} 块，以下为第 {h['page_no']} 页片段）" if total else ""
+        parts.append(f"[{i}] {h['title']}{pos}\n{h['text']}")
+    ctx = "\n\n".join(parts)
     return [
-        {"role": "system", "content": get_prompt("prompt_kb_qa")},
-        {"role": "user", "content": f"【知识库相关内容】\n{ctx}\n\n【问题】{question}"},
+        {"role": "system", "content": get_prompt("prompt_kb_qa")
+            + "\n注意：所给内容只是材料的部分片段（已标注总块数），不得据片段断言该材料没有其他内容或「没有正文」。"},
+        {"role": "user", "content": f"【知识库相关内容】\n{ctx}\n\n{extra}【问题】{question}"},
     ]
 
 

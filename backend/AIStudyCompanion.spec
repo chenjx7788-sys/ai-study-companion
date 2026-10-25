@@ -61,6 +61,14 @@ _TPL_FILES = sorted(_glob_tpl.glob(_os_tpl.path.join(_TPL_DIR, 'stage_tpl*.html'
 if not _TPL_FILES:
     raise SystemExit("[spec] 未找到舞台模板：%s —— 路径锚错，打包会缺模板" % _TPL_DIR)
 datas += [(_p, 'app/services') for _p in _TPL_FILES]
+# ⚠️ **技能文件**（`app/skills/*.skill.md`）也是 `collect_all()` 收不到的**数据文件**。
+#    漏收的后果**只在打包版暴露**：技能页空列表，源码态一切正常。
+#    同样用 glob + SPECPATH 锚点（不能裸写相对路径，cwd 不保证），命中 0 个直接报错。
+_SKILL_DIR = _os_tpl.path.join(globals().get('SPECPATH') or _os_tpl.getcwd(), 'app', 'skills')
+_SKILL_FILES = sorted(_glob_tpl.glob(_os_tpl.path.join(_SKILL_DIR, '*.skill.md')))
+if not _SKILL_FILES:
+    raise SystemExit("[spec] 未找到技能文件：%s —— 路径锚错，打包版技能页会为空" % _SKILL_DIR)
+datas += [(_p, 'app/skills') for _p in _SKILL_FILES]
 
 # 收集依赖（动态库 + 数据文件 + 隐藏导入）
 for pkg in ['faster_whisper', 'ctranslate2', 'onnxruntime', 'tokenizers',

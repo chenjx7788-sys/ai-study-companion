@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from app_version import __version__ as APP_VERSION
 from .core.config import settings
 from .database import Base, engine
-from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats, podcasts, ephemeral, imgproxy, ext, simple_learn, drill, videos, zipvoice, update, renderenv
+from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats, podcasts, ephemeral, imgproxy, ext, simple_learn, drill, videos, zipvoice, update, renderenv, skills
 
 Base.metadata.create_all(bind=engine)
 
@@ -23,6 +23,19 @@ def _migrate_columns():
             if "reasoning" not in cols:
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE chat_messages ADD COLUMN reasoning TEXT DEFAULT ''"))
+            # 错误落库（口径 A）：半截回答 + 错误标记持久化。存量行默认 ''，行为与改造前一致。
+            if "error" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE chat_messages ADD COLUMN error VARCHAR(255) DEFAULT ''"))
+            # 工具步骤落库（P1-②）。存量行为 NULL，读取侧一律 `m.tool_steps or []`。
+            # ⚠️ 不能用 `DEFAULT ''`：JSON 列读到空串会在反序列化时抛错。
+            if "tool_steps" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE chat_messages ADD COLUMN tool_steps TEXT"))
+            # 回答口径（三档问答，2026-10-25）。存量行 '' = 旧数据，前端按 kb_hit 回落，行为不变。
+            if "answer_kind" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE chat_messages ADD COLUMN answer_kind VARCHAR(16) DEFAULT ''"))
         if "materials" in insp.get_table_names():
             cols = {c["name"] for c in insp.get_columns("materials")}
             if "storage_mode" not in cols:
@@ -479,6 +492,7 @@ app.include_router(ai.router, prefix="/api")
 app.include_router(notes.router, prefix="/api")
 app.include_router(kb.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
+app.include_router(skills.router, prefix="/api")
 app.include_router(review.router, prefix="/api")
 app.include_router(settings_router.router, prefix="/api")
 app.include_router(asr.router, prefix="/api")

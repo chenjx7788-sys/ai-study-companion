@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     # 命中阈值：BGE-small-zh 实测 相关 0.18~0.51 / 无关 <0，取 0.15 为界
     # （若改用其他 embedding 模型需重新校准）
     kb_hit_threshold: float = 0.15
+    # 多轮问答上下文预算（P5）：注入历史的 token 上限，按「字符 / 1.6」估算（与用量记账同口径）。
+    # 超出部分从最旧的开始丢，但至少保留最近 1 轮；条数另有硬上限（见 chat.py HISTORY_LIMIT）。
+    # 调低 = 省 token / 少串味；调高 = 记得更久但可能顶到模型窗口。
+    chat_history_token_budget: int = 4000
     review_daily_limit: int = 30   # 每日复习上限，防积压
     # 陪练·难度自适应（管理中心「陪练」页可调；出题时读取，改动即时生效）
     drill_adapt_up_score: int = 80      # 「答得好」判定线

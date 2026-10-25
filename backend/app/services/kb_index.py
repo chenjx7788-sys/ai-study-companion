@@ -14,6 +14,33 @@ from . import vector as vector_svc
 NOTE_WEIGHT = 1.5     # 笔记权重默认值（实际值读设置 note_weight，检索打分另行读取）
 CHUNK_WEIGHT = 1.0
 
+MERGE_MIN = 50   # 短于此长度的非表格碎块，索引时与相邻块合并为一组向量
+                 # （2026-10-23 第三期：实测 42% 的 chunk 是 <50 字碎片——标题行/标签行，
+                 #    白吃 embedding 算力、稀释检索。只改索引层，DB 原文不动，可回滚）
+
+
+def _group_for_embedding(chunks):
+    """把连续碎块合并为 embedding 组：累计 <MERGE_MIN 字的邻块并成一组，含表格行或
+    累计达标即封口。组内用**首块 id** 作代表 ref_id（来源回显/跳转均按首块）。
+
+    取舍说明：
+    - 组的向量文本 = 组内各块拼接，但检索回显的 snippet 取向量文档（拼接文本），
+      实体/FTS 通道仍按单块回显——两通道文案粒度不同，可接受；
+    - reindex_chunk（转写校对）按单块重建：若该块曾是组首，组内其余碎块暂失索引，
+      待下次整材料重建恢复；若非组首，会短暂双份。校对对象是音视频转写块（都是大块），
+      与碎块组几乎不重叠，风险可忽略。
+    """
+    groups, cur, cur_len = [], [], 0
+    for c in chunks:
+        cur.append(c)
+        cur_len += len(c.content or "")
+        if "|" in (c.content or "") or cur_len >= MERGE_MIN:
+            groups.append(cur)
+            cur, cur_len = [], 0
+    if cur:
+        groups.append(cur)
+    return groups
+
 
 def index_material(db: Session, material_id: int) -> int:
     """把一份材料的全部原文块切分向量化入库。返回入库块数。
@@ -54,20 +81,24 @@ def index_material(db: Session, material_id: int) -> int:
         return 0
 
     items, entries = [], []
-    for c in chunks:
-        for seq, part in enumerate(vector_svc.split_text(c.content)):
-            eid = vector_svc.make_embedding_id("chunk", c.id, seq)
+    for group in _group_for_embedding(chunks):
+        head = group[0]   # 组代表：来源回显/跳转按首块
+        text = "\n".join((c.content or "").strip() for c in group if (c.content or "").strip())
+        if not text:
+            continue
+        for seq, part in enumerate(vector_svc.split_text(text)):
+            eid = vector_svc.make_embedding_id("chunk", head.id, seq)
             items.append({
                 "embedding_id": eid,
                 "text": part,
                 "metadata": {
-                    "ref_type": "chunk", "ref_id": c.id,
+                    "ref_type": "chunk", "ref_id": head.id,
                     "material_id": material_id, "material_title": m.title,
-                    "page_no": c.page_no or 0, "section_path": c.section_path or "",
+                    "page_no": head.page_no or 0, "section_path": head.section_path or "",
                 },
             })
             entries.append(KbEntry(material_id=material_id, ref_type="chunk",
-                                   ref_id=c.id, embedding_id=eid, weight=CHUNK_WEIGHT))
+                                   ref_id=head.id, embedding_id=eid, weight=CHUNK_WEIGHT))
 
     vector_svc.index_texts(items, kind="chunk")
     db.query(KbEntry).filter(KbEntry.material_id == material_id, KbEntry.ref_type == "chunk").delete()
