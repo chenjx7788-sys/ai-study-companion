@@ -4,11 +4,11 @@
 > 资料、笔记、向量索引全部存在你自己电脑上——**数据不出设备，只需一个 LLM API Key**。
 
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue)
-![version](https://img.shields.io/badge/version-v0.1.6-purple)
+![version](https://img.shields.io/badge/version-v0.1.8-purple)
 ![local](https://img.shields.io/badge/data-100%25%20local-brightgreen)
-[![download](https://img.shields.io/badge/%E4%B8%8B%E8%BD%BD-v0.1.6%20zip-orange)](https://github.com/chenjx7788-sys/ai-study-companion/releases/latest)
+[![download](https://img.shields.io/badge/%E4%B8%8B%E8%BD%BD-v0.1.7%20zip-orange)](https://github.com/chenjx7788-sys/ai-study-companion/releases/latest)
 
-> 👉 **下载体验版**：点击上方橙色「下载」徽章，或到 [Releases 页面](https://github.com/chenjx7788-sys/ai-study-companion/releases/latest) 下载 —— **Windows**：`AIStudyCompanion-v0.1.6-win.zip`（解压双击 `AIStudyCompanion.exe`）；**macOS**：`ai-study-companion-v0.1.6-macos-arm64.zip`（Apple Silicon）/ `ai-study-companion-v0.1.6-macos-x86_64.zip`（Intel），解压后打开 `.app`（首次需右键 → 打开）。
+> 👉 **下载体验版**：点击上方橙色「下载」徽章，或到 [Releases 页面](https://github.com/chenjx7788-sys/ai-study-companion/releases/latest) 下载 —— **Windows**：`AIStudyCompanion-v0.1.7-win.zip`（解压双击 `AIStudyCompanion.exe`）；**macOS**：`ai-study-companion-v0.1.7-macos-arm64.zip`（Apple Silicon）/ `ai-study-companion-v0.1.7-macos-x86_64.zip`（Intel），解压后打开 `.app`（首次需右键 → 打开）。
 
 ---
 
@@ -51,7 +51,7 @@
 
 > 当前提供 **Windows 10 / 11（64 位）** 与 **macOS 13 或更高（Apple Silicon / Intel）** 绿色版，免安装。
 
-1. 到 [Releases](https://github.com/chenjx7788-sys/ai-study-companion/releases) 下载最新版 —— Windows：`AIStudyCompanion-v0.1.6-win.zip`（约 290 MB）；macOS：`ai-study-companion-v0.1.6-macos-arm64.zip`（约 269 MB，Apple Silicon）/ `ai-study-companion-v0.1.6-macos-x86_64.zip`（约 287 MB，Intel）
+1. 到 [Releases](https://github.com/chenjx7788-sys/ai-study-companion/releases) 下载最新版 —— Windows：`AIStudyCompanion-v0.1.7-win.zip`（约 290 MB）；macOS：`ai-study-companion-v0.1.7-macos-arm64.zip`（约 269 MB，Apple Silicon）/ `ai-study-companion-v0.1.7-macos-x86_64.zip`（约 287 MB，Intel）
 2. Windows 解压后双击 `AIStudyCompanion/AIStudyCompanion.exe`；macOS 解压后打开 `.app`（首次需右键 → 打开）。首次启动会自动就位内置向量模型（约 10 秒）
 3. 打开「管理中心 → 大模型配置」填入你的 **LLM API Key**（DeepSeek 等任意 OpenAI 兼容厂商，注册即得）即可使用全部 AI 能力
 
@@ -73,7 +73,7 @@
 
 ## 📝 更新日志
 
-完整按版本记录见 [CHANGELOG.md](./CHANGELOG.md)。v0.1.6 主要新增：**AI 视频**（讲稿 → 分镜 → 本地渲染出片，口播形象与视觉皮肤）、**AI 陪练**（出题 · 念题 · 口述作答 · 即时点评）、**ZipVoice 本地语音合成**（断网可用，模型按需下载）；并修复 edge-tts 合成端点失效、语音错误提示不准确等问题。
+完整按版本记录见 [CHANGELOG.md](./CHANGELOG.md)。v0.1.7 主要新增：**AI 视频三皮肤**（PPT 课件 / 板书 / 动效图解）、**客户端内检查更新**、扫描版 PDF 章节层级识别（98.8% 召回）、「在原文中查看」精确到行、导出结构化 Markdown、学习页统一编辑面、简单学长材料分章生成；并修复安装版无法渲染出片、Word / EPUB 导出结构错误等问题。
 
 ## 🚀 从源码运行（开发者）
 

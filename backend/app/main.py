@@ -329,7 +329,7 @@ _backfill_material_origin()
 _migrate_source_folder_to_folder()
 _backfill_chunk_kind()
 
-app = FastAPI(title="知萤 - AI知识中枢", version="0.1.7")
+app = FastAPI(title="知萤 - AI知识中枢", version=APP_VERSION)
 
 # 自动定时备份（启动后延迟 30s 首备，此后每日一次，保留最近 7 份）
 from .services import auto_backup
