@@ -236,6 +236,7 @@
           {{ current.type === 'recall' ? '我讲完了，看答案（空格）' : '查看答案（空格）' }}
         </el-button>
       </div>
+      <div class="queue-progress" v-if="freshCount > 0">今日新增 {{ freshCount }} 张，已排在最前</div>
       <div class="queue-progress" v-if="quota > queue.length">今日上限 {{ limit }} 张，剩余 {{ quota - queue.length }} 张顺延</div>
       </div>
 
@@ -414,6 +415,7 @@ let allListScrollPos = null      // 展开前的滚动位置：收起时还原
 const convertingId = ref(null)
 const quota = ref(0)       // 到期总卡数
 const limit = ref(30)      // 每日上限
+const freshCount = ref(0)  // 今日新增卡数（后端 N1：新建卡当日排前且不被上限截断）
 
 const current = computed(() => queue.value[idx.value] || null)
 const revealed = computed(() => current.value?.type === 'choice' ? picked.value !== null : flipped.value)
@@ -452,6 +454,7 @@ async function load() {
     queue.value = t.data.cards
     quota.value = t.data.total_due
     limit.value = t.data.limit
+    freshCount.value = t.data.fresh_count || 0
     stats.value = s.data
     idx.value = 0
     resetState()

@@ -337,27 +337,39 @@ def review_filters(db: Session = Depends(get_db)):
 def today_cards(material_id: int | None = None, tag: str | None = None,
                 type: str | None = None, db: Session = Depends(get_db)):
     """今日待复习队列：到期卡片受每日上限约束（防积压），可按资料/标签/题型筛选。
-    采用交错排序：按材料分组轮流取，避免同材料题连续出现（交错练习利于长期记忆）。"""
+    采用交错排序：按材料分组轮流取，避免同材料题连续出现（交错练习利于长期记忆）。
+    例外（N1，10-26）：当日新建卡（北京日界，与 /stats 口径一致）永远排前且不被
+    每日上限截断 —— 用户刚「转复习卡 / 测一测错题重答」生成的卡当天必须能看到。"""
     now = datetime.utcnow()
     q = db.query(ReviewCard).filter(ReviewCard.next_review_at <= now)
     q = _apply_filters(q, material_id, tag, type, db)
     due = q.order_by(ReviewCard.next_review_at).all()
     total_due = len(due)
 
-    # 交错排序：按材料分组（组内保持到期时间序），轮流取一张
-    groups = {}
-    for c in due:
-        groups.setdefault(c.material_id or 0, []).append(c)
-    interleaved = []
-    while groups:
-        for mid in list(groups.keys()):
-            interleaved.append(groups[mid].pop(0))
-            if not groups[mid]:
-                del groups[mid]
+    def _interleave(cards):
+        # 交错排序：按材料分组（组内保持到期时间序），轮流取一张
+        groups = {}
+        for c in cards:
+            groups.setdefault(c.material_id or 0, []).append(c)
+        out = []
+        while groups:
+            for mid in list(groups.keys()):
+                out.append(groups[mid].pop(0))
+                if not groups[mid]:
+                    del groups[mid]
+        return out
 
-    rows = interleaved[:settings.review_daily_limit]
+    # 当日新建卡：北京日界换算回 UTC 阈值（created_at 存的是 UTC naive）
+    CN = timedelta(hours=8)
+    today_start_utc = datetime.combine((now + CN).date(), datetime.min.time()) - CN
+    fresh = [c for c in due if c.created_at and c.created_at >= today_start_utc]
+    fresh_ids = {c.id for c in fresh}
+    rest = [c for c in due if c.id not in fresh_ids]
+
+    rows = _interleave(fresh) + _interleave(rest)[:settings.review_daily_limit]
     return {"cards": [card_to_dict(c) for c in rows],
-            "total_due": total_due, "limit": settings.review_daily_limit}
+            "total_due": total_due, "limit": settings.review_daily_limit,
+            "fresh_count": len(fresh)}
 
 
 class GradeReq(BaseModel):

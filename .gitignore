@@ -71,6 +71,9 @@ _proc*.txt
 _bak_*/
 _apply_*
 _probe_*
+# ⚠️ 例外：tests/probes/ 是沉淀的验收探针（N3，2026-10-26 起入仓库随版本走）
+!tests/probes/
+!tests/probes/_probe_*
 _hide_*
 _fetch_probe/
 _brand_*.txt
