@@ -29,6 +29,17 @@ BACKEND = REPO / "backend"
 TMP = WS / "_tmp_probe_apps_20261027"
 RESULTS = []
 
+# 环境预检：探针自己会起隔离 uvicorn，解释器不对时子进程秒退，
+# 外表只是一句「READY 未就绪」—— 会被误读成回归。这里提前拦住。
+try:
+    import uvicorn  # noqa: F401
+except ModuleNotFoundError:
+    print("[PRECHECK] 当前解释器没有 uvicorn：" + sys.executable, flush=True)
+    print(r"[PRECHECK] 请用 C:\Users\陈锦祥\.workbuddy\binaries\python\envs\default\Scripts\python.exe 运行本探针",
+          flush=True)
+    print("[PRECHECK] 这不是回归，是环境不对 —— 不计入 PASS/FAIL", flush=True)
+    sys.exit(2)
+
 
 def report(rid, ok, detail=""):
     RESULTS.append((rid, ok))
@@ -103,9 +114,11 @@ env["ASC_DB_URL"] = f"sqlite:///{TMP / 'app.db'}"
 env["ASC_CHROMA_DIR"] = str(TMP / "chroma")
 env["PYTHONIOENCODING"] = "utf-8"
 
+BOOT_LOG = TMP / "iso_uvicorn.log"
+_boot_fh = open(BOOT_LOG, "wb")
 proc = subprocess.Popen(
     [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(PORT)],
-    cwd=str(BACKEND), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cwd=str(BACKEND), env=env, stdout=_boot_fh, stderr=subprocess.STDOUT)
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 BASE = f"http://127.0.0.1:{PORT}/api"
 
@@ -137,7 +150,16 @@ try:
         except Exception:
             time.sleep(0.5)
     else:
-        report("READY", False, "隔离实例未就绪")
+        _tail = ""
+        try:
+            _boot_fh.flush()
+            _tail = BOOT_LOG.read_bytes().decode("utf-8", "replace")[-1500:]
+        except Exception:
+            pass
+        report("READY", False, "隔离实例未就绪（子进程末段日志见下）")
+        print("---- iso uvicorn log tail ----", flush=True)
+        print(_tail, flush=True)
+        print("---- end ----", flush=True)
         sys.exit(1)
     report("READY", True, f"port={PORT}")
 
