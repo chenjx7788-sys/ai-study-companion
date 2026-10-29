@@ -26,7 +26,7 @@
             <div class="ac-name">{{ a.name }}</div>
           </div>
           <div class="ac-body">
-            <p class="ac-persona">{{ (a.persona || '').slice(0, 46) }}<template v-if="(a.persona || '').length > 46">…</template></p>
+            <p class="ac-persona">{{ (a.persona_head || '').slice(0, 46) }}<template v-if="(a.persona_head || '').length >= 300">…</template></p>
             <div class="ac-meta">绑定 {{ a.material_count }} 份资料 · 已聊 {{ a.session_count }} 场</div>
             <div class="ac-ops">
               <el-button v-if="a.status === 'draft'" type="primary" class="ac-go"

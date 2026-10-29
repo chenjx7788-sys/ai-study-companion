@@ -155,7 +155,7 @@
             <div class="stats-row">
               <div class="stat"><div class="stat-n">{{ stats.session_count }}</div><div class="stat-l">已聊场数</div></div>
               <div class="stat"><div class="stat-n">{{ stats.question_count }}</div><div class="stat-l">总提问</div></div>
-              <div class="stat"><div class="stat-n">{{ stats.hit_rate === null ? '—' : Math.round(stats.hit_rate * 100) + '%' }}</div><div class="stat-l">资料命中率</div></div>
+              <div class="stat"><div class="stat-n">{{ stats.hit_rate === null ? '—' : Math.round(stats.hit_rate * 100) + '%' }}</div><div class="stat-l" :title="`只统计真正给出回答的助手消息；报错/中断 ${stats.failed_count || 0} 条不计入分母`">资料命中率</div></div>
               <div class="stat"><div class="stat-n stat-sm">{{ stats.last_active ? stats.last_active.slice(5, 16).replace('T', ' ') : '—' }}</div><div class="stat-l">最近活跃</div></div>
             </div>
             <div class="trend" v-if="stats.daily && stats.daily.length">

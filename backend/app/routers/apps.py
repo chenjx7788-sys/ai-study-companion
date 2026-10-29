@@ -6,6 +6,7 @@
   且不吃请求级 Depends(get_db)：检索与装配做完即关临时会话，流式期间不持有 DB
 """
 import json
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -38,8 +39,8 @@ class AppUpsertReq(BaseModel):
 
 @router.get("")
 def list_apps(db: Session = Depends(get_db)):
-    rows = db.query(App).order_by(App.updated_at.desc(), App.id.desc()).all()
-    return [apps_svc.app_to_dict(a, db) for a in rows]
+    # O1（2026-10-30）：列表走瘦身投影（一次 group by，人格截断），详情仍走 app_to_dict。
+    return apps_svc.list_apps_slim(db)
 
 
 @router.post("")
@@ -199,6 +200,12 @@ class NudgeReq(BaseModel):
     session_id: int | None = None
 
 
+# 搭话节流（O5，2026-10-30）：接口原来没有任何冷却，可被刷 token（每次一次 LLM）。
+# 进程内字典够用（单实例 dev / 桌面端）；重启清零不影响正确性。
+_NUDGE_LAST: dict[tuple[int, int | None], float] = {}
+_NUDGE_COOLDOWN = 60.0
+
+
 @router.post("/{app_id}/nudge")
 def nudge(app_id: int, req: NudgeReq, db: Session = Depends(get_db)):
     """生成一句人格化搭话。失败向上抛 502，前端静默降级为不显示。"""
@@ -211,6 +218,13 @@ def nudge(app_id: int, req: NudgeReq, db: Session = Depends(get_db)):
         s = db.get(ChatSession, req.session_id)
         if not s or s.app_id != app.id:
             raise HTTPException(400, "会话不属于此应用")
+    # O5：60s 内同一 (应用, 会话) 只生成一次。超频返回空文案（200），
+    # 前端原本就按「没有 text 就不显示」处理 → 静默降级，不弹错误气泡。
+    key = (app.id, req.session_id)
+    now = time.monotonic()
+    if now - _NUDGE_LAST.get(key, 0.0) < _NUDGE_COOLDOWN:
+        return {"text": "", "questions": [], "throttled": True}
+    _NUDGE_LAST[key] = now
     return apps_svc.gen_nudge(db, app, req.session_id)
 
 

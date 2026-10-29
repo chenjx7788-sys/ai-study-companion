@@ -24,7 +24,10 @@ from ..core.config import settings
 from ..database import get_db, SessionLocal
 from ..models import ChatSession, ChatMessage
 from ..services import llm, search as search_svc, settings_store, skills as skills_svc, skill_tools as skill_tools_svc
+from ..services import retrieval_agent as retrieval_agent_svc
+from ..services import apps as apps_svc
 from ..services import skill_fetch as skill_fetch_svc
+from ..services import discover as discover_svc
 from ..services.query_understanding import analyze_query
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -47,9 +50,10 @@ class AskReq(BaseModel):
     material_ids: list[int] | None = None    # scope=material 时指定材料（空=全部）
     note_ids: list[int] | None = None        # scope=note 时指定笔记（空=全部）
     folder_ids: list[int] | None = None      # scope=folder 时指定文件夹（含子文件夹）
-    model_id: str | None = None              # 指定模型（问答页切换），空=默认问答模型
+    model_id: str | None = None              # 指定模型（对话页切换），空=默认对话模型
     reasoning_effort: str | None = None      # 推理强度 low/high/max，空=服务商默认
     skill_id: str | None = None              # P1 本轮启用的对话技能（空=不启用）
+    app_id: int | None = None                # 炼丹炉：应用对话（空=主问答）。带它走第四条装配分支
 
 SCOPE_KINDS = {"all": ("chunk", "note"), "material": ("chunk",), "note": ("note",), "folder": ("chunk",)}
 
@@ -83,7 +87,7 @@ def session_to_dict(s: ChatSession, db: Session) -> dict:
     last = (db.query(ChatMessage).filter(ChatMessage.session_id == s.id)
             .order_by(ChatMessage.id.desc()).first())
     return {"id": s.id, "title": s.title, "message_count": count,
-            "pinned": bool(s.pinned),
+            "pinned": bool(s.pinned), "app_id": s.app_id,
             "last_message": (last.content[:60] if last else None),
             "created_at": s.created_at.isoformat() if s.created_at else None,
             "updated_at": s.updated_at.isoformat() if s.updated_at else None}
@@ -96,13 +100,31 @@ def message_to_dict(m: ChatMessage) -> dict:
             "sources": m.sources or [], "suggestions": m.suggestions or [],
             # 工具步骤（P1-②）：刷新后回填界面，否则回答看起来像凭空出现
             "tool_steps": m.tool_steps or [],
+            # 库内相关资源卡片（2026-10-26）。存量行为 NULL，`or []` 兜住。
+            "resources": m.resources or [],
             "created_at": m.created_at.isoformat() if m.created_at else None}
 
 
 @router.get("/sessions")
-def list_sessions(db: Session = Depends(get_db)):
-    rows = (db.query(ChatSession)
-            .order_by(ChatSession.pinned.desc(), ChatSession.updated_at.desc()).all())
+def list_sessions(app_id: str | None = None, db: Session = Depends(get_db)):
+    """会话列表。⚠️ 隔离语义（2026-10-27 炼丹炉起，R4）：
+    - 不传 app_id = 主问答 → 只看 app_id IS NULL（应用会话绝不漏进主列表；
+      存量主问答会话全为 NULL，行为不变）；
+    - app_id=N → 只看该应用的会话（应用页专用）。"""
+    q = db.query(ChatSession)
+    if app_id is None:
+        q = q.filter(ChatSession.app_id.is_(None))
+    else:
+        # 2026-10-29 修：裸 int() 让 ?app_id=abc / ?app_id=（空串）直接 500，
+        # 违反「非法入参一律 4xx 不 500」的既定口径。
+        try:
+            aid = int(app_id)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "app_id 必须是整数")
+        if aid <= 0:
+            raise HTTPException(400, "app_id 必须是正整数")
+        q = q.filter(ChatSession.app_id == aid)
+    rows = q.order_by(ChatSession.pinned.desc(), ChatSession.updated_at.desc()).all()
     return [session_to_dict(s, db) for s in rows]
 
 
@@ -264,10 +286,10 @@ def _build_history(db: Session, session_id: int, before_id: int) -> tuple[list[d
     return picked, meta
 
 
-def _hits_to_sources(hits: list[dict]) -> list[dict]:
-    """检索结果 → 来源卡片（最多 3 条）"""
+def _hits_to_sources(hits: list[dict], limit: int = 3) -> list[dict]:
+    """检索结果 → 来源卡片（普通路径最多 3 条；两段式计划检索放宽到 PLAN_INJECT_LIMIT）"""
     sources = []
-    for h in hits[:3]:
+    for h in hits[:limit]:
         meta = h["metadata"]
         sources.append({
             "ref_type": h["ref_type"],
@@ -281,17 +303,12 @@ def _hits_to_sources(hits: list[dict]) -> list[dict]:
 
 
 def _is_fragment(text: str) -> bool:
-    """零信息量碎片块（2026-10-23 P0-3）：标签行/标题行这类 <50 字的小块，
-    关键词密度高反而免阈值直进 top-3，把有内容的块挤出去。
-    表格行（含 |）与列表项豁免——短但有结构信息。"""
-    t = text.strip()
-    if len(t) >= 50:
-        return False
-    if "|" in t:
-        return False
-    if t.startswith(("- ", "* ", "·", "1.")):
-        return False
-    return True
+    """转发到 services/search.is_fragment（2026-10-30 上收）。
+
+    炼丹炉试聊也要用同一份碎片判定（预览与正式必须同口径），
+    两处各写一份 = 迟早漂移成「正式过滤了、试聊没过滤」。
+    """
+    return search_svc.is_fragment(text)
 
 
 _OVERVIEW_HINTS = ("有什么", "有哪些", "包含", "目录", "内容", "学了什么", "都有什么", "收录", "讲了什么")
@@ -507,21 +524,49 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
     if req.mode not in ("auto", "kb", "general"):
         raise HTTPException(400, "mode 必须是 auto / kb / general")
 
+    # ---- 炼丹炉：应用对话（第四条装配分支，2026-10-27） ----
+    # 强制 kb 语义：检索锁死在绑定资料（R1）、未命中走定制口径（R2）、不挂技能、不做查询理解。
+    # ⚠️ 存量三档（auto/kb/general）零改动：app 分支只通过 req.mode 改写 + 下文 app 守卫生效。
+    app = None
+    app_mids: list[int] = []          # 绑定资料（2026-10-29：本请求只查一次，供检索/双保险复用）
+    if req.app_id is not None:
+        app = apps_svc.get_app_or_404(db, req.app_id)
+        if req.skill_id:
+            raise HTTPException(400, "应用对话不支持挂载技能")
+        app_mids = apps_svc.material_ids(db, app.id)
+        if not app_mids:
+            raise HTTPException(400, "应用的资料已被删除，请先在配置页重新绑定资料")
+        req.mode = "kb"                       # 应用强制 kb 语义（未命中绝不滑向通用兜底）
+        if not req.model_id and app.model_id:
+            req.model_id = app.model_id       # 模型解析序：请求级 > 应用默认 > 全局
+
     # 会话：无则新建，首问作为标题
     if req.session_id:
         session = db.get(ChatSession, req.session_id)
         if not session:
             raise HTTPException(404, "会话不存在")
+        # R4 归属判据（2026-10-29 修）：**双向**严格相等，NULL 也算不一致。
+        # ⚠️ 旧判据只挡「应用 A → 应用 B」，放过了「主问答 NULL → 应用」，还顺手把归属改写成 app.id
+        #    → 主问答会话被迁进应用（主列表丢失）、会话里老消息 app_id 仍为 NULL
+        #    → 删应用时按 app_id 删不到 → 孤儿消息 → 会话 id 被 SQLite 复用后新会话串台。
+        if app is not None and session.app_id != app.id:
+            raise HTTPException(400, "该会话不属于此应用")
+        if app is None and session.app_id is not None:
+            raise HTTPException(400, "该会话属于某个 AI 应用，不能继续在主问答中提问")
     else:
-        session = ChatSession(title=question[:20])
+        session = ChatSession(title=question[:20], app_id=app.id if app else None)
         db.add(session)
         db.commit()
         db.refresh(session)
+    # ⚠️ 这里原本有「首次带入应用 → 定型归属 session.app_id = app.id」。删掉（2026-10-29）：
+    #    带 app_id 新建会话时上面 else 分支已经写好归属，这段唯一能命中的场景就是
+    #    「把既有主问答会话迁进应用」——正是 R4 要禁的事。
     if session.title == "新会话":
         session.title = question[:20]
     session.updated_at = datetime.utcnow()   # 最近活动时间（侧边栏排序/相对时间）
 
-    user_msg = ChatMessage(session_id=session.id, role="user", content=question)
+    user_msg = ChatMessage(session_id=session.id, role="user", content=question,
+                           app_id=app.id if app else None)
     db.add(user_msg)
     db.commit()
     db.refresh(user_msg)
@@ -537,6 +582,10 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
     if _install_url:
         return _install_skill_stream(req, request, session, user_msg, _install_url)
 
+    # 检索增强层（2026-10-28）观测元数据：改写/计划痕迹随 sources 事件带出（前端不消费，仅观测）。
+    retrieval_meta: dict = {"rewrite": None, "plan": None}
+    inject_limit = 3   # 注入上下文与来源卡片条数；两段式计划检索放宽到 PLAN_INJECT_LIMIT
+
     # 检索 + 阈值过滤（scope 限定集合；指定条目时加 metadata 过滤）
     kinds = SCOPE_KINDS.get(req.scope, ("chunk", "note"))
     specified = bool(req.material_ids or req.note_ids or req.folder_ids)
@@ -545,6 +594,11 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
         where = {"material_id": {"$in": req.material_ids}}
     elif req.scope == "note" and req.note_ids:
         where = {"ref_id": {"$in": req.note_ids}}
+    # 应用分支：检索锁（R1）——where 恒为绑定资料集合，绝不 None。
+    # ⚠️ 刻意不走 specified 免阈值通道：绑定资料是**语料宇宙**而非单问强意图，
+    #    免阈值会让向量总能捞出点什么 → kb_miss 永不发生（探针 V4/V5 实证翻车）。
+    if app is not None:
+        where = {"material_id": {"$in": app_mids}}
 
     # 查询理解前置层（2026-10-23 P0 族）：仅 scope=all 且未显式指定条目时启用，
     # 尊重用户显式选择的范围。命中即分流，全部落空走原检索路径（兜底不更差）。
@@ -552,9 +606,12 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
     enum_extra = ""       # enumerate：清单文本，随检索结果一起注入
     enum_material_ids: list[int] = []   # enumerate 标题命中的材料（块保送用）
     search_q = question   # 意图词剥离后的检索词
+    # ⚠️ plan 只在「非通用档 + scope=all + 未指定条目」时才被赋值，其余路径必须容忍 None
+    plan = None
     req_material_ids = req.material_ids   # 指代解析命中时会被覆盖为解析结果
-    # 通用档跳过查询理解：它的产物（指代解析/统计/枚举/概览）全部是为检索服务的
-    if req.mode != "general" and not specified and req.scope == "all":
+    # 通用档跳过查询理解：它的产物（指代解析/统计/枚举/概览）全部是为检索服务的。
+    # 应用分支同样跳过（app is None 守卫）：应用语义只有「锁死资料集合的检索」，无意图分流。
+    if req.mode != "general" and not specified and req.scope == "all" and app is None:
         plan = analyze_query(question, db)
         if plan.intent == "reference" and plan.material_ids:
             # 指代（材料N/《标题》）→ 走指定材料强意图路径
@@ -585,22 +642,34 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
         kb_hit = True
         sources = []
     else:
-        if req.scope == "folder":
-            # folder 范围：实时展开所选文件夹（含子文件夹）→ 动态反映内容变化。
-            # 未指定文件夹 或 文件夹下无材料 → 不检索（避免 where=None 误检索整个知识库）
-            folder_mids = _folder_to_material_ids(db, req.folder_ids) if req.folder_ids else []
-            hits = [] if not folder_mids else search_svc.search(
-                search_q, db, kinds=kinds, where={"material_id": {"$in": folder_mids}})
-        else:
-            hits = search_svc.search(search_q, db, kinds=kinds, where=where)
+        def _do_search(q: str) -> list[dict]:
+            if req.scope == "folder":
+                # folder 范围：实时展开所选文件夹（含子文件夹）→ 动态反映内容变化。
+                # 未指定文件夹 或 文件夹下无材料 → 不检索（避免 where=None 误检索整个知识库）
+                folder_mids = _folder_to_material_ids(db, req.folder_ids) if req.folder_ids else []
+                return [] if not folder_mids else search_svc.search(
+                    q, db, kinds=kinds, where={"material_id": {"$in": folder_mids}})
+            return search_svc.search(q, db, kinds=kinds, where=where)
+
+        def _app_lock(hs: list[dict]) -> list[dict]:
+            # 炼丹炉：检索锁双保险（R1，2026-10-27 实证）——实体图谱召回路不吃 where、
+            # 且 from_entity 免阈值：真实库下「明天天气」都能捞出库外笔记进 sources。
+            # 双保险必须落在 chat 装配点（不是只在 search_locked 里）。
+            if app is None:
+                return hs
+            _allow = set(app_mids)
+            return [h for h in hs if h.get("material_id") in _allow]
 
         # 材料级保送（P12）：枚举意图标题命中的材料，其有货块保送进候选——
         # chunk 级自由竞争下标题命中的材料没有加权通道，有货块会被「密度块」挤出 top-3。
-        # ⚠️ 必须放在队首：filtered 保持 hits 顺序，sources/prompt 只取前 3，追加在队尾等于没保送。
-        if enum_material_ids:
+        # ⚠️ 必须放在队首：filtered 保持 hits 顺序，sources/prompt 只取前 N，追加在队尾等于没保送。
+        # 编排下沉（2026-10-28 二轮）：补强逻辑收编为闭包，由 retrieve() 在过滤前调用。
+        def _augment(hs: list[dict]) -> list[dict]:
+            if not enum_material_ids:
+                return hs
             boosted = search_svc.search(search_q, db, kinds=("chunk",),
                                         where={"material_id": {"$in": enum_material_ids}})
-            seen_mids, have = set(), {(h["ref_type"], h["ref_id"]) for h in hits}
+            seen_mids, have = set(), {(h["ref_type"], h["ref_id"]) for h in hs}
             boost_hits = []
             for h in boosted:
                 if h["material_id"] in seen_mids or _is_fragment(h["text"]):
@@ -612,7 +681,7 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
                 boost_hits.append(h)
                 if len(seen_mids) >= 3:   # 保送上限 3 份，避免压制语义召回
                     break
-            hits = boost_hits + hits
+            return boost_hits + hs
 
         # 指定单份资料时：若该资料已有脉络摘要产物，作为最高优先级上下文注入——
         # 「这篇讲了什么」类泛化提问用摘要比向量碎片更准
@@ -635,26 +704,41 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
                     "metadata": {"material_title": m.title, "page_no": None},
                     "score": 9.9,
                 }
-        # 用户显式指定了资料/笔记 = 强意图：不做任何分数过滤（向量分可为负，阈值滤会误杀），
-        # 指定内容必被引用；未指定时才用阈值过滤，避免无关内容注入
-        _threshold = float(settings_store.load().get("kb_hit_threshold", settings.kb_hit_threshold))
-        # 阈值过滤：全文精确命中（关键词命中即相关）或实体命中（命中了实体名）或
-        # 向量分达标者保留；指定条目仍不过滤（强意图必引用）。
-        # 实体命中即相关：question 直接匹配到实体名，等价于「精确关联」，不该被向量阈值误杀。
-        if specified:
-            filtered = hits
-        else:
-            filtered = [h for h in hits
-                        if h.get("from_fts") or h.get("from_entity") or h.get("from_title")
-                        or (h.get("vec_score") or 0.0) >= _threshold]
+        # 阈值过滤判据（注入 retrieve 复用，改写路与主路同一判据）：全文精确命中
+        # （关键词命中即相关）或实体命中（命中了实体名，等价于「精确关联」）或向量分达标者保留。
+        # conf 只读一次：阈值与两个检索增强开关同源，避免多次 load 读到不一致快照。
+        _conf = settings_store.load()
+        _threshold = float(_conf.get("kb_hit_threshold", settings.kb_hit_threshold))
+
+        def _threshold_filter(hs: list[dict]) -> list[dict]:
+            f = [h for h in hs
+                 if h.get("from_fts") or h.get("from_entity") or h.get("from_title")
+                 or (h.get("vec_score") or 0.0) >= _threshold]
             # 碎片块过滤（P0-3）：<50 字的标签行/标题行挤出有内容块；全部被剔则保留原结果（防空）
-            solid = [h for h in filtered if not _is_fragment(h["text"])]
-            if solid:
-                filtered = solid
+            solid = [h for h in f if not _is_fragment(h["text"])]
+            return solid if solid else f
+
+        # 编排下沉（2026-10-28 二轮）：计划/检索/锁/补强/过滤/改写重检的装配在
+        # retrieval_agent.retrieve()，本层只注入判据闭包与开关——
+        # specified 强意图 = 恒等过滤 + 禁改写（指定内容必被引用，向量分可为负，阈值滤会误杀）；
+        # 开关口径「仅显式 False 才关」（conf 缺省值是 ""，按 falsy 判会把默认当成关）。
+        res = retrieval_agent_svc.retrieve(
+            question, search_q,
+            do_search=_do_search, lock=_app_lock,
+            quality_filter=(lambda hs: hs) if specified else _threshold_filter,
+            augment=_augment,
+            can_plan=(plan is not None and plan.intent == "content"
+                      and _conf.get("retrieval_plan_enabled") is not False),
+            can_rewrite=(not specified and req.mode in ("auto", "kb")
+                         and _conf.get("query_rewrite_enabled") is not False),
+            top_k=settings.kb_top_k)
+        retrieval_meta.update(res["meta"])
+        inject_limit = res["inject_limit"]
+        filtered = res["filtered"]
         if summary_hit:
             filtered = [summary_hit] + filtered
         kb_hit = bool(filtered)
-        sources = _hits_to_sources(filtered)
+        sources = _hits_to_sources(filtered, limit=inject_limit)
 
     # 历史上下文（P5）：条数护栏 + token 预算，详见 _build_history
     history, history_meta = _build_history(db, session.id, before_id=user_msg.id)
@@ -664,8 +748,31 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
     # 前端据此区分「徽章：通用回答」与「灰条：未找到」；旧数据为空串，按 kb_hit 回落。
     answer_kind = ""
 
-    if meta_text:
-        # 统计/概览：注入数据库实时结果，LLM 只负责组织语言（prompt_kb_meta）
+    # 找内容（2026-10-26）：跨「材料 / 笔记 / AI 视频 / AI 讲书」的资源目录检索。
+    # ⚠️ 只对 discover 意图跑：普通问答不需要卡片区，跑了只会往回答里塞无关资源。
+    is_discover = bool(plan and plan.intent == "discover") and req.mode != "general"
+    discover_res = discover_svc.search(db, question, limit=6) if is_discover else []
+
+    if is_discover:
+        # 找内容：库内资源优先；库外推荐必须标注「未在资料库中」（prompt_discover）。
+        # 口径单列：discover 有资源 / discover_miss 无资源 —— 复用它俩会让前端
+        # 的「知识库中未找到」灰条挂在一条明明给了建议的回答上，像是失败。
+        kb_hit = bool(discover_res)
+        answer_kind = "discover" if discover_res else "discover_miss"
+        sources = []          # 资源卡片走 resources 字段，不计入「引用 N 条」
+        res_text = ""
+        if discover_res:
+            lines = ["【库内相关资源】（以下在用户自己的资料库里，界面会渲染成卡片）"]
+            for _r in discover_res:
+                _meta = (" · " + _r["meta"]) if _r.get("meta") else ""
+                lines.append("- [%s] %s%s" % (_r["badge"], _r["title"], _meta))
+            res_text = "\n".join(lines) + "\n\n"
+        messages = [
+            {"role": "system", "content": llm.get_prompt("prompt_discover")},
+            *history,
+            {"role": "user", "content": res_text + "【用户问题】" + question},
+        ]
+    elif meta_text:        # 统计/概览：注入数据库实时结果，LLM 只负责组织语言（prompt_kb_meta）
         answer_kind = "kb"
         messages = [
             {"role": "system", "content": llm.get_prompt("prompt_kb_meta")},
@@ -677,7 +784,7 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
         # 块位置语境（P0-3）：告诉 LLM「这是全文的第几块/共几块」，
         # 避免把一块碎片当成材料全貌，如实答出「没有正文」
         from ..models import MaterialChunk
-        mids = {h["material_id"] for h in filtered[:3] if h.get("material_id")}
+        mids = {h["material_id"] for h in filtered[:inject_limit] if h.get("material_id")}
         totals = {}
         if mids:
             totals = dict(db.query(MaterialChunk.material_id, func.count(MaterialChunk.id))
@@ -691,7 +798,7 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
             return h["metadata"].get("note_title") or t or "未知来源"
         mapped = [{"title": _disp_title(h),
                    "page_no": h["metadata"].get("page_no"), "text": h["text"],
-                   "total_chunks": totals.get(h.get("material_id"))} for h in filtered[:3]]
+                   "total_chunks": totals.get(h.get("material_id"))} for h in filtered[:inject_limit]]
         extra = f"【标题匹配的材料清单】\n{enum_extra}\n\n" if enum_extra else ""
         messages = llm.build_kb_qa_prompt(question, mapped, extra=extra)
         # 历史插在 system 之后
@@ -720,11 +827,22 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
         elif req.mode == "kb":
             # 知识库档未命中：如实告知 + 给引导，**不**滑向通用兜底（2026-10-25 用户拍板）
             answer_kind = "kb_miss"
-            messages = [
-                {"role": "system", "content": llm.get_prompt("prompt_kb_miss")},
-                *history,
-                {"role": "user", "content": question},
-            ]
+            if app is not None:
+                # 应用未命中（R2）：口径来自应用自身，不用通用 prompt_kb_miss ——
+                # 拒答话术是 IP 人格的一部分；通用提示词的口径会盖过 miss_text（探针 S2 实证）。
+                sys_miss = ("你是「" + app.name + "」。资料中未命中相关内容。"
+                            "请严格按你的未命中口径如实拒答，不得硬答、不得动用通用知识。")
+                messages = [
+                    {"role": "system", "content": sys_miss},
+                    *history,
+                    {"role": "user", "content": question},
+                ]
+            else:
+                messages = [
+                    {"role": "system", "content": llm.get_prompt("prompt_kb_miss")},
+                    *history,
+                    {"role": "user", "content": question},
+                ]
         else:
             answer_kind = "general_fallback"
             messages = [
@@ -732,6 +850,11 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
                 *history,
                 {"role": "user", "content": question},
             ]
+
+    # ---- 炼丹炉：人格与边界注入（追加到 system 尾部，与技能注入同构；纯字符串拼接禁 format） ----
+    # 各装配路径首元素均为 system（含 build_kb_qa_prompt / kb_miss 分支），追加式全覆盖。
+    if app is not None:
+        messages[0]["content"] = messages[0]["content"] + "\n\n" + apps_svc.build_injection(app)
 
     # ---- P1：技能注入。只追加 system 正文，不新增消息、不改消息结构 ----
     # 四条装配路径的首元素都是 system（3 处 list 字面量 + build_kb_qa_prompt），
@@ -766,6 +889,7 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
         tool_first = bool(getattr(_sk, "tool_first", False))
 
     session_id = session.id
+    sess_app_id = session.app_id              # 炼丹炉：随消息冗余落库（查询免 join）
 
     async def gen():
         """async 生成器（P1-2）：同步 LLM 迭代经 to_thread 下放线程，每 chunk 后检查断连。
@@ -788,7 +912,7 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
         #    变成 gen 的局部变量，前面那次读取直接 UnboundLocalError（所有问答 500）。
         hit_extra = False
         cur_msgs = messages
-        yield f"event: sources\ndata: {json.dumps({'session_id': session_id, 'user_message_id': user_msg.id, 'kb_hit': kb_hit, 'answer_kind': answer_kind, 'sources': sources, 'skill': skill_used, 'history': history_meta}, ensure_ascii=False)}\n\n"
+        yield f"event: sources\ndata: {json.dumps({'session_id': session_id, 'user_message_id': user_msg.id, 'kb_hit': kb_hit, 'answer_kind': answer_kind, 'sources': sources, 'resources': discover_res, 'skill': skill_used, 'history': history_meta, 'retrieval': retrieval_meta}, ensure_ascii=False)}\n\n"
         sentinel = object()
         # 工具补充来源的去重键。必须**在 sources 事件之后**定格：
         # 事件里那 3 条已经发给前端了，工具再读到同一段时不能重复追加。
@@ -819,7 +943,8 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
                                  reasoning=reasoning,
                                  sources=sources, suggestions=[], error=err,
                                  kb_hit=(kb_hit or hit_extra), answer_kind=_final_kind(),
-                                 tool_steps=tools_log)
+                                 tool_steps=tools_log, resources=discover_res,
+                                 app_id=sess_app_id)
                 dbx.add(mm)
                 dbx.commit()
                 saved = True
@@ -1009,8 +1134,8 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
                 m = ChatMessage(session_id=session_id, role="assistant", content=full,
                                 reasoning=reasoning,
                                 kb_hit=(kb_hit or hit_extra), answer_kind=_final_kind(), sources=sources,
-                                suggestions=[], tool_steps=tools_log,
-                                error=err_msg)
+                                suggestions=[], tool_steps=tools_log, resources=discover_res,
+                                error=err_msg, app_id=sess_app_id)
                 db2.add(m)
                 db2.commit()
                 db2.refresh(m)
@@ -1027,7 +1152,8 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
             m = ChatMessage(session_id=session_id, role="assistant", content=full,
                             reasoning=reasoning,
                             kb_hit=(kb_hit or hit_extra), answer_kind=_final_kind(), sources=sources,
-                            suggestions=[], tool_steps=tools_log)
+                            suggestions=[], tool_steps=tools_log, resources=discover_res,
+                            app_id=sess_app_id)
             db2.add(m)
             db2.commit()
             db2.refresh(m)
@@ -1036,7 +1162,8 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
         finally:
             db2.close()
         # 再生成 3 个相关问题（问答内容驱动，失败不阻塞；生成后回写已落库的消息）
-        suggestions = llm.generate_suggestions(question, full)
+        # 应用的追问建议开关（suggest_on，2026-10-27）：关了就不产；主问答行为不变。
+        suggestions = [] if (app is not None and not app.suggest_on) else llm.generate_suggestions(question, full)
         if suggestions:
             db3 = SessionLocal()
             try:

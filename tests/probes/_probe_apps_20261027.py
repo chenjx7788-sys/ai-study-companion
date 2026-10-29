@@ -232,9 +232,13 @@ try:
     report("G1 同值改写不留档", st == 200 and vs == [], f"count={len(vs)}")
     http_json("PATCH", f"/apps/{VID}", {"persona": "第二版：更克制"})
     st, vs = http_json("GET", f"/apps/{VID}/versions")
+    # ⚠️ 2026-10-30（O2）：版本列表不再下发全量 snapshot（每条含整段人格，前端从未使用）。
+    #    判据从「payload 里有 snapshot.persona」改成「快照里的旧值能被头部字段反映出来」，
+    #    回滚真的恢复旧人格由 G4 端到端兜住 —— 只验字段存在反而更弱。
     report("G2 实质修改留 v1（快照为旧值）",
-           len(vs) == 1 and vs[0]["version"] == 1 and vs[0]["snapshot"].get("persona") == "第一版人格",
-           f"count={len(vs)} snap={str((vs[0].get('snapshot') or {}).get('persona'))[:12] if vs else None}")
+           len(vs) == 1 and vs[0]["version"] == 1 and vs[0].get("persona_head") == "第一版人格"
+           and "snapshot" not in vs[0],
+           f"count={len(vs)} persona_head={str((vs[0].get('persona_head')))[:12] if vs else None}")
     http_json("PATCH", f"/apps/{VID}", {"persona": "第三版：更活泼"})
     st, vs = http_json("GET", f"/apps/{VID}/versions")
     report("G3 再改留 v2", len(vs) == 2 and vs[0]["version"] == 2, f"count={len(vs)}")

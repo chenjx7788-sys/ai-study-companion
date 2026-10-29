@@ -86,7 +86,27 @@ def _rerank(hits: list[dict], note_weight: float = NOTE_WEIGHT) -> list[dict]:
     return selected
 
 
-def _entity_hits(db, query: str, kinds=("chunk", "note"), limit: int = 8) -> list[dict]:
+def _where_material_ids(where: dict | None) -> set[int] | None:
+    """从检索 where 解析 material_id 白名单；无约束返回 None（不过滤）。"""
+    if not where:
+        return None
+    v = where.get("material_id")
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        ids = v.get("$in") or []
+    elif isinstance(v, (list, tuple, set)):
+        ids = list(v)
+    else:
+        ids = [v]
+    try:
+        return {int(x) for x in ids}
+    except (TypeError, ValueError):
+        return None
+
+
+def _entity_hits(db, query: str, kinds=("chunk", "note"), limit: int = 8,
+                 where: dict | None = None) -> list[dict]:
     """知识图谱召回：问题命中实体 → 扩展召回该实体关联的块/笔记。
 
     这是「轻量实体索引」的唯一检索用途——不做关系多跳、不做图谱可视化，
@@ -106,6 +126,12 @@ def _entity_hits(db, query: str, kinds=("chunk", "note"), limit: int = 8) -> lis
     if not ref_types:
         return []
 
+    # 2026-10-27 P1 根治：实体召回路与 vector/fts 同口径吃 where——
+    # 此前 where 被丢弃，应用语境下库外笔记经实体路直接进入回答（炼丹炉 P0 实证翻车，
+    # 当时只能在 apps.py 事后过滤兜底）。过滤点放在「引用落点」EntityRef.material_id，
+    # 实体名匹配仍全表扫（同名实体可跨材料存在，名字匹配不该受材料限制）。
+    allow_ids = _where_material_ids(where)
+
     # 命中的实体名（任一关键词是实体名的子串，或实体名是关键词的子串）
     entity_rows = db.query(Entity).all()
     matched_names: set[str] = set()
@@ -120,9 +146,12 @@ def _entity_hits(db, query: str, kinds=("chunk", "note"), limit: int = 8) -> lis
     if not matched_names:
         return []
 
-    refs = (db.query(EntityRef).filter(
+    q = (db.query(EntityRef).filter(
         EntityRef.ref_type.in_(ref_types),
-        EntityRef.entity.in_(matched_names)).all())
+        EntityRef.entity.in_(matched_names)))
+    if allow_ids is not None:
+        q = q.filter(EntityRef.material_id.in_(allow_ids))
+    refs = q.all()
 
     hits = []
     seen: set[tuple[str, int]] = set()
@@ -155,6 +184,9 @@ def _entity_hits(db, query: str, kinds=("chunk", "note"), limit: int = 8) -> lis
                         "note_title": n.title, "material_title": title,
                         "page_no": (n.anchor or {}).get("page_no", 0)}
         if not text:
+            continue
+        # 解析后再校验一次：ref.material_id 是写入时的快照，真实对象的归属才是权威
+        if allow_ids is not None and material_id not in allow_ids:
             continue
         hits.append({
             "ref_type": ref.ref_type,
@@ -205,9 +237,10 @@ def search(query: str, db, kinds=("chunk", "note"), where: dict | None = None,
         h["fts_score"] = h["score"]
 
     # 第三路：知识图谱实体召回（命中实体 → 扩展关联块）。失败/无实体时为空，不影响主链路。
+    # 2026-10-27 P1：where 同口径传入（根治应用语境的库外泄漏）
     ent: list[dict] = []
     try:
-        ent = _entity_hits(db, query, kinds=kinds, limit=top_k)
+        ent = _entity_hits(db, query, kinds=kinds, limit=top_k, where=where)
     except Exception:
         ent = []
 
@@ -218,3 +251,21 @@ def search(query: str, db, kinds=("chunk", "note"), where: dict | None = None,
     for h in merged:
         h.pop("_rel", None)  # 清理重排中间量，仅内部使用
     return merged[:top_k]
+
+
+
+def is_fragment(text: str) -> bool:
+    """零信息量碎片块（2026-10-30 从 routers/chat.py 上收，判定只留这一份）。
+
+    标签行/标题行这类 <50 字的小块，关键词密度高反而免阈值直进 top-3，把有内容的块挤出去；
+    表格行（含 |）与列表项豁免 —— 短但有结构信息。
+    ⚠️ 为什么上收：炼丹炉试聊要与正式对话**同口径**过滤，两处各写一份必然漂移。
+    """
+    t = (text or "").strip()
+    if len(t) >= 50:
+        return False
+    if "|" in t:
+        return False
+    if t.startswith(("- ", "* ", "·", "1.")):
+        return False
+    return True

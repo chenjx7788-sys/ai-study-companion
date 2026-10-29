@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from ..core.config import settings
 from ..models import App, AppMaterial, AppVersion, Material, MaterialChunk, AIAsset, ChatSession, ChatMessage
 from . import llm
+from . import retrieval_agent as retrieval_agent_svc
 from . import search as search_svc
 from . import settings_store
 
@@ -96,6 +97,32 @@ def app_to_dict(app: App, db: Session) -> dict:
         "created_at": app.created_at.isoformat() if app.created_at else None,
         "updated_at": app.updated_at.isoformat() if app.updated_at else None,
     }
+
+
+def list_apps_slim(db: Session) -> list[dict]:
+    """列表卡片专用投影（2026-10-30，O1）。
+
+    原来 GET /apps 对每个应用调 app_to_dict：绑定的 material_ids、材料详情、会话 count 各一次，
+    N 个应用 3N 次查询，且把整段人格（上限 4000 字）下发 —— 卡片实际只显示 46 字。
+    现在绑定数/会话数各一次 group by 算完，人格只回前 300 字（字段名改为 persona_head，
+    避免「同名不同义」）；需要全文请走 GET /apps/{id}。
+    """
+    from sqlalchemy import func
+    bind = dict(db.query(AppMaterial.app_id, func.count())
+                .group_by(AppMaterial.app_id).all())
+    sess = dict(db.query(ChatSession.app_id, func.count())
+                .filter(ChatSession.app_id.isnot(None))
+                .group_by(ChatSession.app_id).all())
+    rows = db.query(App).order_by(App.updated_at.desc(), App.id.desc()).all()
+    return [{
+        "id": a.id, "name": a.name, "spirit": a.spirit or "book",
+        "persona_head": (a.persona or "")[:300],
+        "status": a.status or "active",
+        "material_count": int(bind.get(a.id, 0)),
+        "session_count": int(sess.get(a.id, 0)),
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+        "updated_at": a.updated_at.isoformat() if a.updated_at else None,
+    } for a in rows]
 
 
 def check_materials_ready(db: Session, ids: list[int]) -> list[Material]:
@@ -359,6 +386,48 @@ def normalize_preview_history(history) -> list[dict]:
     return out
 
 
+def _preview_retrieve(db: Session, ids: list[int], query: str) -> list[dict]:
+    """试聊检索（2026-10-30，O7）：复用正式对话的 retrieve() 编排，只把语料宇宙锁到绑定资料。
+
+    为什么必须复用：预览原来直接 search_locked + filter_hits —— 没有改写重检、没有碎片过滤、
+    没有计划模式的注入上限，于是同一个问题会「试聊拒答、正式对话答得出」（也可能反过来），
+    用户会误判成「人格/边界配错了」。现在两侧同一套判据，差异只剩「锁范围」这一项业务语义。
+
+    口径说明：
+    - 范围锁仍是双保险（retrieve 的 lock 闭包）：实体图谱召回路不吃 where。
+    - 开关口径沿用正式侧「仅显式 False 才关」（conf 缺省是 ""，按 falsy 判会把默认当成关）。
+    - 预览不做 specified 强意图的恒等过滤：应用没有「指定单份必引用」语义。
+    """
+    conf = settings_store.load()
+    try:
+        th = float(conf.get("kb_hit_threshold", settings.kb_hit_threshold))
+    except Exception:
+        th = settings.kb_hit_threshold
+    allow = set(ids)
+
+    def _do_search(q: str) -> list[dict]:
+        return search_svc.search(q, db, kinds=("chunk", "note"),
+                                 where={"material_id": {"$in": ids}}, top_k=5)
+
+    def _lock(hs: list[dict]) -> list[dict]:
+        return [h for h in hs if h.get("material_id") in allow]
+
+    def _quality(hs: list[dict]) -> list[dict]:
+        f = [h for h in hs
+             if h.get("from_fts") or h.get("from_entity") or h.get("from_title")
+             or (h.get("vec_score") or 0.0) >= th]
+        solid = [h for h in f if not search_svc.is_fragment(h.get("text") or "")]
+        return solid if solid else f
+
+    res = retrieval_agent_svc.retrieve(
+        query, query,
+        do_search=_do_search, lock=_lock, quality_filter=_quality, augment=None,
+        can_plan=conf.get("retrieval_plan_enabled") is not False,
+        can_rewrite=conf.get("query_rewrite_enabled") is not False,
+        top_k=5)
+    return res["filtered"][:res["inject_limit"]]
+
+
 def build_preview_messages(db: Session, cfg: dict, question: str,
                            history=None) -> tuple[list[dict], bool]:
     """返回 (messages, kb_hit)。与正式对话同语义：检索锁 + 人格注入 + 未命中口径。
@@ -372,7 +441,7 @@ def build_preview_messages(db: Session, cfg: dict, question: str,
         raise HTTPException(400, "试聊至少绑定 1 份资料")
     check_materials_ready(db, ids)
     hist = normalize_preview_history(history)
-    hits = filter_hits(search_locked(question, db, ids, top_k=5))
+    hits = _preview_retrieve(db, ids, question)
     # 追问兜底（2026-10-29）：多轮里「它多长」「那第二条呢」这类依赖上文的问法，
     # 按当前问题单独检索必然 miss，紧接着会被判成 kb_miss → 按未命中口径拒答，
     # 多轮等于没用（还更糟：用户以为能追问，实际被判「不在资料范围」）。
@@ -382,7 +451,7 @@ def build_preview_messages(db: Session, cfg: dict, question: str,
         last_user = next((m["content"] for m in reversed(hist) if m["role"] == "user"), "")
         if last_user:
             merged = f"{last_user} {question}"[:300]
-            hits = filter_hits(search_locked(merged, db, ids, top_k=5))
+            hits = _preview_retrieve(db, ids, merged)
     pseudo = App(name=cfg.get("name") or "未命名应用", persona=cfg.get("persona") or "",
                  boundaries=cfg.get("boundaries") or "", miss_text=cfg.get("miss_text") or "")
     system = build_injection(pseudo)
@@ -416,6 +485,10 @@ def _snapshot_of(app: App) -> dict:
     return {k: getattr(app, k) for k in TRACKED_FIELDS}
 
 
+# 版本留档上限（O6）：最近 N 条 + 最早的 1 条
+VERSION_KEEP = 30
+
+
 def maybe_snapshot(db: Session, app: App, incoming: dict, note: str = "") -> int:
     """incoming = 即将应用的新值（仅含本次要改的追踪字段）。
     与现值逐一比对，有实际差异才把**旧值**整体存为一个版本；返回新版本号或 0（未快照）。
@@ -433,15 +506,26 @@ def maybe_snapshot(db: Session, app: App, incoming: dict, note: str = "") -> int
            .order_by(AppVersion.version.desc()).first())
     nxt = (ver.version if ver else 0) + 1
     db.add(AppVersion(app_id=app.id, version=nxt, snapshot=_snapshot_of(app), note=note))
+    # O6（2026-10-30）：长跑应用每次实质修改留一条，会堆到几百条且面板不分页
+    # → 只留最近 30 条 + 最早的 1 条（最早那条通常是初始配置，回滚锚点）。
+    db.flush()
+    olds = (db.query(AppVersion).filter(AppVersion.app_id == app.id)
+            .order_by(AppVersion.version.desc()).all())
+    if len(olds) > VERSION_KEEP + 1:
+        keep = {v.id for v in olds[:VERSION_KEEP]} | {olds[-1].id}
+        for v in olds:
+            if v.id not in keep:
+                db.delete(v)
     return nxt
 
 
 def list_versions(db: Session, app_id: int) -> list[dict]:
     rows = (db.query(AppVersion).filter(AppVersion.app_id == app_id)
             .order_by(AppVersion.version.desc()).all())
+    # O2（2026-10-30）：不再下发全量 snapshot —— 每条含整段人格（上限 4000 字），
+    # 前端只用 persona_head / note / version / created_at，回滚按 id 走，正文根本不需要。
     return [{"id": r.id, "version": r.version, "note": r.note or "",
              "persona_head": str((r.snapshot or {}).get("persona") or "")[:40],
-             "snapshot": r.snapshot or {},
              "created_at": r.created_at.isoformat() if r.created_at else None}
             for r in rows]
 
@@ -466,22 +550,42 @@ def restore_version(db: Session, app: App, version_id: int) -> App:
 # ---------- 应用空间·用量（P2）：全部现算，不建冗余表 ----------
 
 def app_stats(db: Session, app_id: int) -> dict:
+    from datetime import date, datetime, time, timedelta
     from sqlalchemy import func
     sess_count = db.query(ChatSession).filter(ChatSession.app_id == app_id).count()
     q_count = (db.query(ChatMessage)
                .filter(ChatMessage.app_id == app_id, ChatMessage.role == "user").count())
-    ans = (db.query(ChatMessage)
-           .filter(ChatMessage.app_id == app_id, ChatMessage.role == "assistant").all())
-    hits = sum(1 for m in ans if m.kb_hit)
-    miss = sum(1 for m in ans if not m.kb_hit)
+    # O3（2026-10-30）：原来把该应用所有助手消息 .all() 读进内存再 Python 计数，
+    # 消息一多就是纯浪费；改成 SQL 聚合。
+    # 口径（看板命中率，2026-10-30）：分母只算「真的给出了回答」的助手消息 ——
+    # 报错/中断（error 非空）与空内容不是「资料没命中」，计进分母会把命中率系统性拉低，
+    # 且用户看到的数字无法解释。被排除的条数单独回 failed_count，面板可解释。
+    from sqlalchemy import and_, or_
+    answered = and_(
+        ChatMessage.role == "assistant",
+        ChatMessage.content.isnot(None),
+        ChatMessage.content != "",
+        or_(ChatMessage.error.is_(None), ChatMessage.error == ""),
+    )
+    hits = int((db.query(func.count(ChatMessage.id))
+                .filter(ChatMessage.app_id == app_id, answered,
+                        ChatMessage.kb_hit.is_(True)).scalar()) or 0)
+    valid = int((db.query(func.count(ChatMessage.id))
+                 .filter(ChatMessage.app_id == app_id, answered).scalar()) or 0)
+    miss = valid - hits
+    all_ans = int((db.query(func.count(ChatMessage.id))
+                   .filter(ChatMessage.app_id == app_id,
+                           ChatMessage.role == "assistant").scalar()) or 0)
+    failed = all_ans - valid
     last = (db.query(ChatSession).filter(ChatSession.app_id == app_id)
             .order_by(ChatSession.updated_at.desc()).first())
-    # 近 7 天提问趋势（按自然日）
+    # 近 7 天提问趋势（按自然日；O3：加时间过滤，别把全表都 group 一遍）
+    since = datetime.combine(date.today() - timedelta(days=6), time.min)
     rows = (db.query(func.date(ChatMessage.created_at), func.count())
-            .filter(ChatMessage.app_id == app_id, ChatMessage.role == "user")
+            .filter(ChatMessage.app_id == app_id, ChatMessage.role == "user",
+                    ChatMessage.created_at >= since)
             .group_by(func.date(ChatMessage.created_at)).all())
     by_day = {str(d): c for d, c in rows}
-    from datetime import date, timedelta
     daily = []
     today = date.today()
     for i in range(6, -1, -1):
@@ -489,7 +593,8 @@ def app_stats(db: Session, app_id: int) -> dict:
         daily.append({"date": d[5:], "count": int(by_day.get(d, 0))})
     return {"session_count": sess_count, "question_count": q_count,
             "hit_count": hits, "miss_count": miss,
-            "hit_rate": round(hits / (hits + miss), 2) if (hits + miss) else None,
+            "answered_count": valid, "failed_count": failed,
+            "hit_rate": round(hits / valid, 2) if valid else None,
             "last_active": last.updated_at.isoformat() if last and last.updated_at else None,
             "daily": daily}
 
