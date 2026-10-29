@@ -87,3 +87,7 @@ frontend/dist__fixed_tmp/
 frontend/dist_stash_*/
 frontend/dist_tmp_*/
 _tocfollow_*/
+# 构建产物目录（dist_check_* / dist_bak* / dist_build_* 等，2026-10-30 补）
+frontend/dist_*/
+# 仓库内的临时备份副本（真正的备份放工作区根目录）
+frontend/src/_bak_*
