@@ -36,7 +36,7 @@ def ok(name, cond, detail=""):
 print("========== A. build_injection ==========")
 
 ALL = {s.id: s for s in skills_svc.load_all()["skills"]}
-ok("A0 三个技能已加载", set(ALL) >= {"term_translate", "argue_check", "law_compare"}, sorted(ALL))
+ok("A0 基础三个技能在新增内置后仍加载", set(ALL) >= {"term_translate", "argue_check", "law_compare"}, sorted(ALL))
 
 tt = ALL["term_translate"]
 inj = skills_svc.build_injection(tt)
@@ -58,7 +58,8 @@ ok("A6 真的不抛 KeyError（format 会炸）", True)
 
 law = ALL["law_compare"]
 linj = skills_svc.build_injection(law)
-ok("A7 law_compare 的 {count} 在注入结果里原样保留", "{count}" in linj)
+ok("A7 law_compare 不再保留死占位符，片段顺序要求仍在",
+   "{count}" not in linj and "按材料片段顺序摘" in linj, linj[:180])
 
 # ================================================================ D. 静态结构
 print("\n========== D. 静态结构 ==========")
@@ -148,7 +149,8 @@ ok("B10 sources.skill 回传实际启用的技能",
 
 r3, ev3, msg3 = ask("law_compare")
 body3 = msg3[0]["content"]
-ok("B11 law_compare：system 里 {count} 原样保留", "{count}" in body3)
+ok("B11 law_compare：system 不含死占位符，且片段顺序要求注入",
+   "{count}" not in body3 and "按材料片段顺序摘" in body3, body3[:180])
 ok("B12 law_compare：正文没被吞（含「法条」）", "法条" in body3)
 
 r4, ev4, msg4 = ask("no_such_skill")

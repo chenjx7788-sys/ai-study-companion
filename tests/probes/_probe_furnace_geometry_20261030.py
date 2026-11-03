@@ -14,6 +14,9 @@
   2. 「吸顶生效」这类判据必须配负向自检（把 position 改成 static，同一条判据必须判红），
      否则「元素碰巧在视口里」也会 PASS。
   3. 输入法回车必须双向验：组词回车不发送 + 普通回车确实发送（只验前者时，钩子根本没接也能过）。
+  4. 配置页 2026-10-30 起为三 tab 结构（当日起默认落第一顺位「人格」tab）：凡操作人格表单/试聊
+     可直接测；面板是 v-if 互斥，未激活面板的选择器直接不存在。
+     吸顶 G5/G6 也必须在人格 tab 下测 —— 资料绑定 tab 太短，页面滚不动，负向自检会假绿。
 """
 import json
 import sys
@@ -105,6 +108,25 @@ def main():
             browser.close()
             return summarize()
 
+        # ---------- T1/T2 页级 tab（2026-10-30 三 tab 改版）----------
+        tabs = pg.query_selector_all(".fe-tab")
+        report("T1 三个页级 tab 渲染", len(tabs) == 3, f"tab 数={len(tabs)}")
+        report("T2a 默认落「人格」（试聊已挂载、资料面板未挂载）",
+               pg.query_selector(".pv-bar") is not None and pg.query_selector(".mat-grid") is None,
+               f"pv-bar 存在={pg.query_selector('.pv-bar') is not None} "
+               f"mat-grid 存在={pg.query_selector('.mat-grid') is not None}")
+        pg.click(".fe-tab:has-text('数据看板')")
+        pg.wait_for_timeout(300)
+        stats_no_pv = pg.query_selector(".pv-bar") is None
+        pg.click(".fe-tab:has-text('人格')")
+        pg.wait_for_timeout(300)
+        persona_has_pv = pg.query_selector(".pv-bar") is not None
+        report("T2b 切 tab 面板互斥（看板无试聊、人格有试聊）",
+               stats_no_pv and persona_has_pv,
+               f"看板时 pv-bar 存在={not stats_no_pv} 人格时 pv-bar 存在={persona_has_pv}")
+        report("T2c 切 tab 同步 URL 深链", "tab=persona" in pg.url,
+               f"url 尾={pg.url.split('?')[-1][:40]!r}")
+
         # G7 横向溢出（先测，避免后面滚动影响）
         sw, cw = pg.evaluate("() => { const m = document.querySelector('.app-main');"
                              " return [m.scrollWidth, m.clientWidth]; }")
@@ -153,16 +175,22 @@ def main():
         except Exception as e:
             report("G8 未保存离开被拦（选继续编辑则留在原页）", False, f"未出现确认框：{e}")
 
-        # G9 换配色不落库（本地生效 → 计入 dirty；后端未变）
+        # G9 换气质不落库（本地生效 → 计入 dirty；后端未变）
+        # ⚠️ 2026-10-30 形象位图化后「换一身配色」已下线，本测改验「换气质同样只改表单」。
+        #    目标气质必须避开当前装饰（点已选中的不会变脏）。
         pg.reload(wait_until="domcontentloaded")
         pg.wait_for_selector(".fhead h2", timeout=30000)
         pg.wait_for_timeout(400)
+        pg.click(".fe-tab:has-text('人格')")   # reload 后回到默认 tab；点击幂等（已在其上则空操作）
+        pg.wait_for_timeout(300)
         had_pill = pg.query_selector(".dirty-pill") is not None
-        pg.click("button:has-text('换一身配色')")
+        cur_deco = (before_spirit or '').split(':')[1] if (before_spirit or '').startswith('g:') else (before_spirit or 'book')
+        target = '启明丹灵' if cur_deco != 'star' else '元气丹灵'
+        pg.click(f".spirit-opt:has-text('{target}')")
         pg.wait_for_timeout(300)
         pill2 = pg.query_selector(".dirty-pill")
         after_spirit = api_get(f"/api/apps/{APP_ID}").get("spirit")
-        report("G9 换配色只在本地生效（不即时落库）",
+        report("G9 换气质只在本地生效（不即时落库）",
                (not had_pill) and bool(pill2) and after_spirit == before_spirit,
                f"改前脏={had_pill} 改后脏={bool(pill2)} 后端 spirit 变化={after_spirit != before_spirit}")
 

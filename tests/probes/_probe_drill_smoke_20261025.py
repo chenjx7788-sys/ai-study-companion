@@ -151,6 +151,21 @@ try:
     code, r = http("POST", "/drill/asr", body=None)  # 无文件 → 422
     report("D8 asr 无文件 → 422/400", code in (400, 422), f"code={code}")
 
+    # D8b 单题重答端点（打磨 P5，2026-11-02）：不存在的场次 → 404
+    # ⚠️ 判据用 404 而不是「非 500」：路由没注册时静态挂载会返回 **405**，
+    #    那也算「不是 500」，会假绿。
+    code, r = http("POST", "/drill/sessions/999999/retry/stream",
+                   {"seq": 1, "answer": "x"})
+    report("D8b retry 端点已注册（不存在场次 → 404，非 405 兜底）", code == 404, f"code={code}")
+
+    # D8c 趋势的完成度语义（打磨 P7）
+    # ⚠️ 必须同时断言 sessions 非空 —— 空数组会让 all() 恒真 = 假绿。
+    code, r = http("GET", "/drill/trend")
+    ss = r.get("sessions") if isinstance(r, dict) else None
+    ok = (code == 200 and bool(ss)
+          and all(k in x for x in ss for k in ("graded", "answered", "outline_count")))
+    report("D8c 趋势每场带 graded/answered/outline_count", ok, r)
+
     # D9 删除会话
     code, r = http("DELETE", f"/drill/sessions/{sid}")
     code2, r2 = http("GET", f"/drill/sessions/{sid}")

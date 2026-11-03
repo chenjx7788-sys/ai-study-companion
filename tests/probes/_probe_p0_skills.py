@@ -55,12 +55,16 @@ print("\n===== Part A · 真实内置技能（证明随包内容是对的）====
 svc.invalidate()
 r = client.get("/api/skills")
 body = r.json()
-ids = [x["id"] for x in body["items"]]
+# ⚠️ 断言只对**内置**集：导入的技能会进同一清单（P6 起真实库里就有 17 个 imported），
+#    用全集断言「=7 个」会把「用户导入了技能」误判成回归。
+all_ids = [x["id"] for x in body["items"]]
+ids = [x["id"] for x in body["items"] if x.get("builtin")]
+baseline_ids = list(all_ids)   # C1 的前后对比基线（探针不许污染实例）
 ok("A1 GET /skills 返回 200", r.status_code == 200, r.status_code)
-ok("A2 真实内置技能 = 7 个", len(ids) == 7, ids)
-ok("A3 七个 id 齐全", set(ids) == {"term_translate", "argue_check", "law_compare", "concept_compare", "feynman_explain", "error_analysis", "socratic_ask"}, ids)
+ok("A2 真实内置技能 = 13 个", len(ids) == 13, ids)
+ok("A3 十三个 id 齐全", set(ids) == {"term_translate", "outline_map", "concept_compare", "worked_example", "memory_cards", "argue_check", "feynman_explain", "data_interpretation", "error_analysis", "mindmap", "law_compare", "study_plan", "socratic_ask"}, ids)
 ok("A4 无文件被拒（种子文件都合法）", body["rejected"] == [], body["rejected"])
-ok("A5 按 priority 降序（20/18/15/14/12/10/8）", ids == ["term_translate", "concept_compare", "argue_check", "feynman_explain", "error_analysis", "law_compare", "socratic_ask"], ids)
+ok("A5 按 priority 降序（20→8）", ids == ["term_translate", "outline_map", "concept_compare", "worked_example", "memory_cards", "argue_check", "feynman_explain", "data_interpretation", "error_analysis", "mindmap", "law_compare", "study_plan", "socratic_ask"], ids)
 ok("A6 列表**不含** instructions", all("instructions" not in x for x in body["items"]))
 ok("A7 返回 user_dir 供页面显示", bool(body.get("user_dir")), body.get("user_dir"))
 
@@ -75,6 +79,35 @@ m2 = client.post("/api/skills/match", json={"question": "今天天气怎么样"}
 # ⚠️ 这条是 want==0 型断言 → 必须配 A10（want>=1）作守卫；A10 已 PASS 才算数
 ok("A12 无关问题不硬塞技能", m2["suggest"] is None and m2["matched"] == 0, m2,
    )
+
+new_skill_cases = [
+    ("请把这一章的知识框架梳理一下", "outline_map"),
+    ("这道例题怎么算", "worked_example"),
+    ("把这些考点做成记忆卡片", "memory_cards"),
+    ("这张图表的趋势怎么解读", "data_interpretation"),
+    ("帮我做一份学习计划", "study_plan"),
+    ("把这部分画成思维导图", "mindmap"),
+]
+for i, (question, want) in enumerate(new_skill_cases, start=13):
+    m = client.post("/api/skills/match", json={"question": question}).json()
+    ok(f"A{i} 新增技能触发词命中 {want}",
+       m["suggest"] and m["suggest"]["id"] == want and m["suggest"]["via"] == "rule", m)
+
+# ---- 新增内置技能的静态契约：权限、首轮工具、死占位符、token 预算
+builtin_objs = [svc.get_skill(sid) for sid in ids]
+ok("A19 13 个内置技能对象都能从注册表取回", all(x is not None for x in builtin_objs), ids)
+save_note_ids = {s.id for s in builtin_objs if s and "save_note" in s.capabilities}
+ok("A20 save_note 仍只给允许写笔记的内置技能", save_note_ids == {"term_translate", "memory_cards"}, save_note_ids)
+tool_first_ids = {s.id for s in builtin_objs if s and s.tool_first}
+ok("A21 tool_first 只给找全/读材料类技能",
+   tool_first_ids == {"term_translate", "outline_map", "concept_compare", "worked_example",
+                      "memory_cards", "data_interpretation", "mindmap", "law_compare"},
+   tool_first_ids)
+placeholder_ids = [s.id for s in builtin_objs if s and "{" in s.instructions]
+ok("A22 内置技能正文无 {placeholder} 死占位", placeholder_ids == [], placeholder_ids)
+ok("A23 13 个内置技能都在指令 token 预算内",
+   all(s and svc.est_tokens(s.instructions) <= svc.MAX_INSTRUCTION_TOKENS for s in builtin_objs),
+   [(s.id, svc.est_tokens(s.instructions)) for s in builtin_objs if s])
 
 # =====================================================================
 print("\n===== Part B · 负向用例（临时目录，不动真实文件）=====")
@@ -163,7 +196,7 @@ try:
        any("同 id" in x["reason"] for x in g["rejected"]), g["rejected"])
     os.remove(os.path.join(tmp, "skills", "good_one.skill.md"))
 
-    # ---- B7 12 条常驻上限
+    # ---- B7 13 条语义建议候选上限
     for i in range(15):
         sid = "s%02d" % i
         open(os.path.join(builtin_tmp, sid + ".skill.md"), "w", encoding="utf-8", newline="\n").write(
@@ -173,18 +206,120 @@ try:
     ok("B7 总共 16 个技能（15 + good_one）", len(svc.load_all()["skills"]) == 16,
        len(svc.load_all()["skills"]))
     # P2 起契约变更：items **返回全部**（含停用技能，否则用户关掉就再也看不到），
-    # 12 条上限改由 `resident` 标记表达 —— 判据必须跟着搬家，否则测的还是旧契约。
+    # 13 条上限由历史字段 `resident` 标记表达，实际语义是「语义建议候选」。
     ok("B7b 列表返回全部 16 条（不再截断）", len(g["items"]) == 16, len(g["items"]))
-    ok("B7b2 常驻标记只给 12 条", sum(1 for x in g["items"] if x.get("resident")) == 12,
+    ok("B7b2 语义候选标记只给 13 条", sum(1 for x in g["items"] if x.get("resident")) == 13,
        sum(1 for x in g["items"] if x.get("resident")))
-    ok("B7c truncated=4（16-12）", g["truncated"] == 4, g["truncated"])
+    ok("B7c truncated=3（16-13）", g["truncated"] == 3, g["truncated"])
     pri = [x["priority"] for x in g["items"] if x.get("resident")]
-    ok("B7d 常驻按 priority 降序（保留最高 12 个）", pri == sorted(pri, reverse=True), pri)
+    ok("B7d 语义候选按 priority 降序（保留最高 13 个）", pri == sorted(pri, reverse=True), pri)
 
     # ---- B8 safe_stem 的拦截能力（纵深防御；ID_RE 下不可达，此处单独验证工具本身）
     from app.core.filename import safe_stem
     ok("B8 safe_stem 能清掉路径穿越", safe_stem("../evil") != "../evil", safe_stem("../evil"))
     ok("B8b safe_stem 能清掉 NTFS ADS 冒号", ":" not in safe_stem("a:b"), safe_stem("a:b"))
+
+    # ---- B9 外部手动放文件：列表缓存必须按目录指纹自动失效（不能依赖 svc.invalidate）
+    fresh_path = os.path.join(builtin_tmp, "fresh_external.skill.md")
+    with open(fresh_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(skill_text("fresh_external", desc="外部第一次放入", trigger="外刷"))
+    g = client.get("/api/skills").json()
+    ok("B9 外部新增文件后，直接 GET 即可见到", any(x["id"] == "fresh_external" for x in g["items"]),
+       [x["id"] for x in g["items"]][-4:])
+    with open(fresh_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(skill_text("fresh_external", desc="外部第二次修改", trigger="外刷"))
+    st = os.stat(fresh_path)
+    os.utime(fresh_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
+    g = client.get("/api/skills").json()
+    got = next((x for x in g["items"] if x["id"] == "fresh_external"), {})
+    ok("B9b 外部修改同名字件后，描述同步更新", got.get("description") == "外部第二次修改", got.get("description"))
+    os.remove(fresh_path)
+    g = client.get("/api/skills").json()
+    ok("B9c 外部删除文件后，列表同步移除", all(x["id"] != "fresh_external" for x in g["items"]),
+       [x["id"] for x in g["items"]][-4:])
+
+    # ---- B10 批量导入护栏：数量 / 单文件大小 / 扫描条目都要能提前拒
+    folder_tmp = tempfile.mkdtemp(prefix="asc_skill_import_guard_")
+    try:
+        old_max = skills_router.IMPORT_FOLDER_MAX_FILES
+        skills_router.IMPORT_FOLDER_MAX_FILES = 3
+        for i in range(4):
+            sid = "guard_%02d" % i
+            with open(os.path.join(folder_tmp, sid + ".skill.md"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(skill_text(sid, desc="导入护栏", trigger="护栏"))
+        rr = client.post("/api/skills/import-folder", json={"path": folder_tmp, "dry_run": True})
+        ok("B10 候选文件超上限 → 400 且说明原因", rr.status_code == 400 and "超过" in rr.json().get("detail", ""),
+           rr.text[:120])
+    finally:
+        skills_router.IMPORT_FOLDER_MAX_FILES = old_max
+        shutil.rmtree(folder_tmp, ignore_errors=True)
+
+    folder_tmp = tempfile.mkdtemp(prefix="asc_skill_import_size_")
+    try:
+        old_size = skills_router.IMPORT_FOLDER_MAX_BYTES
+        skills_router.IMPORT_FOLDER_MAX_BYTES = 64
+        with open(os.path.join(folder_tmp, "too_big.skill.md"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(skill_text("too_big", desc="超过大小上限", trigger="超大"))
+        rr = client.post("/api/skills/import-folder", json={"path": folder_tmp, "dry_run": True})
+        rows = rr.json().get("results", []) if rr.status_code == 200 else []
+        ok("B10b 单文件超上限 → 预览里标 failed，不整批 500",
+           rr.status_code == 200 and any(r["status"] == "failed" and "超过" in r["reason"] for r in rows),
+           rr.text[:160])
+    finally:
+        skills_router.IMPORT_FOLDER_MAX_BYTES = old_size
+        shutil.rmtree(folder_tmp, ignore_errors=True)
+
+    folder_tmp = tempfile.mkdtemp(prefix="asc_skill_import_scan_")
+    try:
+        old_scan = skills_router.IMPORT_FOLDER_SCAN_LIMIT
+        skills_router.IMPORT_FOLDER_SCAN_LIMIT = 5
+        for i in range(6):
+            open(os.path.join(folder_tmp, "plain_%02d.txt" % i), "w", encoding="utf-8").write("x")
+        rr = client.post("/api/skills/import-folder", json={"path": folder_tmp, "dry_run": True})
+        ok("B10c 目录条目超扫描上限 → 400 且不继续递归", rr.status_code == 400 and "条目过多" in rr.json().get("detail", ""),
+           rr.text[:120])
+    finally:
+        skills_router.IMPORT_FOLDER_SCAN_LIMIT = old_scan
+        shutil.rmtree(folder_tmp, ignore_errors=True)
+
+    # ---- B11 浏览器文件夹选择模式（相对路径 + 内容，不依赖本机绝对路径）
+    picked_files = [
+        {"file": "picked/pick_one.skill.md", "text": skill_text("pick_one", desc="文件夹选择", trigger="选夹")},
+        {"file": "picked/dupe/pick_one.skill.md", "text": skill_text("pick_one", desc="同 id 重复", trigger="选夹")},
+        {"file": "picked/bad.skill.md", "text": "not a skill"},
+    ]
+    rr = client.post("/api/skills/import-files", json={"files": picked_files, "dry_run": True})
+    rows = rr.json().get("results", []) if rr.status_code == 200 else []
+    ok("B11 文件夹选择 dry_run 返回 ready/dup/failed 三态",
+       rr.status_code == 200 and [r["status"] for r in rows] == ["ready", "dup", "failed"], rr.text[:180])
+    rr = client.post("/api/skills/import-files", json={"files": picked_files, "dry_run": False})
+    imported = svc.get_skill("pick_one")
+    ok("B11b 文件夹选择确认导入：只落首份，重复不误写",
+       rr.status_code == 200 and rr.json().get("ok_count") == 1 and imported is not None and imported.source == "imported",
+       rr.text[:180])
+
+    old_size = skills_router.IMPORT_FOLDER_MAX_BYTES
+    try:
+        skills_router.IMPORT_FOLDER_MAX_BYTES = 64
+        rr = client.post("/api/skills/import-files", json={
+            "files": [{"file": "picked/too_big.skill.md", "text": skill_text("too_big2", desc="太大", trigger="大")}],
+            "dry_run": True,
+        })
+        rows = rr.json().get("results", []) if rr.status_code == 200 else []
+        ok("B11c 文件夹选择单文件超限 → 标 failed 不 500",
+           rr.status_code == 200 and rows and rows[0]["status"] == "failed" and "超过" in rows[0]["reason"],
+           rr.text[:160])
+    finally:
+        skills_router.IMPORT_FOLDER_MAX_BYTES = old_size
+
+    old_total = skills_router.IMPORT_FILES_MAX_TOTAL_BYTES
+    try:
+        skills_router.IMPORT_FILES_MAX_TOTAL_BYTES = 10
+        rr = client.post("/api/skills/import-files", json={"files": picked_files[:1], "dry_run": True})
+        ok("B11d 文件夹选择总大小超限 → 400 并建议改走路径扫描",
+           rr.status_code == 400 and "路径扫描" in rr.json().get("detail", ""), rr.text[:140])
+    finally:
+        skills_router.IMPORT_FILES_MAX_TOTAL_BYTES = old_total
 
 finally:
     svc.BUILTIN_DIR = _orig_builtin
@@ -195,9 +330,9 @@ finally:
 # =====================================================================
 print("\n===== Part C · 隔离是否真的恢复 =====")
 after = client.get("/api/skills").json()
-ok("C1 探针结束后回到真实 7 个技能（没污染实例）",
-   [x["id"] for x in after["items"]] == ["term_translate", "concept_compare", "argue_check", "feynman_explain", "error_analysis", "law_compare", "socratic_ask"],
-   [x["id"] for x in after["items"]])
+ok("C1 探针结束后清单与探针前**逐一致**（没污染实例；不硬编码个数，真实库会随导入增长）",
+   [x["id"] for x in after["items"]] == baseline_ids,
+   [x["id"] for x in after["items"]][:8])
 
 print("\n===== Part D · 打包判据 =====")
 skip("D1 打包后 _internal 内技能数 > 0",

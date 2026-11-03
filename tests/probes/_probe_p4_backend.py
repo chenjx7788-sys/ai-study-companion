@@ -410,18 +410,62 @@ ok("C6d tool 事件照常发（start + done 各一条）",
    [d.get("state") for e, d in ev if e == "tool"] == ["start", "done"],
    [d for e, d in ev if e == "tool"])
 
-# C7 轮数上限
+# C7 轮数上限（2026-11-02 修订：用尽后必须补一次**不带 tools** 的收尾调用）
+#    旧实现 `tool_round >= MAX` 直接 break —— 若模型四轮全是 tool_calls、一句正文没写，
+#    full 为空却仍按「回答完成」落库 → 界面上一个空气泡（思维导图技能实测）。
+from app.database import SessionLocal as _SL  # noqa: E402
+from app.models import ChatMessage as _CM  # noqa: E402
+
 reset([
-    [("tool_calls", [{"id": "c%d" % i, "name": "list_materials", "arguments": "{}"}])]
-    for i in range(6)
+    *[[("tool_calls", [{"id": "c%d" % i, "name": "list_materials", "arguments": "{}"}])]
+      for i in range(4)],
+    [("content", "收尾正文：资料里能确认的只有这些。")],   # 第 5 次 = 不带 tools 的收尾
 ])
 r, ev = ask("term_translate")
-ok("C7 模型一直要工具 → 最多 3 轮工具 + 1 次收尾 = 4 次调用"
-   "（写死 4：引用常量会自我一致 —— 改成常量后贪心循环跟着变，判据永远不会红）",
-   len(STREAM_CALLS) == 4, len(STREAM_CALLS))
+ok("C7 模型一直要工具 → 4 次带工具 + 1 次收尾 = 5 次调用"
+   "（写死 5：引用常量会自我一致 —— 改成常量后贪心循环跟着变，判据永远不会红）",
+   len(STREAM_CALLS) == 5, len(STREAM_CALLS))
 ok("C7b 轮数上限就是 3（改上限必须同步本判据与方案文档）",
    T.MAX_TOOL_ROUNDS == 3, T.MAX_TOOL_ROUNDS)
-ok("C7b 不会无限循环（HTTP 仍然 200 并结束）", r.status_code == 200, r.status_code)
+# ⚠️ 安全取值：负向自检时收尾调用根本不存在，`STREAM_CALLS[4]` 会 IndexError
+#    把整条探针打断 → 后面几条连「红」的机会都没有，看起来像探针崩了而不是判据失效。
+_c5 = STREAM_CALLS[4] if len(STREAM_CALLS) > 4 else {"kind": None, "tools": None, "messages": []}
+ok("C7c 收尾那次**不带 tools**（带了模型就会继续调，收尾等于没做）",
+   _c5["kind"] == "plain" and _c5["tools"] == [], (_c5["kind"], _c5["tools"]))
+_txt7 = "".join(d.get("t", "") for e, d in ev if e == "token")
+ok("C7d 收尾真的产出了正文，且 token 事件到达前端", "收尾正文" in _txt7, _txt7[:120])
+ok("C7e 收尾提示明确告知「轮数已用尽、直接作答」（靠它压住模型的检索冲动）",
+   any("轮数已用尽" in str(m.get("content") or "") for m in _c5["messages"]),
+   (_c5["messages"][-1].get("content", "")[:160] if _c5["messages"] else "没有收尾调用"))
+ok("C7f 不会无限循环（HTTP 仍然 200 并结束）", r.status_code == 200, r.status_code)
+_mid7 = next((d.get("message_id") for e, d in ev if e == "done"), None)
+_db7 = _SL()
+try:
+    _m7 = _db7.get(_CM, _mid7) if _mid7 else None
+    ok("C7g 落库正文非空（旧实现在这里落的是空字符串 → 界面空气泡）",
+       bool(_m7) and bool((_m7.content or "").strip()),
+       None if _m7 is None else len(_m7.content or ""))
+finally:
+    _db7.close()
+
+# C7h 负向：收尾也一个字不吐 → 必须落 error，绝不能当成功
+reset([
+    *[[("tool_calls", [{"id": "e%d" % i, "name": "list_materials", "arguments": "{}"}])]
+      for i in range(4)],
+    [],                                   # 收尾调用什么都不返回
+])
+r, ev = ask("term_translate")
+_err = next((d for e, d in ev if e == "error"), None)
+ok("C7h 收尾也空 → 必须发 error 事件（不能静默 done）",
+   _err is not None and "没有产出正文" in str(_err.get("message") or ""), _err)
+_db8 = _SL()
+try:
+    _m8 = _db8.get(_CM, (_err or {}).get("message_id")) if _err else None
+    ok("C7i 空回答落库必须带 error（空气泡 + 空 error 是最糟的组合）",
+       bool(_m8) and bool(_m8.error or "") and not (_m8.content or "").strip(),
+       None if _m8 is None else (_m8.error, len(_m8.content or "")))
+finally:
+    _db8.close()
 
 # C8 工具执行抛异常
 import app.services.skill_tools as _st  # noqa: E402
