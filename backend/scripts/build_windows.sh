@@ -13,7 +13,7 @@
 #   bash backend/scripts/build_windows.sh
 # 可选环境变量：
 #   OUT_ROOT  输出根目录，默认 /d/AIStudyCompanion-build
-#   VERSION   版本号，默认 0.1.6（用于 zip 命名）
+#   VERSION   版本号，默认读 backend/app_version.py（用于 zip 命名）
 #   PY        打包用的 Python（需装齐依赖 + PyInstaller）
 # =============================================================================
 set -uo pipefail
@@ -30,7 +30,16 @@ RELEASE_DIR="$OUT_ROOT/release"
 DIST_DIR_WIN="$OUT_ROOT_WIN/dist"
 BUILD_DIR_WIN="$OUT_ROOT_WIN/build"
 RELEASE_DIR_WIN="$OUT_ROOT_WIN/release"
-VERSION="${VERSION:-0.1.7}"
+# ⚠️ 版本号是产物名的组成部分、也是 workflow 读回来的依据：
+#    读不到就**直接判红**，不静默退化成「没有版本号的名字」。
+VERSION="${VERSION:-}"
+if [ -z "${VERSION}" ]; then
+  VERSION="$(sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${BACKEND_DIR}/app_version.py" 2>/dev/null | head -1 || true)"
+fi
+if [ -z "${VERSION}" ]; then
+  echo "[ERROR] 无法从 backend/app_version.py 读到 __version__" >&2
+  exit 1
+fi
 PY="${PY:-C:/Users/陈锦祥/.workbuddy/binaries/python/envs/default/Scripts/python.exe}"
 MGR_PY="${MGR_PY:-C:/Users/陈锦祥/.workbuddy/binaries/python/versions/3.13.12/python.exe}"
 

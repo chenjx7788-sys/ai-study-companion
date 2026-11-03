@@ -65,6 +65,24 @@ _rst*.txt
 _port*.txt
 _proc*.txt
 
+# 一次性过程脚本（2026-11-03 补，v0.1.8 定稿前清账）
+# ⚠️ _patch_*/_verify_*/_shot_*（含 backend/ 下）是「改完即弃」的补丁、验证与截图脚本，
+#    _bump_* / _fix_* 是一次性数据修正 —— 全部不进仓库；沉淀探针例外仍走 tests/probes/。
+_patch_*
+_verify_*
+_shot_*
+_bump_*
+_fix_*
+backend/_patch_*
+backend/_verify_*
+backend/_backfill_*
+backend/_rebuild_*
+
+# 构建产物暂存目录（改名保留 / 池化复用 / 交换旧版，2026-11-03 补）
+frontend/_dist_old_*/
+frontend/_dist_pool/
+frontend/_dist_swap_*/
+
 # 开发期临时产物（2026-10-14 补，v0.1.6 发布前清账）
 # ⚠️ _bak_* 是改前备份、_apply_*/_probe_*/_write_* 是一次性补丁与验证脚本、
 #    _fetch_probe/ 是抓取探针、_brand_*.txt 是扫描输出 —— 全部不进仓库。
