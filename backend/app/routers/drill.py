@@ -43,6 +43,12 @@ class AnswerReq(BaseModel):
     skip: bool = False
 
 
+class RetryReq(BaseModel):
+    """单题重答（打磨 P5）：只带 seq 与新答案，不参与推进。"""
+    seq: int
+    answer: str = ""
+
+
 class FinishReq(BaseModel):
     reason: str = "abort"      # complete / abort
 
@@ -221,6 +227,48 @@ def answer_stream(sid: int, req: AnswerReq):
     finally:
         db.close()
     job = drill_svc.start_answer_job(sid, req.seq, (req.answer or "").strip(), req.skip)
+    return _sse_response(job)
+
+
+@router.post("/sessions/{sid}/retry/stream")
+def retry_stream(sid: int, req: RetryReq):
+    """单题重答（打磨 P5）：重新评分该轮，**不推进、不追问**。
+
+    ⚠️ 与 `answer/stream` 的关键区别在这里：那个端点见到 `user_answer is not None`
+      就 409（一题只能答一次），而重答的语义正是「答过的题再答一次」→ 必须是独立端点，
+      不能靠放开那个 409 实现，否则「续跑」路径会把同一题重复推进。
+    ⚠️ 允许 `status == finished`：成绩单里的重答就是发生在结算之后。
+    """
+    ans = (req.answer or "").strip()
+    if not ans:
+        raise HTTPException(400, "先写点什么再提交")
+    if len(ans) > 2000:
+        raise HTTPException(400, "作答过长，请精简到 2000 字以内")
+    db = SessionLocal()
+    try:
+        s = db.get(DrillSession, sid)
+        if not s:
+            raise HTTPException(404, "陪练记录不存在或已删除")
+        if s.status in ("draft", "outlining"):
+            raise HTTPException(400, "本场还没出题，无法重答")
+        if not drill_svc.llm_ready():
+            raise HTTPException(400, "[NEED_SETUP]请先在「管理中心」配置模型")
+        if drill_svc.has_running_job(sid):
+            raise HTTPException(409, "本场还有题目在处理中，请稍候再试")
+        turn = (db.query(DrillTurn)
+                .filter(DrillTurn.session_id == sid, DrillTurn.seq == req.seq).first())
+        if not turn:
+            raise HTTPException(404, "轮次不存在，请刷新后重试")
+        if turn.user_answer is None:
+            raise HTTPException(400, "该题还没作答，无法重答")
+        if turn.is_followup:
+            raise HTTPException(400, "追问不支持重答")
+    finally:
+        db.close()
+    try:
+        job = drill_svc.start_retry_job(sid, req.seq, ans)
+    except Exception:       # noqa: BLE001  start_retry_job 的第二道并发闸
+        raise HTTPException(409, "本场还有题目在处理中，请稍候再试")
     return _sse_response(job)
 
 

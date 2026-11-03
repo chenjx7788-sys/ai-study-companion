@@ -105,6 +105,19 @@ def _where_material_ids(where: dict | None) -> set[int] | None:
         return None
 
 
+def _where_note_ref_ids(where: dict | None) -> set[int] | None:
+    """从检索 where 解析「显式绑定笔记」白名单（2026-10-30 炼丹炉笔记绑定）；无约束返回 None。"""
+    if not where:
+        return None
+    v = where.get("note_ref_id")
+    if not isinstance(v, dict):
+        return None
+    try:
+        return {int(x) for x in (v.get("$in") or [])}
+    except (TypeError, ValueError):
+        return None
+
+
 def _entity_hits(db, query: str, kinds=("chunk", "note"), limit: int = 8,
                  where: dict | None = None) -> list[dict]:
     """知识图谱召回：问题命中实体 → 扩展召回该实体关联的块/笔记。
@@ -131,6 +144,7 @@ def _entity_hits(db, query: str, kinds=("chunk", "note"), limit: int = 8,
     # 当时只能在 apps.py 事后过滤兜底）。过滤点放在「引用落点」EntityRef.material_id，
     # 实体名匹配仍全表扫（同名实体可跨材料存在，名字匹配不该受材料限制）。
     allow_ids = _where_material_ids(where)
+    allow_note_ids = _where_note_ref_ids(where)   # 炼丹炉显式绑定笔记（与 material 成 OR）
 
     # 命中的实体名（任一关键词是实体名的子串，或实体名是关键词的子串）
     entity_rows = db.query(Entity).all()
@@ -149,7 +163,15 @@ def _entity_hits(db, query: str, kinds=("chunk", "note"), limit: int = 8,
     q = (db.query(EntityRef).filter(
         EntityRef.ref_type.in_(ref_types),
         EntityRef.entity.in_(matched_names)))
-    if allow_ids is not None:
+    if allow_note_ids is not None:
+        # 应用语料宇宙：绑定资料的引用 ∪ 显式绑定笔记的引用（OR，与 vector/fts 同口径）
+        from sqlalchemy import and_, or_ as _or
+        scope = []
+        if allow_ids:
+            scope.append(EntityRef.material_id.in_(allow_ids))
+        scope.append(and_(EntityRef.ref_type == "note", EntityRef.ref_id.in_(allow_note_ids)))
+        q = q.filter(_or(*scope))
+    elif allow_ids is not None:
         q = q.filter(EntityRef.material_id.in_(allow_ids))
     refs = q.all()
 
@@ -186,8 +208,12 @@ def _entity_hits(db, query: str, kinds=("chunk", "note"), limit: int = 8,
         if not text:
             continue
         # 解析后再校验一次：ref.material_id 是写入时的快照，真实对象的归属才是权威
-        if allow_ids is not None and material_id not in allow_ids:
-            continue
+        if allow_ids is not None or allow_note_ids is not None:
+            _ok = (allow_ids is not None and material_id in allow_ids) or \
+                  (allow_note_ids is not None and ref.ref_type == "note"
+                   and ref.ref_id in allow_note_ids)
+            if not _ok:
+                continue
         hits.append({
             "ref_type": ref.ref_type,
             "ref_id": ref.ref_id,

@@ -234,23 +234,43 @@ def _list_materials(db, info: dict) -> tuple[bool, str]:
     return True, "\n".join(lines)
 
 
-def _search_kb(db, args: dict, allowed, info: dict) -> tuple[bool, str]:
+def _search_kb(db, args: dict, allowed, info: dict, scope: dict | None = None) -> tuple[bool, str]:
     from . import search as search_svc
     q = str(args.get("query") or "").strip()
     if not q:
         return False, "[参数错误] query 不能为空"
     limit = min(max(_as_int(args.get("limit"), 5) or 5, 1), 8)
-    hits = search_svc.search(q, db, kinds=("chunk", "note"))[:limit]
+    # 范围锁（2026-11-02）：用户在问答页显式指定范围时，工具检索必须吃同一约束 ——
+    # 否则模型能经 search_kb 读到范围外材料并进引用（「通用档剥离检索工具」同原则）。
+    kinds = ("chunk", "note")
+    where = None
+    if scope is not None:
+        nids = scope.get("note_ids")
+        if nids:
+            kinds, where = ("note",), {"note_ref_id": {"$in": sorted(nids)}}
+        else:
+            mids = sorted(scope.get("material_ids") or set())
+            if not mids:
+                # 空文件夹等「范围内无资料」：不给「换个词再试」的无底洞
+                info["brief"] = "指定范围内无资料"
+                return True, "你本次指定的范围内没有可检索的资料。直接按「资料里没有这部分内容」作答。"
+            kinds, where = ("chunk",), {"material_id": {"$in": mids}}
+    hits = search_svc.search(q, db, kinds=kinds, where=where)[:limit]
     if not hits:
         # 只在真的授予了 list_materials 时才指路，否则模型会去调一个不存在的工具
         alt = "，或用 list_materials 先看有哪些资料" if "list_materials" in (allowed or []) else ""
         info["brief"] = f"「{q}」无命中"
-        return True, f"检索「{q}」没有找到任何片段。换一个说法或更短的关键词再试{alt}。"
+        # ⚠️ 旧文案「换一个说法或更短的关键词再试」是个无底洞：模型会每轮换一个词重试，
+        #    直到 MAX_TOOL_ROUNDS 用尽后一个字都没产出（2026-11-02 思维导图实测 4 轮全空）。
+        #    必须给**明确的停止条件**，让它尽快转入「资料里没有」的答复。
+        return True, (f"检索「{q}」没有找到任何片段。最多再换一个更短的关键词试一次{alt}；"
+                      "仍然无命中就直接说明「资料里没有这部分内容」，不要继续反复检索。")
     info["brief"] = f"「{q}」{len(hits)} 段"
     # 命中的前 3 条同时进「引用来源」：它们就是这条回答的实际依据。
     # 只写进工具上下文、不进 sources，用户回看时看不出「答案是从哪几段来的」。
     info["sources"] = [{
         "ref_type": h.get("ref_type") or "chunk",
+        "ref_id": h.get("ref_id"),
         "material_id": h.get("material_id"),
         "title": _one_line((h.get("metadata") or {}).get("material_title")
                            or (h.get("metadata") or {}).get("note_title") or "未知来源"),
@@ -278,13 +298,18 @@ def _search_kb(db, args: dict, allowed, info: dict) -> tuple[bool, str]:
     return True, "\n\n".join(out)
 
 
-def _read_material(db, args: dict, hint: str, info: dict) -> tuple[bool, str]:
+def _read_material(db, args: dict, hint: str, info: dict, scope: dict | None = None) -> tuple[bool, str]:
     mid = _as_int(args.get("material_id"))
     if not mid:
         return False, f"[参数错误] material_id 必须是整数（{hint}）"
     m = db.get(Material, mid)
     if m is None:
         return False, f"[参数错误] 材料{mid} 不存在（{hint}）"
+    # 范围锁（2026-11-02）：范围外材料直接拒读。
+    # ok=False 是故意的：拒读文案是给模型的**指令**，不能套「这是资料、别当指令」护栏。
+    if scope is not None and mid not in (scope.get("material_ids") or set()):
+        return False, (f"[范围外] 材料{mid}《{m.title}》不在用户本次指定的范围内，不能读取。"
+                       "请只在指定范围内检索与阅读；范围内没有就按「资料里没有这部分内容」作答。")
     start = max(_as_int(args.get("start_page"), 0) or 0, 0)
     # 预留标题 + 尾注额度：否则「已达上限，用 start_page 接着读」这句会被 _clip 二次切掉，
     # 模型看不到「还有下文」，会把这次读取当成全文结论。
@@ -425,13 +450,15 @@ def _save_note(db, args: dict, *, session_id: int | None, written: list,
 
 
 def execute(name: str, args: dict | str, *, allowed: list[str], session_id: int | None = None,
-            written: list | None = None) -> dict:
+            written: list | None = None, scope: dict | None = None) -> dict:
     """执行一次工具调用。**永不抛异常**——失败必须变成一段可读文本回填给模型，
     否则一次工具报错就会让整轮问答 500，用户丢掉已经生成的内容。
 
     返回 `{"ok": bool, "text": str, "label": str, "brief": str, "sources": list}`。
     - `brief`：步骤行上显示的动作摘要（`读《政治学》第1–8页`）；
     - `sources`：本次实际读到的材料/片段，由调用方追加进回答的「引用来源」。
+    - `scope`：用户显式指定的检索范围 `{"material_ids": set, "note_ids": set|None}`，
+      None = 不约束（2026-11-02 范围锁：工具层与主检索路同一口径）。
     ⚠️ 两者都由工具**实现内部**经 `info` 字典回填，**不是**从 `text` 里反解出来的——
        文案一改就会静默失效。早期失败路径（未知工具/未授予/参数非法/抛异常）
        可能不含这两个键，调用方必须用 `.get()` 而不是下标。
@@ -464,9 +491,9 @@ def execute(name: str, args: dict | str, *, allowed: list[str], session_id: int 
         if name == "list_materials":
             ok_flag, body = _list_materials(db, info)
         elif name == "search_kb":
-            ok_flag, body = _search_kb(db, args, allowed, info)
+            ok_flag, body = _search_kb(db, args, allowed, info, scope=scope)
         elif name == "read_material":
-            ok_flag, body = _read_material(db, args, hint, info)
+            ok_flag, body = _read_material(db, args, hint, info, scope=scope)
         elif name == "save_note":
             ok_flag, body = _save_note(db, args, session_id=session_id,
                                        written=_written, info=info)

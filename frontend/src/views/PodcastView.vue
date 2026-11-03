@@ -42,6 +42,15 @@
             <p class="work-empty" v-if="!visibleWorks.length">没有匹配的作品</p>
             <div v-for="p in visibleWorks" :key="p.id" class="work-item"
               :class="{ on: current && current.id === p.id }" @click="openWork(p)">
+              <!-- 封面砖：讲书没有真封面，用来源类型渐变 + 耳机图标给列表一点视觉身份 -->
+              <span class="work-tile" :data-st="p.source_type" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+                  stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 14v-2a9 9 0 0 1 18 0v2"/>
+                  <path d="M21 17a2 2 0 0 1-2 2h-1a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h3Z"/>
+                  <path d="M3 17a2 2 0 0 0 2 2h1a1 1 0 0 0 1-1v-3a1 1 0 0 0-1-1H3Z"/>
+                </svg>
+              </span>
               <span class="work-dot" :class="workState(p)" :title="workStateText(p)"></span>
               <div class="work-main">
                 <div class="work-title">{{ p.title }}</div>
@@ -251,7 +260,7 @@
               <label>背景音乐<span class="hint-inline">点 ▶ 可试听</span></label>
               <div class="bgm-row">
                 <el-select v-model="form.bgm_id" size="small" style="flex:1"
-                  placeholder="不加背景音乐" @change="persistBgm">
+                  class="sel-inherit" placeholder="不加背景音乐" @change="persistBgm">
                   <el-option label="不加背景音乐" value="" />
                   <el-option v-for="t in bgmSelectOptions" :key="t.id"
                     :label="t.name" :value="t.id">
@@ -554,7 +563,7 @@
 
 <script setup>
 import { ref, computed, reactive, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { createMd, renderMd as renderMdSafe } from '../utils/md'
 import mascot from '../assets/mascot.png'
@@ -686,6 +695,7 @@ const sourceTypes = [
 
 const voiceStatus = ref({ ok: true, label: '语音服务', text: '点击检测语音服务' })
 // 本地合成模型未下载时的引导：跳到管理中心下载（与 SettingsView 的下载卡片同页）
+const route = useRoute()
 const router = useRouter()
 function goSettings() { router.push('/settings') }
 
@@ -1180,7 +1190,7 @@ const scriptView = reactive({ show: false, id: null })
 const briefView = reactive({ show: false, id: null })
 
 // 这里只用 anchor 判断「这个产物转过笔记没有」，正文一个字都用不上 ——
-// 所以带 slim=1 拉**不带正文**的列表（否则会把全部周报 / 播客脚本 / 问答的
+// 所以带 slim=1 拉**不带正文**的列表（否则会把全部周报 / 播客脚本 / 对话的
 // 正文一起下载下来，笔记正文正是这批数据里最大的一块）。
 async function loadAiNotes() {
   try {
@@ -1789,7 +1799,19 @@ onMounted(async () => {
   } finally {
     loading.value = false
   }
+  openFromQuery()
 })
+
+// 从对话资源卡片进来（`/podcast?p=<id>`）：直接把这条作品打开。
+// 不做的话点卡片只到列表页，用户还得自己在几十条里找 —— 闭环断在最后一步。
+// ⚠️ 列表接口只回卡片字段，所以必须复用 openWork（它按需拉详情）。
+async function openFromQuery() {
+  const id = Number(route.query.p)
+  if (!id) return
+  const w = (list.value || []).find((x) => x.id === id)
+  if (w) await openWork(w)
+  else ElMessage.warning('这条讲书已不在列表中')
+}
 </script>
 
 <style scoped>
@@ -2047,6 +2069,25 @@ onMounted(async () => {
   content: ''; position: absolute; left: 0; top: 50%; transform: translateY(-50%);
   width: 3px; height: 0; border-radius: 2px; background: var(--asc-primary);
   transition: height .2s ease;
+}
+/* 封面砖（2026-10-26）：34px 圆角渐变砖，按来源类型着色；内阴影描边避免 +2px 撑歪行高 */
+.work-tile {
+  flex-shrink: 0; width: 34px; height: 34px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(135deg, #ece8fb, #d9d0f5); color: #534ab7;
+  box-shadow: inset 0 0 0 1px rgba(83, 74, 183, .10);
+}
+.work-tile[data-st="notes"] {
+  background: linear-gradient(135deg, #e4f1e8, #cfe5d7); color: #2c7a45;
+  box-shadow: inset 0 0 0 1px rgba(44, 122, 69, .10);
+}
+.work-tile[data-st="highlights"] {
+  background: linear-gradient(135deg, #fbf0da, #f3e0b8); color: #8a6d1f;
+  box-shadow: inset 0 0 0 1px rgba(138, 109, 31, .10);
+}
+.work-tile[data-st="text"] {
+  background: linear-gradient(135deg, #e3eefb, #cfdff5); color: #1f5fa8;
+  box-shadow: inset 0 0 0 1px rgba(31, 95, 168, .10);
 }
 .work-item:hover { background: var(--asc-surface-2); }
 .work-item.on { background: var(--asc-primary-soft); }
@@ -2355,5 +2396,10 @@ onMounted(async () => {
     animation-duration: .01ms !important;
     transition-duration: .01ms !important;
   }
+}
+/* 「不加背景音乐」是真实语义值（存 ''），不是空态 —— placeholder 默认灰化会误导。
+   只作用于显式打了 sel-inherit 的 select，不影响真正的空态占位。 */
+.sel-inherit :deep(.el-select__placeholder.is-transparent) {
+  color: var(--el-text-color-regular);
 }
 </style>

@@ -42,7 +42,7 @@ SSE_HEARTBEAT_SEC = 10.0
 # job.subs 里的订阅者永久滞留（2026-10-14 实测：断开 4.3s 后仍为 1）。
 SSE_POLL_SEC = 0.1
 JOB_TTL_SEC = 600                 # 已结束任务在内存中保留 10 分钟（供附着取结果）
-SENTINEL_MATERIAL_ID = -1         # ⚠️ 回写卡 material_id 的哨兵值（0 已被「AI 问答」占用）
+SENTINEL_MATERIAL_ID = -1         # ⚠️ 回写卡 material_id 的哨兵值（0 已被「AI 对话」占用）
 
 # ---------- 难度自适应参数（C 档） ----------
 DIFFICULTY_LEVELS = ("easy", "medium", "hard")
@@ -146,6 +146,39 @@ def _match_material_id(db, title: str):
         return None
     m = db.query(Material).filter(Material.title == t).first()
     return m.id if m else None
+
+
+# 评分时喂给评分官的素材片段长度（打磨 P1）：够覆盖一个考点的上下文，
+# 又不至于让每题评分都背上整份材料的 token。
+JUDGE_EXCERPT_CHARS = 1200
+
+
+def _judge_excerpt(db, turn: DrillTurn) -> str:
+    """评分用的素材片段：优先本题来源材料的摘要，退回原文前 N 字。
+
+    ⚠️ 拿不到来源（全库/跨材料题纲未标 source，或哨兵值）时返回空串 ——
+       评分层会退化为「只判要点覆盖」，`prompt_drill_judge` 已明确禁止此时
+       武断判「事实错误」。
+    ⚠️ 只读、不写库：评分失败重试时会再取一次，保持幂等。
+    """
+    mid = turn.source_material_id
+    if mid is None or mid == SENTINEL_MATERIAL_ID:
+        return ""
+    txt = _summary_text(db, mid) or _material_fallback_text(db, mid, limit=JUDGE_EXCERPT_CHARS)
+    return (txt or "").strip()[:JUDGE_EXCERPT_CHARS]
+
+
+def _outline_hint(s: DrillSession, outline_index) -> str:
+    """该考点的「提问角度提示」（题纲里已生成，但此前从未展示给用户）。
+
+    作答前用于「给点提示」，作答后（答得不好时）用于「换个角度想想」。
+    ⚠️ 只是角度提示，不含答案要点，所以不受 show_answer 开关约束。
+    """
+    ol = s.outline or []
+    if outline_index is None or not (0 <= outline_index < len(ol)):
+        return ""
+    item = ol[outline_index] or {}
+    return str(item.get("hint") or "").strip()
 
 
 # ---------- 范围解析与素材组装（PRD 3.1 / 3.3.5） ----------
@@ -433,6 +466,24 @@ def start_answer_job(sid: int, seq: int, answer: str, skip: bool) -> _DrillJob:
     return job
 
 
+def start_retry_job(sid: int, seq: int, answer: str) -> _DrillJob:
+    """启动单题重答任务（打磨 P5）。
+
+    ⚠️ **不复用 `_new_job_locked`**：那个函数在已有 running 任务时会返回**旧 job**
+       （= 附着到别人的流上），重答会因此拿到上一次评分的回放、行为完全错乱。
+       路由层已先判 `has_running_job` → 409，这里是第二道闸。
+    """
+    with _DRILL_LOCK:
+        old = _DRILL_JOBS.get(sid)
+        if old and old.status == "running":
+            raise _Fatal("本场还有题目在处理中，请稍候再试")
+        _purge_jobs()
+        job = _DrillJob(sid, "score")
+        _DRILL_JOBS[sid] = job
+    threading.Thread(target=_run_retry, args=(sid, seq, answer, job), daemon=True).start()
+    return job
+
+
 async def event_stream(job: _DrillJob):
     """SSE 生成器：先补发回放缓冲（中途回来能看到已有进度），再实时推送。
 
@@ -587,6 +638,8 @@ def _run_answer(sid: int, seq: int, answer: str, skip: bool, job: _DrillJob) -> 
 
         total = len(s.outline or [])
         cur = (turn.outline_index or 0) + 1
+        # 本题的「换个角度」提示：作答不理想时前端据此给线索（不含答案要点）
+        hint = _outline_hint(s, turn.outline_index)
 
         if skip:
             job.stage = "score"
@@ -601,6 +654,7 @@ def _run_answer(sid: int, seq: int, answer: str, skip: bool, job: _DrillJob) -> 
             db.commit()
             job.broadcast("score", {"seq": seq, "skipped": True, "score": None,
                                     "verdict": None, "comment": turn.comment,
+                                    "hint": hint,
                                     "progress": {"cur": cur, "total": total}})
             _advance(db, s, job, turn)
         else:
@@ -609,7 +663,10 @@ def _run_answer(sid: int, seq: int, answer: str, skip: bool, job: _DrillJob) -> 
             turn.user_answer = answer
             db.commit()
             try:
-                res = llm.judge_drill_answer(turn.question, turn.expected_points or [], answer)
+                # 打磨 P1：把考点来源材料的片段一并喂入 —— 否则「正确性」这一维
+                # 只能靠数要点覆盖，事实说反了也照样高分。
+                res = llm.judge_drill_answer(turn.question, turn.expected_points or [], answer,
+                                             material_excerpt=_judge_excerpt(db, turn))
             except Exception as e:      # noqa: BLE001  含 HTTPException
                 # 降级（PRD 3.4.7 / 3.5）：该题标「未评分」且**不阻断后续**。
                 # ⚠️ 绝不走 job.status="failed"：那会让整场停在原地、要用户手点重试，
@@ -626,6 +683,7 @@ def _run_answer(sid: int, seq: int, answer: str, skip: bool, job: _DrillJob) -> 
                     "seq": seq, "turn_id": turn.id, "outline_index": turn.outline_index or 0,
                     "skipped": False, "failed": True, "score": None, "verdict": None,
                     "comment": turn.comment, "message": fail_msg,
+                    "hint": hint,
                     "progress": {"cur": cur, "total": total}})
                 _advance(db, s, job, turn)
             else:
@@ -642,6 +700,7 @@ def _run_answer(sid: int, seq: int, answer: str, skip: bool, job: _DrillJob) -> 
                     "dimensions": res["dimensions"], "comment": res["comment"],
                     "missing_points": res["missing_points"],
                     "expect_points": (turn.expected_points or []) if show_answer else [],
+                    "hint": hint,
                     "progress": {"cur": cur, "total": total}})
                 if _should_followup(db, s, turn) and res.get("followup"):
                     _emit_question(db, s, job, turn.outline_index or 0, True, res["followup"])
@@ -657,6 +716,87 @@ def _run_answer(sid: int, seq: int, answer: str, skip: bool, job: _DrillJob) -> 
     except BaseException as e:      # noqa: BLE001
         db.rollback()
         msg = str(getattr(e, "detail", None) or e or "评分失败")[:200]
+        job.status = "failed"
+        job.error = msg
+        job.broadcast("error", {"message": msg})
+    finally:
+        job.finished_at = time.time()
+        db.close()
+
+
+def _run_retry(sid: int, seq: int, answer: str, job: _DrillJob) -> None:
+    """单题重答：重新评分**同一轮**，不推进、不追问（打磨 P5）。
+
+    与 `_run_answer` 的三条差别（每条都是刻意为之）：
+    1. **不推进**：重答的是已经答过的题，答完应停在本题看新评分，不跳到下一考点；
+    2. **不追问**：重答本身就是补救动作，再追加一层追问会把用户绕回原地；
+    3. **失败不清空原分**：重答失败时保留上次的分数与点评 —— 用户主动改进答案，
+       不该反而丢掉已经拿到的成绩。
+    ⚠️ 已结算（finished）的场次重答后必须**重算 total_score**（口径与 `_finalize` 一致），
+       否则成绩单总分与逐题分数自相矛盾。
+    ⚠️ 复习卡不因重答而撤销（write_back 幂等）：卡片在本场结算时已写入，
+       重答把某题从 wrong 改成 correct 不代表当初不该复习。
+    """
+    db = SessionLocal()
+    try:
+        s = db.get(DrillSession, sid)
+        if not s:
+            raise _Fatal("陪练记录不存在或已删除")
+        turn = (db.query(DrillTurn)
+                .filter(DrillTurn.session_id == sid, DrillTurn.seq == seq).first())
+        if not turn:
+            raise _Fatal("轮次不存在，请刷新后重试")
+        if turn.is_followup:
+            raise _Fatal("追问不支持重答")
+        if turn.user_answer is None:
+            raise _Fatal("该题还没作答，无法重答")
+
+        job.stage = "score"
+        job.broadcast("stage", {"stage": "score", "text": "AI 正在重新评分…"})
+        try:
+            res = llm.judge_drill_answer(turn.question, turn.expected_points or [], answer,
+                                         material_excerpt=_judge_excerpt(db, turn))
+        except Exception as e:      # noqa: BLE001  含 HTTPException
+            db.rollback()
+            msg = str(getattr(e, "detail", None) or e or "本题评分失败")[:200]
+            job.status = "failed"
+            job.error = msg
+            job.broadcast("error", {"message": f"{msg}（原评分已保留）"})
+            return
+
+        turn.user_answer = answer
+        turn.score = res["score"]
+        turn.verdict = res["verdict"]
+        turn.dimensions = res["dimensions"]
+        turn.comment = res["comment"]
+        turn.missing_points = res["missing_points"]
+        if s.status == "finished":
+            rows = db.query(DrillTurn).filter(DrillTurn.session_id == sid).all()
+            graded = [t.score for t in rows if t.score is not None]
+            s.total_score = round(sum(graded) / len(graded), 1) if graded else None
+        s.updated_at = datetime.utcnow()
+        db.commit()
+
+        show_answer = bool((s.config or {}).get("show_answer", True))
+        job.broadcast("score", {
+            "seq": seq, "turn_id": turn.id, "outline_index": turn.outline_index or 0,
+            "skipped": False, "retry": True, "score": res["score"],
+            "verdict": res["verdict"], "dimensions": res["dimensions"],
+            "comment": res["comment"], "missing_points": res["missing_points"],
+            "expect_points": (turn.expected_points or []) if show_answer else [],
+            "hint": _outline_hint(s, turn.outline_index),
+            "total_score": s.total_score,
+        })
+        job.status = "done"
+        job.broadcast("done", {"status": s.status})
+    except _Fatal as e:
+        db.rollback()
+        job.status = "failed"
+        job.error = str(e)
+        job.broadcast("error", {"message": str(e)})
+    except BaseException as e:      # noqa: BLE001
+        db.rollback()
+        msg = str(getattr(e, "detail", None) or e or "重答失败")[:200]
         job.status = "failed"
         job.error = msg
         job.broadcast("error", {"message": msg})
@@ -874,7 +1014,12 @@ def _should_followup(db, s: DrillSession, turn: DrillTurn) -> bool:
         return False
     if policy == FOLLOW_UP_ALWAYS:
         return True
-    return turn.verdict in ("partial", "wrong")
+    # shallow（默认）：只有「答得浅」才深挖。
+    # ⚠️⚠️ 刻意**不含 wrong**（打磨 P2，2026-11-02）：实测对「完全不会」的作答追问，
+    #    模型会生成「请重新作答：<原题>」——等于把题目念第二遍，对用户零价值，
+    #    还把一场陪练拖长一倍。wrong 的补救改走 score 事件的 hint（换个角度）
+    #    与成绩单的「重答这题」；partial 才是「讲了一半」、值得再挖一层的情形。
+    return turn.verdict == "partial"
 
 
 def _advance(db, s: DrillSession, job: _DrillJob, turn: DrillTurn) -> None:
@@ -898,7 +1043,7 @@ def write_back(db, s: DrillSession, weak_turns: list[DrillTurn]) -> int:
 
     ⚠️⚠️ source 必须为 "drill"：复用 "quiz" 会与「测一测 / 简单学」互删，
     连 level/ease/review_count 复习进度一起清空且不可恢复（PRD 附录 A #1）。
-    ⚠️ material_id 无法确定时写哨兵值 -1（不得写 0，0 已被「AI 问答」筛选占用）。
+    ⚠️ material_id 无法确定时写哨兵值 -1（不得写 0，0 已被「AI 对话」筛选占用）。
     """
     cards = []
     for t in weak_turns:
@@ -1035,19 +1180,32 @@ def session_trend(db, limit: int = TREND_MAX_SESSIONS) -> dict:
             .order_by(DrillSession.created_at.desc())
             .limit(limit).all())
     rows = list(reversed(rows))        # 时间正序，前端从左到右画
+    # 轮次一次性取全：既要算每场完成度（打磨 P7），又被后面的漏点聚合复用。
+    # ⚠️ 不要拆成「先建 sessions 再逐场查 turns」—— 那是 N+1，列表页每次进都打 N 次库。
+    all_ids = {s.id for s in rows}
+    turns = (db.query(DrillTurn).filter(DrillTurn.session_id.in_(all_ids)).all()
+             if all_ids else [])
+    by_sid: dict = {}
+    for t in turns:
+        by_sid.setdefault(t.session_id, []).append(t)
+
     sessions = []
     for s in rows:
         stamp = s.created_at or s.updated_at
+        ts = by_sid.get(s.id, [])
         sessions.append({"id": s.id, "title": s.title,
                          "date": stamp.isoformat() if stamp else "",
-                         "score": s.total_score})
+                         "score": s.total_score,
+                         # 完成度语义：成绩单上的「分数」只有在「答得够多」时才有可比性。
+                         # 答 1 题的 0 分和答满 8 题的 0 分完全不是一回事，前端据此区分呈现。
+                         "graded": len([t for t in ts if t.score is not None]),
+                         "answered": len([t for t in ts if t.user_answer is not None]),
+                         "outline_count": len(s.outline or [])})
     if len(rows) < 2:
         return {"n_sessions": len(rows), "sessions": sessions, "weak": [], "split": 0}
 
     half = len(rows) // 2
     recent_ids = {s.id for s in rows[half:]}
-    all_ids = {s.id for s in rows}
-    turns = db.query(DrillTurn).filter(DrillTurn.session_id.in_(all_ids)).all()
 
     agg: dict = {}
     for t in turns:

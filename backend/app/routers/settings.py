@@ -81,6 +81,9 @@ def get_settings():
         # 遍历 FIELDS 中所有 prompt_ 字段，确保新增提示词无需改此处
         **{k: conf.get(k, "") for k in settings_store.FIELDS if k.startswith("prompt_")},
         "kb_hit_threshold": conf.get("kb_hit_threshold", 0.15),
+        # 检索增强层开关（2026-10-28）：默认开；仅显式 False 关闭（conf 缺省值是 ""）
+        "query_rewrite_enabled": conf.get("query_rewrite_enabled") is not False,
+        "retrieval_plan_enabled": conf.get("retrieval_plan_enabled") is not False,
         # 陪练 · 难度自适应参数：**直接复用出题时的读取口径**（adapt_params 带默认回退
         # 与范围钳制）—— 否则设置页显示的值可能和出题实际用的值不一致。
         **{k: v for k, v in zip(
@@ -318,9 +321,14 @@ async def restore(file: UploadFile = File(...)):
             "message": "还原完成。请重启后端服务后刷新页面（向量索引连接需重建）"}
 
 
+# 开发探针写入的 kind：不属于用户真实使用。明细里照列（可查证），但**不计入 _total** ——
+# 否则「累计消耗」里混着调试脚本的调用，用户拿这个数去跟服务商账单对，永远对不上。
+DEV_KINDS = frozenset({"probe"})
+
+
 @router.get("/usage")
 def usage_stats(db: Session = Depends(get_db)):
-    """Token 消耗统计：今日 / 累计，按业务 kind 分组（流式为估算值）"""
+    """Token 消耗统计：今日 / 累计，按业务 kind + 按模型分组（流式为估算值）"""
     from datetime import datetime, timedelta
     from sqlalchemy import func
     from ..models import LLMUsage
@@ -343,11 +351,38 @@ def usage_stats(db: Session = Depends(get_db)):
             for r in q.group_by(LLMUsage.kind).all()
         }
 
-    def total(rows):
+    def agg_model(since=None):
+        """按模型分组：同一台机器常配多个供应商，只有这个维度能与账单对口径。
+
+        ⚠️ 同样剔除 DEV_KINDS，否则某个模型的总量会被探针调用抬高，两处口径不一致。
+        """
+        q = db.query(
+            LLMUsage.model,
+            func.count(LLMUsage.id),
+            func.sum(LLMUsage.prompt_tokens),
+            func.sum(LLMUsage.completion_tokens),
+        ).filter(LLMUsage.kind.notin_(list(DEV_KINDS)))
+        if since:
+            q = q.filter(LLMUsage.created_at >= since)
         return {
-            "calls": sum(v["calls"] for v in rows.values()),
-            "tokens": sum(v["prompt_tokens"] + v["completion_tokens"] for v in rows.values()),
+            (r[0] or "(未记录)"): {"calls": r[1], "prompt_tokens": r[2] or 0,
+                                   "completion_tokens": r[3] or 0}
+            for r in q.group_by(LLMUsage.model).all()
+        }
+
+    def total(rows):
+        live = {k: v for k, v in rows.items() if k not in DEV_KINDS}
+        dev = {k: v for k, v in rows.items() if k in DEV_KINDS}
+        return {
+            "calls": sum(v["calls"] for v in live.values()),
+            "tokens": sum(v["prompt_tokens"] + v["completion_tokens"] for v in live.values()),
+            # 开发消耗单独给出：页面据此提示「另有 X 次探针调用未计入」
+            "dev_calls": sum(v["calls"] for v in dev.values()),
+            "dev_tokens": sum(v["prompt_tokens"] + v["completion_tokens"] for v in dev.values()),
         }
 
     today, all_time = agg(today_start), agg()
-    return {"today": {**today, "_total": total(today)}, "all": {**all_time, "_total": total(all_time)}}
+    return {
+        "today": {**today, "_total": total(today), "_by_model": agg_model(today_start)},
+        "all": {**all_time, "_total": total(all_time), "_by_model": agg_model()},
+    }

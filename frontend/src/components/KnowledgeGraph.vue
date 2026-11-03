@@ -1,10 +1,17 @@
 <template>
   <div class="kg-wrap">
-    <!-- 空态：未抽到实体 -->
+    <!-- 空态：未抽到实体。⚠️ 正有材料在后台生成时文案要换成「正在生成中」，
+         否则用户从「生成中 45%」跳过来只看到一张空图，会以为没生效。 -->
     <div v-if="!loading && allEntities.length === 0" class="kg-empty">
       <img :src="mascot" class="kg-empty-img" alt="" />
-      <p>还没有生成知识图谱</p>
-      <p class="kg-empty-sub">到「知识库 → 按材料」对需要的材料点「生成图谱」，即可按需抽取实体与关系（会调用大模型，消耗少量 token）。</p>
+      <template v-if="runningCount > 0">
+        <p>正在生成知识图谱…</p>
+        <p class="kg-empty-sub">有 {{ runningCount }} 份材料正在后台抽取实体与关系，通常需要几分钟。可以先去做别的，完成后回到本页即可看到图谱。</p>
+      </template>
+      <template v-else>
+        <p>还没有生成知识图谱</p>
+        <p class="kg-empty-sub">到「知识库 → 按材料」对需要的材料点「生成图谱」，即可按需抽取实体与关系（会调用大模型，消耗少量 token）。</p>
+      </template>
     </div>
 
     <div v-else class="kg-layout">
@@ -133,6 +140,10 @@ import mascot from '../assets/mascot.png'
 // 外部指定要聚焦的材料（知识库「按材料」tab 点「图谱 · N」跳转过来时传入）
 const props = defineProps({
   focusMaterial: { type: [Number, String], default: null },
+  // 正在后台生成图谱的材料数（父级轮询得出）：>0 时空态显示「正在生成中…」
+  runningCount: { type: Number, default: 0 },
+  // 父级每发现一份材料生成完成就 +1 → 本组件重载数据（用户可以在图谱页等着看结果）
+  refreshKey: { type: Number, default: 0 },
 })
 
 // 5 类实体配色（语义色固定，不随主题变化）
@@ -200,6 +211,9 @@ watch(() => props.focusMaterial, (id) => {
   const has = allEntities.value.some(e => (e.material_ids || []).includes(Number(id)))
   if (has) selectMaterial(String(id))
 })
+
+// 父级轮询发现「有材料刚生成完」→ 重载一次（用户在图谱页等着时不用手动刷新）
+watch(() => props.refreshKey, (k) => { if (k) load() })
 
 // 计算全库 degree（用于节点大小与裁剪阈值）
 function computeDegree() {

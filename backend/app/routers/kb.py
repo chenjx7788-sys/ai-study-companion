@@ -1,4 +1,6 @@
 """知识库路由（PRD 模块 D）：总览 / 重建索引 / 检索测试 / 阈值校准"""
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -12,6 +14,20 @@ router = APIRouter(prefix="/kb", tags=["kb"])
 
 class RebuildReq(BaseModel):
     material_id: int
+
+
+def _elapsed_seconds(started_at) -> int:
+    """知识图谱生成已用时（整秒）。
+
+    ⚠️ entity_started_at 是 naive UTC（datetime.utcnow 写的），这里也必须用 utcnow 相减。
+       把时间戳丢给前端自己算是不行的：naive 串被 new Date() 按本地时区解析 → 差 8 小时。
+    """
+    if not started_at:
+        return 0
+    try:
+        return max(0, int((datetime.utcnow() - started_at).total_seconds()))
+    except Exception:
+        return 0
 
 
 @router.get("/overview")
@@ -32,6 +48,13 @@ def kb_overview(search: str | None = None, db: Session = Depends(get_db)):
             "parsed_status": m.parsed_status,
             "chunk_count": chunk_count, "note_count": note_count,
             "entity_count": entity_count,
+            # 知识图谱生成状态（2026-11-03）：running 时前端显示百分比并开轮询。
+            # 这是「允许离开页面继续生成」的关键 —— 状态在库里，不随组件卸载消失。
+            "entity_status": m.entity_status or "",
+            "entity_progress": int(m.entity_progress or 0),
+            "entity_error": m.entity_error or "",
+            "entity_elapsed": _elapsed_seconds(m.entity_started_at)
+                               if (m.entity_status or "") == "running" else 0,
             "indexed": chunk_count > 0,
             "created_at": m.created_at.isoformat() if m.created_at else None,
         })
@@ -45,7 +68,7 @@ def kb_overview(search: str | None = None, db: Session = Depends(get_db)):
         indexed = (db.query(KbEntry)
                    .filter(KbEntry.ref_type == "note", KbEntry.ref_id == n.id).count()) > 0
         if n.source_type == "chat":
-            src_label = "AI 问答"          # 问答转存的材料无关笔记
+            src_label = "AI 对话"          # 对话转存的材料无关笔记
         elif n.source_type == "weekly_report":
             src_label = "AI 学习周报"       # 数据统计页的 AI 分析报告
         elif n.source_type == "podcast_script":

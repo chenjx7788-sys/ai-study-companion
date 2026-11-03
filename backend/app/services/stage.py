@@ -2133,6 +2133,66 @@ def _build_ppt_stage(db, v) -> Path:
     return out
 
 
+
+# ---------- 板书 · 激光回指（C1，2026-10-30）----------
+# 讲稿提示词本就要求「核心概念名全文至少出现 2 次（首次讲解 + 后文复述）」——
+# 复述发生时板书上该条还在 → 激光笔移回该条，把「复述」变成看得见的教学动作。
+# ⚠️ 判定全部在后端（与 pick_shape 同一纪律），模板只消费事件与坐标。
+# ⚠️ 宁可少指，不可错指：归一化后 <4 字的词条不指；同句命中多个词条只留最长。
+BOARD_RECALL_MIN_CHARS = 4
+BOARD_RECALL_MAX_PER_PAGE = 6      # 单页回指事件上限（防激光跳舞）
+BOARD_RECALL_MAX_PER_LINE = 2      # 同一条目被回指上限
+BOARD_RECALL_MIN_GAP_MS = 800      # 相邻回指最小间隔
+BOARD_RECALL_MAX_MS = 2400         # 单次回指窗口上限
+
+
+def _attach_board_recalls(slides: list, segs: list) -> None:
+    """要点词条在**后续讲稿句**里原样复现 → 回指事件，就地注入 slides[i]["recalls"]。
+
+    只挂「还在板上」的复述：回指时刻必须落在该页区间内（板擦了就指不到）。
+    图板页（sketch）没有条目可指，跳过；无命中不注入键（存量行为零变化）。
+    """
+    norm_segs = []
+    for sg in segs or []:
+        if not isinstance(sg, dict):
+            continue
+        norm_segs.append((int(sg.get("a") or 0), int(sg.get("b") or 0),
+                          _ppt_punct_off(sg.get("t"))))
+    for s in slides:
+        els = s.get("els") or []
+        if not els or s.get("sketch"):
+            continue
+        pa, pb = int(s.get("a") or 0), int(s.get("b") or 0)
+        terms = [_ppt_punct_off(e.get("t")) for e in els]
+        recalls, last_at = [], -10 ** 9
+        for i, e in enumerate(els):
+            term = terms[i]
+            if len(term) < BOARD_RECALL_MIN_CHARS:
+                continue
+            at0 = int(e.get("at") or 0)
+            per_line = 0
+            for sa, sb, stext in norm_segs:
+                if not stext or sa <= at0 or sa < pa or sa >= pb:
+                    continue            # 引出句及之前 / 板外（已擦）都不指
+                if term not in stext:
+                    continue
+                # 同句命中多个词条只留最长（「缓存穿透」命中时不再指「缓存」）
+                if any(j != i and len(terms[j]) > len(term) and terms[j] in stext
+                       for j in range(len(els))):
+                    continue
+                if recalls and sa - last_at < BOARD_RECALL_MIN_GAP_MS:
+                    continue
+                recalls.append({"i": i, "at": sa,
+                                "dur": min(max(sb - sa, 600), BOARD_RECALL_MAX_MS)})
+                last_at = sa
+                per_line += 1
+                if per_line >= BOARD_RECALL_MAX_PER_LINE:
+                    break
+            if len(recalls) >= BOARD_RECALL_MAX_PER_PAGE:
+                break
+        if recalls:
+            s["recalls"] = recalls[:BOARD_RECALL_MAX_PER_PAGE]
+
 def _build_board_stage(db, v) -> Path:
     """板书 · 粉笔舞台页：独立模板。
 
@@ -2143,6 +2203,8 @@ def _build_board_stage(db, v) -> Path:
     payload = stage_payload(db, v)
     # ⚠️ 只有板书要图板页；同一个 payload 走 PPT 时必须是旧签名（见 SKETCH_TYPES 段）。
     nav, slides = ppt_slides(payload, with_sketch=True)
+    # 激光回指（C1）：只挂板书上还指得到的复述（页内）；无命中不注入，存量零变化
+    _attach_board_recalls(slides, payload["segs"])
     title = getattr(v, "title", "") or "AI 视频"
     repl = {
         "__TITLE__": _esc(title),
@@ -2321,7 +2383,10 @@ def _motion_split(els: list, layout: str) -> list:
 # sketch.type → 动效图解版式。quadrant 没有专属版式：4 个标签正好落 2×2 网格
 # （grid 分支在 n>=3 时就是两列网格），视觉上就是四宫格，不新造版式。
 _SKETCH_LAYOUT = {"flow": "flow", "compare": "compare",
-                  "pyramid": "pyramid", "quadrant": "grid"}
+                  "pyramid": "pyramid", "quadrant": "grid",
+                  # D1（2026-10-30）新原语的最近版式映射：板书有真画法，
+                  # 动效图解先落到最接近的既有版式（绝不白屏）
+                  "timeline": "flow", "cycle": "flow", "tree": "pyramid"}
 
 
 def _expand_sketch(slides: list) -> list:

@@ -2918,6 +2918,41 @@ function stopStudyTrack() {
 
 // ---------- 初始化 ----------
 
+// ---------- 对话卡片直达动作（2026-10-26） ----------
+// 入口：/study/:id?tab=simplelearn|quiz&auto=1（对话资源卡片的「讲义」「出题」按钮）
+// 目的：点完真的开始生成 —— 否则用户落地后还要自己找按钮，那个动作就只是装饰。
+// ⚠️ 已有内容绝不重复生成（那是用户的 token 与等待）：讲义看 learnNote / learnDisplayContent，
+//    测一看 quizCards。
+// ⚠️ App.vue 用 $route.path 当 key → 同路径只换 query 时组件**不重建**，
+//    所以既要能从 init 调，也要能被 watch 调；同一组 query 只处理一次。
+let entryHandled = ''
+let learnReadyP = null
+
+const entryKey = (q) => String((q && q.tab) || '') + '|' + String((q && q.auto) || '')
+
+async function applyEntryAction() {
+  const q = route.query || {}
+  const tab = String(q.tab || '')
+  if (tab !== 'summary' && tab !== 'simplelearn' && tab !== 'quiz') return
+  const key = entryKey(q)
+  if (key === entryHandled) return
+  entryHandled = key
+  activeTab.value = tab
+  if (String(q.auto || '') !== '1') return
+  if (tab === 'simplelearn') {
+    // init 里 resumeLearn() 刻意不 await（不阻塞其余加载）→ 这里等它回填完再判断「有没有讲义」
+    if (learnReadyP) await learnReadyP
+    if (learnNote.value || learnDisplayContent.value || learnLoading.value) return
+    genLearn()
+  } else if (tab === 'quiz') {
+    if (quizCards.value.length || quizLoading.value) return
+    genQuiz()
+  }
+}
+
+// query 变化（同路径换参不重建组件）：比如已经在 /study/5，又点了另一条回答上的「出题」
+watch(() => entryKey(route.query), () => { applyEntryAction() })
+
 // 材料解析完成后的完整加载（首次进入 / 解析中轮询结束后共用）
 async function initAfterParsed() {
   try {
@@ -2932,7 +2967,8 @@ async function initAfterParsed() {
     if (isMedia.value) loadAsr()
     if (isEpub.value) loadEpubChapters()
     await Promise.all([refreshNotes(), loadChains(), loadQuiz(), loadHighlights()])
-    resumeLearn()   // 简单学习：附着进行中的生成，或读回已有讲义（不阻塞其余加载）
+    // ⚠️ 存下 promise 而不是裸调：?auto=1 要等讲义状态回填完才知道「是否已有内容」
+  learnReadyP = resumeLearn()   // 简单学习：附着进行中的生成，或读回已有讲义（不阻塞其余加载）
     const { data: assets } = await aiApi.assets(materialId)
     if (assets.summary) summary.value = assets.summary
     if (assets.keywords) {
@@ -2960,6 +2996,8 @@ async function initAfterParsed() {
   document.addEventListener('fullscreenchange', onFsChange)
   // 学习时长埋点启动（模块 H）
   startStudyTrack()
+  // 对话卡片直达动作（?tab=&auto=1）：放在最后，确保讲义/题目状态都已回填
+  await applyEntryAction()
 }
 
 // 解析中轮询：拿到最新进度，解析结束后自动进入完整加载
@@ -3765,7 +3803,7 @@ onUnmounted(() => {
 .col-left { padding: 18px 12px; }
 .learn-quiz-tip {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  /* ⚠️⚠️ 右侧必须留出 76px：本提示条贴在内容区底部、按钮右对齐，会与「study 页悬浮问答球」
+  /* ⚠️⚠️ 右侧必须留出 76px：本提示条贴在内容区底部、按钮右对齐，会与「study 页悬浮对话球」
      （App.vue `.float-chat-study`：right 26px + 宽 56px + z-index 90）**重叠**。
      实测（1440×960）：按钮 box x∈[1346,1416] y∈[840,864]，悬浮球 x∈[1358,1414] y∈[796,852]
      → 点按钮右半部分会被悬浮球抢走点击（Playwright 表现为 click 超时）。

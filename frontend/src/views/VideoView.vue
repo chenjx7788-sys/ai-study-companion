@@ -125,7 +125,8 @@
                 <label class="field-sub-label">音色<span class="hint-inline">点 ▶ 可试听每个音色</span></label>
                 <div class="voice-row">
                   <el-select v-model="form.voice_map.host" size="small" style="flex: 1">
-                    <el-option label="跟随设置页的语音设置" value="" />
+                    <!-- 哨兵 default = 跟随设置页（空串会被 EP 视为未选）；载荷/脏检查/试听禁用都要映射 -->
+                    <el-option label="跟随设置页的语音设置" value="default" />
                     <el-option v-for="v in opts.voices" :key="v.id" :value="v.id"
                                :label="`${v.name}（${v.desc}）`">
                       <div class="vo-row">
@@ -141,8 +142,8 @@
                   </el-select>
                   <!-- 三态与播客一致：▶ 待试听 / 转圈 等待音频 / ■ 播放中（再点即停）。
                        ⚠️ 空值守卫：`previewId === '' 且未选音色` 时 '' === '' 会误亮停止态。 -->
-                  <button type="button" class="try-btn" :disabled="!form.voice_map.host"
-                          :title="form.voice_map.host ? '试听当前音色' : '先选一个具体音色'"
+                  <button type="button" class="try-btn" :disabled="!form.voice_map.host || form.voice_map.host === 'default'"
+                          :title="form.voice_map.host && form.voice_map.host !== 'default' ? '试听当前音色' : '先选一个具体音色'"
                           @click="previewVoice(form.voice_map.host)">
                     <i v-if="form.voice_map.host && previewId === form.voice_map.host && previewBusy"
                        class="vo-spin"></i>
@@ -164,7 +165,7 @@
                 <label class="field-sub-label">背景音乐<span class="hint-inline">点 ▶ 可试听</span></label>
                 <div class="voice-row">
                   <el-select v-model="form.bgm_id" size="small" style="flex: 1"
-                             placeholder="不加背景音乐">
+                             class="sel-inherit" placeholder="不加背景音乐">
                     <el-option label="不加背景音乐" value="" />
                     <el-option v-for="t in bgmSelectOptions" :key="t.id" :value="t.id"
                                :label="t.name">
@@ -918,9 +919,9 @@ const form = reactive({
   // 自定义背景图（解压型三皮肤）。空 = 用皮肤自带画面。
   bg_id: '',
   instruction: '',
-  // 本片音色（作品级，与播客 voice_map 同构）。host 为空 = 跟随设置页的语音设置。
+  // 本片音色（作品级，与播客 voice_map 同构）。host 为 default（载荷映射回 ''）= 跟随设置页的语音设置。
   // ⚠️ 选中作品时必须能还原它当时用的音色（回填不完整比不回填更危险）。
-  voice_map: { host: '' },
+  voice_map: { host: 'default' },
   // 背景音乐（作品级，与播客 bgm_* 同构）。bgm_id 空 = 不加；volume 单位 dB。
   // 仅「本片单独生成」消费；复用播客时此行不显示、提交也不带（音轨里已含播客自己的 BGM）。
   bgm_id: '',
@@ -1230,7 +1231,7 @@ function applyVideo(v) {
   //    （用户什么都没做，画面却回落到自带背景）。缺失只做提示，见 bgMissing。
   form.bg_id = v.bg_id || ''
   form.instruction = v.instruction || ''
-  form.voice_map.host = (v.voice_map || {}).host || ''
+  form.voice_map.host = (v.voice_map || {}).host || 'default'
   // BGM 同音色纪律：照原值回填（已失效的素材也回填，由 bgmMissing 如实提示，不静默清空）
   form.bgm_id = v.bgm_id || ''
   form.bgm_volume = v.bgm_volume ?? -20
@@ -1337,7 +1338,7 @@ function createPayload() {
     avatar_pos: form.avatar_pos,
     bg_id: form.bg_id || '',
     audio_source: form.audio_source,
-    voice_map: { host: form.voice_map.host || '' },
+    voice_map: { host: form.voice_map.host === 'default' ? '' : (form.voice_map.host || '') },
     instruction: form.instruction || '',
   }
   if (form.audio_source === 'podcast') return { ...base, podcast_id: form.podcast_id }
@@ -1371,8 +1372,9 @@ function updatePayload() {
     bg_id: form.bg_id || '',
     instruction: form.instruction || '',
   }
-  if ((form.voice_map.host || '') !== (((cur.value || {}).voice_map || {}).host || '')) {
-    p.voice_map = { host: form.voice_map.host || '' }
+  const _vh = form.voice_map.host === 'default' ? '' : (form.voice_map.host || '')
+  if (_vh !== (((cur.value || {}).voice_map || {}).host || '')) {
+    p.voice_map = { host: _vh }
   }
   // BGM 与音色同款纪律：变了才带；音量只在有曲子时有意义（没曲子带音量是脏数据）
   const bgmDirty = (form.bgm_id || '') !== ((cur.value || {}).bgm_id || '')
@@ -1496,8 +1498,9 @@ async function flushPlanParams(id) {
   if ((form.bg_id || '') !== (c.bg_id || '')) p.bg_id = form.bg_id || ''
   if ((form.instruction || '') !== (c.instruction || '')) p.instruction = form.instruction || ''
   // 音色与视觉方案同类：生成会重新合成音轨，所以必须**先落库再生成**。
-  if ((form.voice_map.host || '') !== (((c.voice_map || {}).host) || '')) {
-    p.voice_map = { host: form.voice_map.host || '' }
+  const _vh2 = form.voice_map.host === 'default' ? '' : (form.voice_map.host || '')
+  if (_vh2 !== (((c.voice_map || {}).host) || '')) {
+    p.voice_map = { host: _vh2 }
   }
   // BGM 同理：混音发生在音轨生成环节，必须先落库（音量只在有曲子时才参与比对）
   const bgmDirty = (form.bgm_id || '') !== (c.bgm_id || '')
@@ -2434,7 +2437,10 @@ onBeforeUnmount(() => {
   position: relative; border-radius: 8px; overflow: hidden;
   aspect-ratio: 16 / 9; background: #0c0c0f;
 }
-.work-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.work-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .25s ease; }
+/* 封面层级（2026-10-26）：卡面加轻阴影，hover 时海报轻放大（父级 overflow:hidden 收边） */
+.work-thumb { box-shadow: 0 1px 3px rgba(17, 17, 26, .10); }
+.work-card:hover .work-thumb img { transform: scale(1.04); }
 /* 无海报占位封面：按皮肤气质分组配色（默认覆盖 source/graph/graph_paper/graph_clean） */
 .work-thumb-ph {
   width: 100%; height: 100%; display: flex; align-items: center; justify-content: center;
@@ -2625,4 +2631,9 @@ onBeforeUnmount(() => {
 /* 操作行按钮内图标（V9） */
 .btn-ic { width: 13px; height: 13px; margin-right: 4px; vertical-align: -2px; flex: none; }
 
+/* 「不加背景音乐」是真实语义值（存 ''），不是空态 —— placeholder 默认灰化会误导。
+   只作用于显式打了 sel-inherit 的 select，不影响真正的空态占位。 */
+.sel-inherit :deep(.el-select__placeholder.is-transparent) {
+  color: var(--el-text-color-regular);
+}
 </style>

@@ -1,8 +1,54 @@
 """数据模型：对应 PRD 第 5 节 7 个实体"""
+import json
+
 from sqlalchemy import Column, Integer, String, Text, Float, Boolean, DateTime, ForeignKey, JSON
 from sqlalchemy.orm import relationship
+from sqlalchemy.types import TypeDecorator
 from datetime import datetime
 from .database import Base
+
+
+# ---------- 容错 JSON 列（2026-10-26） ----------
+# ⚠️⚠️ 为什么不用 SQLAlchemy 自带的 JSON：
+#   1. 原生 SQL 插入（种子脚本 / 一次性回填 / 迁移）拿不到 ORM 的 `default=dict`，
+#      建表时写的是 `origin_meta TEXT DEFAULT ''` → 空串被原样写进库；
+#   2. 读取时 JSON 列的 result_processor 直接 `json.loads('')` → JSONDecodeError，
+#      `GET /materials`、`/kb/overview`、`/materials/{id}` **整条列表全 500**，
+#      表面像"材料库坏了"，实际只是某一行是空串（本项目已踩过一次）。
+# 这里把 impl 换成 Text，编解码自己做：空串 / NULL / 非法 JSON 一律回落空容器，绝不抛。
+# ⚠️ 不能写成 `impl = JSON` 只覆盖 process_result_value：JSON 自带的 result_processor
+#    （json.loads）会**先于** process_result_value 执行，空串在进到自己的代码前就已经抛了（实测）。
+class _SafeJSON(TypeDecorator):
+    impl = Text
+    cache_ok = True
+    _empty = dict          # 子类覆盖：SafeJSONList → list
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value                      # 已是 JSON 文本：原样存，读时再解析
+        return json.dumps(value, ensure_ascii=False)
+
+    def process_result_value(self, value, dialect):
+        if value is None or value == "":
+            return self._empty()
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            return json.loads(value)
+        except Exception:
+            return self._empty()
+
+
+class SafeJSON(_SafeJSON):
+    """JSON 列，空值回落 {}（对象型，如 origin_meta）"""
+    _empty = dict
+
+
+class SafeJSONList(_SafeJSON):
+    """JSON 列，空值回落 []（数组型，如 sources / suggestions / tags）"""
+    _empty = list
 
 
 class Folder(Base):
@@ -38,15 +84,31 @@ class Material(Base):
     origin_ref = Column(Text, default="")
     # 抽取到的元信息快照：{title, author, date, sitename, ...}。纯展示与溯源用，
     # 不做业务判定（判定一律走 origin_ref）。
-    origin_meta = Column(JSON, default=dict)
+    # ⚠️ 用 SafeJSON 而不是原生 JSON：脚本走原生 SQL 插入时拿到的是建表的
+    #    `DEFAULT ''`，原生 JSON 列读它会 json.loads('') 抛错 → 材料列表整条 500。
+    origin_meta = Column(SafeJSON, default=dict)
     parsed_status = Column(String(16), default="parsing")  # parsing / success / failed
     parse_error = Column(String(255), nullable=True)
     parse_progress = Column(Integer, default=0)   # 解析进度 0-100（音视频转写有真实进度）
     page_count = Column(Integer, default=0)
-    tags = Column(JSON, default=list)
+    tags = Column(SafeJSONList, default=list)
     # 实体抽取的内容指纹（MD5 of 全部 chunk 内容）：重试解析时若指纹未变且已有实体，
     # 跳过 LLM 抽取、只在本地重建引用表（防无意重复消耗 token，B+C 方案的 C）
     extract_sig = Column(String(32), default="")
+    # 知识图谱生成状态（2026-11-03）：把「生成中」变成 DB 事实 —— 抽取要跑几分钟，
+    # 用户会离开页面甚至关掉重开，只靠前端内存里的 loading 会让进度凭空消失。
+    # 取值：'' 未生成 / running 抽取中 / success 已生成 / failed 失败。
+    # ⚠️ running 是瞬时态：进程一重启内存线程就没了，必须由
+    #    main.py::_recover_entity_orphans 收回 failed。否则按钮永远停在「生成中」，
+    #    而路由的 running 幂等保护会让用户连重试都点不动（等于功能坏掉）。
+    # ⚠️ entity_progress 只服务 UI（分段调用数换算的百分比，封顶 95，留 5% 给写库收尾），
+    #    不参与任何业务判定、不进 extract_sig 指纹。
+    entity_status = Column(String(16), default="")
+    entity_progress = Column(Integer, default=0)
+    entity_error = Column(String(255), default="")
+    # 启动时刻（naive UTC，与 created_at 同口径）。已用时由后端算成整秒下发，
+    # 绝不让前端 new Date() 直接相减 —— naive UTC 被当本地时间会差 8 小时。
+    entity_started_at = Column(DateTime, nullable=True)
     # 材料【内容性质】，决定讲义走哪套工艺（P0 材料 AI 工艺分流）。
     # 取值：practical 工具实用 / conceptual 认知思维 / narrative 叙事 /
     #       fragment 碎片（图片·音视频，形态决定、不调 LLM）/ auto 未判定。
@@ -69,7 +131,9 @@ class MaterialChunk(Base):
     content = Column(Text)
     page_no = Column(Integer)
     section_path = Column(String(512), default="")  # 章节层级，如 "第2章/2.1"
-    # 块性质：body 正文 / img_ocr 图片 OCR 文字。
+    # 块性质：body 正文 / img_ocr 图片 OCR 文字 / meta 文档元信息（剪藏署名与来源 URL）。
+    # meta 块**留在原文里**（阅读页要显示来源）但不进向量 / 全文检索 / 实体抽取，
+    # 判据见 `services/cleaner.mark_provenance`。
     # img_ocr 只在【网页剪藏材料】（origin_meta.saved_from=='clip'）上打，
     # 判据见 _parse_material 的 _tag_chunk_kind。这类块**照常分块、照常入向量库与全文检索**，
     # 只是学习页默认不显示（可折叠展开）。⚠️ 判定口径是 saved_from 而不是 origin ——
@@ -156,6 +220,8 @@ class ChatSession(Base):
     pinned = Column(Boolean, default=False)         # 置顶
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)  # 最近活动时间（排序/相对时间）
+    # 炼丹炉：所属应用（2026-10-27）。NULL = 主问答会话；应用会话按 app_id 物理隔离
+    app_id = Column(Integer, ForeignKey("apps.id"), nullable=True, index=True)
 
     messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
 
@@ -171,12 +237,92 @@ class ChatMessage(Base):
     kb_hit = Column(Boolean, default=False)
     answer_kind = Column(String(16), default="")     # 回答口径（三档问答）：kb / general / general_fallback / kb_miss；空 = 旧数据（前端按 kb_hit 回落）
     error = Column(String(255), default="")        # 生成中断/失败标记（半截回答落库，前端错误态+重试；「用户中断生成」为用户主动停止）
-    sources = Column(JSON, default=list)         # [{material_id, title, page_no, snippet}]
-    suggestions = Column(JSON, default=list)     # 回答后推荐的 3 个相关问题
-    tool_steps = Column(JSON, default=list)     # 工具调用步骤（P1-②）：[{round, name, label, brief, ok}]，刷新后回填界面
+    # ⚠️ 以下 4 个列表列同样用 SafeJSONList：任何一条消息的该列为空串，
+    #    都会让整个会话历史接口 500（同 origin_meta 的踩坑）。
+    sources = Column(SafeJSONList, default=list)         # [{material_id, title, page_no, snippet}]
+    suggestions = Column(SafeJSONList, default=list)     # 回答后推荐的 3 个相关问题
+    tool_steps = Column(SafeJSONList, default=list)     # 工具调用步骤（P1-②）：[{round, name, label, brief, ok}]，刷新后回填界面
+    resources = Column(SafeJSONList, default=list)     # 库内相关资源卡片（2026-10-26）：[{kind, id, title, badge, meta, snippet, route}]
+    app_id = Column(Integer, nullable=True, index=True)  # 炼丹炉：随会话冗余（查询免 join）；NULL=主问答（2026-10-27）
     created_at = Column(DateTime, default=datetime.utcnow)
 
     session = relationship("ChatSession", back_populates="messages")
+
+
+class SkillUse(Base):
+    """技能生效记录（P0-1 资产掌控）：一次「技能注入且回答成功完成」= 一条。
+
+    ⚠️ 与 `POST /skills/match` 的**建议**严格区分：建议不写表。
+       在 match 里顺手记一笔会让数字虚高，而虚高的数字没有任何界面能看出来是虚的。
+    ⚠️ 中断/失败的回答不写：本表回答的是「我的技能帮我产出了多少东西」，
+       而不是「匹配过多少次」。判据见 docs/资产掌控力-研发方案.md §3.6。
+    ⚠️ 不用 `_skills_state.json` 存：那边 `write_state` 的键白名单写死，
+       加键会被静默清空；也不用 ActivityLog：`ref_id` 是 Integer，技能 id 是字符串。
+    """
+    __tablename__ = "skill_uses"
+    id = Column(Integer, primary_key=True)
+    skill_id = Column(String(40), index=True)
+    session_id = Column(Integer, default=0)      # 溯源：哪次对话
+    mode = Column(String(16), default="")        # auto / kb / general
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+
+class App(Base):
+    """炼丹炉应用（2026-10-27）：资料炼成的独立 AI 应用 —— 人格 + 知识边界 + 独立会话。
+    定位：应用 = 给别人用的产品；技能 = 给自己用的能力（双概念分立）。
+    全字段可序列化，为 P3 导出应用包预留。"""
+    __tablename__ = "apps"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(64), nullable=False)
+    spirit = Column(String(16), default="book")      # 丹灵形象令牌 g:<deco>:<palette>（P1 程序化独版；老值 book/spark/calm 兼容读）
+    persona = Column(Text, nullable=False, default="")   # 人格（建议结构：身份与视角/语言风格/回答策略/禁用表达）
+    boundaries = Column(Text, default="")            # 回答边界（只答什么/拒答什么）
+    miss_text = Column(Text, default="")             # 未命中口径（kb_miss 话术，绝不滑向通用兜底）
+    welcome = Column(Text, default="")               # 开场白
+    questions = Column(SafeJSONList, default=list)   # 建议问题 [str]，≤3
+    model_id = Column(String(64), default="")        # 默认模型；''=跟随全局问答模型
+    suggest_on = Column(Boolean, default=True)       # 追问建议开关
+    allow_out_of_scope = Column(Boolean, default=False)  # 允许回答资料外问题（2026-11-02）：默认关=知识边界锁定
+    status = Column(String(16), default="active")    # active / draft（P0 创建即 active）
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    materials = relationship("AppMaterial", back_populates="app", cascade="all, delete-orphan")
+
+
+class AppMaterial(Base):
+    """应用 ↔ 资料绑定（多对多）：检索硬锁 where material_id $in 的唯一依据。
+    至少 1 份（创建/解绑接口层拦截）；绑定只是查询时过滤条件，增删零索引重建。"""
+    __tablename__ = "app_materials"
+    app_id = Column(Integer, ForeignKey("apps.id"), primary_key=True)
+    material_id = Column(Integer, ForeignKey("materials.id"), primary_key=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    app = relationship("App", back_populates="materials")
+
+
+class AppNote(Base):
+    """应用 ↔ 笔记绑定（多对多，2026-10-30）：检索硬锁的笔记维度。
+    挂在已绑定资料下的笔记本就随资料自动入语料（向量 metadata 带 material_id），
+    这张表补的是「显式绑定单条笔记」——主要是材料无关笔记（material_id=NULL）的唯一入场券。
+    与 AppMaterial 同构：绑定只是查询过滤条件，增删零索引重建。"""
+    __tablename__ = "app_notes"
+    app_id = Column(Integer, ForeignKey("apps.id"), primary_key=True)
+    note_id = Column(Integer, ForeignKey("notes.id"), primary_key=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AppVersion(Base):
+    """炼丹炉人格版本（2026-10-28 P2）：PATCH 致追踪字段实际变化时自动快照旧值。
+    回滚前先快照当前态 —— 回滚可撤销，任何操作都不丢配置（IP 迭代的安全网）。"""
+    __tablename__ = "app_versions"
+    id = Column(Integer, primary_key=True)
+    app_id = Column(Integer, ForeignKey("apps.id"), index=True)
+    version = Column(Integer, nullable=False)        # 每应用单调递增（1 起），按它排序
+    snapshot = Column(SafeJSON, default=dict)        # 全字段快照（TRACKED_FIELDS，随导出包走）
+    note = Column(String(64), default="")            # 备注（如「回滚到 v2 前自动快照」）
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class LLMUsage(Base):

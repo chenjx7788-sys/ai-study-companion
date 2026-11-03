@@ -909,11 +909,11 @@ function clipErr(e) {
 }
 
 // 来源渠道徽章：只标外部来源（upload / local 不标，见卡片模板注释）
-const ORIGIN_LABELS = { url: '网页剪藏', wx: '公众号文章', xhs: '小红书笔记', weread: '微信读书' }
+const ORIGIN_LABELS = { url: '网页剪藏', wx: '公众号文章', xhs: '小红书笔记', weread: '微信读书', chat: 'AI 对话', brief: 'AI 导读' }
 const originLabel = (o) => ORIGIN_LABELS[o] || ''
 const originTitle = (m) => {
   const meta = m.origin_meta || {}
-  const bits = [meta.sitename, meta.author, meta.date].filter(Boolean)
+  const bits = [meta.sitename, meta.author, meta.date, meta.question].filter(Boolean)
   return bits.length ? `${originLabel(m.origin)} · ${bits.join(' · ')}` : originLabel(m.origin)
 }
 
@@ -1069,6 +1069,11 @@ onUnmounted(() => pollTimer && clearInterval(pollTimer))
   padding: 0 6px; line-height: 16px; white-space: nowrap;
 }
 .o-url { color: #2563eb; background: #e8f0fd; }
+/* AI 对话「转文档」：与主题紫同族，一眼区分「生成物」和「导入的文件」 */
+.o-chat { color: #6d4ae0; background: #f0ecfe; }
+/* AI 导读（库外主题生成）：同为生成物，用内阴影画虚线感，与「转文档」区分 —— 它不是某次对话的产物。
+   ⚠️ 用 inset box-shadow 而不是 border：border 会给徽章加 2px 高度，把列表行高撑歪。 */
+.o-brief { color: #8a6d1f; background: #fdf6e3; box-shadow: inset 0 0 0 1px #e6d5a8; }
 .o-wx { color: #15803d; background: #e8f6ed; }
 .o-weread { color: #15803d; background: #e8f6ed; }
 

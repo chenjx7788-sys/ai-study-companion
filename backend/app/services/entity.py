@@ -156,11 +156,15 @@ def _sample_chunks(chunks: list) -> list:
     return sampled
 
 
-def extract_texts(base_url: str, api_key: str, model: str, texts: list[str]) -> list[dict]:
+def extract_texts(base_url: str, api_key: str, model: str, texts: list[str],
+                  on_progress=None) -> list[dict]:
     """对若干段文本逐段抽取，返回未归并的 parsed dict 列表（每段一个）。
 
     用原生 urllib 直调（不依赖 openai SDK——项目打包态 openai 已含，但探测脚本
     环境未必有；这里统一走 urllib，代价是一次手工拼请求）。
+
+    on_progress(done, total)：每段抽完回调一次（done 从 1 开始）。**只服务 UI 进度**，
+    回调内部异常一律吞掉 —— 进度写不进去绝不该中断抽取主流程。
     """
     import json as _json
     import urllib.request
@@ -168,7 +172,8 @@ def extract_texts(base_url: str, api_key: str, model: str, texts: list[str]) -> 
 
     out: list[dict] = []
     url = (base_url or "").rstrip("/") + "/chat/completions"
-    for text in texts:
+    total = len(texts)
+    for idx, text in enumerate(texts):
         payload = {
             "model": model,
             "messages": [
@@ -192,6 +197,13 @@ def extract_texts(base_url: str, api_key: str, model: str, texts: list[str]) -> 
         # 本函数绕开 llm.py 走原生 urllib（打包兼容性），若不记账，图谱抽取的成本完全隐形。
         _log_usage(model, text, raw, data.get("usage"))
         out.append(_parse_json(raw))
+        # 进度回调：LLM 单段可能跑十几秒，30 段抽样就是好几分钟 ——
+        # 没有进度的话用户在「生成中…」里完全无法判断是活着还是卡死。
+        if on_progress is not None:
+            try:
+                on_progress(idx + 1, total)
+            except Exception:
+                pass
     return out
 
 
@@ -242,8 +254,16 @@ def _resolve_llm():
     return base_url, api_key, model
 
 
-def persist_entities(db: Session, material_id: int, chunks: list) -> int:
+def persist_entities(db: Session, material_id: int, chunks: list,
+                     on_progress=None, report: dict | None = None) -> int:
     """提取并落库一份材料的全部实体/关系/引用。返回实体数（失败返回 0）。
+
+    on_progress(done, total)：透传给 extract_texts，用于 UI 进度。
+    report：调用方传入的空 dict，本函数往里回填 {"reason": ..., "error": ...}。
+      reason 取值：ok 成功 / cached 指纹命中复用 / no_key 没配 Key /
+                   llm_error 模型调用异常 / no_entity 抽完没有有效实体。
+    ⚠️ **返回值语义不变**（失败仍是 0）：自动抽取与手动抽取两条路径都靠它静默降级，
+       report 只是附加信息，绝不把异常抛给调用方。
 
     ⚠️ 纯后台任务：任何异常都静默返回 0，绝不外抛（图谱是检索增强，不能拖垮主流程）。
     ⚠️ 抽取文本仅用于实体抽取，不对应 chunk 逐行落引用——引用（entity_refs）按
@@ -253,20 +273,32 @@ def persist_entities(db: Session, material_id: int, chunks: list) -> int:
     """
     from ..models import Entity, Material, Relation, EntityRef
 
+    def _note(reason: str, msg: str = ""):
+        """回填原因（调用方据此写 UI 状态）。失败必须可区分 ——
+        以前 no_key / llm_error / no_entity 全返回 0，界面上长得一模一样。"""
+        if report is not None:
+            report["reason"] = reason
+            if msg:
+                report["error"] = msg
+
     sig = content_signature(chunks)
     m = db.get(Material, material_id)
     existing = db.query(Entity).filter(Entity.material_id == material_id).count()
     if existing and m is not None and (m.extract_sig or "") == sig:
         # 内容未变：跳过 LLM 抽取，仅按新 chunk 重建引用（chunk id 在重试解析后已变）
         rebuild_refs(db, material_id, chunks)
+        _note("cached")
         return existing
 
     base_url, api_key, model = _resolve_llm()
     if not api_key:
+        _note("no_key", "未配置可用的模型 API Key，请先到「设置」页配置")
         return 0
     try:
-        parsed_list = extract_texts(base_url, api_key, model, _sample_chunks(chunks))
-    except Exception:
+        parsed_list = extract_texts(base_url, api_key, model, _sample_chunks(chunks),
+                                    on_progress=on_progress)
+    except Exception as e:
+        _note("llm_error", f"模型调用失败：{type(e).__name__}: {e}")
         return 0
 
     # 归并 + 过滤（跨 chunk 同名实体合并）
@@ -280,6 +312,7 @@ def persist_entities(db: Session, material_id: int, chunks: list) -> int:
             rels[(r["src"], r["rel"], r["dst"])] = r
 
     if not merged:
+        _note("no_entity", "未从该材料中抽取到有效实体（内容可能过短，或模型未按 JSON 格式返回）")
         return 0
 
     # 写库：先清旧（重试解析会重建），再插入
@@ -301,6 +334,7 @@ def persist_entities(db: Session, material_id: int, chunks: list) -> int:
     if m is not None:
         m.extract_sig = sig
     db.commit()
+    _note("ok")
     return ent_count
 
 

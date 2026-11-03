@@ -46,10 +46,16 @@
           <div class="td-col td-col-bar">
             <div class="td-label">每场总分</div>
             <div class="td-bars">
-              <span v-for="s in trend.sessions" :key="s.id" class="td-bar-wrap"
-                :title="s.title + ' · ' + (s.score == null ? '—' : s.score + ' 分')">
-                <i class="td-bar" :style="{ height: (s.score == null ? 4 : Math.max(6, s.score)) + '%', background: scoreColor(s.score) }"></i>
+              <span v-for="s in trend.sessions" :key="s.id" class="td-bar-wrap" :title="barTitle(s)">
+                <i class="td-bar" :class="{ hollow: s.score == null }"
+                  :style="{ height: (s.score == null ? 6 : Math.max(6, s.score)) + '%', background: s.score == null ? 'transparent' : scoreColor(s.score) }"></i>
               </span>
+            </div>
+            <!-- 打磨 P7：柱子只有一种画法时，「答了 1 题没评分」看起来像「0 分」。
+                 实测线上 4 场里 3 场只答了 1-3 题 —— 不给图例就是在拿噪声当趋势。 -->
+            <div class="td-legend">
+              <span class="lg"><i class="lg-swatch solid"></i>有评分</span>
+              <span class="lg"><i class="lg-swatch hollow"></i>未评分</span>
             </div>
           </div>
         </div>
@@ -95,7 +101,7 @@
     <!-- ==================== ② 新建态 ==================== -->
     <template v-else-if="view === 'create'">
       <div class="cr-head">
-        <span class="cr-back" @click="backToList">← 返回</span>
+        <span class="cr-back" @click="backToList()">← 返回</span>
         <h3>新建陪练</h3>
       </div>
 
@@ -155,7 +161,7 @@
       </div>
 
       <div class="cr-actions">
-        <el-button text @click="backToList">取消</el-button>
+        <el-button text @click="backToList()">取消</el-button>
         <el-button type="primary" class="cr-start" :disabled="!canStart" :loading="creating" @click="createAndStart">
           {{ creating ? '正在创建…' : '开始陪练' }}
         </el-button>
@@ -165,7 +171,7 @@
     <!-- ==================== ③ 会话态 / ④ 成绩单（共用逐题区） ==================== -->
     <template v-else>
       <div class="flow-head" :class="{ 'flow-wide': view === 'session' && outline.length }">
-        <span class="flow-back" @click="backToList">← 返回</span>
+        <span class="flow-back" @click="backToList()">← 返回</span>
         <span class="flow-title" :title="(current || {}).title">{{ (current || {}).title }}</span>
         <span class="flow-progress" :class="{ done: view === 'result' }">
           <template v-if="view === 'session' && phase !== 'outline'">第 {{ progress.cur }} / {{ progress.total }} 题</template>
@@ -255,7 +261,7 @@
       <div v-if="view === 'session' && phase === 'failed'" class="fail-banner">
         <span class="fail-text">{{ failMsg || '生成失败，请重试' }}</span>
         <el-button type="primary" size="small" :loading="retrying" @click="retry">重试</el-button>
-        <el-button size="small" @click="backToList">返回列表</el-button>
+        <el-button size="small" @click="backToList()">返回列表</el-button>
       </div>
 
       <!-- 作答态三栏聚焦：左步骤轨 / 中当前题 / 右状态轨；成绩单为单栏（focus-grid 不生效） -->
@@ -339,13 +345,24 @@
                   </div>
                 </div>
                 <p v-if="t.comment" class="score-comment">{{ t.comment }}</p>
-                <div v-if="t.missing_points && t.missing_points.length" class="score-miss">
+                <!-- 打磨 P2：判 wrong 时不再追问（追问会退化成复读原题），改给一个切入角度 -->
+                <div v-if="t.hint && t.verdict === 'wrong'" class="score-hint">
+                  <span class="sh-label">换个角度</span>{{ t.hint }}
+                </div>
+                <!-- P8（打磨）：要点全漏时，「未覆盖」与「参考答案」是同一份清单 →
+                     不再重复列一遍，把「全未覆盖」并进参考答案标签（见下）。 -->
+                <div v-if="t.missing_points && t.missing_points.length && !allMissed(t)" class="score-miss">
                   <div class="score-sub-label">未覆盖的要点</div>
                   <ul><li v-for="(p, i) in t.missing_points" :key="i">{{ p }}</li></ul>
                 </div>
                 <div v-if="t.expected_points && t.expected_points.length" class="score-expect">
-                  <div class="score-sub-label">参考答案要点</div>
+                  <div class="score-sub-label">参考答案要点<template v-if="allMissed(t)"> · 本题全部未覆盖</template></div>
                   <ul><li v-for="(p, i) in t.expected_points" :key="i">{{ p }}</li></ul>
+                </div>
+                <!-- 打磨 P5：成绩单里能挑一题重答，只重算这一题 -->
+                <div v-if="view === 'result' && !t.is_followup && !t.is_placeholder
+                  && t.user_answer !== null && (t.score != null || t.skipped)" class="score-actions">
+                  <el-button size="small" text type="primary" @click="startRetry(t)">重答这题</el-button>
                 </div>
               </div>
               <div v-else-if="t.user_answer !== null && !t._pending" class="msg-bubble coach score-card failed">
@@ -355,10 +372,15 @@
             </div>
           </div>
 
-          <!-- 作答区（仅当前待答的那一题） -->
-          <div v-if="view === 'session' && phase === 'question' && t === unansweredTurn" class="answer-box">
+          <!-- 作答区（当前待答的那一题；重答时挂在被重答的那一题下面） -->
+          <div v-if="view === 'session' && phase === 'question' && (t === unansweredTurn || t.seq === retrySeq)" class="answer-box">
+            <div v-if="retrySeq != null" class="retry-bar">
+              <span class="rb-label">重答本题</span>
+              <span class="rb-text">重新写一版，只重算这一题的分数，不会影响其他题</span>
+              <el-button size="small" text @click="cancelRetry()">取消</el-button>
+            </div>
             <el-input v-model="answer" type="textarea" :rows="4" resize="none"
-              placeholder="写下你的回答，尽量把要点讲透…（Ctrl/⌘ + Enter 提交）"
+              :placeholder="retrySeq != null ? '写出改进后的回答…（Ctrl/⌘ + Enter 提交）' : '写下你的回答，尽量把要点讲透…（Ctrl/⌘ + Enter 提交）'"
               @keydown.ctrl.enter.prevent="submitAnswer(false)"
               @keydown.meta.enter.prevent="submitAnswer(false)" />
             <div class="answer-tools">
@@ -369,16 +391,30 @@
                 @click="toggleRecord">
                 {{ recording ? '结束录音' : (transcribing ? '识别中…' : '口述作答') }}
               </el-button>
+              <!-- 打磨 P3：题纲早就生成了「提问角度提示」，此前只喂给模型、用户从没见过。
+                   放到这里，卡住时点开看一眼，不用消耗任何模型调用。 -->
+              <el-button v-if="hintOf(t) && !hintOpen" size="small" plain @click="hintOpen = true">
+                给点提示
+              </el-button>
+              <el-button v-else-if="hintOf(t)" size="small" plain @click="hintOpen = false">
+                收起提示
+              </el-button>
               <span v-if="recording" class="rec-hint"><i class="rec-dot"></i>正在录音 {{ recSeconds }} 秒 / 最长 {{ REC_MAX_SECONDS }} 秒</span>
               <span v-else-if="asrHint" class="rec-hint err">{{ asrHint }}</span>
+            </div>
+            <div v-if="hintOpen && hintOf(t)" class="hint-bar">
+              <span class="hb-label">切入角度</span>{{ hintOf(t) }}
+              <span class="hb-note">仅提示角度，不含答案</span>
             </div>
             <div class="answer-actions">
               <span class="answer-hint" :class="{ over: answerOver }">
                 {{ answerLen }} 字<template v-if="answerOver">，超出 {{ MAX_ANSWER }} 字上限</template>
               </span>
-              <el-button size="small" @click="submitAnswer(true)">跳过本题</el-button>
+              <el-button v-if="retrySeq == null" size="small" @click="submitAnswer(true)">跳过本题</el-button>
               <el-button type="primary" size="small" :loading="submitting"
-                :disabled="!answer.trim() || answerOver" @click="submitAnswer(false)">提交作答</el-button>
+                :disabled="!answer.trim() || answerOver" @click="submitAnswer(false)">
+                {{ retrySeq != null ? '重新评分' : '提交作答' }}
+              </el-button>
             </div>
           </div>
         </div>
@@ -412,7 +448,7 @@
 
       <!-- 成绩单底部操作 -->
       <div v-if="view === 'result'" class="rs-actions">
-        <el-button @click="backToList">返回列表</el-button>
+        <el-button @click="backToList()">返回列表</el-button>
         <el-button :loading="noteBusy" @click="saveToNote">
           {{ drillNote ? '更新笔记' : '转成笔记' }}
         </el-button>
@@ -447,6 +483,9 @@ const DEFAULT_COUNT = 8
 const MIN_COUNT = 3
 const MAX_COUNT = 20
 const MAX_ANSWER = 2000          // 作答字符上限（PRD 3.4.5：1–2000；后端同样校验 400）
+// 软拦阈值（打磨 P4）：短于这个字数（去空白）的作答先提示一次，再点一次就放行。
+// 线上实测有「我」「abc」这类误触直接送进评分 → 得 0 分、还触发一次追问。
+const MIN_ANSWER_CHARS = 4
 // 约可出题数：粗估（1 题 ≈ 400 字可用素材）。仅作范围体量提示，不作为硬约束
 const CHARS_PER_QUESTION = 400
 
@@ -545,6 +584,11 @@ const stageText = ref('')
 const failMsg = ref('')
 const answer = ref('')
 const submitting = ref(false)
+// 单题重答（打磨 P5）：成绩单点「重答这题」→ 切回作答态，seq 记在这里。
+// null = 正常作答流程；非 null = 重答该轮（不推进、不追问，评分回来后回成绩单）
+const retrySeq = ref(null)
+// 「给点提示」（打磨 P3）：展开当前题的切入角度。纯前端，不消耗 LLM 调用
+const hintOpen = ref(false)
 
 // 语音（C 档）
 const speaking = ref(false)        // 念题合成中
@@ -616,7 +660,11 @@ const displayedTurns = computed(() => {
   return turns.value.filter((t) => (t.outline_index || 0) === displayedOutline.value)
 })
 const peeking = computed(() => (
-  view.value === 'session' && focusOutline.value != null && focusOutline.value !== currentOutlineIndex.value
+  view.value === 'session' && focusOutline.value != null
+  && focusOutline.value !== currentOutlineIndex.value
+  // 重答时也会把 focusOutline 定位到目标考点，但那是「重答」不是「回看」，
+  // 顶部不该出现「正在回看…回到当前题」（那会让用户以为走错了地方）
+  && retrySeq.value == null
 ))
 const currentTurn = computed(() => unansweredTurn.value || turns.value[turns.value.length - 1] || null)
 // 状态轨·薄弱点：已评分题的漏点按出场顺序聚合
@@ -799,6 +847,34 @@ watch(refsKey, () => {
 // ---------- 工具 ----------
 function statusOf(s) { return STATUS_MAP[s] || { label: s || '—', cls: 'draft' } }
 function verdictLabel(v) { return VERDICT_MAP[v] || '' }
+
+// 「切入角度」提示（打磨 P3）：题纲里 LLM 已经为每个考点产出了 hint（≤20 字），
+// 此前只作为出题参数喂给模型，界面上一次都没出现过。空串 = 该考点没有提示，
+// 按钮直接不出现（宁可不给，也不给一句废话）。
+function hintOf(t) {
+  if (!t || t.is_placeholder) return ''
+  const p = outline.value[t.outline_index || 0] || {}
+  return p.hint || t.hint || ''
+}
+
+// P8：期望要点「全部」都在 missing_points 里 → 两块清单逐条重复，纯噪音。
+// 判据用归一化比较（去标点空白），因为 LLM 抄回来的 missing_points 常在标点上漂移。
+function allMissed(t) {
+  const mp = t.missing_points || []
+  const ep = t.expected_points || []
+  if (!mp.length || !ep.length) return false
+  const norm = (s) => String(s).replace(/[\s，。；、,.;:：！!？?（）()「」"]/g, '')
+  const bucket = new Set(mp.map(norm))
+  return ep.every((p) => bucket.has(norm(p)))
+}
+
+// 趋势柱的悬浮说明（打磨 P7）：必须带完成度 —— 「答 1 题 0 分」与「答满 8 题 0 分」
+// 在柱子上一样高，不加完成度就分不清是「没做」还是「不会」。
+function barTitle(s) {
+  const sc = s.score == null ? '未评分' : s.score + ' 分'
+  const done = s.outline_count ? ` · 答 ${s.answered} / ${s.outline_count} 题` : ''
+  return (s.title || '') + ' · ' + sc + done
+}
 function scoreColor(s) {
   if (s == null) return 'var(--asc-text-2)'   // 占位也用 4.68 对比度（text-3 仅 2.4，空分「—分」曾实测违规）
   if (s >= 80) return '#2e9e5b'
@@ -1077,10 +1153,24 @@ function onScore(p) {
   t.comment = p.comment || ''
   t.missing_points = p.missing_points || []
   if (p.expect_points && p.expect_points.length) t.expected_points = p.expect_points
+  if (p.hint) t.hint = p.hint        // 打磨 P3：答得不理想时的「换个角度」
   t._pending = false
   // 降级（出题失败 / 评分失败）：不阻断后续，但给一次轻提示，别让用户以为是正常的
   if (p.failed) ElMessage.warning(p.message || p.comment || '本题评分失败，可稍后重试')
   if (p.progress) { progress.cur = p.progress.cur; progress.total = p.progress.total }
+  if (p.retry) {
+    // 重答的评分回来了：停在本轮（后端没推进），直接回成绩单看新分数。
+    // ⚠️ 必须清掉 summary 快照 —— resultStats 优先读 summary，留着旧的总分会把
+    //    刚重算出的新总分盖掉（总分与逐题分数自相矛盾）。清掉后走 turns 重算分支，
+    //    total_score 由下面的 current 承接。
+    if (p.total_score !== undefined && current.value) current.value.total_score = p.total_score
+    summary.value = null
+    retrySeq.value = null
+    focusOutline.value = null
+    view.value = 'result'
+    phase.value = 'finished'
+    ElMessage.success('已重新评分')
+  }
   scrollBottom()
 }
 
@@ -1113,8 +1203,17 @@ function applyDetail(d) {
   current.value = d
   outline.value = (d.outline || []).map((p) => ({
     point: p.point || '', difficulty: p.difficulty || 'medium',
+    hint: p.hint || '',          // 打磨 P3：题纲早就生成了 hint，此前前端映射把它丢了
   }))
-  const ts = (d.turns || []).map((t) => ({ ...t, skipped: t.user_answer === '', _pending: false }))
+  const ol = d.outline || []
+  const ts = (d.turns || []).map((t) => ({
+    ...t,
+    skipped: t.user_answer === '',
+    _pending: false,
+    // 回看路径也要带「换个角度」的提示：SSE 的 hint 只覆盖当场，
+    // 刷新后靠题纲按 outline_index 补回来，否则同一条点评时有时无。
+    hint: (ol[t.outline_index] || {}).hint || '',
+  }))
   turns.value = ts
   progress.total = outline.value.length
   const last = ts[ts.length - 1]
@@ -1134,7 +1233,9 @@ async function startStream(sid) {
         else if (p.stage === 'outline') phase.value = 'outline'
       },
       outline: (p) => {
-        outline.value = (p.points || []).map((x) => ({ point: x.point || '', difficulty: x.difficulty || 'medium' }))
+        outline.value = (p.points || []).map((x) => ({
+          point: x.point || '', difficulty: x.difficulty || 'medium', hint: x.hint || '',
+        }))
         if (p.count) progress.total = p.count
       },
       question: onQuestion,
@@ -1190,10 +1291,13 @@ async function retry() {
   }
 }
 
+// P4：过短作答只软拦一次 —— 记住「已经警告过的那段文本」，同一段再点提交就放行。
+// 用普通变量而不是 ref：它不参与渲染，且用户改了文本后需要重新拦。
+let shortWarned = ''
+
 async function submitAnswer(skip) {
   if (submitting.value) return
-  const t = unansweredTurn.value
-  if (!t || !current.value) return
+  if (!current.value) return
   const txt = stripVoiceMark(answer.value).trim()
   if (!skip && !txt) { ElMessage.warning('先写点什么再提交'); return }
   // A2：前端先拦一道（后端 L400 也拦，但等一个来回体验差）
@@ -1201,6 +1305,18 @@ async function submitAnswer(skip) {
     ElMessage.warning('作答过长，请精简到 ' + MAX_ANSWER + ' 字以内')
     return
   }
+  // P4（打磨）：太短的作答先问一句，但**不硬拦** —— 「我就想答一句」也得放得出去。
+  if (!skip && txt.replace(/\s/g, '').length < MIN_ANSWER_CHARS && shortWarned !== txt) {
+    shortWarned = txt
+    ElMessage.warning('这看起来还不像一次作答，再补两句？再点一次提交将直接提交')
+    return
+  }
+  shortWarned = ''
+  // 重答走独立链路：不推进、不追问，评分回来直接回成绩单
+  if (!skip && retrySeq.value != null) { await submitRetry(txt); return }
+
+  const t = unansweredTurn.value
+  if (!t) return
 
   const seq = t.seq
   t.user_answer = skip ? '' : txt
@@ -1226,6 +1342,55 @@ async function submitAnswer(skip) {
     if (msg) { failMsg.value = msg; phase.value = 'failed'; ElMessage.error(msg) }
   } finally {
     t._pending = false
+    submitting.value = false
+  }
+}
+
+// ---------- 单题重答（打磨 P5） ----------
+// 成绩单里点「重答这题」→ 回到作答态，提交走 /retry/stream：后端重新评分**同一轮**，
+// 不推进到下一考点、也不追加追问。评分回来后由 onScore 的 p.retry 分支切回成绩单。
+function startRetry(t) {
+  if (!t || t.is_placeholder || t.is_followup) return
+  retrySeq.value = t.seq
+  answer.value = ''
+  hintOpen.value = false
+  // 中栏只渲染「当前考点这一串」，重答的题不一定是最后一题 → 必须把焦点搬过去，
+  // 否则作答框挂不到任何一张卡上（displayedTurns 里没有它）。
+  focusOutline.value = t.outline_index || 0
+  view.value = 'session'
+  phase.value = 'question'
+  scrollBottom()
+}
+
+function cancelRetry() {
+  retrySeq.value = null
+  focusOutline.value = null
+  failMsg.value = ''
+  view.value = 'result'
+  phase.value = 'finished'
+}
+
+async function submitRetry(txt) {
+  const seq = retrySeq.value
+  submitting.value = true
+  phase.value = 'scoring'
+  stageText.value = 'AI 正在重新评分…'
+  answer.value = ''
+  hintOpen.value = false
+  scrollBottom()
+  try {
+    await runStream(drillApi.retryStreamUrl(current.value.id), { seq, answer: txt }, {
+      stage: (p) => { stageText.value = p.text || stageText.value },
+      score: onScore,
+      // 重答不会出下一题，所以不注册 question；
+      // 失败时要退回成绩单（后端保留了原评分，别把用户丢在一个空的失败页上）
+      error: (p) => { onStreamError(p); cancelRetry() },
+      done: () => { if (retrySeq.value != null) cancelRetry() },
+    })
+  } catch (e) {
+    const msg = throwMessage(e)
+    if (msg) { ElMessage.error(msg); cancelRetry() }
+  } finally {
     submitting.value = false
   }
 }
@@ -1635,7 +1800,21 @@ async function openSession(sid) {
   }
 }
 
-function backToList() {
+async function backToList() {
+  // P6（打磨）：会话进行中直接甩回列表，用户不知道进度还在 —— 先确认一句。
+  // 只对「会话态」拦；成绩单 / 新建 / 失败态返回是无损的，不该多一次点击。
+  // ⚠️ 「进度已保存」是真的：这里只断开 SSE，后台 job 会跑完并把结果落库，
+  //    回来时 attach 会补发（见 startStream 的 done 分支）。
+  if (view.value === 'session' && turns.value.length) {
+    try {
+      await ElMessageBox.confirm(
+        '本场进度已保存，随时可以从列表里点回来接着答。要现在离开吗？',
+        '离开陪练',
+        { confirmButtonText: '离开', cancelButtonText: '继续答题' },
+      )
+    } catch { return }
+  }
+  retrySeq.value = null
   if (streamCtrl) { try { streamCtrl.abort() } catch { /* 忽略 */ } }
   syncRoute(null)
   view.value = 'list'
@@ -2042,6 +2221,15 @@ onUnmounted(() => {
 .score-miss ul, .score-expect ul { margin: 0; padding-left: 18px; }
 .score-miss li, .score-expect li { font-size: 13px; line-height: 1.7; color: var(--asc-text); margin-bottom: 2px; }
 .score-expect { border-top: 1px solid var(--asc-border); margin-top: 8px; padding-top: 4px; }
+/* 打磨 P2：判 wrong 时给的「换个角度」——用警示色但不用红（红＝判错，这里给的是出路） */
+.score-hint {
+  margin-top: 10px; padding: 8px 10px; border-radius: 8px;
+  background: rgba(217, 161, 45, .10); border-left: 3px solid #d9a12d;
+  font-size: 13px; line-height: 1.65; color: var(--asc-text);
+}
+.sh-label { display: inline-block; margin-right: 6px; font-weight: 600; color: #8a5a00; }
+/* 打磨 P5：成绩单里的「重答这题」 */
+.score-actions { margin-top: 10px; border-top: 1px dashed var(--asc-border); padding-top: 4px; }
 
 .answer-box {
   margin-top: 6px;
@@ -2056,6 +2244,22 @@ onUnmounted(() => {
 .answer-actions {
   display: flex; align-items: center; gap: 10px; margin-top: 10px;
 }
+/* 打磨 P3：「给点提示」展开的切入角度（不是答案要点，所以不受 show_answer 影响） */
+.hint-bar {
+  margin-top: 8px; padding: 8px 10px; border-radius: 8px;
+  background: rgba(217, 161, 45, .10); border: 1px solid rgba(217, 161, 45, .35);
+  font-size: 13px; line-height: 1.65; color: var(--asc-text);
+}
+.hb-label { display: inline-block; margin-right: 6px; font-weight: 600; color: #8a5a00; }
+.hb-note { margin-left: 8px; font-size: 11.5px; color: var(--asc-text-2); }
+/* 打磨 P5：重答态的顶部条 —— 让用户知道「只重算这一题」 */
+.retry-bar {
+  display: flex; align-items: center; gap: 8px; margin: 2px 0 8px; padding: 6px 10px;
+  border-radius: 8px; background: rgba(45, 120, 217, .08);
+  border: 1px dashed rgba(45, 120, 217, .35); font-size: 12.5px;
+}
+.rb-label { font-weight: 600; color: #1d5ba8; }
+.rb-text { flex: 1; color: var(--asc-text-2); }
 .answer-hint { flex: 1; font-size: 12px; color: var(--asc-text-2); }
 .answer-hint.over { color: #b45309; font-weight: 600; }
 .rs-actions { display: flex; justify-content: flex-start; gap: 10px; margin: 22px auto 0; max-width: 840px; }
@@ -2140,6 +2344,13 @@ onUnmounted(() => {
 .td-bars { display: flex; align-items: flex-end; gap: 4px; height: 56px; }
 .td-bar-wrap { width: 12px; height: 100%; display: flex; align-items: flex-end; }
 .td-bar { display: block; width: 100%; border-radius: 3px 3px 0 0; min-height: 3px; }
+/* 打磨 P7：未评分场次画空心柱 —— 与「0 分」在视觉上必须可分 */
+.td-bar.hollow { border: 1px solid var(--asc-border); }
+.td-legend { display: flex; gap: 12px; margin-top: 8px; font-size: 11.5px; color: var(--asc-text-2); }
+.td-legend .lg { display: inline-flex; align-items: center; gap: 4px; }
+.lg-swatch { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+.lg-swatch.solid { background: #c9cdd4; }
+.lg-swatch.hollow { border: 1px solid #c9cdd4; }
 
 /* ===== 响应式（本页原先 0 断点；新块虽已 flex-wrap，窄屏仍需真正收敛） ===== */
 @media (max-width: 760px) {

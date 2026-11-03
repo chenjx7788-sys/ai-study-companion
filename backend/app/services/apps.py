@@ -2,19 +2,20 @@
 
 定位：应用 = 给别人用的产品（人格 + 知识边界 + 独立会话）；技能 = 给自己用的能力，双概念分立。
 硬规则（违反即静默出错）：
-- R1 检索必须锁 where={"material_id": {"$in": ids}}，严禁 where=None（静默检索全库）
-- R3 应用至少绑 1 份资料（创建 400、解绑到 0 拒存）
+- R1 检索必须锁语料宇宙（绑定资料 ∪ 显式绑定笔记，见 scope_where），严禁 where=None（静默检索全库）
+- R3 应用至少绑 1 份资料或 1 条笔记（创建 400、解绑到 0 拒存）
 - R7 AI 只产草稿与优化建议，最终值必须经人保存（本模块所有 assist/preview 均不入库）
 """
 import re
 import secrets
+from datetime import datetime
 
 from fastapi import HTTPException
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ..core.config import settings
-from ..models import App, AppMaterial, AppVersion, Material, MaterialChunk, AIAsset, ChatSession, ChatMessage
+from ..models import App, AppMaterial, AppNote, AppVersion, Material, MaterialChunk, Note, AIAsset, ChatSession, ChatMessage
 from . import llm
 from . import retrieval_agent as retrieval_agent_svc
 from . import search as search_svc
@@ -80,10 +81,77 @@ def material_ids(db: Session, app_id: int) -> list[int]:
             db.query(AppMaterial).filter(AppMaterial.app_id == app_id).all()]
 
 
+def note_ids(db: Session, app_id: int) -> list[int]:
+    """显式绑定的笔记（2026-10-30）。挂在已绑定资料下的笔记不在这里——它们随资料自动入语料。"""
+    return [r.note_id for r in
+            db.query(AppNote).filter(AppNote.app_id == app_id).all()]
+
+
+def scope_where(mids: list[int], nids: list[int]) -> dict:
+    """应用语料宇宙的检索锁（R1）：绑定资料 + 显式绑定笔记。
+    note_ref_id 键的按集合派生见 vector._col_where / fts.search / search._entity_hits
+    （chunk 集合绝不吃 note_ref_id —— 块 id 与笔记 id 会撞号误召）。"""
+    w: dict = {"note_ref_id": {"$in": sorted(set(nids))}}
+    if mids:
+        w["material_id"] = {"$in": sorted(set(mids))}
+    return w
+
+
+def hit_in_scope(h: dict, allow_m: set, allow_n: set) -> bool:
+    """双保险放行判据（_app_lock / 试聊 _lock / search_locked 共用）：资料命中 或 显式绑定笔记命中。
+    ⚠️ allow_m/allow_n 必须是 set —— 逐命中调用，传 list 会每次重转。"""
+    if allow_m and h.get("material_id") in allow_m:
+        return True
+    return h.get("ref_type") == "note" and h.get("ref_id") in allow_n
+
+
+# ---------- 默契度成长（B1，2026-10-31）：场次 + 提问数 + 活跃天数 → 四阶段 ----------
+# 阈值定在「个人单机学习」真实可达的范围：灵犀 ≈ 两三周的持续使用。
+# ⚠️ 阶段名是前端舞台卡/仪式/列表卡片的唯一文案来源，改名=三处一起变。
+BOND_STAGES = [
+    ("初识", 0, 0, 0),          # (label, 需场次, 需提问, 需活跃日)
+    ("熟络", 3, 10, 2),
+    ("默契", 8, 40, 4),
+    ("灵犀", 20, 120, 10),
+]
+
+
+def _bond_of(sess: int, questions: int, days: int) -> dict:
+    """纯函数：三维计数 → 阶段 + 到下一级的进度（三项完成度均值）与缺口。"""
+    stage = 0
+    for i, (_, s, q, d) in enumerate(BOND_STAGES):
+        if sess >= s and questions >= q and days >= d:
+            stage = i
+    label = BOND_STAGES[stage][0]
+    if stage >= len(BOND_STAGES) - 1:
+        return {"stage": stage, "label": label, "sessions": sess,
+                "questions": questions, "days": days, "progress": 1.0, "next": None}
+    nl, ns, nq, nd = BOND_STAGES[stage + 1]
+    progress = (min(sess / ns, 1.0) + min(questions / nq, 1.0) + min(days / nd, 1.0)) / 3
+    return {"stage": stage, "label": label, "sessions": sess,
+            "questions": questions, "days": days, "progress": round(progress, 3),
+            "next": {"label": nl, "sessions": ns, "questions": nq, "days": nd}}
+
+
+def bond_state(db: Session, app_id: int) -> dict:
+    """详情接口用：单应用三维计数（2 次聚合查询，只在 GET /apps/{id} 调）。"""
+    from sqlalchemy import func
+    sess = int(db.query(func.count(ChatSession.id))
+               .filter(ChatSession.app_id == app_id).scalar() or 0)
+    q_count, days = (db.query(func.count(ChatMessage.id),
+                              # 活跃日按本地日界（'localtime'，单机=用户机器时区）：
+                              # UTC 日界会把「晚 8 点后」切到明天，成长口径要跟用户的直觉走
+                              func.count(func.distinct(func.date(ChatMessage.created_at, "localtime"))))
+                     .filter(ChatMessage.app_id == app_id, ChatMessage.role == "user")
+                     .first())
+    return _bond_of(sess, int(q_count or 0), int(days or 0))
+
+
 def app_to_dict(app: App, db: Session) -> dict:
     mids = material_ids(db, app.id)
     mats = db.query(Material).filter(Material.id.in_(mids)).all() if mids else []
-    # 默契度口径：已聊 N 场（会话数直接统计，不建表）
+    nids = note_ids(db, app.id)
+    notes = db.query(Note).filter(Note.id.in_(nids)).all() if nids else []
     session_count = db.query(ChatSession).filter(ChatSession.app_id == app.id).count()
     return {
         "id": app.id, "name": app.name, "spirit": app.spirit or "book",
@@ -91,9 +159,16 @@ def app_to_dict(app: App, db: Session) -> dict:
         "miss_text": app.miss_text or "", "welcome": app.welcome or "",
         "questions": app.questions or [], "model_id": app.model_id or "",
         "suggest_on": bool(app.suggest_on), "status": app.status or "active",
+        "allow_out_of_scope": bool(app.allow_out_of_scope),
         "material_ids": mids,
         "materials": [{"id": m.id, "title": m.title, "format": m.format} for m in mats],
-        "material_count": len(mids), "session_count": session_count,
+        "note_ids": nids,
+        "notes": [{"id": n.id, "title": n.title, "material_id": n.material_id} for n in notes],
+        "material_count": len(mids), "note_count": len(nids),
+        "session_count": session_count,
+        # B1（2026-10-31）：默契度成长（阶段 + 进度 + 下一级缺口）。session_count 保留：
+        # 它是「已聊 N 场」的原文案来源，bond 是成长体系的展示层。
+        "bond": bond_state(db, app.id),
         "created_at": app.created_at.isoformat() if app.created_at else None,
         "updated_at": app.updated_at.isoformat() if app.updated_at else None,
     }
@@ -106,20 +181,42 @@ def list_apps_slim(db: Session) -> list[dict]:
     N 个应用 3N 次查询，且把整段人格（上限 4000 字）下发 —— 卡片实际只显示 46 字。
     现在绑定数/会话数各一次 group by 算完，人格只回前 300 字（字段名改为 persona_head，
     避免「同名不同义」）；需要全文请走 GET /apps/{id}。
+
+    A3（2026-10-31）：加 last_active（会话最新消息时间）与 bond 阶段徽章，
+    排序从「应用配置更新时间」改为「最近聊天活跃」（配置更新不等于有人在用）。
     """
     from sqlalchemy import func
     bind = dict(db.query(AppMaterial.app_id, func.count())
                 .group_by(AppMaterial.app_id).all())
-    sess = dict(db.query(ChatSession.app_id, func.count())
-                .filter(ChatSession.app_id.isnot(None))
-                .group_by(ChatSession.app_id).all())
-    rows = db.query(App).order_by(App.updated_at.desc(), App.id.desc()).all()
+    nbind = dict(db.query(AppNote.app_id, func.count())
+                 .group_by(AppNote.app_id).all())
+    # 会话数与最近活跃合并成一次 group by（原来分两趟）
+    sess_rows = (db.query(ChatSession.app_id, func.count(), func.max(ChatSession.updated_at))
+                 .filter(ChatSession.app_id.isnot(None))
+                 .group_by(ChatSession.app_id).all())
+    sess = {r[0]: int(r[1]) for r in sess_rows}
+    last_act = {r[0]: r[2] for r in sess_rows}
+    # 默契度的另外两维：提问数 + 活跃天数（按 app_id 一次 group by；活跃日按本地日界，同 bond_state）
+    msg_rows = (db.query(ChatMessage.app_id, func.count(),
+                         func.count(func.distinct(func.date(ChatMessage.created_at, "localtime"))))
+                .filter(ChatMessage.app_id.isnot(None), ChatMessage.role == "user")
+                .group_by(ChatMessage.app_id).all())
+    qs = {r[0]: int(r[1]) for r in msg_rows}
+    days = {r[0]: int(r[2]) for r in msg_rows}
+    rows = db.query(App).all()
+    # 活跃倒序：没聊过的用配置更新时间垫底（datetime 直接比，同为 naive UTC）；
+    # datetime.min 兜底防历史空行（理论不存在，但 None 比 datetime 会 TypeError）
+    rows.sort(key=lambda a: (last_act.get(a.id) or a.updated_at or a.created_at
+                             or datetime.min), reverse=True)
     return [{
         "id": a.id, "name": a.name, "spirit": a.spirit or "book",
         "persona_head": (a.persona or "")[:300],
         "status": a.status or "active",
         "material_count": int(bind.get(a.id, 0)),
+        "note_count": int(nbind.get(a.id, 0)),
         "session_count": int(sess.get(a.id, 0)),
+        "last_active": last_act[a.id].isoformat() if last_act.get(a.id) else None,
+        "bond": _bond_of(int(sess.get(a.id, 0)), qs.get(a.id, 0), days.get(a.id, 0)),
         "created_at": a.created_at.isoformat() if a.created_at else None,
         "updated_at": a.updated_at.isoformat() if a.updated_at else None,
     } for a in rows]
@@ -182,14 +279,26 @@ def build_injection(app: App) -> str:
     return "\n\n".join(parts)
 
 
-def search_locked(query: str, db: Session, ids: list[int], top_k: int | None = None) -> list[dict]:
-    """R1：应用检索唯一入口。where 永远带 material_id $in，本函数不接受空 ids。"""
-    if not ids:
+def check_notes_exist(db: Session, ids: list[int]) -> list[Note]:
+    """笔记绑定前置校验（2026-10-30）：存在即可（笔记没有解析态）。"""
+    notes = []
+    for nid in ids:
+        n = db.get(Note, nid)
+        if not n:
+            raise HTTPException(400, f"笔记不存在：#{nid}")
+        notes.append(n)
+    return notes
+
+
+def search_locked(query: str, db: Session, ids: list[int],
+                  nids: list[int] | None = None, top_k: int | None = None) -> list[dict]:
+    """R1：应用检索唯一入口。where 永远锁语料宇宙（资料 ∪ 显式笔记），不接受全空。"""
+    nids = nids or []
+    if not ids and not nids:
         raise HTTPException(400, "应用的资料已被删除或尚未绑定，请先在配置页重新绑定资料")
     hits = search_svc.search(query, db, kinds=("chunk", "note"),
-                             where={"material_id": {"$in": ids}}, top_k=top_k)
-    allow = set(ids)
-    return [h for h in hits if h.get("material_id") in allow]
+                             where=scope_where(ids, nids), top_k=top_k)
+    return [h for h in hits if hit_in_scope(h, set(ids), set(nids))]
 
 
 def filter_hits(hits: list[dict]) -> list[dict]:
@@ -266,13 +375,18 @@ _DRAFT_PROMPT = """你在为「炼丹炉」设计一个 AI 应用的配置草稿
 - "questions": 3 个建议问题的数组（各 ≤20字，必须是资料内容能回答的）"""
 
 
-def assist_draft(db: Session, ids: list[int]) -> dict:
-    if not ids:
-        raise HTTPException(400, "请至少选择 1 份资料再生成草稿")
+def assist_draft(db: Session, ids: list[int], nids: list[int] | None = None) -> dict:
+    nids = nids or []
+    if not ids and not nids:
+        raise HTTPException(400, "请至少选择 1 份资料或 1 条笔记再生成草稿")
     mats = check_materials_ready(db, ids)
+    notes = check_notes_exist(db, nids)
     blocks = []
     for m in mats[:5]:                      # 草稿素材上限 5 份，防 prompt 膨胀
         blocks.append(f"《{m.title}》\n{_material_excerpt(db, m)}")
+    for n in notes[:5]:                     # 笔记同样喂给草稿（2026-10-30 笔记绑定）
+        excerpt = (n.content or "").strip()[:600]
+        blocks.append(f"笔记《{n.title}》\n{excerpt}" if excerpt else f"笔记《{n.title}》")
     prompt = _DRAFT_PROMPT.replace("{blocks}", "\n\n".join(blocks))[:6000]
     raw = llm.chat([{"role": "user", "content": prompt}], kind="app_draft")
     obj = llm._parse_drill_json_object(
@@ -321,7 +435,11 @@ _NUDGE_PROMPT = """{persona_block}
 def gen_nudge(db: Session, app: App, session_id: int | None = None) -> dict:
     """搭话生成。轻量单次调用；路由侧吞异常（前端静默不显示，打扰度第一）。"""
     mats = db.query(Material).filter(Material.id.in_(material_ids(db, app.id))).all()
-    titles = "、".join(f"《{m.title}》" for m in mats) or "（未绑定资料）"
+    titles = "、".join(f"《{m.title}》" for m in mats)
+    nts = db.query(Note).filter(Note.id.in_(note_ids(db, app.id))).all()
+    if nts:
+        titles += ("、" if titles else "") + "、".join(f"笔记《{n.title}》" for n in nts)
+    titles = titles or "（未绑定资料）"
     history = ""
     if session_id:
         rows = (db.query(ChatMessage)
@@ -386,8 +504,9 @@ def normalize_preview_history(history) -> list[dict]:
     return out
 
 
-def _preview_retrieve(db: Session, ids: list[int], query: str) -> list[dict]:
-    """试聊检索（2026-10-30，O7）：复用正式对话的 retrieve() 编排，只把语料宇宙锁到绑定资料。
+def _preview_retrieve(db: Session, ids: list[int], query: str,
+                      nids: list[int] | None = None) -> list[dict]:
+    """试聊检索（2026-10-30，O7）：复用正式对话的 retrieve() 编排，只把语料宇宙锁到绑定范围。
 
     为什么必须复用：预览原来直接 search_locked + filter_hits —— 没有改写重检、没有碎片过滤、
     没有计划模式的注入上限，于是同一个问题会「试聊拒答、正式对话答得出」（也可能反过来），
@@ -403,14 +522,15 @@ def _preview_retrieve(db: Session, ids: list[int], query: str) -> list[dict]:
         th = float(conf.get("kb_hit_threshold", settings.kb_hit_threshold))
     except Exception:
         th = settings.kb_hit_threshold
-    allow = set(ids)
+    nids = nids or []
+    _am, _an = set(ids), set(nids)
 
     def _do_search(q: str) -> list[dict]:
         return search_svc.search(q, db, kinds=("chunk", "note"),
-                                 where={"material_id": {"$in": ids}}, top_k=5)
+                                 where=scope_where(ids, nids), top_k=5)
 
     def _lock(hs: list[dict]) -> list[dict]:
-        return [h for h in hs if h.get("material_id") in allow]
+        return [h for h in hs if hit_in_scope(h, _am, _an)]
 
     def _quality(hs: list[dict]) -> list[dict]:
         f = [h for h in hs
@@ -437,11 +557,13 @@ def build_preview_messages(db: Session, cfg: dict, question: str,
        否则每轮都把历史检索片段重塞一遍，token 随轮数线性膨胀。
     """
     ids = cfg.get("material_ids") or []
-    if not ids:
-        raise HTTPException(400, "试聊至少绑定 1 份资料")
+    nids = cfg.get("note_ids") or []
+    if not ids and not nids:
+        raise HTTPException(400, "试聊至少绑定 1 份资料或 1 条笔记")
     check_materials_ready(db, ids)
+    check_notes_exist(db, nids)
     hist = normalize_preview_history(history)
-    hits = _preview_retrieve(db, ids, question)
+    hits = _preview_retrieve(db, ids, question, nids)
     # 追问兜底（2026-10-29）：多轮里「它多长」「那第二条呢」这类依赖上文的问法，
     # 按当前问题单独检索必然 miss，紧接着会被判成 kb_miss → 按未命中口径拒答，
     # 多轮等于没用（还更糟：用户以为能追问，实际被判「不在资料范围」）。
@@ -451,7 +573,7 @@ def build_preview_messages(db: Session, cfg: dict, question: str,
         last_user = next((m["content"] for m in reversed(hist) if m["role"] == "user"), "")
         if last_user:
             merged = f"{last_user} {question}"[:300]
-            hits = _preview_retrieve(db, ids, merged)
+            hits = _preview_retrieve(db, ids, merged, nids)
     pseudo = App(name=cfg.get("name") or "未命名应用", persona=cfg.get("persona") or "",
                  boundaries=cfg.get("boundaries") or "", miss_text=cfg.get("miss_text") or "")
     system = build_injection(pseudo)
@@ -466,8 +588,14 @@ def build_preview_messages(db: Session, cfg: dict, question: str,
         system += "\n\n【要求】只依据「知识库相关内容」回答；回答带有人格。"
         user = f"【知识库相关内容】\n{ctx}\n\n【问题】\n{question}"
     else:
-        # 未命中 = kb_miss 语义预览：严格按定制口径拒答，不兜底
-        system += "\n\n【当前状况】资料中未命中相关内容。请严格按未命中口径回应，不得硬答、不得动用通用知识。"
+        if cfg.get("allow_out_of_scope"):
+            # 资料外开关（2026-11-02）：与正式对话（chat.py kb miss 分支）同口径 ——
+            # 开 = 未命中不拒答，带人格动用通用知识，但必须先声明「不在资料范围内」。
+            system += ("\n\n【当前状况】资料中未命中相关内容。你可以动用通用知识回答，"
+                       "但开头必须先用一句话说明「这部分不在资料范围内」，再作答。")
+        else:
+            # 未命中 = kb_miss 语义预览：严格按定制口径拒答，不兜底
+            system += "\n\n【当前状况】资料中未命中相关内容。请严格按未命中口径回应，不得硬答、不得动用通用知识。"
         user = question
     msgs: list[dict] = [{"role": "system", "content": system}]
     msgs.extend(hist)
@@ -478,7 +606,7 @@ def build_preview_messages(db: Session, cfg: dict, question: str,
 # ---------- 人格版本化（P2）：PATCH 致实际变化时自动快照；回滚先快照当前 ----------
 
 TRACKED_FIELDS = ("name", "spirit", "persona", "boundaries", "miss_text",
-                  "welcome", "questions", "model_id", "suggest_on")
+                  "welcome", "questions", "model_id", "suggest_on", "allow_out_of_scope")
 
 
 def _snapshot_of(app: App) -> dict:
@@ -579,24 +707,53 @@ def app_stats(db: Session, app_id: int) -> dict:
     failed = all_ans - valid
     last = (db.query(ChatSession).filter(ChatSession.app_id == app_id)
             .order_by(ChatSession.updated_at.desc()).first())
-    # 近 7 天提问趋势（按自然日；O3：加时间过滤，别把全表都 group 一遍）
+    # 近 7 天提问趋势（按**本地**自然日：'localtime' 修饰符，单机=用户机器时区；
+    # UTC 日界会把「晚饭后学习」切到明天，趋势图跟用户直觉对不上）
     since = datetime.combine(date.today() - timedelta(days=6), time.min)
-    rows = (db.query(func.date(ChatMessage.created_at), func.count())
+    rows = (db.query(func.date(ChatMessage.created_at, "localtime"), func.count())
             .filter(ChatMessage.app_id == app_id, ChatMessage.role == "user",
                     ChatMessage.created_at >= since)
-            .group_by(func.date(ChatMessage.created_at)).all())
+            .group_by(func.date(ChatMessage.created_at, "localtime")).all())
     by_day = {str(d): c for d, c in rows}
     daily = []
     today = date.today()
     for i in range(6, -1, -1):
         d = (today - timedelta(days=i)).isoformat()
         daily.append({"date": d[5:], "count": int(by_day.get(d, 0))})
+    # C3（2026-10-31）miss 问题清单：看板从「看数字」变成「迭代工具」——
+    # 命中率低了，用户得能看到**是哪几道题没答上来**，才知道该补什么料。
+    # 口径与 missBarText 一致：answer_kind='kb_miss'，旧数据（空串）按 kb_hit=false 回落；
+    # 分母同源：报错/中断（answered 之外）不算 miss。每条回溯同会话最近一条 user 提问。
+    # 去重（2026-10-31 二轮）：同一道题反复 miss 是强信号——聚成一行带 ×N 计数，
+    # 按最近一次出现排序。先取 40 条再去重截 10（直接去重后可能不足 10 行）。
+    miss_cond = or_(ChatMessage.answer_kind == "kb_miss",
+                    and_(ChatMessage.answer_kind == "", ChatMessage.kb_hit.is_(False)))
+    miss_rows = (db.query(ChatMessage)
+                 .filter(ChatMessage.app_id == app_id, answered, miss_cond)
+                 .order_by(ChatMessage.id.desc()).limit(40).all())
+    miss_questions = []
+    seen_q: dict[str, int] = {}
+    for mr in miss_rows:
+        uq = (db.query(ChatMessage)
+              .filter(ChatMessage.session_id == mr.session_id,
+                      ChatMessage.role == "user", ChatMessage.id < mr.id)
+              .order_by(ChatMessage.id.desc()).first())
+        q = ((uq.content or "").strip()[:80]) if uq else ""
+        if q in seen_q:
+            miss_questions[seen_q[q]]["count"] += 1
+            continue
+        seen_q[q] = len(miss_questions)
+        miss_questions.append({
+            "q": q, "count": 1,
+            "at": mr.created_at.isoformat() if mr.created_at else None,
+        })
+    miss_questions = miss_questions[:10]
     return {"session_count": sess_count, "question_count": q_count,
             "hit_count": hits, "miss_count": miss,
             "answered_count": valid, "failed_count": failed,
             "hit_rate": round(hits / valid, 2) if valid else None,
             "last_active": last.updated_at.isoformat() if last and last.updated_at else None,
-            "daily": daily}
+            "daily": daily, "miss_questions": miss_questions}
 
 
 # ---------- 删除级联 ----------
@@ -615,6 +772,7 @@ def delete_app_cascade(db: Session, app: App) -> dict:
     n_sess = db.query(ChatSession).filter(ChatSession.app_id == app.id).delete(synchronize_session=False)
     db.query(AppVersion).filter(AppVersion.app_id == app.id).delete(synchronize_session=False)
     db.query(AppMaterial).filter(AppMaterial.app_id == app.id).delete(synchronize_session=False)
+    db.query(AppNote).filter(AppNote.app_id == app.id).delete(synchronize_session=False)
     db.delete(app)
     db.commit()
     return {"ok": True, "deleted_sessions": n_sess, "deleted_messages": n_msg}

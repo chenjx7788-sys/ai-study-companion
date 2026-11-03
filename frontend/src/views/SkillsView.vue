@@ -1,21 +1,41 @@
 <template>
   <div class="page skills-page">
-    <!-- 头部 -->
-    <div class="skills-hero">
-      <div class="hero-text">
-        <h2>技能</h2>
-        <p>技能是一份「怎么做这件事」的方法说明。在对话里挂载后，它只改变这一轮的表达方式 —— 用不用，由你决定。</p>
+    <!-- 吸顶区：页头 + 筛选（与材料库同款：滚动时搜索与主操作保持在手边） -->
+    <div class="sticky-head">
+      <!-- 页头：标题 + 统计 / 搜索 + 主操作（对齐材料库的单行紧凑布局） -->
+      <div class="page-header">
+        <div class="header-left">
+          <div class="skills-head-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="22" height="22" fill="none" stroke="currentColor"
+                 stroke-width="1.3" stroke-linecap="round">
+              <rect x="2.4" y="3.2" width="11.2" height="9.6" rx="2"/>
+              <path d="M5 6.4h6M5 8.8h6M5 11.2h3.6"/>
+            </svg>
+          </div>
+          <h2>技能库</h2>
+          <span class="header-sub">共 {{ items.length }} 个技能<template v-if="items.length"> · 启用 {{ enabledCount }} · 语义候选 {{ residentCount }}/{{ maxResident }}</template></span>
+        </div>
+        <div class="header-actions">
+          <el-input v-model="search" :prefix-icon="Search" placeholder="搜索名称 / 描述 / 触发词"
+                    clearable class="skills-search" />
+          <el-button plain @click="openImport">导入</el-button>
+          <el-button plain @click="folder.open = true">批量导入…</el-button>
+          <el-button type="primary" :icon="Plus" @click="openCreate">新建技能</el-button>
+        </div>
       </div>
-      <div class="hero-actions">
-        <el-button size="small" @click="openImport">导入</el-button>
-        <el-button size="small" type="primary" @click="openCreate">新建技能</el-button>
-      </div>
-    </div>
+      <div class="hero-desc">技能是一份「怎么做这件事」的方法说明。在对话里挂载后，它只改变这一轮的表达方式 —— 用不用，由你决定。</div>
 
-    <div class="hero-meta">
-      <span class="meta-chip">启用 {{ enabledCount }} / 常驻上限 {{ maxResident }}</span>
-      <span class="meta-chip" :class="{ dim: !residentCount }">已纳入常驻 {{ residentCount }}</span>
-      <span v-if="truncated > 0" class="meta-chip warn">还有 {{ truncated }} 个未纳入常驻</span>
+      <!-- 来源 + 状态筛选（tag-chip 语言与材料库一致） -->
+      <div v-if="items.length" class="filter-bar">
+        <span class="tag-chip" :class="{ on: !srcFilter }" @click="srcFilter = ''">全部来源</span>
+        <span class="tag-chip" :class="{ on: srcFilter === 'builtin' }" @click="srcFilter = 'builtin'">内置</span>
+        <span class="tag-chip" :class="{ on: srcFilter === 'local' }" @click="srcFilter = 'local'">自制</span>
+        <span class="tag-chip" :class="{ on: srcFilter === 'imported' }" @click="srcFilter = 'imported'">导入</span>
+        <span class="type-tag-divider" aria-hidden="true"></span>
+        <span class="tag-chip" :class="{ on: stFilter === 'resident' }" @click="toggleSt('resident')">语义候选</span>
+        <span class="tag-chip" :class="{ on: stFilter === 'off' }" @click="toggleSt('off')">已停用</span>
+        <span v-if="truncated > 0" class="meta-chip warn">还有 {{ truncated }} 个不参与语义建议</span>
+      </div>
     </div>
 
     <!-- 语义预判（P3）：默认关。开着会让「触发词没命中的问题」多一次模型调用，
@@ -42,24 +62,61 @@
       </div>
     </div>
 
-    <!-- 加载中 / 空态 / 列表 -->
-    <div v-if="loading" class="skills-loading">加载中…</div>
+    <!-- 使用痕迹读不出来（典型：后端未重启、表还没建）：绝不能静默显示成「全部还没用过」 -->
+    <div v-if="usageError" class="reject-bar">
+      <div class="reject-title">使用记录暂不可读</div>
+      <div class="reject-row">
+        <span class="reject-reason">{{ usageError }}</span>
+      </div>
+    </div>
+
+    <!-- 首次加载骨架屏（材料库同款）：loading 期间纯白 =「卡了」的感知来源 -->
+    <div v-if="loading" class="skill-grid">
+      <div v-for="i in 6" :key="'sk' + i" class="skill-card sk-card">
+        <div class="sk-top">
+          <div class="sk-block sk-icon"></div>
+          <div class="sk-head">
+            <div class="sk-block sk-line" style="width: 58%"></div>
+            <div class="sk-block sk-line" style="width: 34%"></div>
+          </div>
+        </div>
+        <div class="sk-block sk-line" style="width: 94%"></div>
+        <div class="sk-block sk-line" style="width: 66%"></div>
+      </div>
+    </div>
 
     <div v-else-if="!items.length" class="skills-empty">
-      <div class="empty-title">还没有技能</div>
-      <div class="empty-desc">
-        点右上角「新建技能」写一个，或把 <code>.skill.md</code> 文件放进下面的目录后刷新。
-      </div>
-      <code class="empty-path">{{ userDir || '（用户技能目录）' }}</code>
+      <el-empty :image="mascot" :image-size="120">
+        <template #description>
+          <div class="empty-title">还没有技能</div>
+          <div class="empty-desc">
+            点右上角「新建技能」写一个，或把 <code>.skill.md</code> 文件放进下面的目录后刷新。
+          </div>
+          <code class="empty-path">{{ userDir || '（用户技能目录）' }}</code>
+        </template>
+      </el-empty>
+    </div>
+
+    <!-- 搜索/筛选无结果（与「一个技能都没有」的空态分开：后者要给出路径指引） -->
+    <div v-else-if="!filteredItems.length" class="skills-noresult">
+      <el-empty :image="mascot" :image-size="100"
+                description="没有找到匹配的技能，换个关键词或清除筛选试试" />
     </div>
 
     <div v-else class="skill-grid">
-      <div v-for="s in items" :key="s.id" class="skill-card"
-           :class="{ off: s.enabled === false }" @click="openDetail(s)">
-        <div class="card-head">
-          <span class="card-icon">{{ iconText(s.icon) }}</span>
-          <span class="card-name">{{ s.name }}</span>
-          <span class="card-badge" :class="'badge-' + s.source">{{ badgeText(s) }}</span>
+      <div v-for="(s, i) in filteredItems" :key="s.id" class="skill-card card-in"
+           :class="{ off: s.enabled === false }" :style="{ animationDelay: (i % 12) * 35 + 'ms' }"
+           @click="openDetail(s)">
+        <div class="card-top">
+          <span class="card-icon">{{ skillIconText(s.icon) }}</span>
+          <div class="card-head">
+            <div class="card-name" :title="s.name">{{ s.name }}</div>
+            <div class="card-meta">
+              <span class="card-badge" :class="'badge-' + s.source">{{ badgeText(s) }}</span>
+              <!-- 只在用过时出现：没有记录就整块不渲染，不占版面、不做空态提示 -->
+              <span v-if="useCount(s)" class="card-use" :title="useTitle(s)">用过 {{ useCount(s) }} 次</span>
+            </div>
+          </div>
         </div>
         <div class="card-desc">{{ s.description }}</div>
         <div class="card-foot">
@@ -73,15 +130,16 @@
                      :loading="switching === s.id"
                      @change="(v) => toggle(s, v)" />
           <span class="ops-label" :class="{ dim: !s.resident }">
-            {{ s.enabled === false ? '已停用' : (s.resident ? '常驻清单' : '未纳入清单') }}
+            {{ s.enabled === false ? '已停用' : (s.resident ? '语义候选' : '不参与语义建议') }}
           </span>
+          <!-- 停用的技能不进对话技能池（对话页只列 enabled 的），所以这里必须一起不可点，
+               否则点了会静默退化成普通对话，用户会以为技能生效了 -->
+          <button type="button" class="card-try" :class="{ off: s.enabled === false }"
+                  :disabled="s.enabled === false"
+                  :title="s.enabled === false ? '已停用：先打开左侧开关' : '到 AI 对话里用这个技能回答'"
+                  @click="trySkill(s)">去试试 →</button>
         </div>
       </div>
-    </div>
-
-    <div class="skills-tip">
-      <b>这不是产物目录。</b>摘要、讲义、播客、视频仍在各自页面按原来的方式使用；
-      这里只管理「对话里可挂载的方法」。<b>导入的技能只能手动挂载</b>——它不会自动跳出来建议你用它。
     </div>
 
     <!-- 详情抽屉：让用户看清这个技能到底教了模型什么 -->
@@ -126,10 +184,12 @@
         </div>
 
         <div class="detail-ops">
+          <el-button size="small" type="primary" :disabled="detail.enabled === false"
+                     @click="trySkill(detail)">去试试</el-button>
           <el-button v-if="detail.source === 'builtin'" size="small" @click="copyAsCustom(detail)">
             复制为自定义
           </el-button>
-          <el-button v-else size="small" type="primary" @click="openEdit(detail)">编辑</el-button>
+          <el-button v-else size="small" @click="openEdit(detail)">编辑</el-button>
           <el-button size="small" @click="doExport(detail)">导出</el-button>
           <el-button v-if="detail.source !== 'builtin'" size="small" type="danger" plain
                      @click="doDelete(detail)">删除</el-button>
@@ -192,8 +252,8 @@
               挂载期间，每个问题的第一轮强制发起一次工具调用（适合「找全 / 逐条对比」类技能）
             </el-checkbox>
           </el-form-item>
-          <el-form-item label="方法说明（围栏外正文，≤2400 字，这是技能的全部价值所在）">
-            <el-input v-model="form.instructions" type="textarea" :rows="9" maxlength="2400" show-word-limit
+          <el-form-item label="方法说明（围栏外正文，按 token 预算卡，约合中文 9600 字 / 英文 24000 字符）">
+            <el-input v-model="form.instructions" type="textarea" :rows="9" maxlength="26000" show-word-limit
                       placeholder="写「怎么做这件事」：先做什么、再做什么、什么情况下不算完成。" />
           </el-form-item>
         </el-form>
@@ -237,17 +297,63 @@
         <el-button size="small" type="primary" :loading="importer.loading" @click="doImport">导入</el-button>
       </template>
     </el-dialog>
+
+    <!-- 文件夹批量导入（P6）：扫描预览 → 确认后才落盘 -->
+    <el-dialog v-model="folder.open" title="从文件夹批量导入" width="720px">
+      <div class="import-body">
+        <div class="import-hint">
+          选择技能包文件夹，或填本地路径（都会递归找 <code>SKILL.md</code> 与 <code>.skill.md</code>）。
+          Claude 系格式（YAML frontmatter）会自动转成本系统格式；导入的技能<b>不参与自动建议</b>，只能手动挂载。
+        </div>
+        <div class="import-tools">
+          <el-button size="small" :loading="folder.scanning && folder.mode === 'picker'" @click="pickFolder">选择文件夹…</el-button>
+          <el-input v-model="folder.path" size="small" placeholder="或粘贴本地路径，例如 D:\工作软件\技能\pm-skills-main"
+                    style="flex:1" @keyup.enter="scanFolder" />
+          <el-button size="small" :loading="folder.scanning && folder.mode === 'path'" @click="scanFolder">扫描路径</el-button>
+        </div>
+        <div v-if="folder.sourceName" class="folder-source">
+          已选文件夹：{{ folder.sourceName }} · 候选 {{ folder.files.length }} 份
+        </div>
+        <input ref="folderInput" data-testid="folder-input" type="file" webkitdirectory multiple hidden @change="onFolderPick" />
+        <div v-if="folder.scanned" class="folder-result">
+          <div class="folder-summary">
+            共 {{ folder.results.length }} 份：
+            可导入 <b class="ok-text">{{ readyCount }}</b> 份，
+            冲突 {{ statusCount('conflict') }} 份，重复 {{ statusCount('dup') }} 份，失败 {{ statusCount('failed') }} 份
+          </div>
+          <div class="folder-list">
+            <div v-for="r in folder.results" :key="r.file" class="folder-row" :class="'st-' + r.status">
+              <span class="folder-status">{{ statusText(r.status) }}</span>
+              <span class="folder-name">{{ r.name || r.file }}</span>
+              <span class="folder-id">{{ r.id }}</span>
+              <span class="folder-reason">{{ r.reason || (r.warnings || []).join('；') }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <template #footer>
+        <el-button size="small" @click="folder.open = false">取消</el-button>
+        <el-button size="small" type="primary" :disabled="readyCount === 0"
+                   :loading="folder.importing" @click="doImportFolder">
+          导入 {{ readyCount }} 份</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { Search, Plus } from '@element-plus/icons-vue'
+import { useRouter } from 'vue-router'
 import { skillApi } from '../api'
 import { errMsg } from '../api/http'
+import mascot from '../assets/mascot.png'
+import { skillIconText } from '../utils/skillIcon'
 
-const MAX_RESIDENT_FALLBACK = 12
+const MAX_RESIDENT_FALLBACK = 13
 
+const router = useRouter()
 const loading = ref(true)
 const items = ref([])
 const truncated = ref(0)
@@ -255,11 +361,33 @@ const enabledCount = ref(0)
 const residentCount = ref(0)
 const maxResident = ref(MAX_RESIDENT_FALLBACK)
 const rejected = ref([])
+// 使用痕迹读取失败的原因（空 = 正常）。见后端 `GET /skills` 的 usage_error。
+const usageError = ref('')
 const userDir = ref('')
 const switching = ref('')
 // 语义预判开关（P3）。默认关：与后端 DEFAULT_SEMANTIC 保持一致，实际值以接口为准
 const semantic = ref(false)
 const semanticSaving = ref(false)
+
+// ---- 搜索与筛选（对齐材料库工具行；纯前端过滤，不打接口） ----
+const search = ref('')
+const srcFilter = ref('')
+const stFilter = ref('')
+function toggleSt(k) { stFilter.value = stFilter.value === k ? '' : k }
+// ⚠️ computed 注册即同步求值一次：用到的 ref（items/search/srcFilter/stFilter）必须都已声明
+//    （反过来写会 TDZ → 整页白屏，且构建与文本断言都是绿的）。trigText 是 function 声明，提升安全。
+const filteredItems = computed(() => {
+  const q = search.value.trim().toLowerCase()
+  return items.value.filter((s) => {
+    if (srcFilter.value && s.source !== srcFilter.value) return false
+    if (stFilter.value === 'resident' && !s.resident) return false
+    if (stFilter.value === 'off' && s.enabled !== false) return false
+    if (!q) return true
+    const hay = [s.name, s.description, s.id,
+                 ...(s.triggers || []).map((t) => trigText(t))].join(' ').toLowerCase()
+    return hay.includes(q)
+  })
+})
 
 const drawer = ref(false)
 const detail = ref(null)
@@ -274,6 +402,122 @@ const check = ref({ checked: false, ok: false, error: '', warnings: [] })
 
 // ---- 导入 ----
 const importer = ref({ open: false, text: '', filename: '', overwrite: false, loading: false })
+
+// ---- 文件夹批量导入（P6） ----
+const folder = ref({ open: false, path: '', mode: 'path', sourceName: '', files: [], failures: [], scanning: false, importing: false, scanned: false, results: [] })
+const folderInput = ref(null)
+const PICKER_MAX_FILES = 500
+const PICKER_MAX_FILE_BYTES = 512 * 1024
+const PICKER_MAX_TOTAL_BYTES = 16 * 1024 * 1024
+const readyCount = computed(() =>
+  folder.value.results.filter((r) => r.status === 'ready' || r.status === 'conflict').length)
+function statusCount(s) { return folder.value.results.filter((r) => r.status === s).length }
+function statusText(s) {
+  return { ready: '可导入', ok: '已导入', conflict: '冲突', failed: '失败', dup: '重复' }[s] || s
+}
+async function scanFolder() {
+  if (!folder.value.path.trim()) return
+  folder.value.mode = 'path'
+  folder.value.sourceName = ''
+  folder.value.files = []
+  folder.value.failures = []
+  folder.value.results = []
+  folder.value.scanned = false
+  folder.value.scanning = true
+  try {
+    const { data } = await skillApi.importFolder(folder.value.path.trim(), true)
+    folder.value.results = data.results || []
+    folder.value.scanned = true
+  } catch (e) {
+    ElMessage.error(errMsg(e, '扫描失败'))
+  } finally {
+    folder.value.scanning = false
+  }
+}
+
+function pickFolder() {
+  if (!folderInput.value) return
+  folderInput.value.value = ''       // 允许连续选择同一个文件夹
+  folderInput.value.click()
+}
+
+async function onFolderPick(ev) {
+  const picked = Array.from(ev.target.files || [])
+  if (!picked.length) return
+  folder.value.results = []
+  folder.value.scanned = false
+  folder.value.failures = []
+  const candidates = []
+  const localFailures = []
+  let total = 0
+  for (const f of picked) {
+    const rel = (f.webkitRelativePath || f.name || '').replace(/\\/g, '/')
+    const name = rel.split('/').pop() || f.name
+    if (!(name.toLowerCase() === 'skill.md' || name.toLowerCase().endsWith('.skill.md'))) continue
+    if (candidates.length + localFailures.length + 1 > PICKER_MAX_FILES) {
+      ElMessage.error(`候选技能文件超过 ${PICKER_MAX_FILES} 份，请先拆小文件夹再导入`)
+      return
+    }
+    if (f.size > PICKER_MAX_FILE_BYTES) {
+      localFailures.push({ file: rel, id: '', name: '', status: 'failed',
+        reason: `文件 ${f.size} 字节，超过单文件上限 512KB，已跳过`, warnings: [] })
+      continue
+    }
+    total += f.size
+    if (total > PICKER_MAX_TOTAL_BYTES) {
+      ElMessage.error('选中文件总大小超过 16MB，请改用本地路径扫描')
+      return
+    }
+    candidates.push({ file: rel, blob: f })
+  }
+  if (!candidates.length && !localFailures.length) {
+    ElMessage.warning('这个文件夹里没找到技能文件（SKILL.md 或 .skill.md）')
+    return
+  }
+  folder.value.mode = 'picker'
+  folder.value.path = ''
+  folder.value.sourceName = (candidates[0]?.file || localFailures[0]?.file || '已选文件夹').split('/')[0]
+  folder.value.failures = localFailures
+  folder.value.scanning = true
+  try {
+    const files = []
+    for (const c of candidates) files.push({ file: c.file, text: await c.blob.text() })
+    folder.value.files = files
+    if (!files.length) {
+      folder.value.results = localFailures
+      folder.value.scanned = true
+      return
+    }
+    const { data } = await skillApi.importFiles(files, true)
+    folder.value.results = localFailures.concat(data.results || [])
+    folder.value.scanned = true
+  } catch (e) {
+    ElMessage.error(errMsg(e, '扫描失败'))
+  } finally {
+    folder.value.scanning = false
+  }
+}
+
+async function doImportFolder() {
+  folder.value.importing = true
+  try {
+    const { data } = folder.value.mode === 'picker'
+      ? await skillApi.importFiles(folder.value.files, false)
+      : await skillApi.importFolder(folder.value.path.trim(), false)
+    folder.value.results = folder.value.mode === 'picker'
+      ? folder.value.failures.concat(data.results || [])
+      : (data.results || [])
+    const ok = data.ok_count || 0
+    const failed = statusCount('failed')
+    if (failed) ElMessage.warning(`已导入 ${ok} 份，${failed} 份失败（见列表原因）`)
+    else ElMessage.success(`已导入 ${ok} 份技能，到列表里手动挂载即可使用`)
+    await load()
+  } catch (e) {
+    ElMessage.error(errMsg(e, '导入失败'))
+  } finally {
+    folder.value.importing = false
+  }
+}
 const fileInput = ref(null)
 
 function blankForm() {
@@ -305,11 +549,7 @@ const draftText = computed(() => {
   return '```skill\n' + JSON.stringify(man, null, 2) + '\n```\n\n' + (f.instructions || '').trim() + '\n'
 })
 
-// 符号图标在不同字体下会渲染成方块（原型阶段实测）→ 一律映射成中文单字
-const ICON_TEXT = { term: '译', argue: '证', law: '法', skill: '技' }
-function iconText(key) {
-  return ICON_TEXT[key] || '技'
-}
+// 图标显示规则收敛到 utils/skillIcon.js：技能页与对话页不能各维护一份映射。
 
 // triggers 是**给机器看的正则**（如 `第.{1,3}条`）。直接展示会让用户以为要输入正则，
 // 所以只做展示层清洗；后端匹配仍用原文。（清洗后为空则回落到原文，不显示空白 chip）
@@ -330,6 +570,33 @@ function sourceText(src) {
   if (src === 'builtin') return '内置（随包发布，只读）'
   if (src === 'imported') return '导入（他人提供的方法，只能手动挂载）'
   return '自定义'
+}
+
+// ---- 使用痕迹（P0-1 资产掌控）----
+// 后端只在「技能注入且回答**成功完成**」时记一笔：/skills/match 的建议不记、
+// 中断与报错也不记（判据见 docs/资产掌控力-研发方案.md §3.6）。
+// 没有记录就整块不渲染（2026-11-03 用户拍板：不强制展示空态，不占版面）。
+function useCount(s) {
+  return Number(s.use_count || 0)
+}
+// 后端给的是 UTC（带 Z 后缀），Date.parse 会正确转成本地时间。
+// ⚠️ 别去掉后端的 Z：naive UTC 字符串会被当本地时间解析，整体偏 8 小时。
+function relTime(iso) {
+  const t = Date.parse(iso || '')
+  if (!t) return '—'
+  const mins = Math.floor((Date.now() - t) / 60000)
+  if (mins < 1) return '刚刚'
+  if (mins < 60) return `${mins} 分钟前`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `${hrs} 小时前`
+  const days = Math.floor(hrs / 24)
+  if (days < 30) return `${days} 天前`
+  return `${Math.floor(days / 30)} 个月前`
+}
+// 卡面只显示「用过 N 次」；最后使用时间收进 tooltip，不占版面。
+function useTitle(s) {
+  const t = relTime(s.last_used_at)
+  return t === '—' ? '在 AI 对话里成功完成的回答次数' : `最近一次：${t}`
 }
 
 // ---- 工具能力（P4）----
@@ -375,6 +642,7 @@ async function load() {
       : items.value.filter((s) => s.resident).length
     maxResident.value = data.max_resident || MAX_RESIDENT_FALLBACK
     rejected.value = data.rejected || []
+    usageError.value = data.usage_error || ''
     userDir.value = data.user_dir || ''
     // 开关状态以接口为准（用户可能在别的窗口改过，或后端回落了默认值）
     semantic.value = !!data.semantic_enabled
@@ -419,6 +687,15 @@ async function toggle(s, val) {
   } finally {
     switching.value = ''
   }
+}
+
+// 「去试试」：带技能跳到对话页，由对话页默认挂载它。
+// ⚠️ 只传 id，不传 name —— 名称以对话页拉到的技能列表为准，避免两处中文名漂移；
+//    也不在这里写 localStorage：去不去用、用哪一轮，由对话页自己决定。
+function trySkill(s) {
+  if (!s || s.enabled === false) return
+  drawer.value = false
+  router.push({ name: 'chat', query: { skill: s.id } })
 }
 
 async function openDetail(s) {
@@ -619,35 +896,67 @@ onMounted(load)
 </script>
 
 <style scoped>
-.skills-page { padding: 20px 24px 32px; }
-
-.skills-hero {
-  display: flex; align-items: flex-start; justify-content: space-between;
-  gap: 16px; margin-bottom: 12px;
+/* ===== 页头与筛选（对齐材料库） ===== */
+.sticky-head {
+  position: sticky; top: 0; z-index: 20;
+  margin: -28px -32px 0; padding: 28px 32px 1px;
+  background: var(--asc-bg);
 }
-.hero-text h2 { margin: 0 0 6px; font-size: 18px; font-weight: 600; color: var(--asc-text); }
-.hero-text p { margin: 0; font-size: 13px; line-height: 1.7; color: var(--asc-text-2); max-width: 720px; }
-.hero-actions { display: flex; gap: 8px; flex-shrink: 0; }
-
-.hero-meta { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
-
-/* 语义预判开关：与列表卡片区分开，底色用极浅的 surface-2，不抢视觉重心 */
-.semantic-bar {
-  display: flex; align-items: center; gap: 10px;
-  padding: 10px 14px; margin-bottom: 16px;
-  background: var(--asc-surface-2); border: 1px solid var(--asc-border);
-  border-radius: 8px;
+.page-header {
+  display: flex; justify-content: space-between; align-items: flex-end;
+  gap: 16px 24px; flex-wrap: wrap;
+  margin-bottom: 12px; padding-bottom: 16px;
+  border-bottom: 1px solid var(--asc-divider);
 }
-.semantic-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.semantic-title { font-size: 13px; font-weight: 600; color: var(--asc-text); }
-/* 次要文字 · 12.5px：底色是 surface-2（不是纯白），对比度按元素自身底色算 */
-.semantic-desc { font-size: 12.5px; line-height: 1.6; color: var(--asc-text-2); }
+.header-left { display: flex; align-items: center; gap: 12px; }
+/* 页头图标锚点（与知识库同款渐变方块；图标沿用侧栏「技能库」图形，导航与页头同一语言） */
+.skills-head-icon {
+  width: 44px; height: 44px; border-radius: 12px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--asc-primary);
+  background: linear-gradient(150deg, rgba(124, 92, 252, .16), rgba(124, 92, 252, .06));
+  border: 1px solid rgba(124, 92, 252, .22);
+}
+.page-header h2 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: .2px; }
+.header-sub { font-size: 12px; color: var(--asc-text-3); }
+.header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.skills-search { width: 220px; }
+.skills-search :deep(.el-input__wrapper) { border-radius: 8px !important; }
+.hero-desc {
+  margin: -6px 0 12px; font-size: 12.5px; line-height: 1.6;
+  color: var(--asc-text-2); max-width: 720px;
+}
+.filter-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.tag-chip {
+  height: 28px; display: inline-flex; align-items: center; padding: 0 12px;
+  font-size: 12px; border-radius: 999px; cursor: pointer;
+  background: var(--asc-card); border: 1px solid var(--asc-border); color: var(--asc-text-2);
+  transition: all .15s;
+}
+.tag-chip:hover { border-color: var(--asc-primary); color: var(--asc-primary); }
+.tag-chip.on { background: var(--asc-primary); border-color: var(--asc-primary); color: #fff; }
+.type-tag-divider { width: 1px; height: 16px; background: var(--asc-border); margin: 0 2px; }
+
 .meta-chip {
   font-size: 12px; padding: 3px 9px; border-radius: 999px;
   background: var(--asc-surface-2); color: var(--asc-text-2); white-space: nowrap;
 }
 .meta-chip.warn { background: rgba(230, 145, 56, .12); color: #a55c11; }
-.meta-chip.dim { color: #6e6e6e; }
+
+/* 语义预判开关：与列表卡片区分开，底色用极浅的 surface-2，不抢视觉重心 */
+.semantic-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; margin-bottom: 14px;
+  background: var(--asc-surface-2); border: 1px solid var(--asc-border);
+  border-radius: 10px;
+}
+.semantic-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.semantic-title { font-size: 13px; font-weight: 600; color: var(--asc-text); }
+/* 次要文字 · 12.5px：底色是 surface-2（不是纯白），对比度按元素自身底色算 */
+.semantic-desc { font-size: 12.5px; line-height: 1.6; color: var(--asc-text-2); }
 
 .reject-bar {
   border: 1px solid rgba(230, 145, 56, .35); background: rgba(230, 145, 56, .07);
@@ -660,10 +969,7 @@ onMounted(load)
 
 .skills-loading { padding: 40px 0; text-align: center; font-size: 13px; color: var(--asc-text-2); }
 
-.skills-empty {
-  padding: 48px 24px; text-align: center; border: 1px dashed var(--asc-border);
-  border-radius: var(--asc-radius); background: var(--asc-card);
-}
+.skills-empty { padding: 24px 24px 32px; }
 .empty-title { font-size: 15px; font-weight: 600; color: var(--asc-text); margin-bottom: 8px; }
 .empty-desc { font-size: 13px; color: var(--asc-text-2); line-height: 1.7; }
 .empty-path {
@@ -671,34 +977,70 @@ onMounted(load)
   background: var(--asc-surface-2); border-radius: 6px; color: var(--asc-text-2);
   word-break: break-all; max-width: 100%;
 }
+.skills-noresult { padding: 24px 0 32px; }
 
-.skill-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(268px, 1fr)); gap: 12px; }
-.skill-card {
-  background: var(--asc-card); border: 1px solid var(--asc-border);
-  border-radius: var(--asc-radius); padding: 14px; cursor: pointer;
-  transition: box-shadow .15s, border-color .15s; display: flex; flex-direction: column;
+/* ===== 卡片网格（材料库同款：入场动画 + 上浮 hover） ===== */
+@keyframes card-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
 }
-.skill-card:hover { box-shadow: var(--asc-shadow-hover); border-color: var(--asc-primary-soft); }
+.card-in { animation: card-in .3s ease both; }
+@media (prefers-reduced-motion: reduce) {
+  .card-in { animation: none; }
+  .skill-card { transition: none; }
+}
+.skill-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 16px; }
+.skill-card {
+  position: relative;
+  background: var(--asc-card); border: 1px solid var(--asc-border);
+  border-radius: 14px; overflow: hidden; cursor: pointer;
+  transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
+  display: flex; flex-direction: column;
+  padding: 16px 16px 12px;
+}
+.skill-card:hover {
+  transform: translateY(-3px);
+  border-color: #c9b8fe;
+  box-shadow: 0 10px 28px rgba(124, 92, 252, .1);
+}
 /* 停用态：**虚线边框**承担主要辨识，不靠底色差。
    实测：页面底 #f5f5f6 与 --asc-surface-2 #f0f0f2 只差 5 个色阶，纯靠灰底根本看不出来。
    也不降 opacity —— 半透明会把 12.5px 次要文字压到 4.5:1 以下。 */
 .skill-card.off { background: var(--asc-surface-2); border: 1px dashed #c4c4cc; }
 .skill-card.off .card-name { color: var(--asc-text-2); }
-.card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+
+.card-top { display: flex; align-items: flex-start; gap: 12px; }
+.card-head { flex: 1; min-width: 0; padding-top: 2px; }
 .card-icon {
-  width: 24px; height: 24px; flex-shrink: 0; border-radius: 7px;
+  width: 42px; height: 42px; flex-shrink: 0; border-radius: 11px;
   display: flex; align-items: center; justify-content: center;
   background: var(--asc-primary-soft); color: var(--asc-primary);
-  font-size: 12px; font-weight: 600;
+  font-size: 16px; font-weight: 600;
 }
-.card-name { font-size: 14px; font-weight: 600; color: var(--asc-text); }
+.card-name {
+  font-size: 14px; font-weight: 600; line-height: 1.45; color: var(--asc-text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.card-meta {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12px; color: var(--asc-text-3); margin-top: 4px;
+}
 .card-badge {
-  margin-left: auto; font-size: 11px; padding: 1px 7px; border-radius: 999px; white-space: nowrap;
+  font-size: 11px; padding: 1px 7px; border-radius: 999px; white-space: nowrap;
 }
 .badge-builtin { background: var(--asc-primary-soft); color: var(--asc-primary); }
 .badge-local { background: var(--asc-surface-2); color: var(--asc-text-2); }
 .badge-imported { background: rgba(230, 145, 56, .14); color: #8a4d0f; }
-.card-desc { font-size: 12.5px; line-height: 1.7; color: var(--asc-text-2); flex: 1; }
+/* 使用痕迹：只在用过时渲染。走 text-2（#6e6e6e，白底 4.5:1），不用 text-3
+   （#a0a0a0 仅 2.6:1）—— 这是这张卡信息量最大的一行。 */
+.card-use { font-size: 11px; color: var(--asc-text-2); white-space: nowrap; }
+.card-desc {
+  font-size: 12.5px; line-height: 1.7; color: var(--asc-text-2); flex: 1;
+  margin-top: 10px;
+  /* 描述长短不一 → clamp 三行保证卡片等高（材料库网格的整齐感来源） */
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
+  overflow: hidden;
+}
 .card-foot { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
 .trig {
   font-size: 11px; padding: 1px 6px; border-radius: 4px;
@@ -707,6 +1049,17 @@ onMounted(load)
 .trig.more { background: transparent; color: #6e6e6e; }
 /* 能力标签比触发词更"硬"（它是行为差异，不是匹配规则），用描边区分而不是换色 */
 .trig.cap { background: transparent; border: 1px solid var(--asc-border); color: var(--asc-text); }
+
+/* ===== 骨架屏（材料库同款：复用卡片外壳，内容换呼吸灰块） ===== */
+.sk-card { cursor: default; pointer-events: none; }
+.sk-card:hover { transform: none; box-shadow: none; border-color: var(--asc-border); }
+.sk-top { display: flex; gap: 12px; margin-bottom: 14px; }
+.sk-head { flex: 1; display: flex; flex-direction: column; gap: 10px; padding-top: 3px; }
+.sk-block { background: var(--asc-border); border-radius: 6px; animation: sk-pulse 1.2s ease-in-out infinite; }
+.sk-icon { width: 42px; height: 42px; border-radius: 11px; flex-shrink: 0; }
+.sk-line { height: 12px; }
+.sk-card > .sk-line + .sk-line { margin-top: 10px; }
+@keyframes sk-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
 /* 能力被剔除的原因：必须能看见，否则用户会以为"写了就生效了" */
 .detail-warn {
   margin-top: 8px; font-size: 12px; line-height: 1.7; color: #8a5a12;
@@ -724,13 +1077,14 @@ onMounted(load)
 }
 .ops-label { font-size: 11px; color: var(--asc-text-2); }
 .ops-label.dim { color: #6e6e6e; }
-
-.skills-tip {
-  margin-top: 18px; padding: 10px 12px; font-size: 12px; line-height: 1.8;
-  color: var(--asc-text-2); background: var(--asc-surface-2);
-  border-radius: var(--asc-radius); border-left: 2px solid var(--asc-border);
+.card-try {
+  margin-left: auto; padding: 2px 6px; border: 0; border-radius: 6px;
+  background: transparent; font: inherit; font-size: 11.5px; color: var(--asc-primary);
+  cursor: pointer; white-space: nowrap; transition: background .16s ease;
 }
-.skills-tip b { color: var(--asc-text); font-weight: 600; }
+.card-try:hover { background: rgba(124, 92, 252, .1); }
+.card-try.off { color: #6e6e6e; cursor: not-allowed; }
+.card-try.off:hover { background: transparent; }
 
 .detail-body { font-size: 13px; color: var(--asc-text); }
 .detail-row { display: flex; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--asc-divider); }
@@ -766,5 +1120,21 @@ onMounted(load)
 .import-hint { font-size: 12.5px; line-height: 1.7; color: var(--asc-text-2); margin-bottom: 10px; }
 .import-hint b { color: var(--asc-text); }
 .import-tools { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.folder-source { margin: -2px 0 8px; font-size: 12px; color: var(--asc-text-2); }
 .import-file { font-size: 12px; color: var(--asc-text-2); }
+/* 批量导入结果列表（P6） */
+.folder-result { margin-top: 10px; }
+.folder-summary { font-size: 12.5px; color: var(--asc-text-2); margin-bottom: 6px; }
+.folder-summary .ok-text { color: var(--asc-primary); }
+.folder-list { max-height: 300px; overflow: auto; border: 1px solid rgba(0,0,0,.08); border-radius: 6px; }
+.folder-row { display: flex; gap: 8px; align-items: baseline; padding: 5px 10px; font-size: 12.5px; border-bottom: 1px solid rgba(0,0,0,.05); }
+.folder-row:last-child { border-bottom: none; }
+.folder-status { flex: none; width: 44px; font-weight: 600; }
+.folder-row.st-ready .folder-status, .folder-row.st-ok .folder-status { color: #3a9a5d; }
+.folder-row.st-conflict .folder-status { color: #b57d1e; }
+.folder-row.st-failed .folder-status { color: #c44a4a; }
+.folder-row.st-dup .folder-status { color: var(--asc-text-2); }
+.folder-name { flex: none; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-id { flex: none; color: var(--asc-text-2); font-size: 11.5px; }
+.folder-reason { flex: 1; color: var(--asc-text-2); font-size: 11.5px; }
 </style>

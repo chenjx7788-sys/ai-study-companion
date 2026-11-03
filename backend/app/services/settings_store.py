@@ -20,10 +20,14 @@ FIELDS = ["llm_base_url", "llm_api_key", "summary_model", "chat_model",
           "auto_extract_entities",
           # 笔记检索权重（默认 1.5，检索打分时生效，改动无需重建索引）
           "note_weight",
+          # 检索增强层（2026-10-28）：两个开关（默认开，仅显式 False 关闭）+
+          # 两个提示词覆盖键 —— 漏登记 = 设置页保存时被静默丢弃（FIELDS 是白名单）
+          "query_rewrite_enabled", "retrieval_plan_enabled",
+          "prompt_query_rewrite", "prompt_retrieval_plan",
           "prompt_summary", "prompt_keywords", "prompt_explain", "prompt_kb_qa", "prompt_general", "prompt_review", "prompt_suggest", "prompt_quiz", "prompt_quiz_boundary", "prompt_recall", "prompt_note_rewrite", "prompt_note_expand", "prompt_note_summarize", "prompt_note_continue", "prompt_stats_report", "prompt_learn_note", "prompt_learn_note_conceptual", "prompt_learn_note_practical", "prompt_learn_note_fragment", "prompt_learn_note_chapter", "prompt_drill_examiner", "prompt_drill_judge", "kb_hit_threshold",
           "prompt_podcast_brief", "prompt_podcast_script", "prompt_podcast_script_direct",
           # AI 视频（模块 K）：讲稿 / 结构图内容 / 定位锚点
-          "prompt_video_script", "prompt_video_points", "prompt_video_anchor",
+          "prompt_video_script", "prompt_video_points", "prompt_video_points_board", "prompt_video_anchor",
           "prompt_podcast_script_solo", "prompt_podcast_script_solo_direct",
           # AI 播客 · 语音合成（edge-tts 免费音色，无需 Key）
           "tts_provider", "tts_voice_host", "tts_voice_expert", "tts_rate", "tts_gap_ms",
@@ -37,7 +41,7 @@ FIELDS = ["llm_base_url", "llm_api_key", "summary_model", "chat_model",
 def _ensure_models(conf: dict) -> dict:
     """保证 conf 含 llm_models（兼容旧单套配置 → 迁移为模型列表，惰性幂等）
 
-    注意：迁移出的模型**不自动引用**为总结/问答模型 —— 二者留空，由用户在设置页主动
+    注意：迁移出的模型**不自动引用**为总结/对话模型 —— 二者留空，由用户在设置页主动
     选择（前端对「未选择」态有明确引导）。避免用户「莫名被指定了某个模型」。
     """
     if conf.get("llm_models"):
@@ -58,7 +62,7 @@ def _ensure_models(conf: dict) -> dict:
                            "api_key": key, "model": summary_model})
 
     conf["llm_models"] = models
-    # 不自动引用：总结/问答模型留空，由用户主动选择
+    # 不自动引用：总结/对话模型留空，由用户主动选择
     conf["summary_model_id"] = conf.get("summary_model_id") or ""
     conf["chat_model_id"] = conf.get("chat_model_id") or ""
     return conf
@@ -98,7 +102,7 @@ def resolve_model(model_id: str | None):
 def resolve_model_strict(model_id: str | None):
     """严格版：多模型模式下，条目缺 key 或 model 一律返回 None（不回退残留全局字段）。
 
-    用于「用户显式指定某个 model_id」的场景（问答页切换模型）：选了 key 为空的模型时，
+    用于「用户显式指定某个 model_id」的场景（对话页切换模型）：选了 key 为空的模型时，
     应报 NEED_SETUP 而不是静默用残留的全局 llm_api_key 跑通。
     """
     if not model_id:
@@ -118,7 +122,7 @@ def resolve_usage(kind: str):
     """按「用途」解析模型配置，返回 (base_url, api_key, model) 或 None=未配置。
 
     kind ∈ {'summary', 'chat'}。多模型模式（llm_models 非空）下，用途未选（对应 *_model_id 为空）
-    一律视为**未配置**返回 None —— 不得回退旧的全局单套字段，否则「总结/问答模型没选」也能
+    一律视为**未配置**返回 None —— 不得回退旧的全局单套字段，否则「总结/对话模型没选」也能
     静默用旧字段跑通（用户实测报的 bug）。纯旧单套模式（llm_models 为空）才回退全局字段。
     """
     conf = load()

@@ -1,4 +1,4 @@
-"""查询理解前置层（2026-10-23，AI 问答 P0 族修复）：检索前的意图分类与指代解析。
+"""查询理解前置层（2026-10-23，AI 对话 P0 族修复）：检索前的意图分类与指代解析。
 
 背景：检索前没有查询理解，导致一族实测 bug——
 - 概览/统计问法（"资料库有多少份文件"）被当内容问题走向量检索，LLM 拿 3 块碎片如实答"3 份"；
@@ -19,6 +19,14 @@ _STATS_WORDS = ("多少", "几份", "几个", "几条", "几", "数量", "总共
 _ENUM_WORDS = ("哪些", "哪几", "有什么", "有哪些", "都有什么")
 _OVERVIEW_HINTS = ("有什么", "有哪些", "包含", "目录", "内容", "学了什么", "都有什么", "收录", "讲了什么")
 
+# 找内容（2026-10-26）：用户在求「推荐 / 找资源」，不是问某个知识点的内容。
+# ⚠️ 必须与 content 分开：「有什么讲 Agent 的视频」若落进 content，会走普通相似度检索，
+#    命中什么全凭运气 —— 实测同类的两次提问一次给了书单、一次拒绝给书名。
+_DISCOVER_WORDS = ("推荐", "想读", "想学", "想看看", "想听", "找一下", "值得读",
+                   "书单", "清单", "入门书", "找找")
+_DISCOVER_FORMS = ("视频", "讲书", "播客", "课程", "音频", "有声书", "图书",
+                   "书籍", "文章", "读物", "书")
+
 # 意图词（剥离用）：长的在前，先替长的再替短的
 _STRIP_WORDS = (
     "讲了什么", "讲的是什么", "是什么", "有什么", "有哪些", "都有什么", "哪些", "哪几",
@@ -31,7 +39,7 @@ _STRIP_WORDS = (
 
 @dataclass
 class QueryPlan:
-    intent: str = "content"               # reference / stats / enumerate / overview / content
+    intent: str = "content"               # reference / stats / enumerate / overview / discover / content
     material_ids: list[int] = field(default_factory=list)  # reference 命中的材料 id
     meta_text: str = ""                   # stats / enumerate 注入文本
     search_query: str = ""                # 剥离意图词后的检索词（空 = 用原句）
@@ -92,6 +100,14 @@ def _build_enum_text(db, keyword: str) -> tuple[str, list[int]]:
     return "\n".join(lines), [m.id for m in matches]
 
 
+def _looks_like_discover(q: str) -> bool:
+    """是否在「找内容」：求推荐，或问某类资源有没有。"""
+    if any(w in q for w in _DISCOVER_WORDS):
+        return True
+    return (any(w in q for w in ("有什么", "有哪些", "有没有"))
+            and any(f in q for f in _DISCOVER_FORMS))
+
+
 def analyze_query(question: str, db) -> QueryPlan:
     """意图分类主入口。调用方仅在 scope=all 且未显式指定条目时使用本结果。"""
     q = question.strip()
@@ -125,7 +141,13 @@ def analyze_query(question: str, db) -> QueryPlan:
         plan.intent = "overview"
         return plan
 
-    # 5. 内容问答：剥离意图词（保守：剩余 < 4 字放弃剥离）
+    # 5. 找内容：求推荐 / 要某类资源（「想读三国类图书」「有什么讲 Agent 的视频」）
+    if _looks_like_discover(q):
+        plan.intent = "discover"
+        plan.search_query = stripped if len(stripped) >= 2 else q
+        return plan
+
+    # 6. 内容问答：剥离意图词（保守：剩余 < 4 字放弃剥离）
     plan.intent = "content"
     plan.search_query = stripped if len(stripped) >= 4 else q
     return plan

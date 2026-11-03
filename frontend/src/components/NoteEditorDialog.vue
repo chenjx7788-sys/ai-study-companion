@@ -173,7 +173,7 @@ let draftTimer = null
 
 // ---------- 来源标签（与知识库页同一套文案/配色） ----------
 const NOTE_TAG = {
-  chat: '问答笔记', ai_asset: 'AI 生成',
+  chat: '对话笔记', ai_asset: 'AI 生成',
   weekly_report: 'AI 周报', podcast_script: 'AI 播客脚本',
   podcast_brief: 'AI 播客简报',
   video_script: 'AI 视频文稿',

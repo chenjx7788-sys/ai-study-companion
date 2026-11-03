@@ -2638,7 +2638,7 @@ def note_state(vid: int, db: Session = Depends(get_db)):
 
 # ---------- 转复习卡（学习闭环 B7） ----------
 
-# ⚠️ 复习卡「AI 视频」哨兵：-1 已被陪练占用、0 是「AI 问答」；筛选口径见 review.py::review_filters。
+# ⚠️ 复习卡「AI 视频」哨兵：-1 已被陪练占用、0 是「AI 对话」；筛选口径见 review.py::review_filters。
 SENTINEL_VIDEO_MATERIAL_ID = -2
 
 

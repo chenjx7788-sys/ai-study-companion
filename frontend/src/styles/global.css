@@ -103,7 +103,7 @@ body {
 /* 选中文本高亮 */
 ::selection { background: rgba(124, 92, 252, .2); }
 
-/* ===== Markdown 渲染排版（摘要/笔记/问答共用） ===== */
+/* ===== Markdown 渲染排版（摘要/笔记/对话共用） ===== */
 .md-preview h1, .md-preview h2, .md-preview h3 {
   font-weight: 600; line-height: 1.4;
   margin: 18px 0 8px;
@@ -133,20 +133,59 @@ body {
 
 /* ===== AI 回答 Markdown 增强（2026-10-23 · P0/P1/P2） ===== */
 /* 代码块：外层卡片 + 头部条（语言标签 + 复制按钮） */
-.md-code { margin: 10px 0; border-radius: 8px; overflow: hidden; background: var(--asc-surface-2); }
-.md-code-head { display: flex; justify-content: space-between; align-items: center; padding: 4px 12px; font-size: 12px; color: var(--asc-text-2); background: rgba(0, 0, 0, .04); }
-.md-code-lang { font-family: Consolas, Monaco, monospace; }
+/* ⚠️ 第二行 overflow: clip 才是真正生效的那条：overflow:hidden 会建立滚动包含块，
+   让下面头部条的 position:sticky 完全失效。第一行保留给不认识 clip 的旧内核降级
+   （降级后圆角仍正常，只是头部不吸附）。 */
+.md-code { margin: 10px 0; border-radius: 10px; overflow: hidden; overflow: clip; background: var(--asc-surface-2); border: 1px solid rgba(17, 17, 26, .06); }
+/* 吸附态要贴住滚动容器顶部：位置 + 不透明底色（#e6e6e8 = surface-2 上叠 4% 黑的合成色，
+   截图实测与原来半透明观感一致，但不会把滚过来的代码透出字影）。
+   ⚠️⚠️ 补缝用 ::before（不是 box-shadow）：sticky 会停在滚动容器的 **padding 内侧**（实测 gap 恒等于
+      padding-top：16/0/32 三档一一对应），上方那条 padding 宽的区域会把滚过的代码露出来。
+      高度由容器用 --md-sticky-cover 声明，默认 0 = 不补（没声明的容器行为与改动前完全一致）；
+      静止态下伪元素超出 .md-code 的 overflow:clip 边界，会被自动裁掉。
+      为何不用 box-shadow：实测 0 -32px 0 0 的阴影在 21120px 条带里仍留 29 个暗像素
+      （边缘抗锯齿漏出），::before 精确铺满 -> dark=0。 */
+.md-code-head { position: sticky; top: 0; z-index: 2; display: flex; justify-content: space-between; align-items: center; padding: 4px 7px 4px 12px; font-size: 12px; color: var(--asc-text-2); background: #e6e6e8; }
+.md-code-head::before { content: ""; position: absolute; left: 0; right: 0; bottom: 100%; height: var(--md-sticky-cover, 0px); background: inherit; pointer-events: none; }
+/* ⚠️ 三个子项（语言标签 / 空占位 / 按钮…）用 space-between 会把按钮均分到中间，
+   必须从第 2 个子项起接管左外边距，按钮才会贴在右侧。 */
+.md-code-head > :nth-child(2) { margin-left: auto; }
+.md-code-lang { font-family: Consolas, Monaco, monospace; font-size: 11px; letter-spacing: .02em; color: var(--asc-text-2); }
 .md-code-copy { border: none; background: transparent; cursor: pointer; color: var(--asc-text-2); font-size: 12px; padding: 2px 8px; border-radius: 4px; }
 /* 「导入为技能」（P5）：比复制更显眼一点（它是动作，复制是工具） */
 .md-code-import-skill { border: 1px solid rgba(124, 92, 252, .4); background: rgba(124, 92, 252, .1); cursor: pointer; color: var(--asc-primary); font-size: 12px; padding: 1px 8px; border-radius: 4px; margin-right: 2px; }
 .md-code-import-skill:hover { background: rgba(124, 92, 252, .2); }
 .md-code-import-skill:disabled { opacity: .55; cursor: default; }
 .md-code-copy:hover { color: var(--asc-primary); background: rgba(0, 0, 0, .06); }
+/* 「运行」按钮：与「导入为技能」同一套主色小按钮范式（此前无样式 → 浏览器默认按钮） */
+.md-code-run { font-family: inherit; font-size: 12px; padding: 1px 10px; margin-right: 4px;
+  color: var(--asc-primary); background: rgba(124, 92, 252, .1);
+  border: 1px solid rgba(124, 92, 252, .45); border-radius: 4px; cursor: pointer; }
+.md-code-run:hover { background: rgba(124, 92, 252, .2); }
+.md-code-run:focus-visible { outline: 2px solid var(--asc-primary); outline-offset: 1px; }
+/* 预览中的「收起」：实心主色，和未运行时的描边态区分开 */
+.md-code-run.is-on { color: #fff; background: var(--asc-primary); border-color: var(--asc-primary); box-shadow: 0 1px 4px rgba(124, 92, 252, .3); }
+.md-code-run.is-on:hover { background: var(--asc-primary-hover); border-color: var(--asc-primary-hover); }
 /* 预提级压过各视图 scoped 的 .md-body :deep(pre)（等优先级时后加载的 scoped 会赢） */
 .md-body .md-code pre.md-code-pre, .ep-block .md-code pre.md-code-pre, .md-preview .md-code pre.md-code-pre { margin: 0; padding: 12px 14px; background: transparent; overflow-x: auto; }
 .md-body .md-code pre.md-code-pre code, .ep-block .md-code pre.md-code-pre code, .md-preview .md-code pre.md-code-pre code { background: transparent; padding: 0; }
 /* 正文图片：点击放大 */
 .md-body img, .ep-block img, .md-preview img { max-width: 100%; height: auto; cursor: zoom-in; }
+/* 正文插图卡片化（2026-10-26）：class 由 md.js 的 onImgLoad 只在「独段且原图宽≥160px」时加，
+   行内图/小图标永远停在基础规则，不会有边框阴影。 */
+.md-body img.md-fig, .ep-block img.md-fig, .md-preview img.md-fig {
+  display: block; margin: 16px auto;
+  border-radius: 10px;
+  border: 1px solid rgba(17, 17, 26, .08);
+  box-shadow: 0 1px 2px rgba(17, 17, 26, .05), 0 4px 16px rgba(17, 17, 26, .06);
+  transition: box-shadow .18s ease;
+}
+.md-body img.md-fig:hover, .ep-block img.md-fig:hover, .md-preview img.md-fig:hover {
+  box-shadow: 0 2px 4px rgba(17, 17, 26, .06), 0 8px 24px rgba(17, 17, 26, .10);
+}
+/* mermaid 图（8 种）：点图放大查看（委托在 md.js onDocClick） */
+.mermaid-pending.mermaid-done svg,
+.mermaid-pending.mermaid-done svg * { cursor: zoom-in; }
 /* mermaid 占位与降级 */
 .mermaid-pending { margin: 10px 0; overflow-x: auto; }
 .mermaid-pending .mermaid-hint { padding: 12px; color: var(--asc-text-2); font-size: 12px; text-align: center; }
@@ -165,7 +204,9 @@ body {
 .mermaid-pending.mermaid-done { position: relative; }
 .mermaid-save {
   position: absolute; top: 6px; right: 8px;
-  padding: 3px 9px; font-size: 12px; line-height: 1.5;
+  /* ⚠️ 高度必须 ≤ .mmd-box 的 padding-top 减去 top(6px)，否则按钮会落进图的内容带：
+     现为 2px*2 + 12*1.4 ≈ 23px → 底边 29px，卡片 padding-top 30px → 留 1px 余量。 */
+  padding: 2px 9px; font-size: 12px; line-height: 1.4;
   font-family: inherit;
   color: #555; background: rgba(255, 255, 255, .94);
   border: 1px solid #d6d6e0; border-radius: 6px;
@@ -174,8 +215,119 @@ body {
 .mermaid-pending.mermaid-done:hover .mermaid-save,
 .mermaid-save:focus-visible { opacity: 1; }
 .mermaid-save:hover { color: #1f6feb; border-color: #1f6feb; }
-/* ===== 代码运行面板（A4 · sandbox iframe） ===== */
-.md-code-run-panel { margin: 6px 0 10px; border: 1px solid var(--asc-border, #e5e5ea); border-radius: 8px; overflow: hidden; }
-.md-code-run-head { font-size: 12px; color: #6e6e6e; padding: 6px 10px; background: var(--asc-surface-2, #f7f7f9); }
-.md-code-run-out { margin: 0; padding: 8px 10px; font-size: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; max-height: 140px; overflow: auto; border-top: 1px solid var(--asc-border, #e5e5ea); background: var(--asc-surface, #fff); white-space: pre-wrap; word-break: break-word; }
-.md-code-run-frame { display: block; width: 100%; height: 220px; border: 0; background: #fff; }
+/* ===== 代码运行面板（A4 · sandbox iframe） =====
+   2026-10-28 视觉重做：原来面板是「白底 + 1px 边框」的独立盒子，压在浅灰代码块下方，
+   看着是两件不相干的东西；头部还是一长串 12px 灰字（窄屏必被截断）。现在：
+   ① 与代码块共用卡片语言（圆角 10 + 弱边框 + 8px 间距），读起来是「代码 → 结果」一条流；
+   ② 面板内部分「头部条 / 内容窗」两层，头部按 状态点 → 短标题 → 沙箱徽标 分层；
+   ③ 全屏是带阴影的浮窗（panel 自身铺满视口当遮罩，点空白退出）。 */
+.md-code-run-panel { margin: 8px 0 14px; }
+.md-code-run-win {
+  display: flex; flex-direction: column;
+  border: 1px solid var(--asc-border, #e3e3e6); border-radius: 10px; overflow: hidden;
+  background: var(--asc-card, #fff);
+  box-shadow: 0 1px 2px rgba(17, 17, 26, .04);
+  animation: md-run-in .18s ease-out;
+}
+@keyframes md-run-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+.md-code-run-head {
+  display: flex; align-items: center; gap: 7px;
+  padding: 7px 9px 7px 11px;
+  background: var(--asc-surface-2, #f0f0f2);
+  border-bottom: 1px solid var(--asc-divider, #ececee);
+}
+.md-code-run-dot {
+  flex: none; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--asc-primary, #6366f1);
+  box-shadow: 0 0 0 3px rgba(124, 92, 252, .13);
+}
+.md-code-run-title { flex: none; font-size: 12px; font-weight: 500; color: var(--asc-text, #222); }
+.md-code-run-badge {
+  flex: none; font-size: 11px; line-height: 16px; padding: 0 6px;
+  color: var(--asc-text-2); background: rgba(17, 17, 26, .05);
+  border: 1px solid rgba(17, 17, 26, .06); border-radius: 4px; cursor: help;
+}
+.md-code-run-acts { flex: 1 1 auto; min-width: 0; display: flex; justify-content: flex-end; gap: 6px; }
+.md-code-run-acts button {
+  font-family: inherit; font-size: 12px; line-height: 18px; padding: 2px 9px;
+  color: #444; background: var(--asc-card, #fff);
+  border: 1px solid #dcdce4; border-radius: 6px; cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s, box-shadow .15s;
+}
+.md-code-run-acts button:hover { color: var(--asc-primary); border-color: rgba(124, 92, 252, .5); box-shadow: 0 1px 3px rgba(124, 92, 252, .14); }
+.md-code-run-acts button:focus-visible { outline: 2px solid var(--asc-primary, #6366f1); outline-offset: 1px; }
+/* 「全屏」是主操作 → 主色软底；「下载」「收起」是次操作 → 白底描边 */
+.md-code-run-acts button.md-run-full-btn { color: var(--asc-primary); background: rgba(124, 92, 252, .08); border-color: rgba(124, 92, 252, .42); }
+.md-code-run-acts button.md-run-full-btn:hover { background: rgba(124, 92, 252, .15); border-color: rgba(124, 92, 252, .58); }
+.md-code-run-out {
+  margin: 0; padding: 8px 11px; font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  max-height: 140px; overflow: auto;
+  border-bottom: 1px solid var(--asc-divider, #ececee);
+  background: var(--asc-surface-2, #f0f0f2);
+  white-space: pre-wrap; word-break: break-word;
+}
+.md-code-run-body { position: relative; display: flex; flex-direction: column; min-height: 0; background: var(--asc-card, #fff); }
+/* 高度由 md.js 的 fitRunFrame() 按 iframe 回传的 scrollHeight 设置；300px 只是首帧兜底 */
+.md-code-run-frame { display: block; width: 100%; height: 300px; border: 0; background: #fff; }
+/* 首帧骨架：默认隐藏，只有 JS 主动挂 .md-code-run-loading 时才盖住（无 JS 时不会永久遮罩） */
+.md-code-run-skel {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  gap: 8px; font-size: 12px; color: #8a8a95; background: var(--asc-card, #fff);
+}
+.md-code-run-skel::before {
+  content: ''; width: 12px; height: 12px; border-radius: 50%;
+  border: 2px solid rgba(124, 92, 252, .22); border-top-color: var(--asc-primary, #6366f1);
+  animation: md-run-spin .7s linear infinite;
+}
+.md-code-run-panel:not(.md-code-run-loading) .md-code-run-skel { display: none; }
+@keyframes md-run-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .md-code-run-win, .md-code-run-skel::before { animation: none; }
+}
+/* 全屏预览：应用内浮窗。不做「新窗口」——桌面端 pywebview 会把新窗口请求交给系统浏览器，
+   沙箱页面在那边能跑，但切回来就丢了对话上下文，体验更差。 */
+.md-code-run-panel.md-run-full {
+  position: fixed; inset: 0; z-index: 3100; margin: 0;
+  display: flex; align-items: center; justify-content: center;
+  padding: 4.5vh 4vw;
+  background: rgba(20, 18, 32, .62);
+  -webkit-backdrop-filter: blur(7px); backdrop-filter: blur(7px);
+}
+.md-code-run-panel.md-run-full .md-code-run-win {
+  width: 100%; height: 100%; max-width: 1680px;
+  border-radius: 14px; border-color: rgba(255, 255, 255, .12);
+  box-shadow: 0 28px 72px rgba(0, 0, 0, .42), 0 0 0 1px rgba(255, 255, 255, .26);
+  animation: none;
+}
+.md-code-run-panel.md-run-full .md-code-run-head { flex: none; padding: 9px 12px; background: var(--asc-surface-2, #f0f0f2); border-bottom-color: var(--asc-border, #e3e3e6); }
+.md-code-run-panel.md-run-full .md-code-run-out { flex: none; max-height: 26vh; }
+.md-code-run-panel.md-run-full .md-code-run-body { flex: 1 1 auto; }
+.md-code-run-panel.md-run-full .md-code-run-frame { flex: 1 1 auto; height: auto; min-height: 0; }
+body.md-run-full-open { overflow: hidden; }
+@media (max-width: 720px) {
+  .md-code-run-panel.md-run-full { padding: 0; }
+  .md-code-run-panel.md-run-full .md-code-run-win { border-radius: 0; border: 0; }
+}
+
+/* ===== mermaid 图背景卡片（2026-10-26） =====
+   宽度由 md.js 的 layoutMmdBox() 按 viewBox 精确设置（见那里关于循环依赖的说明）。
+   ⚠️ box-sizing: border-box 必须保留：JS 把 padding+border 一起算进 width。 */
+.mmd-box {
+  box-sizing: border-box;
+  position: relative;
+  max-width: 100%;
+  /* ⚠️⚠️ 顶部这 30px 是给「保存图片」按钮留的**专用带**，不能改回 14px（2026-10-26 实测）：
+     按钮 23px 高 + top:6 → 占卡片顶部 6~29px。padding-top=14 时按钮会压住图顶部 17px
+     的内容带，实测 4/8 种图被压：甘特标题「三周复习计划」被盖掉 594px²（占标题盒 24%）、
+     类图右上角类框边框 365px²、时序图 80px²、思维导图 34px²。
+     改成 30px 后 8 种图的「按钮 ∩ 外接矩形」全部为 0（判据见 _probe_mmd_btn_overlap_20261026.py）。 */
+  margin: 12px 0 14px;
+  padding: 30px 16px 16px;
+  background: #ffffff;
+  border: 1px solid #e9eaf0;
+  border-radius: 10px;
+  box-shadow: 0 1px 2px rgba(17, 17, 26, .04), 0 6px 20px rgba(17, 17, 26, .05);
+}
+/* 卡片内的图不再自带外边距，避免出现双倍留白 */
+.mmd-box > .mermaid-pending { margin: 0; }

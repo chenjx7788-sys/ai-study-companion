@@ -46,7 +46,7 @@
 
       <!-- 有模型但未指定用途：引导选择（未指定时对应功能无法调用） -->
       <el-alert v-if="models.length && (!summaryModelId || !chatModelId)" type="warning" :closable="false" class="pick-tip">
-        已添加模型，请为下方「总结模型」和「问答模型」分别指定用途 —— 未指定时对应功能将无法调用。
+        已添加模型，请为下方「总结模型」和「对话模型」分别指定用途 —— 未指定时对应功能将无法调用。
       </el-alert>
       <el-form label-width="120px" style="max-width: 710px">
         <el-form-item label="总结模型" required>
@@ -56,12 +56,12 @@
           </el-select>
           <div class="field-hint" style="margin-left:0; margin-top:4px;">用于摘要 / 知识点 / 划线解读 / 复习出题</div>
         </el-form-item>
-        <el-form-item label="问答模型" required>
+        <el-form-item label="对话模型" required>
           <el-select v-model="chatModelId" placeholder="请选择（必填）" style="width: 100%"
             :class="{ 'pick-empty': !chatModelId }">
             <el-option v-for="m in models" :key="m.id" :label="`${m.name}（${m.model}）`" :value="m.id" />
           </el-select>
-          <div class="field-hint" style="margin-left:0; margin-top:4px;">问答页默认模型，可在输入区切换</div>
+          <div class="field-hint" style="margin-left:0; margin-top:4px;">对话页默认模型，可在输入区切换</div>
         </el-form-item>
         <el-form-item style="margin-top: 12px">
           <el-button type="primary" :loading="saving" @click="save()">保存</el-button>
@@ -116,6 +116,15 @@
           <span class="field-hint">低于此分数的检索结果不注入回答（换向量模型后建议点「校准」参考新值）</span>
           <el-button size="small" :loading="calibrating" @click="calibrate">校准阈值</el-button>
           <span v-if="calibResult" class="test-result">{{ calibResult }}</span>
+        </el-form-item>
+        <el-form-item label="检索增强">
+          <div class="clean-switches">
+            <el-checkbox v-model="queryRewriteEnabled">未命中时改写查询重检一次</el-checkbox>
+            <el-checkbox v-model="retrievalPlanEnabled">多点问题先拆点再逐点检索</el-checkbox>
+          </div>
+          <div class="field-hint" style="margin-left:0; margin-top:4px;">
+            改写 / 拆点各多一次 LLM 调用，失败自动回落原行为；遇到回答被带偏时可临时关闭排查
+          </div>
         </el-form-item>
         <el-divider content-position="left">切分与去噪（入库管道）</el-divider>
         <el-form-item label="分块大小">
@@ -393,6 +402,7 @@
           <el-button :loading="restoring">从备份恢复</el-button>
         </el-upload>
       </div>
+
       <p class="storage-tip">数据目录：{{ storage.data_dir }}（恢复前会自动备份当前数据，可随时回滚）</p>
     </el-card>
       </el-tab-pane>
@@ -436,7 +446,7 @@
         <div class="usage-section">
           <div class="usage-section-title">
             <span>业务分布</span>
-            <span class="usage-section-sub">按 Token 数排序 · 共 {{ Object.keys(usageKinds).length }} 类</span>
+            <span class="usage-section-sub">按功能聚拢 · 共 {{ Object.keys(usageKinds).length }} 项</span>
           </div>
           <div class="usage-list">
             <div v-for="([k, v], idx) in usageKindsSorted" :key="k" class="usage-row">
@@ -452,18 +462,48 @@
                   </span>
                 </div>
                 <div class="usage-bar-wrap">
-                  <div class="usage-bar" :style="{ width: usageBarWidth(v.prompt_tokens + v.completion_tokens) }" />
+                  <div class="usage-bar" :style="{ width: usageBarWidth(v.prompt_tokens + v.completion_tokens, usageMaxTokens) }" />
                 </div>
               </div>
             </div>
           </div>
         </div>
 
+        <div v-if="usageByModel.length" class="usage-section">
+          <div class="usage-section-title">
+            <span>按模型</span>
+            <span class="usage-section-sub">多供应商对账口径 · 已排除开发探针</span>
+          </div>
+          <div class="usage-list">
+            <div v-for="([m, v], idx) in usageByModel" :key="m" class="usage-row">
+              <div class="usage-rank">{{ idx + 1 }}</div>
+              <div class="usage-row-main">
+                <div class="usage-row-head">
+                  <span class="usage-kind usage-model">{{ m }}</span>
+                  <span class="usage-kind-nums">
+                    <b>{{ fmtTokens(v.prompt_tokens + v.completion_tokens) }}</b> tokens
+                    <span class="usage-kind-split">·</span>
+                    {{ v.calls }} 次
+                    <span class="usage-kind-share">{{ usageKindShare(v.prompt_tokens + v.completion_tokens) }}</span>
+                  </span>
+                </div>
+                <div class="usage-bar-wrap">
+                  <div class="usage-bar" :style="{ width: usageBarWidth(v.prompt_tokens + v.completion_tokens, usageModelMax) }" />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <p v-if="usage[usagePeriod]._total.dev_calls" class="usage-dev-note">
+          另有 {{ usage[usagePeriod]._total.dev_calls }} 次开发探针调用（{{ fmtTokens(usage[usagePeriod]._total.dev_tokens) }} tokens）未计入上方合计
+        </p>
+
         <p class="storage-tip">
           <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4">
             <circle cx="8" cy="8" r="6.5" /><path d="M8 5v3.5l2.5 1.3" stroke-linecap="round" />
           </svg>
-          流式调用按字符数估算（≈1.6 字符/token），非流式调用优先使用 API 返回的精确值
+          优先使用 API 返回的 usage 精确值；未返回时按字符数估算（≈1.6 字符/token）；用户中断的轮次同样记账
         </p>
       </div>
       <el-empty v-else description="暂无调用记录（配置 Key 后使用 AI 功能即开始统计）" :image-size="60" />
@@ -682,7 +722,7 @@ const VENDORS = [
   { key: 'yi', name: '零一万物', base_url: 'https://api.lingyiwanwu.com/v1', model: 'yi-lightning', apply: 'https://platform.lingyiwanwu.com/' },
   { key: 'openai', name: 'OpenAI', base_url: 'https://api.openai.com/v1', model: 'gpt-5', apply: 'https://platform.openai.com/api-keys', note: '⚠️ 需可访问外网；国内直连通常不可用' },
   { key: 'siliconflow', name: '硅基流动', base_url: 'https://api.siliconflow.cn/v1', model: 'Qwen/Qwen2.5-7B-Instruct', apply: 'https://cloud.siliconflow.cn/account/ak' },
-  { key: 'custom', name: '自定义', base_url: '', model: '', apply: '', custom: true, note: 'ℹ️ 自填服务商提供的 Base URL 与模型名，需兼容 OpenAI 协议；多数地址需以 /v1 结尾（如 https://xxx.com/v1）——漏写会返回网页而无法问答' },
+  { key: 'custom', name: '自定义', base_url: '', model: '', apply: '', custom: true, note: 'ℹ️ 自填服务商提供的 Base URL 与模型名，需兼容 OpenAI 协议；多数地址需以 /v1 结尾（如 https://xxx.com/v1）——漏写会返回网页而无法对话' },
 ]
 const vendorKey = ref('')
 const currentVendor = computed(() => VENDORS.find(v => v.key === vendorKey.value) || null)
@@ -820,6 +860,8 @@ const cleanSwitches = reactive({ header_footer: true, watermark: true, garbled: 
 // 知识图谱：导入材料后自动抽取实体（默认关——每次抽取调 LLM 耗 token，成本主动权交给用户；
 // 关闭时仍可在知识库页对单份材料手动点「生成图谱」）
 const autoExtractEntities = ref(false)
+const queryRewriteEnabled = ref(true)
+const retrievalPlanEnabled = ref(true)
 const asrModelSize = ref('')   // 语音模型默认转写版本：''=自动，'small'/'base'=强制
 // 语音合成引擎：'edge'=在线 / 'zipvoice'=本地（改动即时保存，播客页下次合成生效）
 const ttsProvider = ref('edge')
@@ -862,10 +904,12 @@ const promptFields = [
   { key: 'prompt_summary', label: '脉络摘要', desc: '生成全文层级大纲（摘要 Tab / 分章总结）', category: 'study' },
   { key: 'prompt_keywords', label: '知识点提炼', desc: '提炼核心概念（注意保留 JSON 输出格式说明）', category: 'study' },
   { key: 'prompt_explain', label: '划线解读 / 追问', desc: '选中文本后的解释与多轮追问', category: 'study' },
-  { key: 'prompt_kb_qa', label: '知识库问答（命中时）', desc: '问答页检索到相关内容时的回答风格', category: 'study' },
+  { key: 'prompt_kb_qa', label: '知识库问答（命中时）', desc: '对话页检索到相关内容时的回答风格', category: 'study' },
   { key: 'prompt_general', label: '通用回答（未命中时）', desc: '知识库未命中时的兜底回答风格', category: 'study' },
+  { key: 'prompt_query_rewrite', label: '检索改写', desc: '知识库未命中时把问题改写成更适合检索的查询后重检一次（最多一次；失败自动回落原口径）', category: 'study' },
+  { key: 'prompt_retrieval_plan', label: '检索计划（多点拆解）', desc: '多点问题先拆成 1-4 个独立子查询再逐点检索（保留 JSON 数组格式说明；拆解失败自动回落单次检索）', category: 'study' },
   { key: 'prompt_review', label: '复习出题', desc: '从笔记生成自测卡片（保留 JSON 输出格式说明）', category: 'study' },
-  { key: 'prompt_suggest', label: '相关问题推荐', desc: '问答回答后生成 3 个追问建议（保留 JSON 数组格式）', category: 'study' },
+  { key: 'prompt_suggest', label: '相关问题推荐', desc: '对话回答后生成 3 个追问建议（保留 JSON 数组格式）', category: 'study' },
   { key: 'prompt_quiz', label: '测一测出题', desc: '基于资料核心内容生成测试题（保留 JSON 数组格式）', category: 'study' },
   { key: 'prompt_quiz_boundary', label: '边界测试题（P2）', desc: '测一测/简单学出题时按比例混入「材料未涉及」的边界识别题（占比 max(1,题数/4)）', category: 'study' },
   { key: 'prompt_learn_note', label: '简单学 · 讲义（叙事类）', desc: '叙事类材料（电子书 / 传记 / 小说）的讲义工艺：必记要点 / 探索历程 / 逐章转译 / ◆三点小结。⚠️ 未判定内容性质的老材料也走这套（默认工艺）', category: 'study' },
@@ -885,7 +929,8 @@ const promptFields = [
   { key: 'prompt_podcast_script_solo', label: 'AI 播客 · 单人精讲脚本', desc: '知识简报改写成单人精讲口播（两步式）。保留 JSON 数组输出说明与 {script_chars} / {max_chars} / {seg_count} / {avg_chars} 占位符', category: 'podcast' },
   // ---- AI 视频（模块 K）：三条提示词构成一条链路 —— 讲稿 → 结构图元素 → 定位锚点 ----
   { key: 'prompt_video_script', label: 'AI 视频 · 讲稿', desc: '素材改写成单人讲解口播。保留 JSON 数组输出说明与 {script_chars} / {seg_count} / {max_chars} / {avg_chars} 占位符；每句里要有原文原样存在的多字短语（4-12 字），否则画面定位不到', category: 'video' },
-  { key: 'prompt_video_points', label: 'AI 视频 · 结构图', desc: '讲稿拆成结构图元素（三类：概念 / 好处 / 代价）。保留 JSON 输出格式说明与 {point_count} / {per_seg} / {seg_count} / {max_group} 占位符。⚠️ {point_count} 是**密度下限**不是参考值：少给会让画面长时间静止、过不了质量自检', category: 'video' },
+  { key: 'prompt_video_points', label: 'AI 视频 · 结构图', desc: '讲稿拆成结构图元素（三类：概念 / 好处 / 代价）。保留 JSON 输出格式说明与 {point_count} / {per_seg} / {seg_count} / {max_group} 占位符。⚠️ {point_count} 是**密度下限**不是参考值：少给会让画面长时间静止、过不了质量自检；板书皮肤走自己的专属提示词（下一条）', category: 'video' },
+  { key: 'prompt_video_points_board', label: 'AI 视频 · 板书要点', desc: '板书皮肤专属：讲稿拆成写上黑板的词条（2-10 字词条化优先、口诀单列成条、有结构关系优先给 sketch）。占位符与「结构图」版相同；留空则用内置板书版', category: 'video' },
   { key: 'prompt_video_anchor', label: 'AI 视频 · 定位锚点', desc: '为每句挑 1-4 个用于在材料原件里定位的锚点短语。系统会把材料的原文片段一并交给模型，锚点必须从那一段里原样摘取（不给原文时模型只能猜，定位命中率上不去）', category: 'video' },
   { key: 'prompt_stats_report', label: '学习周报', desc: '统计页周报：按数据摘要 / 问题诊断 / 行动建议 / 进阶方法四段输出', category: 'other' },
   { key: 'prompt_recall', label: '复述卡', desc: '从笔记生成自我复述提示（保留 JSON 输出格式说明）', category: 'other' },
@@ -985,32 +1030,57 @@ const usage = reactive({ today: { _total: { calls: 0, tokens: 0 } }, all: { _tot
 const usagePeriod = ref('today')
 const usageLoading = ref(false)
 
-// Token 统计业务展示顺序（按业务流），未收录的新 kind 自动排在最后
-const KIND_ORDER = ['summary', 'section_summary', 'keywords', 'explain', 'ask', 'transform',
-                    'chat', 'suggest', 'review', 'quiz', 'learn_note', 'drill', 'drill_judge', 'stats_report',
-                    'podcast_brief', 'podcast_script', 'video_script',
-                    'video_points', 'video_points_graph', 'video_points_graph_paper',
-                    'video_points_graph_clean', 'video_points_ppt', 'video_points_board',
-                    'video_points_motion',
-                    'knowledge_graph', 'embedding_index', 'embedding_query', 'test']
+// Token 统计按「功能聚拢」展示：同一功能的 kind 连续排列，组内按 Token 降序。
+// ⚠️ 未收录的新 kind 自动落到所有组之后（显示名兜底为原始 key，不会消失）。
+const KIND_GROUPS = [
+  ['AI 对话', ['chat', 'suggest', 'explain', 'ask', 'memory', 'brief']],
+  ['材料处理', ['summary', 'transform', 'keywords', 'polish']],
+  ['简单学', ['learn_note', 'section_summary']],
+  ['测一测', ['quiz']],
+  ['笔记复习', ['review']],
+  ['AI 陪练', ['drill', 'drill_judge']],
+  ['AI 视频', ['video_script', 'video_points', 'video_points_board', 'video_points_motion',
+              'video_points_ppt', 'video_points_graph_paper', 'video_points_graph_clean',
+              'video_points_graph']],
+  ['AI 播客', ['podcast_script', 'podcast_brief']],
+  ['知识图谱', ['knowledge_graph']],
+  ['学习报告', ['stats_report']],
+  ['AI炼丹炉应用', ['app_draft', 'app_polish', 'app_preview', 'app_nudge']],
+  ['检索增强', ['query_rewrite', 'retrieval_plan']],
+  ['智能体', ['skill_match']],
+  ['开发探针', ['probe']],
+  ['设置', ['test']],
+  ['向量检索', ['embedding_index', 'embedding_query']],
+]
+// kind → 组序号（排序用；查不到 = 排在所有组之后）
+const KIND_GROUP_ORDER = {}
+KIND_GROUPS.forEach(([, kinds], gi) => kinds.forEach((k) => { KIND_GROUP_ORDER[k] = gi }))
 const usageKinds = computed(() => {
-  const rows = usage[usagePeriod.value] || { _total: { calls: 0, tokens: 0 } }
-  const { _total, ...rest } = rows
-  const ordered = {}
-  for (const k of KIND_ORDER) {
-    if (rest[k]) ordered[k] = rest[k]
+  const rows = usage[usagePeriod.value] || {}
+  // 剥离 _total / _by_model 等下划线开头的元字段，否则它们会被当成业务 kind 列出来
+  const rest = {}
+  for (const [k, v] of Object.entries(rows)) {
+    if (!k.startsWith('_')) rest[k] = v
   }
-  for (const [k, v] of Object.entries(rest)) {
-    if (!ordered[k]) ordered[k] = v
-  }
-  return ordered
+  return rest
 })
 const usageKindsSorted = computed(() => {
+  const groupOf = (k) => (k in KIND_GROUP_ORDER ? KIND_GROUP_ORDER[k] : KIND_GROUPS.length)
+  const tokens = (v) => (v.prompt_tokens || 0) + (v.completion_tokens || 0)
   return Object.entries(usageKinds.value)
-    .sort((a, b) => (b[1].prompt_tokens + b[1].completion_tokens) - (a[1].prompt_tokens + a[1].completion_tokens))
+    .sort((a, b) => (groupOf(a[0]) - groupOf(b[0])) || (tokens(b[1]) - tokens(a[1])))
 })
 const usageMaxTokens = computed(() => {
   return usageKindsSorted.value.reduce((m, [, v]) => Math.max(m, v.prompt_tokens + v.completion_tokens), 0)
+})
+// 按模型分组的消耗（后端 _by_model，已剔除开发探针）：多供应商时与账单对账用
+const usageByModel = computed(() => {
+  const rows = usage[usagePeriod.value]?._by_model || {}
+  return Object.entries(rows)
+    .sort((a, b) => (b[1].prompt_tokens + b[1].completion_tokens) - (a[1].prompt_tokens + a[1].completion_tokens))
+})
+const usageModelMax = computed(() => {
+  return usageByModel.value.reduce((m, [, v]) => Math.max(m, v.prompt_tokens + v.completion_tokens), 0)
 })
 const usageTotalTokensSelected = computed(() => usage[usagePeriod.value]?._total?.tokens || 0)
 const usageKindShare = (tokens) => {
@@ -1018,27 +1088,65 @@ const usageKindShare = (tokens) => {
   if (!total) return '0%'
   return Math.max(0.1, Math.round((tokens / total) * 1000) / 10).toFixed(1).replace('.0', '') + '%'
 }
-const usageBarWidth = (tokens) => {
-  const max = usageMaxTokens.value || 1
-  return Math.max(2, Math.round((tokens / max) * 100)) + '%'
+const usageBarWidth = (tokens, max) => {
+  const m = max || 1
+  return Math.max(2, Math.round((tokens / m) * 100)) + '%'
 }
 const usagePercent = (part, total) => {
   if (!total) return '0%'
   return Math.round((part / total) * 1000) / 10 + '%'
 }
+// 业务来源显示名：一律「功能 · 子功能」。
+// ⚠️ 功能前缀必须与下方 KIND_GROUPS 的组名逐字一致（两处改一处 = 排序和文案对不上）。
 const kindLabel = (k) => ({
-  summary: '摘要', section_summary: '分章总结', keywords: '知识点',
-  explain: '解读/追问', ask: '材料提问', transform: '文本加工',
-  chat: '问答', suggest: '追问建议', review: '复习出题', quiz: '测一测',
-  learn_note: '简单学',
-  drill: 'AI 陪练', drill_judge: '陪练评分',
-  stats_report: '学习报告', podcast_brief: '播客简报', podcast_script: '播客脚本',
-  video_script: '视频讲稿', video_points: '视频结构图（历史）',
-  video_points_graph: '结构图', video_points_graph_paper: '纸感结构图',
-  video_points_graph_clean: '清透结构图', video_points_ppt: 'PPT 课件',
-  video_points_board: '板书', video_points_motion: '动效图解',
-  knowledge_graph: '知识图谱',
-  embedding_index: '向量入库', embedding_query: '检索向量', test: '连接测试',
+  chat: 'AI 对话 · 问答',
+  suggest: 'AI 对话 · 追问建议',
+  explain: 'AI 对话 · 划词解读',
+  ask: 'AI 对话 · 材料提问',
+  memory: 'AI 对话 · 记忆提炼',
+
+  summary: '材料处理 · 摘要',
+  transform: '材料处理 · 文本加工',
+  keywords: '材料处理 · 知识点抽取',
+  polish: '材料处理 · 文本润色',
+
+  learn_note: '简单学 · 讲义与出题',
+  section_summary: '简单学 · 分章总结',
+
+  quiz: '测一测 · 出题',
+  review: '笔记复习 · 自测卡',
+
+  drill: 'AI 陪练 · 出题',
+  drill_judge: 'AI 陪练 · 评分',
+
+  video_script: 'AI 视频 · 讲稿',
+  video_points: 'AI 视频 · 视觉分镜（历史·未分皮肤）',
+  video_points_board: 'AI 视频 · 板书',
+  video_points_motion: 'AI 视频 · 动效图解',
+  video_points_ppt: 'AI 视频 · PPT 课件',
+  video_points_graph_paper: 'AI 视频 · 纸感结构图',
+  video_points_graph_clean: 'AI 视频 · 清透结构图',
+  video_points_graph: 'AI 视频 · 结构图（入口已暂停）',
+
+  podcast_script: 'AI 播客 · 脚本',
+  podcast_brief: 'AI 播客 · 简报',
+
+  knowledge_graph: '知识图谱 · 实体抽取',
+  stats_report: '学习报告 · 生成',
+  brief: 'AI 对话 · 导读文档生成',
+  skill_match: '智能体 · 技能匹配',
+  query_rewrite: '检索增强 · 查询改写',
+  retrieval_plan: '检索增强 · 检索计划',
+
+  app_draft: 'AI炼丹炉应用 · 生成初稿',
+  app_polish: 'AI炼丹炉应用 · 润色修改',
+  app_preview: 'AI炼丹炉应用 · 生成预览',
+  app_nudge: 'AI炼丹炉应用 · 智能搭话',
+
+  probe: '开发探针 · 不计入合计',
+  test: '设置 · 连接测试',
+  embedding_index: '向量检索 · 入库',
+  embedding_query: '向量检索 · 查询',
 }[k] || k)
 const fmtTokens = (n) => n >= 10000 ? (n / 10000).toFixed(1) + 'w' : (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n))
 
@@ -1168,6 +1276,8 @@ onMounted(async () => {
   cleanSwitches.garbled = data.clean_garbled ?? true
   cleanSwitches.dedup = data.clean_dedup ?? true
   autoExtractEntities.value = data.auto_extract_entities ?? false
+  queryRewriteEnabled.value = data.query_rewrite_enabled ?? true
+  retrievalPlanEnabled.value = data.retrieval_plan_enabled ?? true
   asrModelSize.value = data.asr_model_size || ''
   ttsProvider.value = data.tts_provider || 'edge'
   adaptUpScore.value = data.drill_adapt_up_score ?? 80
@@ -1181,7 +1291,7 @@ onMounted(async () => {
   loadAsr()
   loadZipvoice()
   loadExtToken()
-  // 从问答页「前往配置模型」跳入（/settings?add=1）：直接打开添加模型弹窗
+  // 从对话页「前往配置模型」跳入（/settings?add=1）：直接打开添加模型弹窗
   if (route.query.add) openModelEditor(null)
 })
 
@@ -1207,6 +1317,8 @@ async function save(successMsg = '保存成功', skipGuide = false) {
       clean_garbled: cleanSwitches.garbled,
       clean_dedup: cleanSwitches.dedup,
       auto_extract_entities: autoExtractEntities.value,
+      query_rewrite_enabled: queryRewriteEnabled.value,
+      retrieval_plan_enabled: retrievalPlanEnabled.value,
       // 陪练 · 难度自适应（后端 adapt_params() 会兜底 + 钳制，这里原样提交）
       drill_adapt_up_score: adaptUpScore.value,
       drill_adapt_down_score: adaptDownScore.value,
@@ -1430,6 +1542,8 @@ async function doCheckUpdate() {
 .usage-kind-nums b { color: var(--asc-text); font-weight: 600; }
 .usage-kind-split { margin: 0 5px; color: var(--asc-text-3); }
 .usage-kind-share { margin-left: 8px; font-size: 11.5px; color: var(--asc-primary); font-weight: 500; }
+.usage-model { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-dev-note { margin: 10px 0 0; font-size: 12px; color: var(--asc-text-2); }
 .usage-bar-wrap { height: 6px; border-radius: 3px; background: var(--asc-surface-2); overflow: hidden; }
 .usage-bar {
   height: 100%; border-radius: 3px;

@@ -11,7 +11,7 @@
       </div>
       <div class="header-title">
         <h2>个人知识库</h2>
-        <p class="header-sub">原文与笔记自动归档、向量化 · AI 问答优先从这里取答案</p>
+        <p class="header-sub">原文与笔记自动归档、向量化 · AI 对话优先从这里取答案</p>
       </div>
       <!-- 笔记权重：可修改，检索打分即时生效（默认 1.5） -->
       <el-popover v-model:visible="weightPop" placement="bottom-end" :width="288" trigger="click"
@@ -30,7 +30,7 @@
           </button>
         </template>
         <div class="nw-title">笔记检索权重</div>
-        <p class="nw-desc">笔记相对原文的检索优先级：越高，AI 问答越倾向先取笔记作答。修改即时生效，无需重建索引。</p>
+        <p class="nw-desc">笔记相对原文的检索优先级：越高，AI 对话越倾向先取笔记作答。修改即时生效，无需重建索引。</p>
         <div class="nw-input-row">
           <el-input-number v-model="noteWeight" :min="0.5" :max="3" :step="0.1"
             :precision="1" size="small" controls-position="right" />
@@ -115,16 +115,21 @@
           <el-table-column label="导入时间" width="110">
             <template #default="{ row }"><span class="kb-date">{{ shortDate(row.created_at) }}</span></template>
           </el-table-column>
-          <el-table-column label="" width="200" align="right">
+          <!-- 操作列宽 240：按钮三态里「生成中 45%」带 loading 转圈，比「图谱 · N」
+               多出 ~40px；200 放不下会让第二枚按钮换行、右对齐顶出卡片边界（2026-11-03 实测）。 -->
+          <el-table-column label="" width="240" align="right">
             <template #default="{ row }">
               <el-button size="small" text type="primary" :disabled="row.parsed_status !== 'success'"
                 :loading="rebuilding === row.material_id" @click="rebuild(row)">重建索引</el-button>
-              <el-button size="small" text :type="row.entity_count ? 'success' : 'primary'"
+              <!-- 生成图谱按钮：三态由后端 entity_status 驱动（running / 有图谱 / failed）。
+                   状态在库里，所以离开页面、刷新、重开应用后依然准确 ——
+                   不再依赖组件内存里的 extracting（它只活到 HTTP 返回那一刻）。 -->
+              <el-button size="small" text :type="epState(row).type"
                 :disabled="row.parsed_status !== 'success'"
-                :loading="extracting === row.material_id"
-                :title="row.entity_count ? '查看该材料的知识图谱' : '为该材料生成知识图谱（调用大模型，消耗少量 token）'"
-                @click="row.entity_count ? viewGraph(row) : extractGraph(row)">
-                {{ row.entity_count ? `图谱 · ${row.entity_count}` : '生成图谱' }}
+                :loading="epState(row).busy || extracting === row.material_id"
+                :title="epState(row).title"
+                @click="onGraphClick(row)">
+                {{ epState(row).label }}
               </el-button>
             </template>
           </el-table-column>
@@ -178,7 +183,7 @@
           </div>
         </div>
         <el-empty v-if="!loading && data.notes.length === 0" :image="mascot" :image-size="120"
-          description="暂无笔记，在学习页划线或转 AI 内容，或在 AI 问答页把回答转存为笔记" />
+          description="暂无笔记，在学习页划线或转 AI 内容，或在 AI 对话页把回答转存为笔记" />
         <div v-else-if="!loading && !filteredNotes.length" class="kb-filter-empty">
           <span>该类型下暂无笔记</span>
           <el-button text type="primary" size="small" @click="typeFilter = 'all'">查看全部 {{ data.notes.length }} 条</el-button>
@@ -186,7 +191,10 @@
       </el-tab-pane>
       <!-- 知识图谱：实体 + 关系可视化（只读，数据来自后台异步抽取） -->
       <el-tab-pane label="知识图谱" name="graph">
-        <KnowledgeGraph :focus-material="graphFocusMaterial" />
+        <!-- running-count：有材料在跑时把空态换成「正在生成中」，否则用户跳过来只看到空图；
+             refresh-key：轮询发现新完成时 +1，让图谱自己重载（用户可在本页等着看结果）。 -->
+        <KnowledgeGraph :focus-material="graphFocusMaterial"
+          :running-count="runningCount" :refresh-key="graphRefresh" />
       </el-tab-pane>
       </el-tabs>
     </div>
@@ -232,7 +240,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Search, Document, Picture, Headset, VideoPlay, Reading } from '@element-plus/icons-vue'
@@ -331,9 +339,9 @@ const aiNoteCount = computed(() => data.notes.filter(n => n.source_type === 'ai_
 // 待入库 = 已解析成功但未建索引（可通过「重建索引」修复；扫描件/未解析不算）
 const pendingCount = computed(() => data.materials.filter(m => !m.indexed && m.parsed_status === 'success').length)
 
-// ---------- 笔记类型筛选（问答 chat / AI ai_asset / 手动 manual；客户端即时过滤，与搜索联动） ----------
+// ---------- 笔记类型筛选（对话 chat / AI ai_asset / 手动 manual；客户端即时过滤，与搜索联动） ----------
 const NOTE_TYPE_FILTERS = [
-  { key: 'chat', label: '问答' },
+  { key: 'chat', label: '对话' },
   { key: 'ai_asset', label: 'AI' },
   { key: 'weekly_report', label: '周报' },
   { key: 'podcast_script', label: '播客' },
@@ -346,7 +354,7 @@ const typeFilter = ref('all')
 const visibleTypeFilters = computed(() => NOTE_TYPE_FILTERS.filter(t => typeCount(t.key) > 0))
 
 // 来源徽章：卡片上短标签 / 弹窗里长标签，共用一份映射，避免两处口径漂移
-const SRC_PILL = { chat: '问答', ai_asset: 'AI', weekly_report: '周报',
+const SRC_PILL = { chat: '对话', ai_asset: 'AI', weekly_report: '周报',
   podcast_script: '播客', podcast_brief: '简报', video_script: '视频' }
 const srcPillLabel = (t) => SRC_PILL[t] || '手动'
 const srcPillClass = (t) => ({
@@ -421,21 +429,122 @@ async function rebuild(row) {
   }
 }
 
-// 生成知识图谱：后台异步抽取实体（约需几分钟，取决于材料块数）；
-// 内容未变时服务端会跳过 LLM 调用直接复用（指纹去重），点击后稍等刷新列表即可看到实体数。
+// ---------- 生成知识图谱（状态落库 + 轮询） ----------
+// 抽取在服务端后台线程里跑（30 段抽样，约 3–10 分钟），本页只是它的投影：
+// entity_status 由后端写库，所以离开页面 / 刷新 / 切 tab 都不会丢「生成中」。
+// 组件内不需要持久化任何东西 —— 卸载即停轮询，回来 load() 重新读到 running 再接着轮询。
+
+// 按钮三态：生成中（转圈 + 百分比）/ 已有图谱（进图谱页）/ 失败（重试）
+function epState(row) {
+  const st = row.entity_status || ''
+  if (st === 'running') {
+    const p = Math.max(0, Math.min(100, row.entity_progress || 0))
+    return {
+      label: p > 0 ? `生成中 ${p}%` : '生成中…',
+      busy: true, type: 'primary',
+      title: `正在后台生成${row.entity_elapsed ? `，已用时 ${elapsedText(row.entity_elapsed)}` : ''}。可以离开本页，完成后会自动更新。`,
+    }
+  }
+  // 已有图谱：即使上次「重新生成」失败也让人能看旧图，别把这个入口被失败状态锁死
+  if (row.entity_count) {
+    return {
+      label: `图谱 · ${row.entity_count}`, busy: false,
+      type: st === 'failed' ? 'warning' : 'success',
+      title: st === 'failed'
+        ? `上次重新生成失败：${row.entity_error || '未知原因'}。当前显示的是已有图谱，如需重建可在图谱页删除后重新生成。`
+        : '查看该材料的知识图谱',
+    }
+  }
+  if (st === 'failed') {
+    return {
+      label: '重试生成', busy: false, type: 'danger',
+      title: row.entity_error ? `上次生成失败：${row.entity_error}。点击重试` : '上次生成失败，点击重试',
+    }
+  }
+  return {
+    label: '生成图谱', busy: false, type: 'primary',
+    title: '为该材料生成知识图谱（调用大模型，消耗少量 token）',
+  }
+}
+
+// 已用时（后端算好整秒下发，规避 naive UTC 被前端当本地时间的 8 小时偏移）
+function elapsedText(sec) {
+  const s = Number(sec) || 0
+  if (s < 60) return `${s} 秒`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m} 分钟`
+  return `${Math.floor(m / 60)} 小时 ${m % 60} 分`
+}
+
+function onGraphClick(row) {
+  if ((row.entity_status || '') === 'running') {
+    ElMessage.info('正在后台生成，可以离开本页；完成后实体数会自动出现')
+    return
+  }
+  if (row.entity_count) viewGraph(row)
+  else extractGraph(row)
+}
+
 async function extractGraph(row) {
   extracting.value = row.material_id
   try {
-    await kbApi.extractEntities(row.material_id)
-    ElMessage.success(`已开始为「${row.title}」生成知识图谱，完成后实体数会显示在按钮上`)
-    // 后台抽取需要时间，延迟刷新一次列表（短材料约 1-2 分钟）
-    setTimeout(() => load(), 30000)
+    const { data: r } = await kbApi.extractEntities(row.material_id)
+    if (r?.already) ElMessage.info(`「${row.title}」正在生成知识图谱，可以离开本页`)
+    else ElMessage.success(`已开始为「${row.title}」生成知识图谱，可离开本页，完成后自动更新`)
+    // 不等下一轮轮询：先就地标成 running，按钮立刻进入「生成中」
+    const item = data.materials.find(m => m.material_id === row.material_id)
+    if (item) { item.entity_status = 'running'; item.entity_progress = 0; item.entity_elapsed = 0 }
+    startPolling()
   } catch (e) {
     ElMessage.error(e.response?.data?.detail || '生成失败')
   } finally {
     extracting.value = null
   }
 }
+
+// ---------- 生成中轮询 ----------
+// 4 秒一次、只在有 running 材料时开。静默刷新（不置 loading）——否则 el-table 的
+// v-loading 会每 4 秒把整张表闪白一次，比不刷新更难用。
+const pollTimer = ref(null)
+const graphRefresh = ref(0)
+const runningCount = computed(() => data.materials.filter(m => m.entity_status === 'running').length)
+
+async function refreshSilent() {
+  try {
+    const { data: d } = await kbApi.overview({ search: search.value || undefined })
+    const before = new Set(data.materials.filter(m => m.entity_status === 'running').map(m => m.material_id))
+    data.materials = d.materials
+    data.notes = d.notes
+    // running → 终态：弹一次结果。只对本轮观察到的 id 弹，避免刷新页面时批量弹。
+    let done = 0
+    for (const id of before) {
+      const m = d.materials.find(x => x.material_id === id)
+      if (!m || m.entity_status === 'running') continue
+      if (m.entity_status === 'success') {
+        done += 1
+        ElMessage.success(`「${m.title}」知识图谱已生成（${m.entity_count} 个实体）`)
+      } else {
+        ElMessage.warning(`「${m.title}」知识图谱生成失败${m.entity_error ? '：' + m.entity_error : ''}`)
+      }
+    }
+    if (done) graphRefresh.value += 1     // 图谱页正在看的话，让它自己重载
+    if (!runningCount.value) stopPolling()
+  } catch {
+    /* 轮询失败静默：下一轮再试，不打扰用户 */
+  }
+}
+
+function startPolling() {
+  if (pollTimer.value) return
+  pollTimer.value = setInterval(refreshSilent, 4000)
+}
+
+function stopPolling() {
+  if (pollTimer.value) { clearInterval(pollTimer.value); pollTimer.value = null }
+}
+
+// 组件销毁（路由切走）时停表。⚠️ 只停前端定时器，服务端抽取不受影响。
+onBeforeUnmount(stopPolling)
 
 // 已生成图谱的材料：点击跳到「知识图谱」tab，并自动选中该材料的子图
 const graphFocusMaterial = ref(null)
@@ -446,6 +555,8 @@ function viewGraph(row) {
 
 onMounted(async () => {
   await Promise.all([load(), loadNoteWeight()])
+  // 进页面时已有材料在后台生成（上次点了「生成图谱」就走人）→ 接着轮询，接着显示进度
+  if (runningCount.value) startPolling()
   // 从「已转笔记 · 查看」跳转过来：加载完列表再打开，这样能拿到来源标签
   const qid = route.query.note
   if (qid) {

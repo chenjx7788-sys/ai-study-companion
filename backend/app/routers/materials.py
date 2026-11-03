@@ -7,6 +7,7 @@ import posixpath
 import re
 import shutil
 import threading
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -116,11 +117,15 @@ IMG_OCR_PREFIX = "[图片]"
 def _chunk_kind(content: str, m) -> str:
     """单个解析块的性质：`img_ocr`（图片里的文字）或 `body`（正文）。
 
+    ⚠️ 第三种 `meta`（剪藏署名 / 来源 URL）**不在这里判**：它靠位置与结构锚点识别，
+       由 `cleaner.mark_provenance` 在入库前标好，调用方写成
+       `c.get("kind") or _chunk_kind(...)`，优先用 cleaner 的结论。
     ⚠️ **只对网页剪藏材料生效**（`origin_meta.saved_from == 'clip'`）。
        判据用 `saved_from` 而**不是** `origin`：早期小红书笔记的 origin 记的是 `'upload'`
        （实测 #40/#43/#45 都是小红书、origin 却 = upload），按 origin 枚举判会漏掉最大的那几篇。
-    ⚠️ 这类块**照常分块、照常入向量库与全文检索**，只是学习页默认不显示（有折叠入口）。
-       所以这里只打标记，**绝不去动 content** —— content 是 extract_sig 指纹的输入，
+    ⚠️ img_ocr 这类块**照常分块、照常入向量库与全文检索**，只是学习页默认不显示（有折叠入口）；
+       meta 相反 —— 照常分块、留在原文里，但**不进**向量 / 全文检索 / 实体抽取。
+       两者都只打标记，**绝不去动 content** —— content 是 extract_sig 指纹的输入，
        改动会误触发重新抽实体、白烧 token。
     """
     if not (content or "").startswith(IMG_OCR_PREFIX):
@@ -168,6 +173,7 @@ def _parse_material(material_id: int):
 
         # 去噪管道：页眉页脚/水印/乱码/重复（清洗失败不阻断解析，用原文兜底）
         raw_had_text = bool(chunks)
+        report = {}
         try:
             from ..services import cleaner
             chunks, report = cleaner.clean_chunks(chunks, m.format)
@@ -175,6 +181,18 @@ def _parse_material(material_id: int):
                 print(f"[cleaner] 材料 {m.id} 清洗: {report}")
         except Exception as e:
             print(f"[cleaner] 清洗异常，使用原文: {e}")
+
+        # 剪藏溯源块（署名 / 号名 / 来源 URL）标为 meta：留在原文里供阅读页溯源，
+        # 但不进向量、不进全文检索、不进实体抽取。清洗失败也照样标，故独立 try。
+        try:
+            from ..services import cleaner
+            _meta = m.origin_meta if isinstance(m.origin_meta, dict) else {}
+            if _meta.get("saved_from") == "clip":
+                _n_meta = cleaner.mark_provenance(chunks)
+                if _n_meta:
+                    print(f"[cleaner] 材料 {m.id} 溯源块 {_n_meta} 个标记为 meta")
+        except Exception as e:
+            print(f"[cleaner] 溯源块标记异常（不影响入库）: {e}")
 
         # 清掉旧块（重试场景）
         db.query(MaterialChunk).filter(MaterialChunk.material_id == m.id).delete()
@@ -202,7 +220,8 @@ def _parse_material(material_id: int):
                 content=c["content"],
                 page_no=c["page_no"],
                 section_path=c.get("section_path", ""),
-                kind=_chunk_kind(c["content"], m),
+                # cleaner 标记的 kind（meta）优先；未标的再按内容判 img_ocr / body
+                kind=c.get("kind") or _chunk_kind(c["content"], m),
                 img_rect=c.get("img_rect", ""),
                 line_boxes=c.get("line_boxes", ""),
             ))
@@ -238,6 +257,10 @@ def _parse_material(material_id: int):
         if bool(_ss.load().get("auto_extract_entities", False)):
             try:
                 _material_id = m.id
+                # 与手动入口同一套状态机：先落 running 再起线程。否则抽到一半时用户
+                # 打开知识库，看到的还是「生成图谱」按钮 —— 一点就再起一个线程重复烧 token。
+                # ⚠️ 走独立短会话（_set_entity_state 自带），不能碰解析主流程的这个 db。
+                _set_entity_state(_material_id, "running", 0, "")
                 threading.Thread(
                     target=_extract_entities_task, args=(_material_id,),
                     daemon=True).start()
@@ -258,26 +281,95 @@ def _parse_material(material_id: int):
         db.close()
 
 
+def _set_entity_state(material_id: int, status: str, progress: int = 0, error: str = ""):
+    """写知识图谱的生成状态（独立短会话 + 失败静默）。
+
+    ⚠️ 必须自带 SessionLocal：调用点既有解析主流程（那里的 db 正在一个事务里，
+       插 commit 会把半成品一起提交），也有后台抽取线程（主会话正被 persist_entities 占着）。
+    ⚠️ error 截断 200 字：列宽 255，模型调用异常的报错可能整段带上响应体。
+    ⚠️ 失败绝不外抛：状态写不进去只是 UI 不准，不能因此带崩抽取或解析。
+    """
+    try:
+        db = SessionLocal()
+        try:
+            m = db.get(Material, material_id)
+            if not m:
+                return          # 材料已被删除，没有可写的行
+            m.entity_status = status
+            m.entity_progress = max(0, min(100, int(progress or 0)))
+            m.entity_error = (error or "")[:200]
+            if status == "running":
+                m.entity_started_at = datetime.utcnow()
+            db.commit()
+        finally:
+            db.close()
+    except BaseException:
+        # ⚠️ BaseException：safe-delete shim 抛的 SystemExit 也不能冒到后台线程外
+        pass
+
+
+def _set_entity_progress(material_id: int, done: int, total: int):
+    """进度推进（1..95 百分比）。
+
+    ⚠️ 封顶 95：最后 5% 留给「写实体 + 回填引用 + commit」的收尾，避免停在 100% 却还没成功。
+    ⚠️ 绝不重写 entity_started_at —— 每段都重置的话「已用时」永远从 0 开始。
+    """
+    try:
+        pct = max(1, min(95, int(round(done * 95.0 / total)))) if total else 1
+        db = SessionLocal()
+        try:
+            m = db.get(Material, material_id)
+            if m and (m.entity_status or "") == "running":
+                m.entity_progress = pct
+                db.commit()
+        finally:
+            db.close()
+    except BaseException:
+        pass
+
+
 def _extract_entities_task(material_id: int):
     """后台抽取实体：独立会话 + 失败静默（绝不外抛、绝不碰主流程事务）。
 
     ⚠️ 必须用**自己的 SessionLocal 重新查 chunk**，绝不能复用调用方传进来的 ORM 对象：
     `_parse_material` 的 db 在 finally 里已 close，其查询出的 chunk 处于 detached 状态，
     本线程稍后访问 c.content/c.id 会触发 DetachedInstanceError 或读到过期数据。
+    ⚠️ 生成状态（entity_status/progress/error）必须落库：抽取要跑几分钟，用户会离开
+       本页、刷新甚至重启服务；收尾一律写终态（success/failed），绝不把 running 留在库里，
+       否则按钮永远转圈。
     """
     from ..services import entity as entity_svc
     from ..models import MaterialChunk
     db = SessionLocal()
     try:
+        # ⚠️ 排除 kind='meta'（剪藏署名 / 来源 URL）：抽出来就是「微信公众平台」这类
+        #    伪实体，还会挤掉 `_MAX_SAMPLE_CHUNKS` 的正文名额（实测每篇白吃 2 块）。
+        from sqlalchemy import or_
         chunks = (db.query(MaterialChunk)
-                  .filter(MaterialChunk.material_id == material_id)
+                  .filter(MaterialChunk.material_id == material_id,
+                          or_(MaterialChunk.kind.is_(None), MaterialChunk.kind != "meta"))
                   .order_by(MaterialChunk.page_no, MaterialChunk.id).all())
-        n = entity_svc.persist_entities(db, material_id, chunks)
-        if n:
+        if not chunks:
+            _set_entity_state(material_id, "failed", 0, "该材料无文本块，无法生成知识图谱")
+            return
+        report: dict = {}
+        # 进度写库用的是另一条短会话（见 _set_entity_progress）——若与这里的 db 共用，
+        # 每段 commit 会把 persist_entities 中途尚未提交的写一并落盘。
+        n = entity_svc.persist_entities(
+            db, material_id, chunks, report=report,
+            on_progress=lambda done, total: _set_entity_progress(material_id, done, total))
+        if n > 0:
+            _set_entity_state(material_id, "success", 100, "")
             print(f"[entity] 材料 {material_id} 实体抽取完成：{n} 个实体")
+        else:
+            _set_entity_state(material_id, "failed", 0,
+                              report.get("error") or "未能抽取到实体，请重试")
     except BaseException:
         # ⚠️ BaseException：safe-delete shim / LLM 异常等都不该让后台线程带出异常
-        pass
+        try:
+            _set_entity_state(material_id, "failed", 0, "生成过程出错，请重试")
+        except BaseException:
+            pass
     finally:
         db.close()
 
@@ -347,6 +439,11 @@ async def upload_material(file: UploadFile = File(...), db: Session = Depends(ge
 class DocumentCreateReq(BaseModel):
     title: str
     content: str
+    # 可选溯源字段（2026-10-26）：AI 对话「转文档」用它标来源 + 做幂等。
+    # 不传 = 材料库手工新建 / 编辑器保存，行为与之前完全一致。
+    origin: str = ""
+    origin_ref: str = ""
+    origin_meta: dict | None = None
 
 
 @router.post("/document")
@@ -360,12 +457,26 @@ def create_document(req: DocumentCreateReq, db: Session = Depends(get_db)):
         raise HTTPException(400, "正文内容过短（少于 2 字）")
     if len(content) > 200000:
         raise HTTPException(400, "正文过长，请拆分后保存")
+    # 幂等（仅当调用方给了 origin_ref）：同一条 AI 回答重复点「转文档」直接返回既有材料，
+    # 不再建出「标题 (2)」；键是「会话 + 消息 id」，刷新页面后重复点也不会。
+    # ⚠️ 传空 = 材料库手工新建，保持「同标题自动加 (n)」的老行为，不受影响。
+    ref = (req.origin_ref or "").strip()
+    if ref:
+        exist = db.query(Material).filter(Material.origin_ref == ref).first()
+        if exist is not None:
+            d = material_to_dict(exist, db)
+            d["duplicated"] = True
+            return d
+
     # 同名处理（与 upload_material 一致）+ 文件名安全化
     # 顺带修掉一个隐性上限：原实现完全没有长度约束，超长标题会撑爆文件名而 500
     title, save_path = _unique_title_and_path(db, title, "md")
     save_path.write_text(content, encoding="utf-8")
 
-    m = Material(title=title, format="md", file_path=str(save_path), parsed_status="parsing")
+    m = Material(title=title, format="md", file_path=str(save_path), parsed_status="parsing",
+                 origin=(req.origin or "").strip() or None,
+                 origin_ref=ref,
+                 origin_meta=req.origin_meta or None)
     db.add(m)
     db.commit()
     db.refresh(m)
@@ -818,6 +929,28 @@ def clip_batch_preview(req: ClipBatchPreviewReq, db: Session = Depends(get_db)):
     }
 
 
+@router.get("/chat-docs")
+def list_chat_docs(session_id: int, db: Session = Depends(get_db)):
+    """某个 AI 会话里已转成文档的回答（origin_ref = `chat:{会话}:{消息}`）。
+
+    只读、只为恢复前端按钮态：`_savedDoc` 存在内存里，刷新会话就丢，
+    用户会以为没存过而再点一次（后端幂等，但交互上像"没生效"）。
+    ⚠️ 本路由必须注册在 `GET /{material_id}` **之前**，否则 "chat-docs" 会被当成 material_id。
+    """
+    prefix = f"chat:{session_id}:"
+    rows = (db.query(Material.id, Material.origin_ref, Material.title)
+            .filter(Material.origin_ref.like(prefix + "%"))
+            .all())
+    items = []
+    for mid, ref, title in rows:
+        try:
+            message_id = int((ref or "").rsplit(":", 1)[1])
+        except (ValueError, IndexError):
+            continue          # 异常格式的 ref 直接跳过，不让一条脏数据拖垮整个恢复
+        items.append({"material_id": mid, "message_id": message_id, "title": title})
+    return {"items": items}
+
+
 @router.get("/{material_id}")
 def get_material(material_id: int, db: Session = Depends(get_db)):
     m = db.get(Material, material_id)
@@ -907,7 +1040,7 @@ def update_chunk(material_id: int, chunk_id: int, req: ChunkUpdateReq, db: Sessi
         kb_index.reindex_chunk(db, c)
     except Exception as e:
         import logging
-        reindex_warning = "已保存，但索引更新失败，后续问答可能检索不到（可到知识库重建索引）"
+        reindex_warning = "已保存，但索引更新失败，后续对话可能检索不到（可到知识库重建索引）"
         logging.getLogger("uvicorn.error").warning(f"文本块 {chunk_id} 重索引失败: {e}")
     return {"id": c.id, "content": c.content, "page_no": c.page_no, "section_path": c.section_path,
             "reindex_warning": reindex_warning}
@@ -1282,6 +1415,12 @@ def extract_entities_manual(material_id: int, db: Session = Depends(get_db)):
     与「自动抽取」的区别：这是用户主动触发的按需抽取，不受 auto_extract_entities 开关限制。
     幂等+省 token：内容指纹未变且已有实体时，跳过 LLM 调用、只本地重建引用（见
     services/entity.py::persist_entities 的指纹去重）。
+
+    ⚠️ 「生成中」是 DB 状态（entity_status），不是前端内存里的 loading：抽取要跑几分钟，
+       用户点了就走、回来（或刷新、重开应用）都要能看到进度，所以必须在**起线程之前**
+       同步把 running 写进库，前端下一次拉 overview 就能读到。
+    ⚠️ 已在 running 时直接返回 already=True、不再起第二个线程：重复点等于重复烧 token。
+       （僵尸 running 由 main.py::_recover_entity_orphans 在启动时收回，不会永久卡死。）
     """
     m = db.get(Material, material_id)
     if not m:
@@ -1293,11 +1432,20 @@ def extract_entities_manual(material_id: int, db: Session = Depends(get_db)):
               .order_by(MaterialChunk.page_no, MaterialChunk.id).all())
     if not chunks:
         raise HTTPException(400, "该材料无文本块，无法生成知识图谱")
+    if (m.entity_status or "") == "running":
+        return {"ok": True, "already": True,
+                "message": "该材料正在生成知识图谱，可以离开本页，完成后会自动更新"}
+    m.entity_status = "running"
+    m.entity_progress = 0
+    m.entity_error = ""
+    m.entity_started_at = datetime.utcnow()
+    db.commit()
     # 只传 material_id：task 用自己的 SessionLocal 重查 chunk（复用/传本路由的 ORM 对象
     # 会在 db 依赖关闭后 detached，见 _extract_entities_task 说明）
     threading.Thread(target=_extract_entities_task, args=(material_id,),
                      daemon=True).start()
-    return {"ok": True, "message": "已开始在后台生成知识图谱，稍后可到「知识图谱」页查看"}
+    return {"ok": True, "already": False,
+            "message": "已开始在后台生成知识图谱，可以离开本页，完成后会自动更新"}
 
 
 class DocumentUpdateReq(BaseModel):
@@ -1433,6 +1581,19 @@ def _delete_material_impl(db, m: Material):
     asset_dir = _material_asset_dir(m)
     db.delete(m)  # cascade 清理 chunks / notes；AIAsset 手动清
     db.query(AIAsset).filter(AIAsset.material_id == material_id).delete()
+    # 炼丹炉（2026-10-28 边界探针实证）：级联清应用绑定，否则留幽灵行 ——
+    # 列表计数失真、应用对话永远空命中且无任何提示。
+    from ..models import AppMaterial, AppNote, App
+    bound_app_ids = [r.app_id for r in
+                     db.query(AppMaterial).filter(AppMaterial.material_id == material_id).all()]
+    if bound_app_ids:
+        db.query(AppMaterial).filter(AppMaterial.material_id == material_id).delete(synchronize_session=False)
+        for aid in bound_app_ids:
+            a = db.get(App, aid)
+            # 2026-10-30 笔记绑定：资料删光但仍显式绑着笔记的应用不降 draft（笔记还能喂语料）
+            if a and not db.query(AppMaterial).filter(AppMaterial.app_id == aid).count() \
+                    and not db.query(AppNote).filter(AppNote.app_id == aid).count():
+                a.status = "draft"      # 0 绑定降级草稿态；重新绑资料时接口层自动复活
     db.commit()
     if storage_mode != "reference" and file_path.exists():
         _unlink_in_files_dir(file_path)

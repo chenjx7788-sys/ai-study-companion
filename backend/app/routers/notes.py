@@ -49,7 +49,7 @@ class NoteUpdate(BaseModel):
     anchor: dict | None = None     # 摘要笔记「覆盖更新」时同步 version，用于判定「摘要已更新」
 
 class ChatNoteCreate(BaseModel):
-    """AI 问答转笔记：材料无关（material_id=NULL, source_type=chat）
+    """AI 对话转笔记：材料无关（material_id=NULL, source_type=chat）
     标题=用户问题，内容=AI 回答；同「标题+内容」幂等，重复转存返回既有笔记。"""
     title: str = ""
     content: str = ""
@@ -76,12 +76,12 @@ def list_notes(material_id: int | None = None, slim: int = 0,
     """按材料隔离：只返回该材料的笔记。
 
     ⚠️ **省略 material_id 时返回「材料无关笔记」（material_id 为 NULL）** ——
-    AI 问答、学习周报、播客脚本这类产物不归属任何单一材料，
+    AI 对话、学习周报、播客脚本这类产物不归属任何单一材料，
     但状态查询（「这个产物转过笔记没有」）需要一次拿到它们。
     传了 material_id 的调用方行为完全不变（学习页仍只看到本材料的笔记）。
 
     slim=1 时**不下发 content**：播客页 / 统计页只用 anchor 判断「这个产物转过笔记
-    没有」，却为此把全部周报 / 播客脚本 / 问答沉淀的正文一起下载了（笔记正文是
+    没有」，却为此把全部周报 / 播客脚本 / 对话沉淀的正文一起下载了（笔记正文是
     这批数据里最大的部分）。不需要正文的调用方都该带这个参数。
     """
     q = db.query(Note)
@@ -103,15 +103,15 @@ def get_note(note_id: int, db: Session = Depends(get_db)):
 
 @router.post("/from-chat")
 def create_chat_note(req: ChatNoteCreate, db: Session = Depends(get_db)):
-    """AI 问答转笔记（材料无关）：沉淀到知识库「按笔记」，可检索、可出复习卡。
+    """AI 对话转笔记（材料无关）：沉淀到知识库「按笔记」，可检索、可出复习卡。
 
-    幂等口径：同「标题+内容」视为同一条问答——重复转存不新建，返回既有笔记；
+    幂等口径：同「标题+内容」视为同一条对话——重复转存不新建，返回既有笔记；
     若用户编辑过旧笔记、或回答内容已变（重新生成），则内容不同会放行新建。
     """
     title = (req.title or "").strip()[:255]
     content = (req.content or "").strip()
     if not title:
-        title = _smart_title(content, "AI 问答")
+        title = _smart_title(content, "AI 对话")
     if len(content) < 2:
         raise HTTPException(400, "回答内容为空或过短，无法转成笔记")
 
@@ -149,8 +149,8 @@ def create_chat_note(req: ChatNoteCreate, db: Session = Depends(get_db)):
         kb_index.index_note(db, n)
     except Exception as e:
         import logging
-        reindex_warning = "已转存，但向量索引未建立，后续问答可能检索不到（可到知识库重建索引）"
-        logging.getLogger("uvicorn.error").warning(f"问答转笔记 {n.id} 索引失败: {e}")
+        reindex_warning = "已转存，但向量索引未建立，后续对话可能检索不到（可到知识库重建索引）"
+        logging.getLogger("uvicorn.error").warning(f"对话转笔记 {n.id} 索引失败: {e}")
     d = note_to_dict(n)
     if reindex_warning:
         d["reindex_warning"] = reindex_warning
@@ -201,7 +201,7 @@ def create_ai_note(req: AiNoteCreate, db: Session = Depends(get_db)):
         kb_index.index_note(db, n)
     except Exception as e:
         import logging
-        reindex_warning = "已转存，但向量索引未建立，后续问答可能检索不到（可到知识库重建索引）"
+        reindex_warning = "已转存，但向量索引未建立，后续对话可能检索不到（可到知识库重建索引）"
         logging.getLogger("uvicorn.error").warning(f"产物转笔记 {n.id} 索引失败: {e}")
     d = note_to_dict(n)
     if reindex_warning:
@@ -257,7 +257,7 @@ def update_note(note_id: int, req: NoteUpdate, db: Session = Depends(get_db)):
         kb_index.index_note(db, n)
     except Exception as e:
         import logging
-        reindex_warning = "已保存，但索引更新失败，后续问答可能检索不到（可到知识库重建索引）"
+        reindex_warning = "已保存，但索引更新失败，后续对话可能检索不到（可到知识库重建索引）"
         logging.getLogger("uvicorn.error").warning(f"笔记 {note_id} 重索引失败: {e}")
     d = note_to_dict(n)
     if reindex_warning:
@@ -273,6 +273,18 @@ def delete_note(note_id: int, db: Session = Depends(get_db)):
     # 级联删除该笔记的复习卡（避免孤儿卡残留）
     from ..models import ReviewCard
     db.query(ReviewCard).filter(ReviewCard.note_id == note_id).delete()
+    # 炼丹炉笔记绑定（2026-10-30）：级联清应用绑定（与资料删除同口径，防幽灵行）；
+    # 绑定删光（资料+笔记全 0）的应用降草稿态，重新绑定后接口层自动复活。
+    from ..models import AppMaterial, AppNote, App
+    bound_app_ids = [r.app_id for r in
+                     db.query(AppNote).filter(AppNote.note_id == note_id).all()]
+    if bound_app_ids:
+        db.query(AppNote).filter(AppNote.note_id == note_id).delete(synchronize_session=False)
+        for aid in bound_app_ids:
+            a = db.get(App, aid)
+            if a and not db.query(AppNote).filter(AppNote.app_id == aid).count() \
+                    and not db.query(AppMaterial).filter(AppMaterial.app_id == aid).count():
+                a.status = "draft"
     db.delete(n)
     db.commit()
     # 同步删除向量条目

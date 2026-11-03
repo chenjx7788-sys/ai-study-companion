@@ -79,6 +79,8 @@ def search(db: Session, query: str, kinds=("chunk", "note"),
     """全文检索，返回与 vector.search 同构的 hits（按命中词数降序）。
 
     where 兼容 chroma 格式：{"material_id": {"$in": [...]}} / {"ref_id": {"$in": [...]}}
+    应用笔记绑定扩展键（2026-10-30）：note_ref_id {"$in": [...]} 仅约束 note 分支，
+    与 material_id 成 OR（显式绑定的笔记并入语料）；此时 chunk 分支只认 material_id。
     """
     kws = _keywords(query)
     if not kws:
@@ -86,28 +88,39 @@ def search(db: Session, query: str, kinds=("chunk", "note"),
 
     material_ids: set[int] | None = None
     note_ids: set[int] | None = None
+    app_note_ids: set[int] | None = None
     if where:
         if "material_id" in where and "$in" in where["material_id"]:
             material_ids = set(where["material_id"]["$in"])
         if "ref_id" in where and "$in" in where["ref_id"]:
             note_ids = set(where["ref_id"]["$in"])
+        if "note_ref_id" in where and "$in" in where["note_ref_id"]:
+            app_note_ids = set(where["note_ref_id"]["$in"])
 
     hits: list[dict] = []
 
     if "chunk" in kinds:
-        conds = [MaterialChunk.content.like(_like(k), escape="\\") for k in kws]
-        q = (db.query(MaterialChunk)
-             .filter(MaterialChunk.content != "", or_(*conds)))
-        if material_ids is not None:
-            q = q.filter(MaterialChunk.material_id.in_(material_ids))
-        for c in q.all():
-            cnt = sum(1 for k in kws if k in (c.content or ""))
-            title = c.material.title if c.material else ""
-            hits.append(_hit("chunk", c.id, c.material_id, c.content, {
-                "ref_type": "chunk", "ref_id": c.id, "material_id": c.material_id,
-                "material_title": title, "page_no": c.page_no,
-                "section_path": c.section_path or "",
-            }, cnt))
+        if app_note_ids is not None and material_ids is None:
+            # 纯笔记锁：chunk 颗粒无收（与 vector._col_where 同口径）
+            pass
+        else:
+            conds = [MaterialChunk.content.like(_like(k), escape="\\") for k in kws]
+            # ⚠️ 排除 kind='meta'（剪藏署名 / 来源 URL）：`> 来源：https://…` 会让
+            #    任何带域名的提问都命中一条零信息量的块（向量侧同样已跳过）。
+            q = (db.query(MaterialChunk)
+                 .filter(MaterialChunk.content != "",
+                         or_(MaterialChunk.kind.is_(None), MaterialChunk.kind != "meta"),
+                         or_(*conds)))
+            if material_ids is not None:
+                q = q.filter(MaterialChunk.material_id.in_(material_ids))
+            for c in q.all():
+                cnt = sum(1 for k in kws if k in (c.content or ""))
+                title = c.material.title if c.material else ""
+                hits.append(_hit("chunk", c.id, c.material_id, c.content, {
+                    "ref_type": "chunk", "ref_id": c.id, "material_id": c.material_id,
+                    "material_title": title, "page_no": c.page_no,
+                    "section_path": c.section_path or "",
+                }, cnt))
 
     if "note" in kinds:
         conds = []
@@ -115,7 +128,14 @@ def search(db: Session, query: str, kinds=("chunk", "note"),
             conds.append(Note.title.like(_like(k), escape="\\"))
             conds.append(Note.content.like(_like(k), escape="\\"))
         q = db.query(Note).filter(or_(*conds))
-        if note_ids is not None:
+        if app_note_ids is not None:
+            # 应用语料宇宙：绑定资料下的笔记 ∪ 显式绑定的笔记（OR）
+            scope = []
+            if material_ids is not None:
+                scope.append(Note.material_id.in_(material_ids))
+            scope.append(Note.id.in_(app_note_ids))
+            q = q.filter(or_(*scope))
+        elif note_ids is not None:
             q = q.filter(Note.id.in_(note_ids))
         for n in q.all():
             text = f"{n.title}\n{n.content or ''}".strip()

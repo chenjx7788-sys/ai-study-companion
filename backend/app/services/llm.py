@@ -1,4 +1,4 @@
-"""LLM 服务：OpenAI 兼容协议，总结模型 / 问答模型分开配置
+"""LLM 服务：OpenAI 兼容协议，总结模型 / 对话模型分开配置
 
 prompt 原则：
 - 摘要：层级大纲 + 每条要点标注页码；长文档两段式（先分块再汇总）
@@ -65,14 +65,17 @@ def _llm_error(e: Exception) -> HTTPException:
 def _chat_create(client, model, messages, temperature=0.3, stream=False, reasoning_effort=None,
                  thinking=None, tools=None, tool_choice=None):
     """发起 chat.completions 调用，带参数降级兜底（循环逐级降级）：
+    - stream_options（要流式精确 usage）不被网关认 → 去掉重试；
     - temperature 不支持（如 kimi-for-coding 仅允许 1）→ 改 1 重试；
     - reasoning_effort / thinking 不支持（部分服务商/中转）→ 去掉重试；
     - tools 不支持（部分中转不认 function calling）→ 去掉 tools 重试。
       ⚠️ 去掉 tools 后模型不会再调工具，但这轮至少能正常回答；
         「中转不支持工具就让整个问答 500」是更差的结果。
     thinking ∈ {None 不干预, 'enabled', 'disabled'}，经 extra_body 传给 DeepSeek 等支持方。"""
-    def call(temp, effort, think, tls, tch):
+    def call(temp, effort, think, tls, tch, sopt):
         kwargs = dict(model=model, messages=messages, temperature=temp, stream=stream)
+        if sopt:
+            kwargs["stream_options"] = {"include_usage": True}
         if effort:
             kwargs["reasoning_effort"] = effort
         if think:
@@ -84,11 +87,17 @@ def _chat_create(client, model, messages, temperature=0.3, stream=False, reasoni
         return client.chat.completions.create(**kwargs)
 
     temp, effort, think, tls, tch = temperature, reasoning_effort, thinking, tools, tool_choice
+    # 流式一律先要末帧 usage：拿不到就只能按字符估算（实测偏差可达 ±20%）。
+    # 降级判断放最前面：这跟模型能力无关，只是网关认不认这个参数。
+    sopt = bool(stream)
     while True:
         try:
-            return call(temp, effort, think, tls, tch)
+            return call(temp, effort, think, tls, tch, sopt)
         except Exception as e:
             s = str(e).lower()
+            if sopt and ("stream_options" in s or "include_usage" in s or "stream option" in s):
+                sopt = False
+                continue
             # temperature 限制：从错误信息解析允许值（如「only 0.6/1 is allowed」）
             m = re.search(r"only\s+([\d.]+)\s+is allowed", s)
             if "temperature" in s and m and temp != float(m.group(1)):
@@ -118,10 +127,30 @@ def log_usage(kind: str, model: str, prompt_tokens: int, completion_tokens: int,
         pass
 
 
+
+def _log_stream_usage(kind: str, model: str, got_usage, in_chars: int, out_chars: int,
+                      extra_in_tokens: int = 0):
+    """流式记账统一出口：服务商回传了 usage 就用精确值，否则按 1.6 字符/token 估算。
+
+    ⚠️⚠️ 调用点必须在 `finally` 里：用户点「停止」/ SSE 断开 / 消费方 close 时生成器停在
+       yield 处，GeneratorExit 直接穿过函数体 —— 写在循环之后的 log_usage 永远不会执行，
+       这一轮的 input+output 在统计里整段消失（实测库里有 10 次「用户中断生成」）。
+    """
+    try:
+        pt = getattr(got_usage, "prompt_tokens", None) if got_usage is not None else None
+        if pt is not None:
+            log_usage(kind, model, int(pt or 0),
+                      int(getattr(got_usage, "completion_tokens", 0) or 0))
+        else:
+            log_usage(kind, model, int(in_chars / 1.6) + extra_in_tokens,
+                      int(out_chars / 1.6), estimated=True)
+    except Exception:
+        pass
+
 def chat(messages: list[dict], model: str | None = None, kind: str = "chat") -> str:
-    """非问答、非总结场景（划线解读/追问、相关问题推荐）用问答模型：
+    """非对话、非总结场景（划线解读/追问、相关问题推荐）用对话模型：
     与 summary_chat 一致，按 chat_model_id 解析多模型配置。
-    ⚠️ 多模型模式下「问答模型」未选 = 未配置，直接报 NEED_SETUP（不回退旧字段）。"""
+    ⚠️ 多模型模式下「对话模型」未选 = 未配置，直接报 NEED_SETUP（不回退旧字段）。"""
     conf = settings_store.load()
     if model:
         r = settings_store.resolve_model_strict(model)
@@ -131,7 +160,7 @@ def chat(messages: list[dict], model: str | None = None, kind: str = "chat") -> 
     else:
         r = settings_store.resolve_usage("chat")
         if r is None:
-            raise HTTPException(400, "[NEED_SETUP]请先在「管理中心」为问答模型指定用途")
+            raise HTTPException(400, "[NEED_SETUP]请先在「管理中心」为对话模型指定用途")
         base_url, api_key, resolved = r
     use_model = model or resolved
     try:
@@ -156,7 +185,7 @@ def chat_stream(messages: list[dict], model_id: str | None = None, reasoning_eff
     reasoning_effort：None=关闭推理（默认，thinking=disabled），low/high/max=开启推理。
     kind：记账业务场景（全局问答默认 chat；解读/提问/文本加工等流式入口需显式传入对应 kind）"""
     conf = settings_store.load()
-    # 未显式指定模型时走到「问答用途」解析；多模型模式下用途未选 = 未配置（报 NEED_SETUP，不回退旧字段）
+    # 未显式指定模型时走到「对话用途」解析；多模型模式下用途未选 = 未配置（报 NEED_SETUP，不回退旧字段）
     if model_id:
         r = settings_store.resolve_model_strict(model_id)
         if r is None:
@@ -165,7 +194,7 @@ def chat_stream(messages: list[dict], model_id: str | None = None, reasoning_eff
     else:
         r = settings_store.resolve_usage("chat")
         if r is None:
-            raise HTTPException(400, "[NEED_SETUP]请先在「管理中心」为问答模型指定用途")
+            raise HTTPException(400, "[NEED_SETUP]请先在「管理中心」为对话模型指定用途")
         base_url, api_key, model = r
     use_model = model
     thinking = "enabled" if reasoning_effort else "disabled"
@@ -176,22 +205,29 @@ def chat_stream(messages: list[dict], model_id: str | None = None, reasoning_eff
         raise
     except Exception as e:
         raise _llm_error(e)
-    total_in = sum(len(m["content"]) for m in messages)
+    total_in = sum(len(str(m.get("content") or "")) for m in messages)
     total_out = 0
-    for chunk in resp:
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-        rc = getattr(delta, "reasoning_content", None)
-        c = getattr(delta, "content", None)
-        if rc:
-            total_out += len(rc)
-            yield "reasoning", rc
-        if c:
-            total_out += len(c)
-            yield "content", c
-    # 中英混合按 ~1.6 字符/token 粗估
-    log_usage(kind, use_model, int(total_in / 1.6), int(total_out / 1.6), estimated=True)
+    got_usage = None
+    try:
+        for chunk in resp:
+            # 开了 stream_options.include_usage 后，末帧 choices 为空、usage 才有值，
+            # 必须在 if not chunk.choices: continue **之前**抓，否则精确值被跳过。
+            u = getattr(chunk, "usage", None)
+            if u is not None:
+                got_usage = u
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            rc = getattr(delta, "reasoning_content", None)
+            c = getattr(delta, "content", None)
+            if rc:
+                total_out += len(rc)
+                yield "reasoning", rc
+            if c:
+                total_out += len(c)
+                yield "content", c
+    finally:
+        _log_stream_usage(kind, use_model, got_usage, total_in, total_out)
 
 
 def chat_stream_tools(messages: list[dict], tools: list[dict], model_id: str | None = None,
@@ -218,7 +254,7 @@ def chat_stream_tools(messages: list[dict], tools: list[dict], model_id: str | N
     else:
         r = settings_store.resolve_usage("chat")
         if r is None:
-            raise HTTPException(400, "[NEED_SETUP]请先在「管理中心」为问答模型指定用途")
+            raise HTTPException(400, "[NEED_SETUP]请先在「管理中心」为对话模型指定用途")
         base_url, api_key, model = r
     use_model = model
     thinking = "enabled" if reasoning_effort else "disabled"
@@ -232,36 +268,53 @@ def chat_stream_tools(messages: list[dict], tools: list[dict], model_id: str | N
         raise _llm_error(e)
 
     total_in = sum(len(str(m.get("content") or "")) for m in messages)
+    # ⚠️ tools 的 JSON schema 每轮都随请求发出去，是实打实的 input token，但 messages 里没有它。
+    #    单独按英文 JSON 密度（≈3.2 字符/token）折算，并进 1.6 中英混合口径会高估近一倍。
+    tools_in_tokens = 0
+    if tools:
+        try:
+            tools_in_tokens = int(len(json.dumps(tools, ensure_ascii=False)) / 3.2)
+        except Exception:
+            tools_in_tokens = 0
     total_out = 0
     acc: dict[int, dict] = {}
-    for chunk in resp:
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-        rc = getattr(delta, "reasoning_content", None)
-        c = getattr(delta, "content", None)
-        if rc:
-            total_out += len(rc)
-            yield "reasoning", rc
-        if c:
-            total_out += len(c)
-            yield "content", c
-        for tc in (getattr(delta, "tool_calls", None) or []):
-            idx = getattr(tc, "index", None)
-            idx = 0 if idx is None else idx
-            cur = acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-            tid = getattr(tc, "id", None)
-            if tid:
-                cur["id"] = tid
-            fn = getattr(tc, "function", None)
-            if fn is not None:
-                nm = getattr(fn, "name", None)
-                if nm:
-                    cur["name"] = nm
-                ar = getattr(fn, "arguments", None)
-                if ar:
-                    cur["arguments"] += ar
-    log_usage(kind, use_model, int(total_in / 1.6), int(total_out / 1.6), estimated=True)
+    got_usage = None
+    try:
+        for chunk in resp:
+            # 开了 stream_options.include_usage 后，末帧 choices 为空、usage 才有值，
+            # 必须在 if not chunk.choices: continue **之前**抓，否则精确值被跳过。
+            u = getattr(chunk, "usage", None)
+            if u is not None:
+                got_usage = u
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            rc = getattr(delta, "reasoning_content", None)
+            c = getattr(delta, "content", None)
+            if rc:
+                total_out += len(rc)
+                yield "reasoning", rc
+            if c:
+                total_out += len(c)
+                yield "content", c
+            for tc in (getattr(delta, "tool_calls", None) or []):
+                idx = getattr(tc, "index", None)
+                idx = 0 if idx is None else idx
+                cur = acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                tid = getattr(tc, "id", None)
+                if tid:
+                    cur["id"] = tid
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    nm = getattr(fn, "name", None)
+                    if nm:
+                        cur["name"] = nm
+                    ar = getattr(fn, "arguments", None)
+                    if ar:
+                        cur["arguments"] += ar
+    finally:
+        _log_stream_usage(kind, use_model, got_usage, total_in, total_out,
+                          extra_in_tokens=tools_in_tokens)
     if acc:
         out = [acc[k] for k in sorted(acc) if acc[k]["name"]]
         if out:
@@ -308,16 +361,24 @@ def summary_chat_stream(messages: list[dict], kind: str = "summary"):
         raise
     except Exception as e:
         raise _llm_error(e)
-    total_in = sum(len(m["content"]) for m in messages)
+    total_in = sum(len(str(m.get("content") or "")) for m in messages)
     total_out = 0
-    for chunk in resp:
-        if not chunk.choices:
-            continue
-        c = getattr(chunk.choices[0].delta, "content", None)
-        if c:
-            total_out += len(c)
-            yield c
-    log_usage(kind, use_model, int(total_in / 1.6), int(total_out / 1.6), estimated=True)
+    got_usage = None
+    try:
+        for chunk in resp:
+            # 开了 stream_options.include_usage 后，末帧 choices 为空、usage 才有值，
+            # 必须在 if not chunk.choices: continue **之前**抓，否则精确值被跳过。
+            u = getattr(chunk, "usage", None)
+            if u is not None:
+                got_usage = u
+            if not chunk.choices:
+                continue
+            c = getattr(chunk.choices[0].delta, "content", None)
+            if c:
+                total_out += len(c)
+                yield c
+    finally:
+        _log_stream_usage(kind, use_model, got_usage, total_in, total_out)
 
 
 # ---------- 文本准备 ----------
@@ -363,6 +424,48 @@ DEFAULT_PROMPTS = {
     "prompt_kb_qa": "你是伴学助手。优先基于给定的知识库内容回答。引用知识库内容时，在相关句末用 [1]、[2] 等编号标注来源（编号对应【知识库相关内容】中的 [1][2] 标记）；知识库未覆盖的部分可补充通用知识并注明，不要编造不存在的编号。当回答涉及流程、步骤、时序、架构或状态转换时，用 ```mermaid 代码块输出图表，并与文字说明配合；顺序/步骤类优先用 flowchart TD（纵向排布，在窄栏里字号更大更易读），只有分支对照等场景才用 LR；节点控制在 8 个以内，避免图过大。",
     "prompt_general": "你是一名学习助手。请基于通用知识回答用户的问题，保持简洁准确；不要声称回答出自用户的个人知识库。当回答涉及流程、步骤、时序、架构或状态转换时，用 ```mermaid 代码块输出图表，并与文字说明配合；顺序/步骤类优先用 flowchart TD（纵向排布，在窄栏里字号更大更易读），只有分支对照等场景才用 LR；节点控制在 8 个以内，避免图过大。",
     "prompt_kb_miss": "你是伴学助手。用户指定了「仅在个人知识库中查找答案」，但知识库中没有找到与问题相关的内容。请如实告知未找到（一两句即可），不得编造内容、不得改用通用知识作答；然后给出简短可操作的引导，例如：换个问法或关键词再试、在上方「范围」里指定某份资料重查、把相关资料导入知识库、或切换到「通用」模式获取基于通用知识的回答。建议不超过 4 条，保持简洁。",
+    # ---- 检索增强（2026-10-28）：检索后评估改写 / 两段式计划检索（口径属于「检索质量」而非「回答口径」）----
+    "prompt_query_rewrite": """你是检索查询改写助手。用户在个人知识库中检索，没有找到与问题相关的内容。请把问题改写成一个更适合语义与关键词检索的查询：
+1. 保留问题的核心意图，提取关键概念；
+2. 去掉「是什么」「怎么看」「给我讲讲」这类口语化表达；
+3. 可以补充常见的同义说法或上位概念，但不得偏离原问题的主题；
+4. 只输出改写后的查询本身（一行），不要解释、不要引号、不要编号；若原问题已经足够简洁，原样输出。""",
+    "prompt_retrieval_plan": """你是检索规划助手。用户的问题可能需要查证多个知识点。请把问题拆成 1-4 个可以**分别独立检索**的子查询，严格输出 JSON 数组，不要输出其他任何内容（不要 Markdown 代码块）：
+["子查询1", "子查询2"]
+要求：
+1. 每个子查询是一句具体、自包含的检索描述（不要编号、不要空泛的「相关内容」）；
+2. 子查询之间不重叠，合起来覆盖问题的全部要点；
+3. 问题本身只涉及一个知识点时，输出只含一个元素的数组；
+4. 只拆用户问到的点，不得新增问题之外的知识点。""",
+    # 找内容（2026-10-26）：用户在求推荐 / 找资源。与 prompt_kb_miss 分开 ——
+    # 后者的口径是「找不到就说找不到、禁止通用知识」，用在推荐场景等于把诉求堵死。
+    # 这里允许库外推荐，但必须显式标注「未在资料库中」，且不许虚构可核实信息。
+    "prompt_discover": (
+        "你是一名内容发现助手，帮用户在自己的资料库里找书、文章、讲书、视频这类**内容**。按两种情况分别处理：\n"
+        "【情况一】给了「库内相关资源」清单：以清单为准作答，优先介绍它们，说清形态和大概内容，"
+        "让用户能判断要不要看；不要逐条复述清单（界面会把清单渲染成卡片），用一两句话点出最值得先看的一两条。\n"
+        "【情况二】没有清单：一句话说明库里暂时没有相关资源，然后给出资料库之外的推荐建议。\n"
+        "两种情况都必须遵守：\n"
+        "1. 凭记忆给书名、人名可以，但 ISBN、出版社、具体版本、页数、链接、价格这类可核实信息，"
+        "不确定就一律不写，写成「具体版本请自行核实」；\n"
+        "2. 推荐资料库之外的内容时，必须明确标注「不在你的资料库中，建议核实」；\n"
+        "3. 不要输出虚构的引用编号；\n"
+        "4. 结尾给一条可操作的建议：把资料导进来、换个关键词再找、或基于已有资料做讲义/视频。\n"
+        "当回答涉及阅读顺序、选书路径这类流程时，用 ```mermaid 代码块配图，节点控制在 8 个以内；"
+        "顺序/层级类优先 flowchart TD（纵向排布在窄栏里字号更大），只有分支对照才用 LR。"
+    ),
+    "prompt_brief": (
+        "你是一名学习导读作者。用户想读某个主题，但自己的资料库里没有相关内容，需要你写一份**入门导读**，"
+        "帮他判断值不值得深入、该从哪里开始。\n"
+        "硬性要求：\n"
+        "1. 只写「这个主题大致在讲什么、可按什么顺序入门、常见卡点、值得追问的问题」；"
+        "不要假装读过某一本具体的书，不要编造 ISBN、出版社、版本、页数、章节标题、销量、链接、价格；\n"
+        "2. 必须提到具体书名时，写成「常见读本包括……（具体版本请自行核实）」这种不确定口径；\n"
+        "3. 输出 Markdown，结构固定：2-3 句导语 → `## 这个主题在讲什么` → `## 入门路径`"
+        "（有序列表 3-5 步，每步写清「做什么 + 做到什么程度算过关」）→ `## 常见卡点` → `## 可以接着问的 3 个问题`；\n"
+        "4. 全文 900-1400 字，中文；不要客套话，不要「作为 AI」这类自述。\n"
+        "语气：像一个读过不少书的人给朋友指路——具体、克制、不吹。"
+    ),
     "prompt_kb_overview": """你是一名学习助手。用户问的是「知识库整体有什么内容」这类概览问题。下面给你的是该知识库的完整目录（资料清单 + 笔记清单）。请基于目录如实、清晰地回答用户，列出知识库包含的资料和笔记，可按主题适当归类；目录里没有的内容不要编造。""",
     "prompt_kb_meta": """你是一名学习助手。下面给你的是知识库的统计信息或材料清单（来自数据库实时查询，准确可靠）。请基于这些信息如实、简洁地回答用户问题；数字与条目以给定信息为准，不要编造；信息未覆盖的方面明确说明不知道。""",
     "prompt_review": """你是一名记忆教练。根据用户的学习笔记生成一道自测选择题，严格输出 JSON（不要输出其他内容）：
@@ -399,8 +502,8 @@ DEFAULT_PROMPTS = {
 
 【模式三 · 追问】用户给出原问题、期望要点与作答并明确要求追问时，输出 JSON 对象：
 {"question": "针对作答中未讲透之处的一层深挖问题（一句话，不要重复原问题）", "expected_points": ["..."]}
-要求：追问必须建立在素材事实上，不引入素材之外的新知识。""",
-    "prompt_drill_judge": """你是一名严谨而友善的评分官。请根据「问题 + 期望要点 + 学习者作答」给出结构化评分，严格输出 JSON 对象，不要输出任何其他内容（不要 Markdown 代码块）：
+要求：追问必须建立在素材事实上，不引入素材之外的新知识。若学习者作答**过短、为空或与题目无关**，不要复述原题（不要输出「请重新作答：…」这类句子），而应给出一个更小、更具体的切入点帮他开口。""",
+    "prompt_drill_judge": """你是一名严谨而友善的评分官。请根据「问题 + 期望要点 + 素材片段 + 学习者作答」给出结构化评分，严格输出 JSON 对象，不要输出任何其他内容（不要 Markdown 代码块）：
 {"score": 0-100 的整数, "verdict": "correct|partial|wrong", "dimensions": {"正确性": 0-100, "完整度": 0-100, "表达": 0-100}, "comment": "点评（≤120字，先肯定对的部分，再指出问题）", "missing_points": ["未覆盖的期望要点"], "followup": {"question": "需要追问时给出一个针对未讲透之处的追问；不需要则留空字符串", "expected_points": ["..."]}}
 
 评分标准：
@@ -408,7 +511,13 @@ DEFAULT_PROMPTS = {
 2. **完整度**：期望要点的覆盖比例；
 3. **表达**：逻辑是否清晰、是否讲得让人听懂。
 verdict 判定：score >= 80 且无关键错误 → correct；40-79 或漏掉主要要点 → partial；< 40 或方向性错误 → wrong。
-要求：1. 严格对照期望要点，不要因措辞不同就判错（意思对即算覆盖）；2. missing_points 只列**期望要点中未被覆盖**的，不新增素材之外的要点；3. 不编造材料中没有的评价标准；4. followup.question 只在「作答明显没讲透、值得再挖一层」时给出，否则留空串。""",
+
+素材片段的使用规则（决定「正确性」这一维判得准不准）：
+1. 用户消息提供了素材片段时，**事实以素材为准**：作答与素材矛盾（把材料说的事实说反、编造材料里没有的数字/结论）→ 必须在 comment 里点名指出，并在「正确性」上扣分，**即使要点覆盖率高也不能给 correct**；
+2. 作答超出期望要点、但事实与素材一致且确实理解到位 → **既不加分也不扣分**，且**不得写进 missing_points**（那是「该讲而没讲」，不是「多讲了」）；
+3. 用户消息**未**提供素材片段时，你只能判「有没有覆盖期望要点」，**不得凭印象断言事实错误**，也不得因此判 wrong。
+
+要求：1. 严格对照期望要点，不要因措辞不同就判错（意思对即算覆盖）；2. missing_points 只列**期望要点中未被覆盖**的，不新增素材之外的要点；3. 不编造材料中没有的评价标准；4. followup.question 只在「作答明显没讲透、值得再挖一层」时给出，否则留空串；**作答为空、极短或与题目无关时不要输出「请重新作答」这类复述原题的追问**——那种情况留空串即可。""",
     "prompt_learn_note": """你是一名顶尖学习教练。你的任务不是"总结"，而是把给定材料【转译】成一份结构化的学习笔记：让一个非本专业的初学者，不看原文也能在最短时间内抓住知识骨架、理解核心概念、并记住要点。
 
 ## 输出结构（必须严格照此，缺一不可）
@@ -849,20 +958,23 @@ verdict 判定：score >= 80 且无关键错误 → correct；40-79 或漏掉主
 - sketch（**可选**，板书 / 动效图解两个皮肤共用：板书会把它画成一整块黑板上
   的简图、一笔一笔写出来；动效图解会把它变成**这一屏的结构图**，每个 label 逐个
   长出来、并按 type 摆成链 / 左右对照 / 层级 / 四宫格）。
-  只有讲稿里真的存在**结构性关系**才给，type 只能取这四值之一：
+  只有讲稿里真的存在**结构性关系**才给，type 只能取这七值之一：
   flow     = 步骤 / 因果链：labels 2-4 个，按先后顺序，每项是链上一步
   compare  = 两方取舍对比：labels **4 或 6 个（必须偶数）**，**前一半是左边一方、
              后一半是右边一方**；每边第一个是该方的标题，后面是该方的论据
   quadrant = 两维定位（如投入×回报）：labels **正好 4 个**，顺序固定为
              「左上 / 右上 / 右下 / 左下」；另给 x（横轴名）、y（纵轴名），各 ≤8 字
   pyramid  = 层级 / 递进：labels 3-4 个，**从顶层写到底层**（如 工具→方法→判断→视野）
+  timeline = 时间线 / 阶段演进（阶段、版本、年份有明确先后）：labels 3-6 个，按时间先后
+  cycle    = 循环 / 闭环（讲稿明确说了「循环 / 反复 / 又回到」）：labels 2-5 个，按循环顺序
+  tree     = 总分结构（一个总概念拆成几个子项）：labels 3-5 个，**第 1 个是根**，其余是子项
   硬规则：
   ① 一个元素最多带一个 sketch，**不许与 tex / chart 同时给**；整条视频里带 sketch
      的元素不超过「总屏数 ÷ 3」—— 宁可少给，满屏都是图反而没人看
   ② labels 里每个词都必须**在本屏元素或讲稿里原样出现过**，不得自创、不得凑数；
      同一张图里不许出现两个相同的标签
   ③ 每个 label ≤ 8 个字（黑板上是大字，长了装不下也看不清）
-  ④ 这一屏只是并列罗列、彼此没有步骤 / 对比 / 层次 / 两维关系 → **不要给**
+  ④ 这一屏只是并列罗列、彼此没有步骤 / 对比 / 层次 / 两维 / 时间 / 循环 / 总分关系 → **不要给**
   ⑤ 给了 sketch 时，t 写「这张图在讲什么」（4-18 字）：它会成为这一板的标题
 - seg：该元素应当在第几句讲稿被点亮（必须在所属镜头的句号范围内）
 
@@ -886,8 +998,98 @@ verdict 判定：score >= 80 且无关键错误 → correct；40-79 或漏掉主
 10. 数据图元素（带 chart 的）**每屏最多 1 个**，且 k 取 concept；只有讲稿真的给了
     一组数字才给，一整条视频没有数据图元素完全正常；chart 与 tex 不要同时给一个元素
 11. 草图元素（带 sketch 的）：**有结构关系就给**（动效图解靠它出图，只给文字卡
-    就是一屏框框），上限仍是「总屏数 ÷ 3」。判断标准是讲稿里**真的存在**步骤链 /
-    两方取舍 / 层级递进 / 两维定位之一；**不许为了凑数硬造关系** —— 图上画出一条
+    就是一屏框框），上限仍是「总屏数 ÷ 3」。判断标准是讲稿里**真的存在**步骤链 / 时间演进 /
+    两方取舍 / 层级递进 / 两维定位 / 循环往复 / 总分结构之一；**不许为了凑数硬造关系** —— 图上画出一条
+    讲稿里没有的因果，比不画这张图糟得多。labels 必须是本屏元素或讲稿里原样出现
+    的词，这条会被程序校验，编造的整张图会被丢弃""",
+    "prompt_video_points_board": """你是一名板书设计老师。请依据下面的视频讲稿与分镜表，为每个镜头设计「若干屏」板书画面 —— 观众看到的是一块黑板：镜头标题写在上方，要点像老师讲课时随手写下的关键词一样，逐条写上黑板。
+
+严格输出一个 JSON 对象，不要输出其他任何内容（不要 Markdown 代码块）：
+{"title": "全片标题（不超过 14 字）",
+ "scenes": [{"shot": 1, "title": "镜头标题（不超过 12 字）",
+             "screens": [{"layout": "grid",
+                          "elements": [{"t": "元素文本（不超过 16 字）", "k": "concept", "seg": 1,
+                                        "tex": ["A_i =", "\\frac{r_i}{\\sum_j r_j}"]（可选，仅公式元素）}]}]}]}
+
+字段说明：
+- shot：镜头编号（必须使用分镜表里给定的编号，每个镜头恰好出现一次）
+- title：这个镜头在讲什么，写成完整通顺的短语（会原样写在黑板顶部，
+  禁止写半截词、禁止以「的/了/和」这类虚字结尾）
+- screens：把这个镜头**按时间先后拆成若干屏**（一屏 = 一块黑板，写满就擦掉换下一板）。
+  一个 30-60 秒的镜头通常 2-5 屏；内容少时 1 屏也可以，但**每屏 3-6 个元素**。
+- layout：**这一屏**的版式，只能取这五个值之一 ——
+  grid（要点平铺，不确定时的默认）、flow（步骤/流程，元素按先后连成链）、
+  hub（中心辐射：第 1 个元素是中心主题，其余是围绕它的分支）、
+  compare（左右对比：前一半元素是一方，后一半是另一方）、
+  pyramid（分层递进：元素自上而下逐层展开，越往下越具体）
+  按**这一屏**的内容选最贴切的：讲流程用 flow、讲取舍对比用 compare、
+  讲体系组成用 hub、讲层次递进用 pyramid，都不像就用 grid
+- elements：这一屏里逐条写上黑板的元素；k 只能取
+  concept（概念 / 机制，粉笔白）、good（良方 / 做法，黄色 + 写完画圈）、
+  cost（代价 / 边界，暖橙 + 写完下划线）—— 颜色与圈画是板书上唯一的强调手段，要省着用
+- tex（**可选**，只有讲稿里明确出现公式 / 数学关系的元素才给）：LaTeX 源码
+  按**讲解顺序**拆成 2-6 项的数组（每项只含数学符号，不含中文）；
+  此时 t 写这个公式的口头称呼（如「优势归一化」）。
+  讲稿里没有的公式绝不编造；这一屏没有公式就**不要输出这个字段**
+- chart（**可选**，只有讲稿里明确给出一组**数字的对比或趋势**才给）：
+  {"type": "bar 或 line", "items": [{"label": "讲稿原词", "value": 数字}]}
+  bar 用于 2-6 项对比（如几个方案的得分），line 用于 2-8 个点的趋势（如逐季度变化）；
+  value **必须是讲稿里原样出现的数字**（不得换算单位、不得估算、不得编造）；
+  label 用讲稿里的原词（不超过 8 字）；此时 t 写这组数据的口头称呼
+  （如「三种方案得分对比」）。这一屏没有数据对比就**不要输出这个字段**
+- sketch（**可选**，板书的**看家本领**：有结构关系的内容会画满整块黑板、
+  一笔一笔现场画出来，这是板书最好看的形态，**有结构关系就优先给**），
+  type 只能取这七值之一：
+  flow     = 步骤 / 因果链：labels 2-4 个，按先后顺序，每项是链上一步
+  compare  = 两方取舍对比：labels **4 或 6 个（必须偶数）**，**前一半是左边一方、
+             后一半是右边一方**；每边第一个是该方的标题，后面是该方的论据
+  quadrant = 两维定位（如投入×回报）：labels **正好 4 个**，顺序固定为
+             「左上 / 右上 / 右下 / 左下」；另给 x（横轴名）、y（纵轴名），各 ≤8 字
+  pyramid  = 层级 / 递进：labels 3-4 个，**从顶层写到底层**（如 工具→方法→判断→视野）
+  timeline = 时间线 / 阶段演进（阶段、版本、年份有明确先后）：labels 3-6 个，按时间先后
+  cycle    = 循环 / 闭环（讲稿明确说了「循环 / 反复 / 又回到」）：labels 2-5 个，按循环顺序
+  tree     = 总分结构（一个总概念拆成几个子项）：labels 3-5 个，**第 1 个是根**，其余是子项
+  硬规则：
+  ① 一个元素最多带一个 sketch，**不许与 tex / chart 同时给**；整条视频里带 sketch
+     的元素不超过「总屏数 ÷ 3」—— 宁可少给，满屏都是图反而没人看
+  ② labels 里每个词都必须**在本屏元素或讲稿里原样出现过**，不得自创、不得凑数；
+     同一张图里不许出现两个相同的标签
+  ③ 每个 label ≤ 8 个字（黑板上是大字，长了装不下也看不清）
+  ④ 这一屏只是并列罗列、彼此没有步骤 / 对比 / 层次 / 两维 / 时间 / 循环 / 总分关系 → **不要给**
+  ⑤ 给了 sketch 时，t 写「这张图在讲什么」（4-18 字）：它会成为这一板的标题
+- seg：该元素应当在第几句讲稿被写上黑板（必须在所属镜头的句号范围内）
+
+板书特有的写法（与信息图版提示词的差别）：
+A. 【词条化】t 写**板书词条**，不写完整句：优先 2-10 字的关键词、短语或数字结论
+   （写「缓存穿透」，不写「缓存穿透是指查询一个不存在的数据」）——
+   黑板上一行写不下长句，观众也只会扫关键词。硬上限仍是 16 字
+B. 【口诀单列】讲稿里出现「三步」「两条」「一句话记住」这类结构化表述时，
+   把口诀本身单独写成一个元素（k 取 good）—— 它是这堂课最该被圈出来的东西
+C. 【数字留住】条目里有**度量数字**时（如「先校验 39 个」），数字必须留在 t 里 ——
+   板书会把一组数字递增的条目画成「阶梯」，数字会被放大写成台阶
+
+要求：
+1. 【一屏的容量】每屏 3-6 个元素，grid 最多 {max_group} 个 —— 这是**硬上限**：
+   一块黑板塞进十几个词条会糊成一团、谁也看不清。内容多就**多拆几屏**，不要往一屏里堆。
+2. 【全片总量】元素总数**不得少于 {point_count} 个**（这是**密度下限**，不是参考值）：
+   黑板上「写出来」的次数直接决定最长静止，数量不够会被质量闸门拦下、
+   **整条片子不允许渲染**。请按讲稿顺序铺开，平均每句约 {per_seg} 个；
+   长句（超过 30 字）给 2-4 个，短句至少 1 个。
+   ⚠️ 总量靠「更多屏」达成，**不是**靠「每屏更多元素」。
+3. 分布必须**铺满整条视频**，不许在开头一口气给完 ——
+   视频最后 20% 的时间里必须仍有元素待写
+4. 屏的时间顺序必须与讲稿一致：同一镜头里，后面那屏的 seg 只能更大，不许倒回去
+5. 每个镜头都要有元素，不许留空镜头
+6. 元素词条用讲稿里出现过的说法，不要自创新词
+7. concept / good / cost 三类都要在全片出现；「代价 / 边界 / 风险」要单独成元素，不要混进良方
+8. 不要编造讲稿里没有的内容
+9. 公式元素（带 tex 的）**每屏最多 1 个**，且 k 取 concept；只有讲稿真的在推公式才给，
+   一整条视频没有公式元素完全正常
+10. 数据图元素（带 chart 的）**每屏最多 1 个**，且 k 取 concept；只有讲稿真的给了
+    一组数字才给，一整条视频没有数据图元素完全正常；chart 与 tex 不要同时给一个元素
+11. 草图元素（带 sketch 的）：**有结构关系就给**（板书靠它出整板粉笔画，只给文字
+    就是一板干巴巴的词条），上限仍是「总屏数 ÷ 3」。判断标准是讲稿里**真的存在**步骤链 / 时间演进 /
+    两方取舍 / 层级递进 / 两维定位 / 循环往复 / 总分结构之一；**不许为了凑数硬造关系** —— 图上画出一条
     讲稿里没有的因果，比不画这张图糟得多。labels 必须是本屏元素或讲稿里原样出现
     的词，这条会被程序校验，编造的整张图会被丢弃""",
     "prompt_video_anchor": """你是一名信息检索助手。下面是一份视频讲稿（每行一句，行首是序号）。
@@ -1669,9 +1871,14 @@ def generate_video_points(script_text: str, seg_count: int,
        并把「上一次差多少」明确告诉模型（PRD 3.6.8 的「重试 1 次」策略，
        从"生成失败"扩展到"数量不足"；这里只重试、**不编造**任何元素）。
     ⚠️ `skin`：实际视觉方案（graph/graph_paper/graph_clean/ppt/board/motion），
-       **只用于记账 kind 的拆分**，不影响提示词与产出。
+       除记账 kind 拆分外，**board 会改用专属提示词** prompt_video_points_board；
+       其余皮肤行为不变（仍用共享版 prompt_video_points）。
     """
     kind = points_usage_kind(skin)
+    # 板书走专属提示词（词条化 / 口诀单列 / 更积极的 sketch）；其余皮肤仍用共享版。
+    # ⚠️ 新增提示词键必须登记 settings_store.FIELDS（漏登 = 设置页保存静默丢弃）。
+    pkey = "prompt_video_points_board" if (skin or "").strip() == "board" \
+        else "prompt_video_points"
     n = max(8, int(point_count or seg_count))
     segs = _split_point_lines(script_text, seg_count)
     shots = _valid_point_shots(shots, seg_count)
@@ -1680,7 +1887,8 @@ def generate_video_points(script_text: str, seg_count: int,
         # ---- 有分镜表：按镜头边界分批（绝不劈开镜头），模型按镜头出 title/layout ----
         batches = _point_batches(segs, shots)
         if len(batches) <= 1:
-            return _gen_points_single(script_text, seg_count, n, shots_table=shots, kind=kind)
+            return _gen_points_single(script_text, seg_count, n, shots_table=shots,
+                                      kind=kind, prompt_key=pkey)
         merged: list = []
         scenes_all: list = []
         title = ""
@@ -1693,7 +1901,8 @@ def generate_video_points(script_text: str, seg_count: int,
             local_table = [{"n": i, "a": sh["a"] - seg_cursor, "b": sh["b"] - seg_cursor}
                            for i, sh in enumerate(b_shots, 1)]
             sub = _gen_points_single(text, take, max(8, -(-n * take // len(segs))),
-                                     want_title=(not title), shots_table=local_table, kind=kind)
+                                     want_title=(not title), shots_table=local_table,
+                                     kind=kind, prompt_key=pkey)
             title = title or str(sub.get("title") or "")
             for e in sub.get("elements") or []:
                 try:
@@ -1748,7 +1957,7 @@ def generate_video_points(script_text: str, seg_count: int,
                 -(-n // POINT_CHUNK_EVENT_BUDGET),
                 -(-len(segs) // POINT_CHUNK_SEG_BUDGET))
     if k <= 1:
-        return _gen_points_single(script_text, seg_count, n, kind=kind)
+        return _gen_points_single(script_text, seg_count, n, kind=kind, prompt_key=pkey)
 
     # ⚠️ 分句失败（格式不符）时 `segs` 为 None → k 保持 1 → 走上面的单批路径，
     #    绝不因为「分不开」把原本能生成的情况弄坏。
@@ -1764,7 +1973,7 @@ def generate_video_points(script_text: str, seg_count: int,
         cursor += take
         text = "\n".join(f"{j}. {t}" for j, t in enumerate(part, 1))
         sub = _gen_points_single(text, len(part), max(8, -(-n // k)),
-                                 want_title=(not title), kind=kind)
+                                 want_title=(not title), kind=kind, prompt_key=pkey)
         title = title or str(sub.get("title") or "")
         for e in sub.get("elements") or []:
             try:
@@ -1871,11 +2080,13 @@ def _split_point_lines(script_text: str, seg_count: int) -> list | None:
 
 def _gen_points_single(script_text: str, seg_count: int, need: int,
                        want_title: bool = True, shots_table: list | None = None,
-                       kind: str = "video_points") -> dict:
+                       kind: str = "video_points",
+                       prompt_key: str = "prompt_video_points") -> dict:
     """**单批**结构图要点：讲稿 → {title, elements, scenes}。
 
     `generate_video_points` 分批后每一批都走这里，接口与旧实现等价。
     ⚠️ `kind`：记账用的业务场景（由 `points_usage_kind(skin)` 算出，按皮肤拆分）。
+    ⚠️ `prompt_key`：提示词键（板书 = prompt_video_points_board，其余 = 共享版）。
     ⚠️ 只让模型给「第几句」（seg），**绝对毫秒由后端按该句的 start_ms 算**：
        让模型写毫秒是必错的（它不知道 TTS 之后的真实时间轴）。
     ⚠️ `shots_table` 是批内分镜表 [{n,a,b}]（句号也是批内编号）；给了它，
@@ -1888,7 +2099,7 @@ def _gen_points_single(script_text: str, seg_count: int, need: int,
     """
     n = max(8, int(need or seg_count))
     per_seg = max(1, round(n / max(1, seg_count)))
-    prompt = (get_prompt("prompt_video_points")
+    prompt = (get_prompt(prompt_key)
               .replace("{seg_count}", str(seg_count))
               .replace("{point_count}", str(n))
               .replace("{per_seg}", str(per_seg))
@@ -2366,19 +2577,25 @@ def generate_drill_followup(context: str, question: str, expected_points: list,
         return None
 
 
-def judge_drill_answer(question: str, expected_points: list, user_answer: str) -> dict:
+def judge_drill_answer(question: str, expected_points: list, user_answer: str,
+                       material_excerpt: str = "") -> dict:
     """评分（结构化 JSON）。⚠️ 必须把**期望要点**一并喂入，否则模型只能凭感觉给分（PRD 3.5）。
 
     返回 {score, verdict, dimensions, comment, missing_points, followup}，已做边界钳制与兜底。
     ⚠️ 文案分流（A3）：评分阶段失败说「本题评分失败」，不复用题纲/出题阶段的「生成失败」。
+    ⚠️ material_excerpt（打磨 P1）：考点来源材料的片段。不给的话「正确性」这一维**没有任何
+       判据** —— 模型只能数「覆盖了几条期望要点」，于是「要点全中但事实说反」照样得高分。
+       拿不到来源材料时传空串，提示词已要求此时只判覆盖、不得武断判事实错误。
     """
     pts = "\n".join(f"- {p}" for p in (expected_points or [])) or "（未提供）"
+    src = (material_excerpt or "").strip()
+    src_block = f"【素材片段】\n{src}\n\n" if src else ""
 
     def _once() -> dict:
         raw = summary_chat([
             {"role": "system", "content": get_prompt("prompt_drill_judge")},
             {"role": "user", "content": f"【问题】{question}\n\n【期望要点】\n{pts}\n\n"
-                                        f"【学习者作答】\n{user_answer}"},
+                                        f"{src_block}【学习者作答】\n{user_answer}"},
         ], kind="drill_judge")
         obj = _parse_drill_json_object(raw, ("score", "verdict", "comment"),
                                        err_msg="本题评分失败，可稍后重试")

@@ -1,7 +1,7 @@
 """炼丹炉路由（2026-10-27）：应用 CRUD / 绑定增删 / AI 辅助（草稿+优化）/ 试聊预览。
 
 硬规则：
-- 创建与解绑都必须保住「至少 1 份资料」（空范围 = 拆掉知识边界，R3）
+- 创建与解绑都必须保住「资料+笔记合计 ≥ 1」（空范围 = 拆掉知识边界，R3）
 - preview/stream 为纯 LLM 代理 → SSE 生成器**刻意同步**（改 async = 卡死全服）；
   且不吃请求级 Depends(get_db)：检索与装配做完即关临时会话，流式期间不持有 DB
 """
@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..database import get_db, SessionLocal
-from ..models import App, AppMaterial, ChatSession
+from ..models import App, AppMaterial, AppNote, ChatSession
 from ..services import apps as apps_svc
 from ..services import llm
 
@@ -34,7 +34,9 @@ class AppUpsertReq(BaseModel):
     questions: list[str] = []
     model_id: str = ""
     suggest_on: bool = True
+    allow_out_of_scope: bool = False   # 允许回答资料外问题（默认关=知识边界锁定）
     material_ids: list[int] = []
+    note_ids: list[int] = []        # 显式绑定笔记（2026-10-30）：材料无关笔记的唯一入场券
 
 
 @router.get("")
@@ -46,22 +48,26 @@ def list_apps(db: Session = Depends(get_db)):
 @router.post("")
 def create_app(req: AppUpsertReq, db: Session = Depends(get_db)):
     ids = sorted(set(req.material_ids))
-    if not ids:
-        raise HTTPException(400, "至少选择 1 份资料才能开炉")          # R3
+    nids = sorted(set(req.note_ids))
+    if not ids and not nids:
+        raise HTTPException(400, "至少选择 1 份资料或 1 条笔记才能开炉")    # R3
     apps_svc.validate_fields(req.name, req.persona, req.spirit, req.questions,
                              boundaries=req.boundaries.strip(),
                              miss_text=req.miss_text.strip(),
                              welcome=req.welcome.strip())
     apps_svc.check_materials_ready(db, ids)
+    apps_svc.check_notes_exist(db, nids)
     app = App(name=req.name.strip(), spirit=apps_svc.normalize_spirit(req.spirit, req.name.strip()),
               persona=req.persona.strip(), boundaries=req.boundaries.strip(),
               miss_text=req.miss_text.strip(), welcome=req.welcome.strip(),
               questions=[str(q).strip() for q in req.questions if str(q).strip()][:3],
               model_id=(req.model_id or "").strip(), suggest_on=bool(req.suggest_on),
+              allow_out_of_scope=bool(req.allow_out_of_scope),
               status="active")
     db.add(app)
     db.flush()                                   # 先拿 id 再写绑定
     db.add_all([AppMaterial(app_id=app.id, material_id=mid) for mid in ids])
+    db.add_all([AppNote(app_id=app.id, note_id=nid) for nid in nids])
     db.commit()
     db.refresh(app)
     return apps_svc.app_to_dict(app, db)
@@ -101,6 +107,7 @@ def patch_app(app_id: int, req: AppUpsertReq, db: Session = Depends(get_db)):
     for k in ("boundaries", "miss_text", "welcome", "model_id"):
         if k in fields: incoming[k] = getattr(req, k).strip()
     if "suggest_on" in fields: incoming["suggest_on"] = bool(req.suggest_on)
+    if "allow_out_of_scope" in fields: incoming["allow_out_of_scope"] = bool(req.allow_out_of_scope)
     apps_svc.maybe_snapshot(db, app, incoming)
     for k in ("boundaries", "miss_text", "welcome", "model_id"):
         if k in fields:
@@ -115,13 +122,21 @@ def patch_app(app_id: int, req: AppUpsertReq, db: Session = Depends(get_db)):
         app.questions = new_questions
     if "suggest_on" in fields:
         app.suggest_on = bool(req.suggest_on)
-    if "material_ids" in fields:                 # 整体替换绑定（编辑页保存语义）
-        ids = sorted(set(req.material_ids))
-        if not ids:
-            raise HTTPException(400, "应用至少绑定 1 份资料")      # R3
+    if "allow_out_of_scope" in fields:
+        app.allow_out_of_scope = bool(req.allow_out_of_scope)
+    if "material_ids" in fields or "note_ids" in fields:   # 整体替换绑定（编辑页保存语义）
+        ids = sorted(set(req.material_ids)) if "material_ids" in fields \
+            else apps_svc.material_ids(db, app.id)
+        nids = sorted(set(req.note_ids)) if "note_ids" in fields \
+            else apps_svc.note_ids(db, app.id)
+        if not ids and not nids:
+            raise HTTPException(400, "应用至少绑定 1 份资料或 1 条笔记")      # R3
         apps_svc.check_materials_ready(db, ids)
+        apps_svc.check_notes_exist(db, nids)
         db.query(AppMaterial).filter(AppMaterial.app_id == app.id).delete(synchronize_session=False)
         db.add_all([AppMaterial(app_id=app.id, material_id=mid) for mid in ids])
+        db.query(AppNote).filter(AppNote.app_id == app.id).delete(synchronize_session=False)
+        db.add_all([AppNote(app_id=app.id, note_id=nid) for nid in nids])
         if app.status == "draft":                # 重新绑定 = 复活（资料被删会降级草稿态）
             app.status = "active"
     db.commit()
@@ -136,13 +151,13 @@ class AppMaterialsReq(BaseModel):
 
 @router.patch("/{app_id}/materials")
 def patch_app_materials(app_id: int, req: AppMaterialsReq, db: Session = Depends(get_db)):
-    """增量增删绑定。删到 0 → 400 回滚（最后一份不可移除，R3）。"""
+    """增量增删绑定。资料+笔记删到 0 → 400 回滚（最后一项不可移除，R3）。"""
     app = apps_svc.get_app_or_404(db, app_id)
     cur = set(apps_svc.material_ids(db, app_id))
     apps_svc.check_materials_ready(db, sorted(set(req.add)))
     new = (cur | set(req.add)) - set(req.remove)
-    if not new:
-        raise HTTPException(400, "应用至少绑定 1 份资料，最后一份不可移除")
+    if not new and not apps_svc.note_ids(db, app_id):
+        raise HTTPException(400, "应用至少绑定 1 份资料或 1 条笔记，最后一项不可移除")
     db.query(AppMaterial).filter(AppMaterial.app_id == app_id).delete(synchronize_session=False)
     db.add_all([AppMaterial(app_id=app_id, material_id=mid) for mid in sorted(new)])
     if app.status == "draft":                    # 同上：增量重绑也复活
@@ -212,7 +227,8 @@ def nudge(app_id: int, req: NudgeReq, db: Session = Depends(get_db)):
     app = apps_svc.get_app_or_404(db, app_id)
     # 2026-10-29 修：草稿态（0 绑定）应用不得主动搭话 —— 与对话入口 400 同口径，
     # 否则「待补料」的应用仍会白烧一次 LLM，且搭话内容没有资料可依。
-    if not apps_svc.material_ids(db, app.id) or app.status == "draft":
+    if app.status == "draft" or \
+            not (apps_svc.material_ids(db, app.id) or apps_svc.note_ids(db, app.id)):
         raise HTTPException(400, "应用的资料已失效，补料前不能主动搭话")
     if req.session_id:
         s = db.get(ChatSession, req.session_id)
@@ -233,6 +249,7 @@ def nudge(app_id: int, req: NudgeReq, db: Session = Depends(get_db)):
 class AssistReq(BaseModel):
     kind: str                      # draft / polish
     material_ids: list[int] = []   # draft 用
+    note_ids: list[int] = []       # draft 用（2026-10-30 笔记绑定：笔记内容一并喂给草稿）
     field: str = ""                # polish 用：persona / bounds
     text: str = ""                 # polish 用：当前文本
     name: str = ""                 # polish 用：应用名
@@ -241,7 +258,7 @@ class AssistReq(BaseModel):
 @router.post("/assist")
 def assist(req: AssistReq, db: Session = Depends(get_db)):
     if req.kind == "draft":
-        return apps_svc.assist_draft(db, sorted(set(req.material_ids)))
+        return apps_svc.assist_draft(db, sorted(set(req.material_ids)), sorted(set(req.note_ids)))
     if req.kind == "polish":
         return apps_svc.assist_polish(req.name, req.field, req.text)
     raise HTTPException(400, "kind 只支持 draft / polish")
@@ -254,7 +271,9 @@ class PreviewReq(BaseModel):
     persona: str = ""
     boundaries: str = ""
     miss_text: str = ""
+    allow_out_of_scope: bool = False   # 试聊与正式对话同口径（2026-11-02 资料外开关）
     material_ids: list[int] = []
+    note_ids: list[int] = []       # 试聊检索锁同吃笔记维度（2026-10-30）
     question: str
     model_id: str = ""             # ''=跟随全局问答模型
     # 多轮上下文（2026-10-29）：[{role:'user'|'assistant', content:str}]，只带最近 3 轮。

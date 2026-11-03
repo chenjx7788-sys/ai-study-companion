@@ -6,21 +6,18 @@
       <el-radio-button value="note">笔记</el-radio-button>
       <el-radio-button value="folder">文件夹</el-radio-button>
     </el-radio-group>
-    <!-- 指定条目：空 = 全部（问答）／空 = 无效（陪练，见 allow-empty-all） -->
+    <!-- 指定条目：空 = 全部（对话）／空 = 无效（陪练，见 allow-empty-all） -->
     <el-select v-if="scope === 'material'" v-model="materialIds" multiple filterable
-      collapse-tags collapse-tags-tooltip :max-collapse-tags="2"
       :placeholder="allowEmptyAll ? '全部资料（可点选指定）' : '选择资料（至少 1 项）'"
       size="small" class="scope-select">
       <el-option v-for="m in materialOptions" :key="m.id" :label="m.title" :value="m.id" />
     </el-select>
     <el-select v-if="scope === 'note'" v-model="noteIds" multiple filterable
-      collapse-tags collapse-tags-tooltip :max-collapse-tags="2"
       :placeholder="allowEmptyAll ? '全部笔记（可点选指定）' : '选择笔记（至少 1 项）'"
       size="small" class="scope-select">
       <el-option v-for="n in noteOptions" :key="n.id" :label="n.title" :value="n.id" />
     </el-select>
     <el-select v-if="scope === 'folder'" v-model="folderIds" multiple filterable
-      collapse-tags collapse-tags-tooltip :max-collapse-tags="2"
       placeholder="选择文件夹（含子文件夹）" size="small" class="scope-select">
       <el-option v-for="f in folderOptions" :key="f.id" :label="f.name" :value="f.id" />
     </el-select>
@@ -28,7 +25,7 @@
 </template>
 
 <script setup>
-// 检索范围选择器（AI 问答 / AI 陪练共用）
+// 检索范围选择器（AI 对话 / AI 陪练共用）
 // 研发方案 F1：从 ChatView.vue 抽取；模板与样式按原样搬移，只增属性、不改交互语义。
 //
 // ⚠️ 契约（两个调用方都必须遵守）：
@@ -38,8 +35,8 @@
 //   - v-model:folder-ids   —— 文件夹范围下点选的 id 数组
 //   - props.materialOptions / noteOptions / folderOptions 只读，由父组件按需加载。
 //
-// ⚠️ allow-empty-all 是两个调用方的**语义分水岭**（默认 true = 问答的既有行为）：
-//   - true （AI 问答）：空 = 「全部」。取消勾选后自动切回「整个知识库」——否则停留在
+// ⚠️ allow-empty-all 是两个调用方的**语义分水岭**（默认 true = 对话的既有行为）：
+//   - true （AI 对话）：空 = 「全部」。取消勾选后自动切回「整个知识库」——否则停留在
 //     「资料/笔记」范围，检索被收窄（资料范围只查原文、笔记范围只查笔记），无法全库回答。
 //   - false（AI 陪练）：空 = **范围无效**。PRD 3.1.7 明确规定「未勾选任何条目 → 禁用开始
 //     陪练 + 提示『请先选择要陪练的内容』」，**严禁退化为全库**（静默把范围放大到整个
@@ -92,7 +89,10 @@ watch(folderIds, (v) => {
   background: var(--asc-primary-soft) !important; color: var(--asc-primary) !important; font-weight: 600;
   box-shadow: none;
 }
-.scope-select { flex: 1; }
+/* ⚠️ min-width 必须给足（2026-11-02 实测）：父链是 shrink-to-fit 的 flex，
+   只写 flex:1 时「选 1 项 + 点空白收起下拉」会把选择器压到 38px、tag 只剩 10px
+   （条目名完全看不见，用户截图反馈）。220px 保底能放下一行条目名。 */
+.scope-select { flex: 1; min-width: 220px; }
 /* 选中的资料/笔记文件名标签：主题紫高亮 */
 .scope-select :deep(.el-tag) {
   color: var(--asc-primary); font-weight: 500;
@@ -115,4 +115,13 @@ watch(folderIds, (v) => {
   box-shadow: 0 0 0 1.5px rgba(124, 92, 252, .45);
 }
 .scope-select :deep(.el-select__placeholder) { color: var(--asc-text-3); }
+/* 多选 tag 区限高（2026-11-02 实测：选 8 项时工具栏被撑到 4 行 ~110px，右侧大片空白）。
+   限两行半（56px）内部纵滚 —— 露出第三行一截当「还有更多」的线索；
+   滚动条常显细条（overlay 滚动条不 hover 不可见，会被误认成截断） */
+.scope-select :deep(.el-select__selection) {
+  max-height: 56px; overflow-y: auto;
+  scrollbar-width: thin; scrollbar-color: #c9c9d4 transparent;
+}
+.scope-select :deep(.el-select__selection)::-webkit-scrollbar { width: 6px; }
+.scope-select :deep(.el-select__selection)::-webkit-scrollbar-thumb { background: #c9c9d4; border-radius: 3px; }
 </style>

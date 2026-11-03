@@ -42,7 +42,7 @@ STATE_KEYS = ("disabled", "imported")
 #    「每次规则没命中的发问都多 1–2s 延迟 + 一次 token」。开关在技能页可见可改。
 DEFAULT_SEMANTIC = False
 SEMANTIC_KIND = "skill_match"          # 记账用的业务场景名（log_usage）
-MAX_SEMANTIC_CANDIDATES = 12           # 与常驻上限一致：候选越多，prompt 越贵
+MAX_SEMANTIC_CANDIDATES = 13           # 单次语义路由的候选上限：13 个内置技能全部入池，候选越多 prompt 越贵
 MAX_ALTERNATIVES = 2                   # 建议卡上最多再列 2 个备选
 
 # ⚠️ 这段提示词正文里有花括号（JSON 示例）→ **绝不能**对它用 str.format（方案 §十二 风险 1）
@@ -74,20 +74,38 @@ ID_RE = re.compile(r"^[a-z][a-z0-9_]{2,39}$")
 
 # 与 routers/skills.py 里的固定路径同名的 id 一律拒绝：否则 `/api/skills/semantic`
 # 到底指"语义开关"还是"叫 semantic 的技能"，取决于路由声明顺序 —— 这是最难查的一类故障。
-RESERVED_IDS = frozenset({"semantic", "match", "import", "validate", "state"})
+RESERVED_IDS = frozenset({"semantic", "match", "import", "validate", "state", "usage"})
 FENCE_RE = re.compile(r"^```skill\s*\r?\n(.*?)\r?\n```\s*\r?\n", re.S)
 
 MAX_NAME = 20
 MAX_DESC = 120
 MAX_TRIGGERS = 8
 MAX_TRIGGER_LEN = 20
-MAX_INSTRUCTIONS = 2400
-MAX_RESIDENT = 12               # 常驻清单硬上限（每轮都要付 token，见方案 §六）
+# 指令长度的预算本质是 **token**（挂载后每轮都进 system prompt）。
+# 按字符卡会误杀英文技能包：英文 ≈4 字符/token、中文 ≈1.6 字符/token ——
+# 2026-10-26 起按估算 token 卡（用户拍板：2400 中文字 ≈ 1500 tokens 的口径放宽，
+# 换取「整包英文技能可导入」；同日再放宽到 6000——web-design 这类重型技能（22K 字符 ≈5.4K tokens）
+# 用户明确要原样导入。代价已知：挂载期间每轮多背这些 token，只能挂载 1 个的约束因此更重要）。
+MAX_INSTRUCTION_TOKENS = 6000
+MAX_RESIDENT = MAX_SEMANTIC_CANDIDATES
+# ⚠️ 历史字段名：当前没有「每轮注入技能清单」。resident 只表示**语义建议候选**，
+#    保留 MAX_RESIDENT / resident 字段是为了兼容既有 API 与前端，不再按字面叫常驻。
 MAX_PRIORITY = 99
 
 ALLOWED_KINDS = ("chat", "craft")
 ALLOWED_CITATION = ("required", "optional")
 SOURCE_BUILTIN, SOURCE_LOCAL, SOURCE_IMPORTED = "builtin", "local", "imported"
+
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]")
+
+
+def est_tokens(text: str) -> int:
+    """粗估 token 数：CJK/全角按 1.6 字符 = 1 token，ASCII 按 4 字符 = 1，其余按 2。
+    只用于预算校验（MAX_INSTRUCTION_TOKENS），不是精确 tokenizer。"""
+    cjk = len(_CJK_RE.findall(text))
+    ascii_ = sum(1 for ch in text if ord(ch) < 128)
+    other = len(text) - cjk - ascii_
+    return int(cjk / 1.6 + ascii_ / 4.0 + other / 2.0 + 0.999)
 
 
 class SkillInvalid(Exception):
@@ -280,8 +298,10 @@ def parse_skill_text(text: str, *, file_stem: str, builtin: bool, source: str,
 
     if not instructions:
         raise SkillInvalid("instructions 为空：围栏外必须写「怎么做这件事」的方法说明")
-    if len(instructions) > MAX_INSTRUCTIONS:
-        raise SkillInvalid(f"instructions 超过 {MAX_INSTRUCTIONS} 字上限（当前 {len(instructions)} 字）")
+    if est_tokens(instructions) > MAX_INSTRUCTION_TOKENS:
+        raise SkillInvalid(
+            f"方法说明超过预算：约 {est_tokens(instructions)} tokens（上限 {MAX_INSTRUCTION_TOKENS}，"
+            f"约合中文 9600 字 / 英文 24000 字符；当前 {len(instructions)} 字符），请先精简")
 
     return Skill(
         id=sid, name=name.strip(), icon=icon, kind=kind, description=desc.strip(),
@@ -404,12 +424,42 @@ def user_dir() -> Path:
 
 _lock = threading.Lock()
 _cache: dict | None = None
+_cache_fp: tuple | None = None
+
+
+def _snapshot() -> tuple:
+    """技能目录与状态文件的变更指纹。用户按页面指引手动放文件后，下一次列表必须看见。"""
+
+    def dir_sig(directory) -> tuple | None:
+        d = Path(directory)
+        if not d.is_dir():
+            return None
+        sig = []
+        for p in sorted(d.glob("*.skill.md")):
+            try:
+                st = p.stat()
+                sig.append((p.name, st.st_size, st.st_mtime_ns))
+            except OSError:
+                # 读不到元信息也不能假装目录没变；让本次按「不可缓存」签名继续扫描。
+                sig.append((p.name, -1, -1))
+        return tuple(sig)
+
+    sp = state_path()
+    try:
+        st = sp.stat()
+        state_sig = (st.st_size, st.st_mtime_ns)
+    except FileNotFoundError:
+        state_sig = None
+    except OSError:
+        state_sig = (-1, -1)
+    return (dir_sig(BUILTIN_DIR), dir_sig(user_dir()), state_sig)
 
 
 def invalidate() -> None:
-    global _cache
+    global _cache, _cache_fp
     with _lock:
         _cache = None
+        _cache_fp = None
 
 
 def _scan_dir(directory: Path, builtin: bool, rejected: list, st: dict | None = None) -> list[Skill]:
@@ -444,10 +494,15 @@ def _scan_dir(directory: Path, builtin: bool, rejected: list, st: dict | None = 
 
 
 def load_all(force: bool = False) -> dict:
-    """返回 {"skills": [Skill], "rejected": [...]}。内置优先于同名用户技能。"""
-    global _cache
+    """返回 {"skills": [Skill], "rejected": [...]}。内置优先于同名用户技能。
+
+    ⚠️ 缓存必须感知目录外部变化：官方使用路径之一就是「手动把 .skill.md 放进目录后刷新」。
+       只靠 invalidate() 会把这条路径变成「必须重启」，而且没有任何报错。
+    """
+    global _cache, _cache_fp
     with _lock:
-        if _cache is not None and not force:
+        fp = _snapshot()
+        if _cache is not None and _cache_fp == fp and not force:
             return _cache
 
         rejected: list = []
@@ -474,6 +529,7 @@ def load_all(force: bool = False) -> dict:
         # 排序：priority 降序 → id 升序（稳定、可断言）
         skills = sorted(merged.values(), key=lambda x: (-x.priority, x.id))
         _cache = {"skills": skills, "rejected": rejected}
+        _cache_fp = fp
         return _cache
 
 
@@ -486,13 +542,49 @@ def get_skill(skill_id: str) -> Skill | None:
     return None
 
 
+def usage_map() -> tuple[dict, str]:
+    """技能使用统计：`({skill_id: {"count": n, "last_at": "…Z"}}, error)`（P0-1 资产掌控）。
+
+    ⚠️ `last_at` 带 `Z` 后缀：库里存的是 `datetime.utcnow()`（naive UTC），
+       不带时区标记时前端 `new Date("…")` 会按**本地时间**解析，整体偏 8 小时。
+    ⚠️ 延迟导入 ORM：本模块是纯文件层，顶层导入 database/models 会把两条依赖链绑死。
+    ⚠️ 查不出来时返回**第二个值**而不是假装成功：表缺失（改了代码没重启）时若静默
+       返回 `{}`，界面上所有技能都显示「还没用过」—— 那是一个看起来完全正常的假数据。
+       宁可让接口带上 error，也不能让它安静地错。
+    """
+    from sqlalchemy import func
+
+    from ..database import SessionLocal
+    from ..models import SkillUse
+
+    db = None
+    try:
+        db = SessionLocal()
+        rows = (db.query(SkillUse.skill_id, func.count(SkillUse.id),
+                         func.max(SkillUse.created_at))
+                .group_by(SkillUse.skill_id).all())
+    except BaseException as e:            # noqa: BLE001 — 统计失败绝不外抛
+        return {}, f"使用记录暂不可读（{e.__class__.__name__}）：重启后端建表后可用"
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except BaseException:
+                pass
+    out: dict = {}
+    for sid, cnt, last in rows:
+        out[str(sid)] = {"count": int(cnt or 0),
+                         "last_at": (last.isoformat() + "Z") if last else ""}
+    return out, ""
+
+
 def list_public(limit: int = MAX_RESIDENT) -> tuple[list[dict], int]:
     """列表（不含 instructions）。返回 (items, truncated)。
 
     ⚠️ items 里**包含已停用的技能**（带 `enabled=false`）：只返回启用的话，用户一关掉
        就再也看不到它，等于给自己制造了一个无法回滚的开关。
-    ⚠️ `limit` 才是硬上限（每轮都要付 token，超了没人报错、只是悄悄变贵），
-       它管的是「常驻清单」而不是列表长度 → 每条附 `resident` 标出是否进了常驻。
+    ⚠️ `limit` 是语义路由的候选上限（候选越多，单次 match 的 prompt 越贵），
+       不是列表长度 → 每条附历史字段 `resident` 标出是否进入语义建议候选。
     """
     all_skills = load_all()["skills"]
     enabled = [s for s in all_skills if s.enabled]
@@ -556,7 +648,7 @@ def _parse_pick(raw: str, valid: set[str]) -> str | None:
 
 
 def _semantic_pick(question: str, cands: list[Skill]) -> tuple[str | None, str | None]:
-    """让问答模型从候选里挑一个。返回 (id 或 None, 失败原因 或 None)。
+    """让对话模型从候选里挑一个。返回 (id 或 None, 失败原因 或 None)。
 
     ⚠️ 任何异常都降级为「没有建议」：语义预判是**可选增强**，不能因为「模型没配置」
        让用户连发问都发不出去；更不能用随机/高分兜底（那就是硬塞）。
@@ -888,3 +980,80 @@ def export_text(sid: str) -> tuple[str, str]:
     text = raw.decode("utf-8", errors="replace").lstrip("\ufeff")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     return s.id + ".skill.md", text
+
+
+# ---------------------------------------------------------------- 外部技能包（P6）
+
+_FM_RE = re.compile(r"\A\s*---\s*\n(.*?)\n---\s*\n?", re.S)
+
+
+def _slug_to_id(slug: str) -> str:
+    """外部技能名 → 本系统 id：连字符转下划线、只留小写/数字/下划线、字母开头、3–40 位。"""
+    s = re.sub(r"[^a-z0-9_]", "_", (slug or "").lower().replace("-", "_"))
+    s = re.sub(r"_+", "_", s).strip("_")
+    if not s or not s[0].isalpha():
+        s = "skill_" + s
+    s = s[:40].rstrip("_")
+    return s if len(s) >= 3 else (s + "_x")[:40]
+
+
+def external_to_skill_text(text: str, *, fallback_name: str = "") -> str:
+    """把外部技能文件转成本系统 .skill.md 文本。
+
+    两类输入：
+    - 已是本系统格式（```skill 围栏）→ 原样返回（走原有校验/落盘链）；
+    - Claude 系 SKILL.md（YAML frontmatter + Markdown 正文）→ 转 manifest + 正文照搬。
+
+    ⚠️ 触发词**不用 LLM 生成**（v1 拍板：机械生成中文触发词是噪音）。
+    但 chat 技能的硬约束是「必须有 triggers」，所以放一条**技能名原文**（真实、不造假：
+    用户打出技能名就能匹配到；且导入的技能本就不参与自动建议，这条只是满足格式）。
+    ⚠️ 正文**照搬不改写**：翻译/压缩是创作行为，不能在导入时静默发生。
+    """
+    text = (text or "").lstrip("﻿")
+    if FENCE_RE.match(text):
+        return text
+    m = _FM_RE.match(text)
+    if not m:
+        raise SkillInvalid("既不是本系统技能格式（```skill 围栏），也不是带 YAML frontmatter 的 SKILL.md")
+    fm: dict[str, str] = {}
+    lines = m.group(1).splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # 只取顶层 key: value（缩进行是多行/嵌套内容）
+        if ":" in line and not line.startswith((" ", "\t")):
+            k, _, v = line.partition(":")
+            k, v = k.strip(), v.strip()
+            if v.startswith(("|", ">")):
+                # YAML 块标量（`description: |` 后接缩进多行）：后续缩进行都是值
+                block = []
+                i += 1
+                while i < len(lines) and (lines[i].startswith((" ", "\t")) or not lines[i].strip()):
+                    block.append(lines[i].strip())
+                    i += 1
+                fm[k] = " ".join(x for x in block if x).strip()
+                continue
+            fm[k] = v.strip('"').strip("'")
+        i += 1
+    body = text[m.end():].strip()
+    if not body:
+        raise SkillInvalid("frontmatter 之后没有正文（方法说明为空）")
+    name = (fm.get("name") or fallback_name or "imported_skill").strip()
+    desc = (fm.get("description") or "").strip() or f"从外部技能包导入：{name}"
+    # 显示名：连字符转空格；超长按词边界截（「prioritization matri」这种断词太丑）
+    name_disp = name.replace("-", " ").strip()
+    if len(name_disp) > MAX_NAME:
+        name_disp = (name_disp[:MAX_NAME].rsplit(" ", 1)[0] or name_disp[:MAX_NAME]).strip()
+    man = {
+        "schema_version": 1,
+        "id": _slug_to_id(name),
+        "name": name_disp,
+        "icon": "skill",
+        "kind": "chat",
+        "description": desc[:MAX_DESC],
+        # 触发词 = 技能名原文（只保留单词字符/中文/空格，天然无正则元字符，不需要 escape）
+        "triggers": [re.sub(r"[^\w一-鿿 ]", "", name_disp).strip()[:MAX_TRIGGER_LEN] or "skill"],
+        "priority": 10,
+        "citation": "optional",
+    }
+    return render_skill(man, body)

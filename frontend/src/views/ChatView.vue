@@ -71,7 +71,7 @@
           <!-- 已配置：正常空态 -->
           <template v-else>
             <h1 class="greet-title">你好，我是伴伴</h1>
-            <p class="greet-sub">你的 AI 学习搭子 · 向知识库提问，我来帮你答疑解惑</p>
+            <p class="greet-sub">你的 AI 学习搭子 · 有问题，随便问，我来帮你答疑解惑</p>
             <div class="example-list">
               <div class="example-q" v-for="q in examples" :key="q" @click="askSuggestion(q)">
                 <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
@@ -182,14 +182,62 @@
               </div>
               <div v-else class="md-body" v-html="renderAnswer(m)" @click="onMdClick(m, $event)"></div>
               <span v-if="m._streaming" class="cursor">▍</span>
+              <!-- 库内相关资源（找内容）：正文之后单独成区，点开即读 / 看 / 听 -->
+              <div v-if="!m._streaming && m.resources?.length" class="res-block">
+                <div class="res-label">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor"
+                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                    <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+                  </svg>
+                  资料库里找到 {{ m.resources.length }} 项
+                </div>
+                <div class="res-list">
+                  <div v-for="(r, ri) in m.resources" :key="ri" class="res-card"
+                    :class="'k-' + r.kind" @click="openResource(r)">
+                    <span class="res-badge">{{ r.badge }}</span>
+                    <span class="res-title">{{ r.title }}</span>
+                    <span v-if="r.meta" class="res-meta">{{ r.meta }}</span>
+                    <!-- 闭环：材料卡直接给动作，省得跳过去再自己找按钮（@click.stop：点按钮不触发整卡跳转） -->
+                    <span v-if="r.kind === 'material'" class="res-acts" @click.stop>
+                      <button type="button" class="res-act" title="打开讲义并开始生成"
+                        @click="openResource(r, 'simplelearn')">讲义</button>
+                      <button type="button" class="res-act" title="打开测一测并开始出题"
+                        @click="openResource(r, 'quiz')">出题</button>
+                    </span>
+                    <svg class="res-arrow" viewBox="0 0 24 24" width="13" height="13" fill="none"
+                      stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M9 18l6-6-6-6"/>
+                    </svg>
+                  </div>
+                </div>
+              </div>
+              <!-- 库外推荐：正文里只有书名、没有可点的东西 → 给一条真动作，
+                   把这个主题变成材料库里的导读（可读 / 出讲义 / 出题），推荐才落到地面上 -->
+              <div v-if="!m._streaming && m.answer_kind === 'discover_miss'" class="brief-cta">
+                <div class="brief-cta-body">
+                  <div class="brief-cta-title">就这个主题，先来一份入门导读</div>
+                  <div class="brief-cta-sub">
+                    AI 会写一份「大致讲什么 · 怎么入门 · 常见卡点」的导读存进材料库，之后能读、能出讲义、能出题
+                    <span class="brief-cta-note">（AI 生成 · 非原书内容）</span>
+                  </div>
+                </div>
+                <el-button size="small" type="primary" plain :loading="!!m._briefBusy"
+                  @click="createBrief(m, i)">
+                  {{ m._briefBusy ? '正在生成…' : '生成导读' }}
+                </el-button>
+              </div>
               <!-- 相关问题推荐（回答后生成，点击直接发问） -->
               <div v-if="!m._streaming && m.suggestions?.length" class="suggestions">
                 <div class="suggestions-label">继续问</div>
                 <div v-for="(q, i) in m.suggestions" :key="i" class="suggestion-chip"
                   @click="askSuggestion(q)">{{ q }}</div>
               </div>
-              <!-- 引用来源（折叠为标识，点击展开） -->
-              <div v-if="m.sources?.length" class="sources">
+              <!-- 引用来源（折叠为标识，点击展开）。
+                   ⚠️ !m._streaming：sources 事件在 token 之前就下发，不加闸的话回答还在吐字、
+                   引用区就挂在气泡下面（炼丹炉 2026-10-30 已修同款「显示太提前」）。
+                   流式期间点正文 [n] 角标不受影响——弹气泡走 citePop，不依赖这块 DOM。 -->
+              <div v-if="!m._streaming && m.sources?.length" class="sources">
                 <div class="sources-toggle" @click="toggleSources(m)">
                   <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor"
                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -217,8 +265,16 @@
                   </div>
                 </div>
               </div>
-              <!-- 回答底部操作：转笔记 + 复制全部内容 -->
+              <!-- 回答底部操作：重新生成（仅最后一条）+ 转笔记 + 转文档 + 复制 -->
               <div v-if="!m._streaming && m.content" class="answer-actions">
+                <span v-if="!m.error && isLastAssistant(m)" class="msg-op"
+                  title="用同一个问题重新生成（旧回答不保留）" @click="regenerate(m)">
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor"
+                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>
+                  </svg>
+                  重新生成
+                </span>
                 <span class="msg-op" :class="{ done: m._savedNote }"
                   :title="m._savedNote ? '在知识库中查看 / 编辑该笔记' : '标题 = 你的问题 · 内容 = 本回答'"
                   @click="m._savedNote ? viewChatNote(m) : saveAnswerToNote(m, i)">
@@ -231,6 +287,20 @@
                     <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>
                   </svg>
                   {{ m._savedNote ? '✓ 已转存 · 查看' : '转笔记' }}
+                </span>
+                <span class="msg-op" :class="{ done: m._savedDoc }"
+                  :title="m._savedDoc ? '在编辑器里打开这份文档（标题可改）'
+                    : '把本回答存成一份文档：进材料库，可阅读 / 出讲义 / 出题 / 做视频，知识库也能检索'"
+                  @click="m._savedDoc ? openSavedDoc(m) : saveAnswerToDoc(m, i)">
+                  <svg v-if="!m._savedDoc" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor"
+                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/>
+                  </svg>
+                  <svg v-else viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor"
+                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>
+                  </svg>
+                  {{ m._savedDoc ? '✓ 已存文档 · 查看' : '转文档' }}
                 </span>
                 <span class="msg-op" :class="{ done: m._copied }" @click="copyAnswer(m)">
                   <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor"
@@ -310,16 +380,16 @@
           <!-- 语义判断中：延迟 250ms 才出现（规则命中 <5ms，不该闪一下） -->
           <div v-if="matching" class="sk-matching">正在看这问题适合用哪个技能…</div>
 
-          <!-- P1 已加载技能：让用户知道本轮回答被哪个方法影响，可随时卸载 -->
+          <!-- P1 已加载技能：让用户知道本轮回答被哪个方法影响，可随时移除 -->
           <div v-if="mountedSkill" class="skill-bar">
             <span class="skill-bar-ic">{{ iconOf(mountedSkill.id) }}</span>
             <span class="skill-bar-tx">已加载技能 <b>{{ mountedSkill.name }}</b></span>
             <span class="skill-bar-hint">· 本轮及后续提问按这个方法回答</span>
-            <span class="skill-bar-x" title="卸载技能" @click="unmountSkill">卸载</span>
+            <span class="skill-bar-x" title="移除技能" @click="unmountSkill">移除</span>
           </div>
           <div class="composer-row">
-            <el-input v-model="question" type="textarea" :rows="2" resize="none"
-              :placeholder="scopePlaceholder" @keydown.enter.exact.prevent="send" />
+            <el-input ref="inputRef" v-model="question" type="textarea" :rows="2" resize="none"
+              :placeholder="scopePlaceholder" @keydown.enter.exact="onEnterSend" />
             <el-button v-if="asking" type="danger" class="send-btn" circle plain
               title="停止生成" @click="stopAsk">
               <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
@@ -357,13 +427,17 @@
             </el-popover>
             <el-select v-model="reasoningEffort" size="small"
               class="reason-select" title="推理模式（默认快速）">
-              <el-option label="关闭" value="" />
+              <!-- EP isEmptyValue 视 '' 为空 → value="" 的选项永远选不中，显示回落成 placeholder。
+                 哨兵 off 在发请求时映射回 null（reasoning_effort 的「关闭」语义）。 -->
+              <el-option label="关闭" value="off" />
               <el-option label="快速" value="low" />
               <el-option label="标准" value="high" />
               <el-option label="深度" value="max" />
             </el-select>
             <el-select v-if="chatModels.length" v-model="selectedModelId" size="small"
               class="model-select" title="切换模型">
+              <!-- 不选具体模型 = 跟随管理中心的对话模型；哨兵 default 在载荷里映射回 null -->
+              <el-option label="跟随对话模型（管理中心）" value="default" />
               <el-option v-for="m in chatModels" :key="m.id" :label="`${m.name}（${m.model}）`" :value="m.id" />
             </el-select>
           </div>
@@ -372,14 +446,14 @@
       </div>
     </main>
 
-    <!-- 问答笔记查看/编辑弹窗（当前页打开，不跳知识库） -->
+    <!-- 对话笔记查看/编辑弹窗（当前页打开，不跳知识库） -->
     <el-dialog v-model="noteDlg.show" width="640px" class="chat-note-dialog"
       :close-on-click-modal="false">
       <template #header>
         <div class="cnd-head">
-          <span class="cnd-title">问答笔记</span>
-          <span class="cnd-tag">问答笔记</span>
-          <span class="cnd-sub">来自 AI 问答<template v-if="noteDlg.createdAt"> · {{ (noteDlg.createdAt || '').slice(0, 10) }}</template></span>
+          <span class="cnd-title">对话笔记</span>
+          <span class="cnd-tag">对话笔记</span>
+          <span class="cnd-sub">来自 AI 对话<template v-if="noteDlg.createdAt"> · {{ (noteDlg.createdAt || '').slice(0, 10) }}</template></span>
         </div>
       </template>
 
@@ -508,10 +582,12 @@ import { useRouter, useRoute } from 'vue-router'
 import mascot from '../assets/mascot.png'
 import { ElMessage, ElNotification, ElMessageBox } from 'element-plus'
 import { createMd, renderMd as renderMdSafe } from '../utils/md'
-import { chatApi, materialApi, kbApi, settingsApi, foldersApi, noteApi, reviewApi, skillApi } from '../api'
+import { skillIconText } from '../utils/skillIcon'
+import { chatApi, materialApi, kbApi, settingsApi, foldersApi, noteApi, reviewApi, skillApi, resourceApi } from '../api'
 import http, { errMsg } from '../api/http'
 // SSE 统一走共享 util（此前内联副本硬编码 127.0.0.1:8000，换端口即静默失效）
 import { streamSSE } from '../utils/sse'
+import { enterToSend } from '../utils/keys'
 import ScopePicker from '../components/ScopePicker.vue'
 
 const md = createMd({ breaks: true })
@@ -613,11 +689,11 @@ const selectedMaterialIds = ref([])
 const selectedNoteIds = ref([])
 const selectedFolderIds = ref([])
 const sessionSearch = ref('')
-// 模型切换：从配置的模型列表选，默认用问答模型
+// 模型切换：从配置的模型列表选，默认用对话模型
 const chatModels = ref([])
-const selectedModelId = ref('')
+const selectedModelId = ref('default')   // default = 跟随管理中心的对话模型（载荷映射回 null）
 const configured = ref(true)   // 是否已配置 LLM 模型：未配置时空态给「配置引导」，默认 true 避免首屏闪烁
-const reasoningEffort = ref('low')   // 推理：默认快速（low），''=关闭，high/max=更强
+const reasoningEffort = ref('low')   // 推理：默认快速（low）；off=关闭（载荷映射回 null），high/max=更强
 
 // 相对时间：无时区 ISO 视为 UTC（后端 datetime.utcnow）
 function relTime(iso) {
@@ -667,11 +743,12 @@ const groupedSessions = computed(() => {
 })
 
 // ⚠️「取消所有引用后自动切回整个知识库」的 watch 已随范围选择器一起移入
-//    components/ScopePicker.vue（F1）——问答 / 陪练共用同一份交互规则。
+//    components/ScopePicker.vue（F1）——对话 / 陪练共用同一份交互规则。
 const materialOptions = ref([])
 const noteOptions = ref([])
 const folderOptions = ref([])
 const msgAreaRef = ref(null)
+const inputRef = ref(null)          // 对话框（技能库「去试试」进来时直接聚焦）
 
 const scopePlaceholder = computed(() => {
   if (askMode.value === 'general') return '通用模式：不查知识库，由大模型直接回答…'
@@ -684,7 +761,9 @@ const scopePlaceholder = computed(() => {
   })[scope.value]
 })
 
-const examples = ['用户价值公式怎么理解？', '需求管理的流程包含哪些环节？', 'RICE 模型怎么用？']
+// 空态示例问题（2026-11-02 通用化）：原来是产品经理领域题（用户价值公式/RICE），
+// 换成不挑领域的能力示范 —— 库内容发现 / 通俗讲解 / 要点整理
+const examples = ['我的知识库里有哪些内容？', '帮我把一个陌生概念讲得通俗一点', '整理一下我最近导入资料的重点']
 
 // 口径提示条文案（三档问答）：answer_kind 为空 = 旧数据，按 kb_hit 回落到原灰条逻辑
 function missBarText(m) {
@@ -692,6 +771,9 @@ function missBarText(m) {
   if (m.answer_kind === 'kb') return ''
   if (m.answer_kind === 'general') return '通用回答（未查询知识库）'
   if (m.answer_kind === 'kb_miss') return '知识库中未找到相关内容'
+  // 找内容（2026-10-26）：有库内资源时不挂提示条；没有才说明，并带「建议核实」
+  if (m.answer_kind === 'discover') return ''
+  if (m.answer_kind === 'discover_miss') return '资料库里没有相关内容，以下是推荐（建议核实）'
   if (m.answer_kind === 'general_fallback') return '知识库中未找到相关内容，以下为通用回答'
   return m.kb_hit ? '' : '知识库中未找到相关内容，以下为通用回答'
 }
@@ -703,6 +785,7 @@ async function loadSessions() {
 
 async function openSession(id) {
   abortCtrl?.abort()          // 切换会话时中断进行中的流（后端检测断连落库半截回答）
+  matchCtrl?.abort()          // 预检是可选增强，取消后绝不能降级成「把问题发到新会话」
   asking.value = false
   currentId.value = id
   restoreSkillState(id)        // 每个会话各自记住挂了哪个技能
@@ -714,6 +797,24 @@ async function openSession(id) {
     _tools: (m.tool_steps || []).map(s => ({ ...s, done: true, ok: !!s.ok })),
   }))
   scrollBottom(true)
+  restoreChatDocs(id)   // 恢复「已存文档」按钮态（不 await：不影响正文显示）
+}
+
+// 把本会话已转成文档的回答标回「✓ 已存文档」
+async function restoreChatDocs(sid) {
+  if (!sid) return
+  try {
+    const { data } = await materialApi.chatDocs(sid)
+    const map = {}
+    const list = data.items || []
+    list.forEach((it) => { map[it.message_id] = it })
+    messages.value.forEach((m) => {
+      const hit = map[m.id]
+      if (hit) { m._savedDoc = true; m._savedDocId = hit.material_id }
+    })
+  } catch (e) {
+    // 恢复失败不影响主流程（按钮退回「转文档」，再点也只会命中后端幂等）
+  }
 }
 
 function toggleReasoning(m) {
@@ -872,6 +973,119 @@ async function undoChatNote(s) {
   }
 }
 
+// AI 回答转文档（2026-10-26）：写成一份 .md 材料 → 进材料库，后台解析后自动建知识库索引。
+// 与「转笔记」的分工：笔记只能在知识库里看正文；文档是可打开阅读、能出讲义 / 出题 / 做视频的资产。
+async function saveAnswerToDoc(m, i) {
+  if (asking.value || m._savedDoc || m._savingDoc) return
+  const content = (m.content || '').trim()
+  if (!content) return
+  m._savingDoc = true
+  try {
+    const payload = {
+      title: docTitleFor(m, i),
+      content: content + docSourceAppendix(m),
+      origin: 'chat',
+      // 幂等键 = 会话 + 消息 id（后端按它认领）。流式中断的回答没有 id → 传空，退化为不幂等但仍可保存。
+      origin_ref: (currentId.value && m.id) ? `chat:${currentId.value}:${m.id}` : '',
+      origin_meta: {
+        saved_from: 'chat',
+        session_id: currentId.value || null,
+        message_id: m.id || null,
+        question: questionOf(m, i).slice(0, 200),
+      },
+    }
+    const { data } = await materialApi.createDocument(payload)
+    m._savedDocId = data.id
+    m._savedDoc = true
+    if (data.duplicated) ElMessage.info('这条回答此前已转过文档')
+    else if (data.parsed_status === 'parsing') ElMessage.success('已存到材料库，正在后台解析并建索引')
+    else ElMessage.success('已存到材料库，知识库也能检索到了')
+  } catch (e) {
+    ElMessage.error(errMsg(e, '转文档失败'))
+  } finally {
+    m._savingDoc = false
+  }
+}
+
+function openSavedDoc(m) {
+  if (m._savedDocId) router.push(`/editor/${m._savedDocId}`)
+}
+
+// 该回答对应的最近一条用户提问（转笔记 / 转文档共用口径）
+function questionOf(m, i) {
+  for (let j = i - 1; j >= 0; j--) {
+    const prev = messages.value[j]
+    if (prev && prev.role === 'user') return (prev.content || '').trim()
+  }
+  return ''
+}
+
+// 文档标题（会成为文件名与材料库里的名字）：优先回答里的一级/二级标题，其次你的问题，最后截正文
+function docTitleFor(m, i) {
+  const content = (m.content || '').trim()
+  const head = content.split('\n').map(s => s.trim()).find(s => /^#{1,3}\s+\S/.test(s))
+  let t = head ? head.replace(/^#{1,3}\s+/, '') : ''
+  t = t.replace(/[*`>_]/g, '').trim()
+  if (!t) t = questionOf(m, i).replace(/[*`>_#]/g, ' ').trim()
+  if (!t) t = content.replace(/[*`>_#\n]/g, ' ').trim()
+  return (t.slice(0, 60) || 'AI 回答')
+}
+
+// 打开库内资源卡片：route 由后端按类型给（材料 /study/:id、视频 /video/:id、
+// 讲书 /podcast、笔记 /knowledge），前端不自己拼 —— 拼错就是点了没反应。
+// action 有值 = 材料卡的直达动作（讲义 / 出题）：带 tab 与 auto=1 过去，
+// 落地页据此切到目标面板、并在还没有内容时直接开始生成。
+// 不带 auto，用户点「出题」还得在目标页再点一次「生成测试题」—— 那这个动作就是装饰。
+function openResource(r, action) {
+  if (!r || !r.route) return
+  if (action && r.kind === 'material') {
+    router.push({ path: r.route, query: { tab: action, auto: '1' } })
+    return
+  }
+  // 讲书：早期落库的卡片 route 只有 "/podcast"（没带作品 id）→ 点进去只到列表页，
+  // 用户还得自己找。这里按 id 兜底补 ?p=，新数据由后端直接给 "/podcast?p=<id>"。
+  if (r.kind === 'podcast' && r.id && r.route.indexOf('?') < 0) {
+    router.push({ path: r.route, query: { p: r.id } })
+    return
+  }
+  router.push(r.route)
+}
+
+// 库外主题 → 入门导读入库：一次 LLM 调用约 20-40s，幂等键在后端（同主题只生成一份），
+// 所以这里只管 loading 与跳转；生成完直接进学习页读它。
+async function createBrief(m, i) {
+  if (m._briefBusy) return
+  m._briefBusy = true
+  try {
+    const q = questionOf(m, i) || (m.content || '').slice(0, 60) || '学习'
+    const { data } = await resourceApi.brief(q)
+    ElMessage.success(data.duplicated
+      ? '已有一份同主题的导读，直接打开'
+      : '导读已存进材料库，可以读 / 出讲义 / 出题')
+    router.push('/study/' + data.id)
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '生成失败，请稍后重试')
+  } finally {
+    m._briefBusy = false
+  }
+}
+
+// 文末附参考来源（有引用才加）：文档是长期资产，出处要跟着走
+function docSourceAppendix(m) {
+  const list = m.sources || []
+  const seen = new Set()
+  const rows = []
+  list.forEach((s) => {
+    if (!s || !s.title) return
+    const k = s.title + '|' + (s.page_no || '')
+    if (seen.has(k)) return
+    seen.add(k)
+    rows.push('- ' + s.title + (s.page_no ? '（第 ' + s.page_no + ' 页）' : ''))
+  })
+  if (!rows.length) return ''
+  return '\n\n---\n\n> 参考来源（AI 生成本文时引用）\n>\n' + rows.map(r => '> ' + r).join('\n')
+}
+
 async function saveAnswerToNote(m, i) {
   // 防连点：请求发出后置 busy，避免两次并发同时通过幂等检查建出重复笔记
   if (asking.value || m._savedNote || m._savingNote) return
@@ -898,7 +1112,7 @@ async function saveAnswerToNote(m, i) {
       if (data.note?.reindex_warning) ElMessage.warning(data.note.reindex_warning)
       else ElMessage.success('已转存到知识库笔记')
     } else {
-      ElMessage.info('该问答此前已转存过')
+      ElMessage.info('该对话此前已转存过')
     }
   } catch (e) {
     ElMessage.error(errMsg(e, '转笔记失败'))
@@ -907,7 +1121,7 @@ async function saveAnswerToNote(m, i) {
   }
 }
 
-// 查看已转存的问答笔记：当前页弹窗查看/编辑（不跳知识库）
+// 查看已转存的对话笔记：当前页弹窗查看/编辑（不跳知识库）
 async function viewChatNote(m) {
   if (!m._savedNoteId) return
   noteDlg.sourceMsg = m
@@ -928,7 +1142,7 @@ async function viewChatNote(m) {
   }
 }
 
-// ---------- 问答笔记弹窗：保存 / 删除 / 出复习卡 ----------
+// ---------- 对话笔记弹窗：保存 / 删除 / 出复习卡 ----------
 async function saveNoteDlg() {
   if (!noteDlg.id) return
   noteDlg.saving = true
@@ -1109,13 +1323,13 @@ const pendingSkill = ref(null)        // 首问时 session_id 还没有 → 先�
 const suggest = ref(null)             // {id, name, why, question}
 const matching = ref(false)          // 语义判断中（延迟显示，避免规则命中时闪一下）
 let matchTimer = null                // 上面那个延迟的定时器
+let matchCtrl = null                 // 技能预检请求（切会话/离开页面时取消，且取消后不许继续发问）
 const suggestOff = ref(false)         // 本会话不再提示
 const suggestOffPending = ref(false)  // 同上：首问的时序兜底
 const skillPickerOpen = ref(false)
 
 const SKILL_MAP_KEY = 'asc_chat_skill_map'    // { sessionId: {id,name} }
 const SKILL_OFF_KEY = 'asc_chat_skill_off'    // { sessionId: true }
-const SKILL_ICON = { term: '译', argue: '证', law: '法' }
 
 function _lsObj(key) {
   try { return JSON.parse(localStorage.getItem(key) || '{}') || {} } catch { return {} }
@@ -1126,7 +1340,7 @@ function _lsPut(key, obj) {
 
 function iconOf(id) {
   const s = chatSkills.value.find(x => x.id === id)
-  return SKILL_ICON[s?.icon] || '技'
+  return skillIconText(s?.icon)
 }
 
 async function loadChatSkills() {
@@ -1243,6 +1457,10 @@ function cancelSuggest() {
 
 let abortCtrl = null   // 流式请求的中断控制器（停止按钮 / 切会话 / 组件卸载）
 
+// ⚠️ 回车发送统一入口（2026-10-29）：原先 `.enter.exact.prevent` 在中文选词回车时
+//    会 preventDefault（候选词上不了屏）并直接发送半句。判定见 utils/keys.js。
+const onEnterSend = enterToSend(send)
+
 async function send() {
   const q = question.value.trim()
   if (!q || asking.value) return
@@ -1254,9 +1472,11 @@ async function send() {
   }
   // 先问一次建议：规则命中 <5ms；语义开关开着且规则没命中时，会多等一次模型调用。
   // 「正在判断」提示延迟 250ms 才出 —— 正常路径（规则命中）不该闪一下。
+  matchCtrl = new AbortController()
+  let matchCancelled = false
   matchTimer = setTimeout(() => { matching.value = true }, 250)
   try {
-    const { data } = await skillApi.match(q, scope.value)
+    const { data } = await skillApi.match(q, scope.value, { signal: matchCtrl.signal })
     if (data && data.suggest) {
       suggest.value = {
         ...data.suggest,
@@ -1269,10 +1489,15 @@ async function send() {
       nextTick(() => scrollBottom())
       return
     }
-  } catch { /* 匹配失败按普通问答走 */ } finally {
+  } catch {
+    // 超时/接口失败按普通对话走；但外部主动取消（切会话/离开页面）必须停住。
+    matchCancelled = !!matchCtrl?.signal.aborted
+  } finally {
     clearTimeout(matchTimer)
     matching.value = false
+    matchCtrl = null
   }
+  if (matchCancelled) return
   return doSend(q, null)
 }
 
@@ -1282,7 +1507,7 @@ async function doSend(q, skillId) {
 
   const userMsg = { _tmp: 'u' + Date.now(), role: 'user', content: q }
   messages.value.push(userMsg)
-  const aiMsg = reactive({ _tmp: 'a' + Date.now(), role: 'assistant', content: '', _reasoning: '', _showReasoning: false, kb_hit: true, answer_kind: '', sources: [], suggestions: [], _streaming: true, error: '', _tools: [] })
+  const aiMsg = reactive({ _tmp: 'a' + Date.now(), role: 'assistant', content: '', _reasoning: '', _showReasoning: false, kb_hit: true, answer_kind: '', sources: [], resources: [], suggestions: [], _streaming: true, error: '', _tools: [] })
   messages.value.push(aiMsg)
   scrollBottom(true)
 
@@ -1301,8 +1526,8 @@ async function doSend(q, skillId) {
         material_ids: scope.value === 'material' && selectedMaterialIds.value.length ? selectedMaterialIds.value : null,
         note_ids: scope.value === 'note' && selectedNoteIds.value.length ? selectedNoteIds.value : null,
         folder_ids: scope.value === 'folder' && selectedFolderIds.value.length ? selectedFolderIds.value : null,
-        model_id: selectedModelId.value || null,
-        reasoning_effort: reasoningEffort.value || null,
+        model_id: selectedModelId.value && selectedModelId.value !== 'default' ? selectedModelId.value : null,
+        reasoning_effort: reasoningEffort.value && reasoningEffort.value !== 'off' ? reasoningEffort.value : null,
         skill_id: skillId || null,
       }),
     })
@@ -1332,6 +1557,7 @@ async function doSend(q, skillId) {
           aiMsg.kb_hit = payload.kb_hit
           aiMsg.answer_kind = payload.answer_kind || ''
           aiMsg.sources = payload.sources
+          aiMsg.resources = payload.resources || []
         } else if (ev === 'tool') {
           // 工具步骤（P4）。start/done 成对；⚠️ done 找不到对应 start 时要**补一条**，
           // 否则丢了 start 的那一条会让界面永远停在转圈上（看起来像卡死）。
@@ -1417,7 +1643,7 @@ async function doSend(q, skillId) {
       aiMsg._errorQuestion = q
       scrollBottom()
     } else {
-      ElMessage.error(e.message || '问答失败')
+      ElMessage.error(e.message || '对话失败')
       // P1-5：失败回填问题文本（此前输入框已清空，问题直接丢失）
       question.value = q
       if (!aiMsg.content) messages.value = messages.value.filter(m => m !== aiMsg)
@@ -1430,6 +1656,37 @@ async function doSend(q, skillId) {
 
 function stopAsk() {
   abortCtrl?.abort()
+}
+
+// 重新生成：入口只挂**最后一条**回答。中间回答重生成会把之后的整段对话一起截掉
+// （后端 truncate 语义 = 该消息及之后全删），不给确认就丢整段对话太危险，故不放入口；
+// 错误态也不放（err-bar 的「重试」已是同一动作，避免两个按钮抢戏）。
+function isLastAssistant(m) {
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    if (messages.value[i].role === 'assistant') return messages.value[i] === m
+  }
+  return false
+}
+
+// 口径与「重试 / 编辑重发」一致：截断「问题 + 旧回答」后用同一个问题重发，
+// 沿用当前挂载的技能与范围/模型设置。直调 doSend 跳过技能建议卡——
+// 用户点的是「重新生成」，不该再被问一次「要不要用技能」。
+async function regenerate(m) {
+  if (asking.value || !m || m.role !== 'assistant') return
+  const idx = messages.value.indexOf(m)
+  if (idx < 0) return
+  let uIdx = -1
+  for (let i = idx - 1; i >= 0; i--) {
+    if (messages.value[i].role === 'user') { uIdx = i; break }
+  }
+  if (uIdx < 0) return
+  const q = messages.value[uIdx].content
+  const uid = messages.value[uIdx].id
+  if (currentId.value && uid) {
+    try { await chatApi.truncateMessages(currentId.value, uid) } catch { /* 忽略 */ }
+  }
+  messages.value.splice(uIdx)
+  doSend(q, mountedSkill.value ? mountedSkill.value.id : null)
 }
 
 // 错误消息重试（P1-3）：截断掉「问题 + 错误回答」后重新发问，不制造重复消息
@@ -1461,7 +1718,23 @@ onMounted(async () => {
   currentId.value = null
   messages.value = []
   await loadSessions()
-  loadChatSkills()      // P1：可挂载的对话技能（失败则空列表，不影响问答）
+  // P1：可挂载的对话技能（失败则空列表，不影响对话）。
+  // 技能库「去试试」带 ?skill=<id> 进来：必须等列表回来再校验 —— 先挂后校验会把
+  // 已停用 / 已删除的技能当成可用挂上，用户点发送才在后端被拒。
+  await loadChatSkills()
+  const wantSkill = String(route.query.skill || '').trim()
+  if (wantSkill) {
+    const hit = chatSkills.value.find(s => s.id === wantSkill)
+    if (hit) {
+      mountedSkill.value = { id: hit.id, name: hit.name }
+      persistMountedSkill()        // 首问还没有 session_id → 记为 pending，收到 sources 再回填
+      nextTick(() => inputRef.value?.focus?.())
+      ElMessage.success(`已加载技能「${hit.name}」，这轮提问会按它回答`)
+    } else {
+      ElMessage.warning('这个技能当前不可用（可能已停用），已进入普通对话')
+    }
+    router.replace({ path: '/chat' })   // 清掉参数：刷新 / 回退不该再次强行挂载
+  }
   // 范围选择的条目选项
   const [{ data: mats }, { data: kb }, { data: folders }] = await Promise.all([
     materialApi.list(), kbApi.overview(), foldersApi.list(),
@@ -1469,13 +1742,13 @@ onMounted(async () => {
   materialOptions.value = mats.filter(m => m.parsed_status === 'success')
   noteOptions.value = kb.notes
   folderOptions.value = folders
-  // 加载模型列表，默认选中问答模型
+  // 加载模型列表，默认选中对话模型
   try {
     const { data: st } = await settingsApi.get()
     chatModels.value = st.llm_models || []
-    // ⚠️ 默认模型 = 后端「问答用途」配置；不兜底到列表第一条，否则「问答模型没选」时
+    // ⚠️ 默认模型 = 后端「对话用途」配置；不兜底到列表第一条，否则「对话模型没选」时
     // 会静默用列表第一个模型发请求、绕过 NEED_SETUP 校验（用户实测报过）。
-    selectedModelId.value = st.chat_model_id || ''
+    selectedModelId.value = st.chat_model_id || 'default'
     configured.value = st.configured !== false
   } catch { /* 静默 */ }
   // 从资料详情页进入：自动关联当前资料为检索范围
@@ -1489,7 +1762,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  abortCtrl?.abort()   // 离开问答页时中断进行中的流
+  abortCtrl?.abort()   // 离开对话页时中断进行中的流
+  matchCtrl?.abort()   // 技能预检也不能在页面卸载后继续补发问题
   document.removeEventListener('mousedown', closeCitePop)
 })
 
@@ -1566,7 +1840,10 @@ function closeCitePop(e) {
 
 /* ===== 右：对话区 ===== */
 .chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--asc-bg); }
-.msg-area { flex: 1; overflow-y: auto; padding: 32px 40px 24px; position: relative; }
+.msg-area { flex: 1; overflow-y: auto; padding: 32px 40px 24px; position: relative;
+  /* 长代码块的头部吸附在这一层：sticky 的落点是 padding 内侧，需要头部补上这 32px。
+     ⚠️ 改这里的 padding-top 必须同步改这个值（否则又会有代码从头部上方露出来）。 */
+  --md-sticky-cover: 32px; }
 .msg-col { max-width: 768px; margin: 0 auto; }
 /* 回到顶部 / 底部（悬浮于输入框上方，居中偏左 50px） */
 .scroll-btns {
@@ -1637,9 +1914,10 @@ function closeCitePop(e) {
   color: var(--asc-text);
 }
 .user-text { white-space: pre-wrap; word-break: break-word; }
-/* 消息操作（复制/编辑）：hover 显示 */
-.msg-ops { display: flex; gap: 10px; justify-content: flex-end; margin-top: 6px; opacity: 0; transition: opacity .15s ease; }
-.bubble:hover .msg-ops { opacity: 1; }
+/* 消息操作（复制/编辑）：hover 显示。
+   2026-11-02：opacity:0 仍占位会在用户气泡底部留白 → 不收不占地（max-height 0），悬停才展开 */
+.msg-ops { display: flex; gap: 10px; justify-content: flex-end; max-height: 0; margin-top: 0; opacity: 0; overflow: hidden; transition: opacity .15s ease, max-height .15s ease, margin-top .15s ease; }
+.bubble:hover .msg-ops { opacity: 1; max-height: 24px; margin-top: 6px; }
 .msg-op {
   font-size: 12px; color: var(--asc-text-3); cursor: pointer; user-select: none;
   transition: color .15s ease;
@@ -1780,6 +2058,51 @@ function closeCitePop(e) {
 @keyframes blink { 50% { opacity: 0; } }
 
 /* 引用来源（折叠标识，点击展开） */
+/* 库内相关资源卡片（找内容） */
+.res-block { margin-top: 14px; }
+.res-label {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 12px; color: #6e6e6e; margin-bottom: 8px;
+}
+.res-list { display: flex; flex-direction: column; gap: 6px; }
+.res-card {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border: 1px solid #e6e4ef; border-radius: 8px;
+  background: #fbfafe; cursor: pointer;
+}
+.res-card:hover { border-color: #b9aef0; background: #f6f3ff; }
+.res-badge {
+  flex: none; font-size: 11px; line-height: 1; padding: 4px 6px; border-radius: 4px;
+  background: #ece8fd; color: #534ab7; font-weight: 500; white-space: nowrap;
+}
+.res-card.k-note .res-badge { background: #e1f5ee; color: #0f6e56; }
+.res-card.k-video .res-badge { background: #faeeda; color: #854f0b; }
+.res-card.k-podcast .res-badge { background: #fbeaf0; color: #993556; }
+.res-title {
+  flex: 1; min-width: 0; font-size: 13px; color: #2b2b2b; line-height: 1.45;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.res-meta { flex: none; font-size: 11px; color: #7a7a7a; }
+.res-arrow { flex: none; color: #a8a8b3; }
+/* 材料卡的直达动作（讲义 / 出题）：小、浅、只在材料卡上出现，
+   不让「读」这个主入口（整卡点击）被按钮抢走注意力 */
+.res-acts { flex: none; display: inline-flex; gap: 4px; }
+.res-act {
+  font: inherit; font-size: 11px; line-height: 1; padding: 5px 8px;
+  color: #534ab7; background: #fff; border: 1px solid #d9d3f5; border-radius: 6px;
+  cursor: pointer; transition: all .15s ease;
+}
+.res-act:hover { background: #ece8fd; border-color: #b9aef0; }
+/* 库外推荐的动作卡：比正文轻，比灰条重一档，明确是「下一步做什么」 */
+.brief-cta {
+  display: flex; align-items: center; gap: 12px;
+  margin-top: 14px; padding: 11px 13px;
+  border: 1px dashed #cfc7ee; border-radius: 8px; background: #faf9ff;
+}
+.brief-cta-body { flex: 1; min-width: 0; }
+.brief-cta-title { font-size: 13px; color: #2b2b2b; line-height: 1.5; }
+.brief-cta-sub { margin-top: 3px; font-size: 12px; color: #6e6e6e; line-height: 1.6; }
+.brief-cta-note { color: #8a8a94; }
 .sources { margin-top: 14px; }
 .sources-toggle {
   display: inline-flex; align-items: center; gap: 6px;
@@ -1892,10 +2215,13 @@ function closeCitePop(e) {
 .skill-bar-x { margin-left: auto; cursor: pointer; color: #6e6e6e; }
 .skill-bar-x:hover { color: #c45656; }
 
+/* 2026-11-02 实测对齐：按钮原来 25px、旁边下拉 30px → 高度不一。
+   定死 30px（box-sizing 含边框），纵向 padding 交给 height 而不是 3px 上下内边距 */
 .skill-add {
   font-family: inherit; font-size: 12px; color: #4a4a4a; cursor: pointer;
   background: #fff; border: 1px solid #dcdfe6; border-radius: 6px;
-  padding: 3px 9px; display: inline-flex; align-items: center; gap: 2px;
+  height: 30px; box-sizing: border-box;
+  padding: 0 10px; display: inline-flex; align-items: center; gap: 2px;
   white-space: nowrap; transition: none;
 }
 .skill-add:hover { border-color: #2563eb; color: #2563eb; }
@@ -1979,7 +2305,7 @@ function closeCitePop(e) {
 .send-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(124, 92, 252, .4); }
 .send-btn:active { transform: translateY(0) scale(.96); box-shadow: 0 2px 8px rgba(124, 92, 252, .3); }
 
-/* ===== 问答笔记弹窗（当前页查看/编辑） ===== */
+/* ===== 对话笔记弹窗（当前页查看/编辑） ===== */
 .chat-note-dialog { border-radius: 14px; }
 .cnd-head { display: flex; align-items: center; gap: 10px; }
 .cnd-title { font-size: 17px; font-weight: 600; color: var(--asc-text); }

@@ -345,11 +345,44 @@ def _query_col(col, q_emb, top_k: int, where: dict | None):
     return col.query(query_embeddings=[q_emb], n_results=n, **({"where": where} if where else {}))
 
 
+def _col_where(where: dict | None, kind: str) -> dict | None:
+    """按集合派生 metadata 过滤（2026-10-30，炼丹炉笔记绑定）。
+
+    where 通用键：material_id（chunk/note 两集合同义）；note_ref_id（**仅 note 集合**，
+    与 material_id 成 OR）——应用显式绑定的笔记要并入语料宇宙，而 chunk 集合的 ref_id
+    是块 id，同键直接下发会和笔记 id 撞号误召。
+    无 note_ref_id 键时原样透传（存量语义零变化）。"""
+    if not where or "note_ref_id" not in where:
+        return where
+    mids = where.get("material_id")
+    nids = where.get("note_ref_id")
+    # {"$in": []} 是「空约束」不是「无约束」——键在值空 = 该维度颗粒无收，归一化为 None 后走哨兵
+    if isinstance(mids, dict) and not (mids.get("$in") or []):
+        mids = None
+    if isinstance(nids, dict) and not (nids.get("$in") or []):
+        nids = None
+    if kind == "chunk":
+        if mids:
+            return {"material_id": mids}
+        # 纯笔记锁：chunk 集合必须颗粒无收（None=不过滤会搜全库，空 $in chroma 行为不可靠）
+        return {"ref_id": {"$in": [-1]}}
+    parts = []
+    if mids:
+        parts.append({"material_id": mids})
+    if nids:
+        parts.append({"ref_id": nids})
+    if not parts:
+        # 键在但值全空 = 语料宇宙为空，宁可颗粒无收也绝不退化成全库
+        return {"ref_id": {"$in": [-1]}}
+    return parts[0] if len(parts) == 1 else {"$or": parts}
+
+
 def search(query: str, top_k: int | None = None, kinds: tuple = ("chunk", "note"),
            where: dict | None = None) -> list[dict]:
     """按集合检索 → 加权合并。
     kinds 限定类型范围：chunk(资料原文) / note(笔记)
-    where 为 chroma metadata 过滤（如指定材料 {"material_id": {"$in": [1,2]}}）
+    where 为 chroma metadata 过滤（如指定材料 {"material_id": {"$in": [1,2]}}；
+    应用笔记绑定时带 note_ref_id，按集合派生见 _col_where）
     返回 [{ref_type, ref_id, material_id, text, metadata, score}]"""
     top_k = top_k or settings.kb_top_k
     q_emb = embed_texts([query], is_query=True)[0]
@@ -362,7 +395,9 @@ def search(query: str, top_k: int | None = None, kinds: tuple = ("chunk", "note"
     if "note" in kinds:
         candidates.append((NOTE_COL, note_w))
     for name, weight in candidates:
-        res = with_heal(name, lambda col: _query_col(col, q_emb, top_k, where))
+        kind = "chunk" if name == CHUNK_COL else "note"
+        col_where = _col_where(where, kind)
+        res = with_heal(name, lambda col: _query_col(col, q_emb, top_k, col_where))
         if not res:
             continue
         for i in range(len(res["ids"][0])):

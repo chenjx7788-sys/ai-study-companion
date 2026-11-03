@@ -29,6 +29,8 @@ export const materialApi = {
   retryParse: (id) => http.post(`/materials/${id}/reparse`),
   fulltextSearch: (q, folderId) => http.get('/materials/search/fulltext', { params: { q, folder_id: folderId ?? undefined } }),
   createDocument: (data) => http.post('/materials/document', data),
+  // 某会话里已转过文档的回答（刷新后恢复「已存文档」按钮态，2026-10-26）
+  chatDocs: (sessionId) => http.get('/materials/chat-docs', { params: { session_id: sessionId } }),
   updateDocument: (id, data) => http.put(`/materials/${id}/document`, data),
   importLocal: (data) => http.post('/materials/import-local', data),   // 本地文件/文件夹直引
   relocate: (id, data) => http.post(`/materials/${id}/relocate`, data),   // 源文件重新定位
@@ -74,17 +76,17 @@ export const ephemeralApi = {
 
 // 笔记（PRD 模块 C）
 export const noteApi = {
-  // 不传 materialId 时返回「材料无关笔记」（AI 问答 / 学习周报 / 播客脚本），
+  // 不传 materialId 时返回「材料无关笔记」（AI 对话 / 学习周报 / 播客脚本），
   // 供统计页、播客页查询「这个产物转过笔记没有」
   // ⚠️ 只用 anchor 做状态查询的调用方请带 { slim: 1 }：不带的话会把所有笔记的
-  // 正文一起拉下来（播客脚本 / 周报 / 问答的全文是这批数据里最大的一块）
+  // 正文一起拉下来（播客脚本 / 周报 / 对话的全文是这批数据里最大的一块）
   list: (materialId, params) => http.get('/notes', {
     params: { ...(materialId ? { material_id: materialId } : {}), ...(params || {}) },
   }),
   create: (data) => http.post('/notes', data),
   update: (id, data) => http.put(`/notes/${id}`, data),
   remove: (id) => http.delete(`/notes/${id}`),
-  fromChat: (data) => http.post('/notes/from-chat', data),   // AI 问答转笔记（标题=问题，内容=回答）
+  fromChat: (data) => http.post('/notes/from-chat', data),   // AI 对话转笔记（标题=问题，内容=回答）
   fromAi: (data) => http.post('/notes/from-ai', data),       // 材料无关 AI 产物转笔记（周报 / 播客脚本），按 anchor.key 幂等
 }
 
@@ -106,16 +108,32 @@ export const foldersApi = {
   remove: (id) => http.delete(`/folders/${id}`),
 }
 
-// 全局问答（PRD 模块 E）
+// 全局对话（PRD 模块 E）
 export const chatApi = {
-  sessions: () => http.get('/chat/sessions'),
+  sessions: (appId) => http.get('/chat/sessions', appId != null && appId !== '' ? { params: { app_id: appId } } : {}),
   createSession: () => http.post('/chat/sessions'),
   removeSession: (id) => http.delete(`/chat/sessions/${id}`),
   renameSession: (id, title) => http.patch(`/chat/sessions/${id}`, { title }),
   pinSession: (id, pinned) => http.patch(`/chat/sessions/${id}/pin`, { pinned }),
   messages: (sessionId) => http.get(`/chat/sessions/${sessionId}/messages`),
   truncateMessages: (sessionId, messageId) => http.delete(`/chat/sessions/${sessionId}/messages/from/${messageId}`),   // 截断会话（编辑问题重新生成）
-  // 流式问答走 fetch（axios 不便处理 SSE），在 ChatView 内实现
+  // 流式对话走 fetch（axios 不便处理 SSE），在 ChatView 内实现
+}
+
+// 炼丹炉（2026-10-27）：应用 CRUD / 绑定 / AI 辅助（产出建议不入库）；试聊预览走 utils/sse.js streamSSE
+export const appsApi = {
+  list: () => http.get('/apps'),
+  create: (payload) => http.post('/apps', payload),
+  get: (id) => http.get(`/apps/${id}`),
+  update: (id, payload) => http.patch(`/apps/${id}`, payload),
+  remove: (id) => http.delete(`/apps/${id}`),
+  patchMaterials: (id, payload) => http.patch(`/apps/${id}/materials`, payload),
+  assist: (payload) => http.post('/apps/assist', payload),
+  rerollSpirit: (id) => http.post(`/apps/${id}/spirit/reroll`),   // 换一身配色（服务端随机）
+  nudge: (id, sessionId) => http.post(`/apps/${id}/nudge`, { session_id: sessionId }),  // 闲置搭话（不落库）
+  versions: (id) => http.get(`/apps/${id}/versions`),               // 人格版本时间线（P2）
+  restoreVersion: (id, vid) => http.post(`/apps/${id}/versions/${vid}/restore`),  // 回滚（先自动快照当前）
+  stats: (id) => http.get(`/apps/${id}/stats`),                     // 应用空间·用量看板（P2）
 }
 
 // 复习（V2 记忆曲线）
@@ -247,6 +265,8 @@ export const drillApi = {
   fromWeak: (payload) => http.post('/drill/cards/from-weak', payload || {}),
   startStreamUrl: (sid) => `/api/drill/sessions/${sid}/start/stream`,
   answerStreamUrl: (sid) => `/api/drill/sessions/${sid}/answer/stream`,
+  // 单题重答（打磨 P5）：重新评分同一轮，不推进、不追问 —— 与 answer 流是两条独立链路
+  retryStreamUrl: (sid) => `/api/drill/sessions/${sid}/retry/stream`,
   finish: (sid, reason) => http.post(`/drill/sessions/${sid}/finish`, { reason }),
   // 语音（C 档）：念题返回 mp3 字节流；口述作答返回 { text }
   // ⚠️ 念题的 responseType 必须是 blob —— 走默认的 json 解析会把音频当成坏 JSON 报错
@@ -336,11 +356,12 @@ export const updateApi = {
 }
 
 // 技能（对话中可挂载的方法层）
-// ⚠️ 列表**不含 instructions**（常驻清单只吃 name+description）；要全文走 detail。
+// ⚠️ 列表**不含 instructions**（列表只吃 name+description）；要全文走 detail。
 export const skillApi = {
   list: () => http.get('/skills'),
   detail: (id) => http.get(`/skills/${id}`),
-  match: (question, scope = 'all') => http.post('/skills/match', { question, scope }),
+  match: (question, scope = 'all', options = {}) =>
+    http.post('/skills/match', { question, scope }, { timeout: 8000, ...options }),
   // ---- P2 管理能力 ----
   create: (fields) => http.post('/skills', fields),
   // ⚠️ 只传改动字段：后端用 exclude_unset 合并，整份传会把未填项写成空串
@@ -348,6 +369,10 @@ export const skillApi = {
   remove: (id) => http.delete(`/skills/${id}`),
   setEnabled: (id, enabled) => http.put(`/skills/${id}/enabled`, { enabled }),
   importText: (text, overwrite = false) => http.post('/skills/import', { text, overwrite }),
+  // 文件夹批量导入（P6）：dryRun=true 只扫描预览；false 才落盘
+  importFolder: (path, dryRun = true) => http.post('/skills/import-folder', { path, dry_run: dryRun }),
+  // 浏览器选择文件夹模式：只能拿到相对路径和文件内容，拿不到本机绝对路径
+  importFiles: (files, dryRun = true) => http.post('/skills/import-files', { files, dry_run: dryRun }, { timeout: 120000 }),
   validate: (text) => http.post('/skills/validate', { text }),
   // 导出拿的是文件原文（text/markdown），responseType 必须声明，否则 axios 会尝试按 JSON 解析
   exportText: (id) => http.get(`/skills/${id}/export`, { responseType: 'text' }),
@@ -356,3 +381,12 @@ export const skillApi = {
   getSemantic: () => http.get('/skills/semantic'),
   setSemantic: (enabled) => http.put('/skills/semantic', { enabled }),
 }
+
+// 库内内容发现（2026-10-26）：资源级检索，对话侧的卡片走后端直调，这里是给页面/探针留的入口
+export const resourceApi = {
+  search: (q, params) => http.get('/resources/search', { params: { q, ...(params || {}) } }),
+  // 库外主题 → 入门导读入库（P1 闭环）：一次 LLM 调用实测约 20-40s，
+  // 显式给 180s 超时（默认 120s 在慢模型上会先断，前端只能报「超时」而不是等它写完）
+  brief: (query) => http.post('/resources/brief', { query }, { timeout: 180000 }),
+}
+

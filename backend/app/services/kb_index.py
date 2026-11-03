@@ -5,6 +5,7 @@
 - notes 路由（笔记增/改/删三联动）
 - kb 路由（重建索引，D4）
 """
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ..models import Material, MaterialChunk, Note, KbEntry
@@ -59,7 +60,7 @@ def index_material(db: Session, material_id: int) -> int:
     #   `_parse_material` 重试时会「删旧 chunk → 建新 chunk」，新 chunk 的 id 与旧的**必然不同**
     #   （SQLite 的 rowid 取 max+1，真实库里总有别的材料的块压在表尾，不会复用），
     #   而 embedding_id 由 `chunk:{id}:{seq}` 派生 → `index_texts` 的「按 id 先删后增」
-    #   一条旧向量都删不到 → 旧向量留在 Chroma 被检索召回，AI 问答会引用**不存在的 chunk**、
+    #   一条旧向量都删不到 → 旧向量留在 Chroma 被检索召回，AI 对话会引用**不存在的 chunk**、
     #   知识库块数虚高。实测：重试解析一次后 向量 6 / 块 3。
     #   ⚠️ 不能用 `vector.delete_by_material`：它遍历两个集合，会把该材料的**笔记向量**一起删
     #      （笔记不随材料删除，只解绑）。
@@ -74,8 +75,12 @@ def index_material(db: Session, material_id: int) -> int:
         #    （hnsw 索引残缺时 col.get 会抛 InternalError；宁可留孤儿，也不能让解析整体失败）
         print(f"[kb_index] 清理材料 {material_id} 的旧向量失败（继续建索引）: {e}")
 
+    # ⚠️ 跳过 kind='meta'（剪藏署名 / 来源 URL）：它们是文档元信息，不该进向量。
+    #    必须在 `_group_for_embedding` **之前**剔除：溯源块合计不到 50 字，
+    #    留在列表里会把「标题」和「来源 URL」并成首组，白占一条向量且污染标题语义。
     chunks = (db.query(MaterialChunk)
-              .filter(MaterialChunk.material_id == material_id)
+              .filter(MaterialChunk.material_id == material_id,
+                      or_(MaterialChunk.kind.is_(None), MaterialChunk.kind != "meta"))
               .order_by(MaterialChunk.page_no, MaterialChunk.id).all())
     if not chunks:
         return 0
@@ -168,6 +173,87 @@ def deindex_note(db: Session, note_id: int):
     vector_svc.delete_by_ref("note", note_id)
     db.query(KbEntry).filter(KbEntry.ref_type == "note", KbEntry.ref_id == note_id).delete()
     db.commit()
+
+
+def backfill_clip_meta_chunks(db: Session) -> int:
+    """把**存量**剪藏材料的溯源块标为 `kind='meta'`，返回新标记块数。幂等。
+
+    新剪藏已在 `materials._parse_material` 里标过（`cleaner.mark_provenance`），
+    这里只补历史数据：实测 17 篇剪藏各留 2 块（第 2 块署名 / 公众号名、第 3 块
+    `> 来源：URL`），共 34 块进了向量与全文检索；探针重抽时「微信公众平台」被抽成
+    跨 2 份材料的实体（存量库里材料 43 已落下 `运气` / `教职号` 两个号名实体）。
+    ⚠️ 只改 kind、**不动 content / page_no**：页码由块顺序决定，删块会让笔记的
+       `anchor.page_no`、划线位置全部错位 —— 所以只能标记不能删。
+    ⚠️ 判据复用 `cleaner.mark_provenance`（结构锚点），与解析路径同一份逻辑。
+    ⚠️ 向量与 KbEntry 的清理不在这里（要 chroma 就绪）→ 见 `purge_meta_indexes`。
+    """
+    import json
+
+    from . import cleaner
+    from ..models import Material
+
+    clip_ids = []
+    for mid, raw_meta in db.query(Material.id, Material.origin_meta).all():
+        meta = raw_meta
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        if isinstance(meta, dict) and meta.get("saved_from") == "clip":
+            clip_ids.append(mid)
+    if not clip_ids:
+        return 0
+
+    total = 0
+    for mid in clip_ids:
+        rows = (db.query(MaterialChunk)
+                .filter(MaterialChunk.material_id == mid)
+                .order_by(MaterialChunk.page_no, MaterialChunk.id)
+                .limit(cleaner._PROV_SCAN).all())
+        if not rows:
+            continue
+        payload = [{"content": r.content or ""} for r in rows]
+        if not cleaner.mark_provenance(payload):
+            continue
+        for d, r in zip(payload, rows):
+            if d.get("kind") == "meta" and r.kind != "meta":
+                r.kind = "meta"
+                total += 1
+    if total:
+        db.commit()
+    return total
+
+
+def purge_meta_indexes(db: Session) -> int:
+    """清掉 `kind='meta'`（剪藏溯源块）残留的向量与 KbEntry 记账。幂等。
+
+    `main._backfill_clip_meta_chunks` 只改 kind，索引层已不再收录 meta 块，
+    但**旧向量与记账还在** —— 不清掉的话，启动自检比对「向量数 vs 记账数」
+    会判成索引残缺 → 触发一次全量重建（白跑两分钟）。
+    ⚠️ 需要 chroma 已就绪，故不在 import 期调用，由启动自检线程调。
+    """
+    meta_ids = [r[0] for r in
+                db.query(MaterialChunk.id).filter(MaterialChunk.kind == "meta").all()]
+    if not meta_ids:
+        return 0
+    n = 0
+    for cid in meta_ids:
+        entry = (db.query(KbEntry)
+                 .filter(KbEntry.ref_type == "chunk", KbEntry.ref_id == cid).first())
+        if entry is None:
+            continue
+        try:
+            vector_svc.delete_by_ref("chunk", cid)
+        except BaseException as e:
+            # 删向量失败就**保留记账**：宁可让自检判残缺去重建，也不能两边都删一半
+            print(f"[kb_index] 清理溯源块 {cid} 的向量失败（保留记账）: {e}")
+            continue
+        db.query(KbEntry).filter(KbEntry.ref_type == "chunk",
+                                 KbEntry.ref_id == cid).delete()
+        n += 1
+    db.commit()
+    return n
 
 
 def deindex_material(db: Session, material_id: int):

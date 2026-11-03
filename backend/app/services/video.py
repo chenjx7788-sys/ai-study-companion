@@ -1161,11 +1161,14 @@ def tex_to_mathml(terms) -> "list[str] | None":
 # 一张图 = 一板：带 sketch 的要点会被**摘出条目流、独占一页**画成黑板上的一幅简图。
 # ⚠️ 校验与「接地」都放在这里（与 chart 的 _chart_grounded 同一纪律）：
 #    模型给的草图里任何一个标签都可能是它自己编出来的关系，后端必须能拦。
-SKETCH_TYPES = ("flow", "compare", "quadrant", "pyramid")
+SKETCH_TYPES = ("flow", "compare", "quadrant", "pyramid",
+                # D1（2026-10-30）：时间线 / 循环 / 总分树
+                "timeline", "cycle", "tree")
 # 每种原语的标签数下限/上限。**硬约束**：数量不对整张降级成普通条目，
 # 绝不「有多少画多少」—— 少一个标签的流程链会画成断头的箭头。
 SKETCH_LABEL_RANGE = {"flow": (2, 4), "compare": (4, 6),
-                      "quadrant": (4, 4), "pyramid": (3, 4)}
+                      "quadrant": (4, 4), "pyramid": (3, 4),
+                      "timeline": (3, 6), "cycle": (2, 5), "tree": (3, 5)}
 SKETCH_LABEL_MAX = 8          # 单个标签字数上限（图内字号大，超了就挤成一团）
 
 
@@ -1492,7 +1495,9 @@ def pick_shape(els) -> str:
                 if str(e.get("st") or item_state(e.get("t"))) == "fail")
 
     # ① 阶梯：数字是这一页的**唯一**主角，所以要求全数字 + 严格递增
-    if (3 <= n <= 4 and all(_vlen(t) <= 10 for t in texts)
+    #    （2026-11-03 放宽：3-5 级、≤12 字 —— 板书阶梯词条 20px 实测装得下；
+    #      错判用例不变：序号型 / 非递增 / 缺数字仍不判）
+    if (3 <= n <= 5 and all(_vlen(t) <= 12 for t in texts)
             and all(x is not None for x in nums)
             and not any(is_ord)):
         vals = [float(x) for x in nums]
@@ -1502,8 +1507,11 @@ def pick_shape(els) -> str:
     # ② 轨迹：失败步是内容骨架，但必须「有成功有失败」且讲出了先后
     if 0 < fails < n and any(w in t for t in texts for w in _SEQ_WORDS):
         return "path"
-
-    # ③ 闭环：短标签 + 首尾同名（回环感），或两个以上循环词
+    # ③ 闭环：短标签 + 首尾同名（回环感），或两个以上循环词。
+    #    ⚠️ 必须在 ②b 纯顺序分支**之前**：环证据（首尾同名/循环词）比顺序词强 ——
+    #    「想下一步…再想下一步」含「再/下一步」两种连接词，会被 ②b 抢成链条
+    #    （探针实测抓到）。② 失败步分支保持在 ring 前：失败步+首尾同名的罕见
+    #    交集中，勾叉是轨迹的骨架。
     if n <= 5 and all(_vlen(t) <= 8 for t in texts) and not any(is_ord):
         # ⚠️ 必须数**不同种类**：同一句「每次…」在两条里各出现一次，
         #    只说明它们在讲频率，不说明它们首尾相接成环（自测抓到：
@@ -1511,6 +1519,20 @@ def pick_shape(els) -> str:
         kinds = {w for t in texts for w in _LOOP_WORDS if w in t}
         if len(kinds) >= 2 or _lcs(texts[0], texts[-1]) >= 3:
             return "ring"
+
+    # ②b（2026-11-03 放宽）：纯顺序步骤也成链 —— 教程类内容主形态是
+    #    「先…再…然后…」的纯步骤，旧判据要求有失败步 → 永不命中。
+    #    但要 ≥2 种连接词（单种词重复只是口癖，不成链），无失败步
+    #    （有失败步走 ② —— 勾叉是它的骨架），且排除单调数字页
+    #    （数字是主角：递增已被 ① 收走，递减留清单 ——
+    #    「先有 44 个 → 再降到 39 个 → 最后 21 个」画成步骤链是张冠李戴，探针抓到）。
+    _vals = [float(x) for x in nums if x is not None]
+    _mono = len(_vals) >= 3 and (
+        all(_vals[i] < _vals[i + 1] for i in range(len(_vals) - 1))
+        or all(_vals[i] > _vals[i + 1] for i in range(len(_vals) - 1)))
+    if (3 <= n <= 5 and not fails and not _mono
+            and len({w for t in texts for w in _SEQ_WORDS if w in t}) >= 2):
+        return "path"
     return ""
 
 

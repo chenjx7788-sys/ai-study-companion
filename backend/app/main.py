@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from app_version import __version__ as APP_VERSION
 from .core.config import settings
 from .database import Base, engine
-from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats, podcasts, ephemeral, imgproxy, ext, simple_learn, drill, videos, zipvoice, update, renderenv, skills
+from .routers import materials, ai, notes, kb, chat, review, settings as settings_router, asr, folders, stats, podcasts, ephemeral, imgproxy, ext, simple_learn, drill, videos, zipvoice, update, renderenv, skills, resources, apps
 
 Base.metadata.create_all(bind=engine)
 
@@ -36,6 +36,27 @@ def _migrate_columns():
             if "answer_kind" not in cols:
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE chat_messages ADD COLUMN answer_kind VARCHAR(16) DEFAULT ''"))
+            # 库内相关资源卡片（2026-10-26）。存量行 NULL，读取侧一律 `m.resources or []`。
+            # ⚠️ 不能用 `DEFAULT ''`：JSON 列读到空串会在反序列化时抛错（历史踩过）。
+            if "resources" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE chat_messages ADD COLUMN resources TEXT"))
+            # 炼丹炉：消息随会话冗余 app_id（查询免 join）。存量 NULL=主问答，行为不变。
+            if "app_id" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE chat_messages ADD COLUMN app_id INTEGER"))
+        # 炼丹炉（2026-10-27）：会话归属应用；存量 NULL=主问答，列表过滤语义不变。
+        if "chat_sessions" in insp.get_table_names():
+            cols = {c["name"] for c in insp.get_columns("chat_sessions")}
+            if "app_id" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN app_id INTEGER"))
+        # 资料外问题开关（2026-11-02）：存量应用默认 0=知识边界锁定，行为不变。
+        if "apps" in insp.get_table_names():
+            cols = {c["name"] for c in insp.get_columns("apps")}
+            if "allow_out_of_scope" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE apps ADD COLUMN allow_out_of_scope BOOLEAN DEFAULT 0"))
         if "materials" in insp.get_table_names():
             cols = {c["name"] for c in insp.get_columns("materials")}
             if "storage_mode" not in cols:
@@ -57,7 +78,10 @@ def _migrate_columns():
                     conn.execute(text("ALTER TABLE materials ADD COLUMN origin_ref TEXT DEFAULT ''"))
             if "origin_meta" not in cols:
                 with engine.begin() as conn:
-                    conn.execute(text("ALTER TABLE materials ADD COLUMN origin_meta TEXT DEFAULT ''"))
+                    # ⚠️ 新库默认值必须是 '{}' 而不是 ''：空串会让 JSON 列读取时
+                    #    json.loads('') 抛错（老库的 DEFAULT '' 无法用 ALTER 改，
+                    #    读取侧已由 models.SafeJSON 兜底，启动时另有回填）。
+                    conn.execute(text("ALTER TABLE materials ADD COLUMN origin_meta TEXT DEFAULT '{}'"))
             # 实体抽取内容指纹（重试解析时指纹未变则跳过 LLM 抽取，防重复消耗 token）
             if "extract_sig" not in cols:
                 with engine.begin() as conn:
@@ -66,6 +90,21 @@ def _migrate_columns():
             if "doc_kind" not in cols:
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE materials ADD COLUMN doc_kind VARCHAR(16) DEFAULT ''"))
+            # 知识图谱生成状态（2026-11-03）：存量行 '' = 未生成，按钮文案与改造前完全一致。
+            # ⚠️ entity_started_at 一次定成 DATETIME：SQLite 的 ALTER 只能加列不能改类型，
+            #    若先建成 TEXT 再想改成时间类型就只能重建表。
+            if "entity_status" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE materials ADD COLUMN entity_status VARCHAR(16) DEFAULT ''"))
+            if "entity_progress" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE materials ADD COLUMN entity_progress INTEGER DEFAULT 0"))
+            if "entity_error" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE materials ADD COLUMN entity_error VARCHAR(255) DEFAULT ''"))
+            if "entity_started_at" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE materials ADD COLUMN entity_started_at DATETIME"))
         # 原文块性质（body / img_ocr）：老行全部视为 body → 存量行为完全不变。
         # img_ocr 由回填脚本按 saved_from=='clip' AND content LIKE '[图片]%' 单独打。
         if "material_chunks" in insp.get_table_names():
@@ -324,16 +363,64 @@ def _backfill_chunk_kind():
         db.close()
 
 
+def _backfill_clip_meta_chunks():
+    """把存量剪藏材料的溯源块标为 kind='meta'（幂等，每次启动都跑）。
+
+    新剪藏已在 `materials._parse_material` 里标过，这里只补存量：实测 17 篇剪藏
+    各留 2 块（第 2 块署名 / 号名、第 3 块 `> 来源：URL`），共 34 块进了向量与
+    全文检索（探针重抽时「微信公众平台」被抽成跨 2 份材料的实体）。
+    ⚠️ 只改 kind、**不动 content / page_no**：页码由块顺序决定，删块会让笔记的
+       `anchor.page_no`、划线位置全部错位 —— 所以只能标记不能删。
+    ⚠️ 判据与循环都在 `kb_index.backfill_clip_meta_chunks`（与解析路径共用
+       `cleaner.mark_provenance` 的结构锚点），这里只是启动钩子的壳。
+    ⚠️ 向量与记账的清理在 `kb_index.purge_meta_indexes`（要 chroma 就绪，见
+       `_auto_repair_chroma` 里的 `_purge_meta_vectors`）。
+    """
+    from .services import kb_index
+    from .database import SessionLocal
+    db = SessionLocal()
+    try:
+        n = kb_index.backfill_clip_meta_chunks(db)
+        if n:
+            print(f"[migrate] 回填 {n} 个剪藏溯源块为 meta")
+    except Exception as e:
+        db.rollback()
+        print(f"[migrate] 回填剪藏溯源块失败（不阻塞启动）: {e}")
+    finally:
+        db.close()
+
+
 _migrate_columns()
 _backfill_material_origin()
 _migrate_source_folder_to_folder()
 _backfill_chunk_kind()
+_backfill_clip_meta_chunks()
 
 app = FastAPI(title="知萤 - AI知识中枢", version=APP_VERSION)
 
 # 自动定时备份（启动后延迟 30s 首备，此后每日一次，保留最近 7 份）
 from .services import auto_backup
 auto_backup.start_auto_backup()
+
+def _purge_meta_vectors():
+    """清剪藏溯源块（kind='meta'）残留的向量与 KbEntry 记账（幂等）。
+
+    由启动自检线程在计数比对**之前**调用：`_backfill_clip_meta_chunks` 只改 kind，
+    索引层已不再收录 meta 块，但旧向量与记账还在 —— 不先清掉，下面的「向量数 vs
+    记账数」会判成索引残缺并触发一次全量重建（白跑两分钟）。
+    """
+    from .services import kb_index
+    from .database import SessionLocal
+    db = SessionLocal()
+    try:
+        n = kb_index.purge_meta_indexes(db)
+        if n:
+            print(f"[migrate] 清理 {n} 个溯源块的残留向量与记账")
+    except BaseException as e:
+        print(f"[migrate] 清理溯源块向量失败（不阻塞启动）: {e}")
+    finally:
+        db.close()
+
 
 # chroma HNSW 索引在进程被强杀后可能损坏，启动时后台检测并自动重建
 import threading
@@ -342,6 +429,8 @@ import threading
 def _auto_repair_chroma():
     def _repair():
         from .services import vector
+        # 溯源块的旧向量/记账必须在下面的计数自检之前清掉（同线程，无竞态）
+        _purge_meta_vectors()
         need_rebuild = False
         n_chunks = n_notes = 0
         try:
@@ -479,6 +568,69 @@ def _recover_video_orphans():
 
 _recover_video_orphans()
 
+
+# 知识图谱：启动时回收孤儿的「生成中」状态（2026-11-03）。
+# ⚠️ 抽取跑在内存线程里，进程一重启线程就没了，而 entity_status 是落库的 ——
+#    不回收的话按钮永远显示「生成中 x%」，且路由有 running 幂等保护，
+#    用户连重新点一次都点不动（表现上等于功能坏了）。
+# ⚠️ 一律置 failed 而不是 ''：让按钮显示「重试生成」，用户知道要重来；
+#    置成 '' 则跟「从没生成过」一样，会掩盖一次真实失败。
+# ⚠️ 打印一律 ASCII：CI 的 Windows runner 控制台是 cp1252，中文 print 会直接崩。
+def _recover_entity_orphans():
+    def _run():
+        try:
+            from .database import SessionLocal
+            from .models import Material
+            db = SessionLocal()
+            try:
+                n = (db.query(Material)
+                     .filter(Material.entity_status == "running")
+                     .update({Material.entity_status: "failed",
+                              Material.entity_progress: 0,
+                              Material.entity_error: "服务重启，生成已中断，请重新生成"},
+                             synchronize_session=False))
+                db.commit()
+                if n:
+                    print(f"[startup] recovered {n} orphan knowledge-graph task(s) -> failed")
+            finally:
+                db.close()
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
+_recover_entity_orphans()
+
+
+# 炼丹炉：启动时清理孤儿消息（2026-10-29）。
+# 来源：旧版「首次带入应用 → 改写归属」会让主问答会话里的消息 app_id 仍为 NULL，
+# 删应用时按 app_id 删不到 → 消息行残留；而 SQLite 会复用被删会话的 id，
+# 残留行随后会挂到**新会话**上（实测串台）。此类行不可被任何界面访问，属纯垃圾。
+def _purge_orphan_messages():
+    def _run():
+        try:
+            from sqlalchemy import select
+            from .database import SessionLocal
+            from .models import ChatMessage, ChatSession
+            db = SessionLocal()
+            try:
+                # 只清「有 session_id 但对应会话已不存在」的行：这类行任何界面都访问不到。
+                n = (db.query(ChatMessage)
+                     .filter(ChatMessage.session_id.isnot(None),
+                             ~ChatMessage.session_id.in_(select(ChatSession.id)))
+                     .delete(synchronize_session=False))
+                db.commit()
+                if n:
+                    print(f"[startup] purged {n} orphan chat message(s)")
+            finally:
+                db.close()
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
+_purge_orphan_messages()
+
 # CORS：本地单机应用，放宽到 * 让 pywebview 内联 loading 页（origin=null）也能轮询 /api/health
 app.add_middleware(
     CORSMiddleware,
@@ -523,12 +675,17 @@ app.include_router(imgproxy.router, prefix="/api")
 # /token 是免 token 的配对信息端点（带 Sec-Fetch-Site 防护），与受保护端点分两个 router。
 # ⚠️ 同样必须注册在下方 SPA catch-all 之前。
 app.include_router(ext.router, prefix="/api")
+app.include_router(apps.router, prefix="/api")
 app.include_router(ext.pairing_router, prefix="/api")
 
 # 客户端更新（routers/update.py）：/api/update/*（检查 / 下载 / 进度 / 定位 / 清空）
 # ⚠️ 没有服务端推送通道，客户端启动时主动拉；三源降级（GitHub 直连 → gh-proxy → 官网）。
 # ⚠️ 必须注册在下方 SPA catch-all 之前，否则接口被吞成 404。
 app.include_router(update.router, prefix="/api")
+
+# 库内内容发现（routers/resources.py）：/api/resources/search
+# 纯只读、不写索引；问答内的资源卡片走 services.discover 直调，不依赖此路由。
+app.include_router(resources.router, prefix="/api")
 
 
 

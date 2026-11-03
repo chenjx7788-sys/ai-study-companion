@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from ..core.config import settings
 from ..database import get_db, SessionLocal
-from ..models import ChatSession, ChatMessage
+from ..models import ChatSession, ChatMessage, SkillUse
 from ..services import llm, search as search_svc, settings_store, skills as skills_svc, skill_tools as skill_tools_svc
 from ..services import retrieval_agent as retrieval_agent_svc
 from ..services import apps as apps_svc
@@ -478,6 +478,10 @@ def _install_skill_stream(req: AskReq, request: Request,
                         yield f"event: token\ndata: {json.dumps({'t': payload}, ensure_ascii=False)}\n\n"
                     if await request.is_disconnected():
                         _save("用户中断生成")
+                        try:
+                            await asyncio.to_thread(it.close)
+                        except Exception:
+                            pass
                         return
         except BaseException:
             _save("用户中断生成")
@@ -529,12 +533,14 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
     # ⚠️ 存量三档（auto/kb/general）零改动：app 分支只通过 req.mode 改写 + 下文 app 守卫生效。
     app = None
     app_mids: list[int] = []          # 绑定资料（2026-10-29：本请求只查一次，供检索/双保险复用）
+    app_nids: list[int] = []          # 显式绑定笔记（2026-10-30 笔记绑定：语料宇宙的笔记维度）
     if req.app_id is not None:
         app = apps_svc.get_app_or_404(db, req.app_id)
         if req.skill_id:
             raise HTTPException(400, "应用对话不支持挂载技能")
         app_mids = apps_svc.material_ids(db, app.id)
-        if not app_mids:
+        app_nids = apps_svc.note_ids(db, app.id)
+        if not app_mids and not app_nids:
             raise HTTPException(400, "应用的资料已被删除，请先在配置页重新绑定资料")
         req.mode = "kb"                       # 应用强制 kb 语义（未命中绝不滑向通用兜底）
         if not req.model_id and app.model_id:
@@ -593,12 +599,27 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
     if req.scope == "material" and req.material_ids:
         where = {"material_id": {"$in": req.material_ids}}
     elif req.scope == "note" and req.note_ids:
-        where = {"ref_id": {"$in": req.note_ids}}
-    # 应用分支：检索锁（R1）——where 恒为绑定资料集合，绝不 None。
+        # note_ref_id（不是 ref_id）：实体召回路只认这个键（2026-11-02 修 ——
+        # 传 ref_id 时 vector/fts 正常过滤、实体路放行全部，范围外笔记漏进引用）
+        where = {"note_ref_id": {"$in": req.note_ids}}
+    # 应用分支：检索锁（R1）——where 恒为语料宇宙（绑定资料 ∪ 显式绑定笔记），绝不 None。
     # ⚠️ 刻意不走 specified 免阈值通道：绑定资料是**语料宇宙**而非单问强意图，
     #    免阈值会让向量总能捞出点什么 → kb_miss 永不发生（探针 V4/V5 实证翻车）。
     if app is not None:
-        where = {"material_id": {"$in": app_mids}}
+        where = apps_svc.scope_where(app_mids, app_nids)
+
+    # 工具层范围锁（2026-11-02）：用户显式指定范围时，技能工具（search_kb/read_material）
+    # 必须吃同一约束 —— 否则模型经工具读到范围外材料并进「引用来源」（实测翻车场景）。
+    # None = 不约束（scope=all 或未指定条目）；app 分支入口已拒绝挂技能，到不了这里。
+    tool_scope: dict | None = None
+    if req.scope == "material" and req.material_ids:
+        tool_scope = {"material_ids": set(req.material_ids), "note_ids": None}
+    elif req.scope == "note" and req.note_ids:
+        # 笔记范围下读取任何材料都算越界（空集），检索只看笔记集合
+        tool_scope = {"material_ids": set(), "note_ids": set(req.note_ids)}
+    elif req.scope == "folder" and req.folder_ids:
+        tool_scope = {"material_ids": set(_folder_to_material_ids(db, req.folder_ids)),
+                      "note_ids": None}
 
     # 查询理解前置层（2026-10-23 P0 族）：仅 scope=all 且未显式指定条目时启用，
     # 尊重用户显式选择的范围。命中即分流，全部落空走原检索路径（兜底不更差）。
@@ -655,10 +676,10 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
             # 炼丹炉：检索锁双保险（R1，2026-10-27 实证）——实体图谱召回路不吃 where、
             # 且 from_entity 免阈值：真实库下「明天天气」都能捞出库外笔记进 sources。
             # 双保险必须落在 chat 装配点（不是只在 search_locked 里）。
+            # 2026-10-30：放行判据扩为「绑定资料 ∪ 显式绑定笔记」（笔记绑定）。
             if app is None:
                 return hs
-            _allow = set(app_mids)
-            return [h for h in hs if h.get("material_id") in _allow]
+            return [h for h in hs if apps_svc.hit_in_scope(h, set(app_mids), set(app_nids))]
 
         # 材料级保送（P12）：枚举意图标题命中的材料，其有货块保送进候选——
         # chunk 级自由竞争下标题命中的材料没有加权通道，有货块会被「密度块」挤出 top-3。
@@ -827,7 +848,19 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
         elif req.mode == "kb":
             # 知识库档未命中：如实告知 + 给引导，**不**滑向通用兜底（2026-10-25 用户拍板）
             answer_kind = "kb_miss"
-            if app is not None:
+            if app is not None and getattr(app, "allow_out_of_scope", False):
+                # 资料外开关（2026-11-02）：应用显式允许时未命中不拒答 —— 带人格动用通用知识，
+                # answer_kind=general_fallback（前端 missBarText 已有对应提示条文案）。
+                # 人格仍由下方「追加式注入」统一拼上；不改走 mode=auto（会连带查询理解/安装快通）。
+                answer_kind = "general_fallback"
+                sys_oos = ("你是「" + app.name + "」。本问题在绑定资料中未命中。"
+                           "你可以动用通用知识回答，但开头必须先用一句话说明「这部分不在资料范围内」，再作答。")
+                messages = [
+                    {"role": "system", "content": sys_oos},
+                    *history,
+                    {"role": "user", "content": question},
+                ]
+            elif app is not None:
                 # 应用未命中（R2）：口径来自应用自身，不用通用 prompt_kb_miss ——
                 # 拒答话术是 IP 人格的一部分；通用提示词的口径会盖过 miss_text（探针 S2 实证）。
                 sys_miss = ("你是「" + app.name + "」。资料中未命中相关内容。"
@@ -904,6 +937,7 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
         reasoning = ""
         err_msg = ""
         stopped = False
+        exhausted = False          # 工具轮用尽但模型仍要工具 → 出循环后走「强制收尾」
         tool_round = 0
         written: list = []          # save_note 的单次上限靠它（防模型刷屏式写库）
         tools_log: list = []        # 工具步骤（落库用）：[{round, name, label, brief, ok}]
@@ -1005,9 +1039,21 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
                         err_msg = str(getattr(e, "detail", None) or e)[:200]
                     break
                 if stopped:
+                    try:
+                        await asyncio.to_thread(it.close)
+                    except Exception:
+                        pass
                     break
                 # 结束条件：没有工具调用 / 轮数用尽。本轮已吐过正文**不再**是结束条件（方案 A）
-                if not tool_calls or tool_round >= skill_tools_svc.MAX_TOOL_ROUNDS:
+                if not tool_calls:
+                    break
+                if tool_round >= skill_tools_svc.MAX_TOOL_ROUNDS:
+                    # ⚠️ 用尽时模型仍在要工具 → **不能直接 break**：此刻 full 里可能一个字都没有
+                    #    （2026-11-02 思维导图技能实测：4 次调用 completion_tokens 全为 0），
+                    #    break 之后下面会按「回答完成」落库一条空 assistant 消息，
+                    #    界面上就是一个空气泡 —— 用户既不知道发生了什么，也没有可操作的提示。
+                    #    置标志，出循环后补一次**不带 tools** 的收尾调用。
+                    exhausted = True
                     break
                 tool_round += 1
                 results = []
@@ -1042,7 +1088,8 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
                         try:
                             res = await asyncio.to_thread(
                                 skill_tools_svc.execute, name, tc.get("arguments") or "{}",
-                                allowed=tool_caps, session_id=session_id, written=written)
+                                allowed=tool_caps, session_id=session_id, written=written,
+                                scope=tool_scope)
                         except Exception as e:
                             # execute 内部已兜底；这里挡的是线程池/参数装配这类**外层**异常。
                             # 少了这层，一个工具的 bug 会让整个 SSE 连接被掐断 ——
@@ -1076,6 +1123,14 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
                     #    从中间插入会让正文里的 [n] 全部指错来源。
                     added = []
                     for s in (res.get("sources") or []):
+                        # 双保险（同 _app_lock 先例）：工具实现已吃范围锁，这里再挡一层 ——
+                        # 任何路径来的范围外来源都不进「引用来源」。
+                        if tool_scope is not None:
+                            if s.get("ref_type") == "note":
+                                if s.get("ref_id") not in (tool_scope.get("note_ids") or set()):
+                                    continue
+                            elif s.get("material_id") not in (tool_scope.get("material_ids") or set()):
+                                continue
                         k = (s.get("ref_type"), s.get("material_id"), s.get("page_no"),
                              (s.get("snippet") or "")[:24])
                         if k in src_keys:
@@ -1093,6 +1148,11 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
                         stopped = True
                         break
                 if stopped or not results:
+                    if stopped:
+                        try:
+                            await asyncio.to_thread(it.close)
+                        except Exception:
+                            pass
                     break
                 # 回填：一条 assistant(tool_calls) + 每个调用一条 tool 结果。
                 # ⚠️ 部分中转不返回 tool_call.id，必须补一个稳定 id，且 tool 消息要引用同一个 ——
@@ -1114,7 +1174,51 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
                         f"超过单轮上限（{skill_tools_svc.MAX_CALLS_PER_ROUND} 个），"
                         f"只执行了前 {skill_tools_svc.MAX_CALLS_PER_ROUND} 个；"
                         f"未执行：{_names}。如还需要，请下一轮再发起。")
+                if tool_round >= skill_tools_svc.MAX_TOOL_ROUNDS:
+                    # 最后一轮工具：提前告知「下一轮就是收尾」，能答就先答，减少被强制收尾的概率。
+                    # 追加在**最后一条 tool 消息**里（新增独立消息会打乱 assistant/tool 配对 → 400）。
+                    tool_msgs[-1]["content"] += (
+                        "\n\n[提示] 工具调用轮数即将用尽。若上面这些信息已经够回答，"
+                        "请直接作答；确实还缺再发起最后一次调用。")
                 cur_msgs = cur_msgs + [asst] + tool_msgs
+
+            # ---- 收尾（P0-1）：工具轮用尽但模型仍在要工具 ----
+            # 工具结果都已经在 cur_msgs 里；这一次**不传 tools**，模型没有工具可用，
+            # 只能输出正文。比「把上限抬到 5/6 轮」更便宜也更可控：上限抬高只是把
+            # 空回答推迟，每一轮仍要重发全部上下文。
+            if exhausted and not stopped:
+                tail = ("[系统提示] 工具调用轮数已用尽，未执行的调用不会再执行。"
+                        "请直接基于上面已经获得的工具结果，写出完整、可用的最终回答；"
+                        "不要再写「我再查一下」，也不要再请求工具。"
+                        "如果工具结果不足以支撑某一部分，就明确说明资料里没有这部分内容，不要编造。")
+                try:
+                    it = llm.chat_stream(cur_msgs + [{"role": "user", "content": tail}],
+                                         model_id=req.model_id,
+                                         reasoning_effort=req.reasoning_effort)
+                    while True:
+                        item = await asyncio.to_thread(next, it, sentinel)
+                        if item is sentinel:
+                            break
+                        kind, payload = item
+                        if kind == "reasoning":
+                            reasoning += payload
+                            yield f"event: reasoning\ndata: {json.dumps({'t': payload}, ensure_ascii=False)}\n\n"
+                        else:
+                            full += payload
+                            yield f"event: token\ndata: {json.dumps({'t': payload}, ensure_ascii=False)}\n\n"
+                        if await request.is_disconnected():
+                            stopped = True
+                            break
+                    if stopped:
+                        try:
+                            await asyncio.to_thread(it.close)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    if await request.is_disconnected():
+                        stopped = True
+                    else:
+                        err_msg = str(getattr(e, "detail", None) or e)[:200]
 
         except BaseException:
             # GeneratorExit / CancelledError：客户端走了，按「用户中断」补存半截回答。
@@ -1126,6 +1230,11 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
             return   # 秒停且无任何内容：不留痕
         if stopped:
             err_msg = "用户中断生成"
+        if not full.strip() and not err_msg:
+            # 走到这里说明整轮一个字正文都没产出（典型：模型连续要工具直到轮数用尽，
+            # 收尾调用也没吐出内容）。绝不能按「回答完成」落库：空 assistant 消息在界面上
+            # 就是一个空气泡 —— 用户既不知道出了什么事，也没有任何可操作的提示。
+            err_msg = "模型连续多轮只调用工具、没有产出正文，请重试或换个问法"
         if err_msg:
             # 错误落库（口径 A，2026-10-23 用户拍板）：半截回答 + 错误标记持久化，
             # 刷新后仍可见、可重试；同时避免「有问无答」的孤儿用户消息
@@ -1158,6 +1267,21 @@ def _prepare_stream(req: AskReq, request: Request, db: Session):
             db2.commit()
             db2.refresh(m)
             saved = True
+            # 技能使用痕迹（P0-1 资产掌控）：**只在这一条路径**记 —— 它代表
+            # 「技能注入且回答成功完成」。三条不记的路径各有理由：
+            #   · /skills/match 只是建议，用户可能不采纳（记了数字必虚高）
+            #   · _save_partial / err_msg 分支是中断与失败（台账问的是「产出了多少」）
+            # ⚠️ 绝不外抛：这只是统计，失败不该把一次已成功的回答变成错误。
+            if skill_used:
+                try:
+                    db2.add(SkillUse(skill_id=skill_used["id"], session_id=session_id,
+                                     mode=req.mode or ""))
+                    db2.commit()
+                except BaseException:
+                    try:
+                        db2.rollback()
+                    except BaseException:
+                        pass
             yield f"event: done\ndata: {json.dumps({'message_id': m.id}, ensure_ascii=False)}\n\n"
         finally:
             db2.close()

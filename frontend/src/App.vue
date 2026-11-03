@@ -15,6 +15,7 @@
           <span class="nav-icon" v-html="item.icon"></span>
           <span class="nav-label">{{ item.label }}</span>
           <span v-if="item.path === '/review' && reviewDue > 0" class="due-badge">{{ reviewDue }}</span>
+          <span v-if="item.badge" class="new-badge">{{ item.badge }}</span>
         </div>
       </nav>
       <div class="nav-help" :class="{ active: isActive('/help') }"
@@ -39,7 +40,7 @@
       <div v-if="!isBare && needSetup" class="setup-banner">
         <span class="setup-banner-text">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/><circle cx="12" cy="12" r="4"/></svg>
-          还差一步：配置 LLM 模型后，即可开始导入资料、AI 问答与复习
+          还差一步：配置 LLM 模型后，即可开始导入资料、AI 对话与复习
         </span>
         <el-button size="small" type="primary" @click="$router.push('/settings')">前往配置</el-button>
       </div>
@@ -64,8 +65,10 @@
         <component :is="Component" :key="$route.path" @tour="restartTour" />
       </router-view>
     </el-main>
-    <!-- E1 全局悬浮问答入口（问答页自身不显示） -->
-    <div v-if="!isBare && $route.path !== '/chat'" class="float-chat" :class="{ 'float-chat-study': $route.path.startsWith('/study') }"
+    <!-- E1 全局悬浮对话入口（对话页自身不显示） -->
+    <!-- 炼丹炉应用对话页（/furnace/app/:id）同样是对话场景 → 悬浮球让位，
+         否则挡住输入区右下的发送键（前端探针实测拦截点击 30s 超时） -->
+    <div v-if="!isBare && $route.path !== '/chat' && !$route.path.startsWith('/furnace/app')" class="float-chat" :class="{ 'float-chat-study': $route.path.startsWith('/study') }"
       @click="goChat" title="问伴伴">
       <img :src="mascot" class="float-mascot" alt="知萤猫头鹰" />
       <span class="float-bubble">有学习问题，问伴伴</span>
@@ -89,10 +92,10 @@
       </el-tour-step>
       <el-tour-step target="[data-nav='/chat']" placement="right" :title="(needSetup ? '③' : '②') + ' 理解 & 提问'">
         <template #default>
-          在学习页做 AI 总结、划线解读，或随时打开 AI 问答向你的知识库提问。
+          在学习页做 AI 总结、划线解读，或随时打开 AI 对话向你的知识库提问。
         </template>
       </el-tour-step>
-      <el-tour-step target="[data-nav='/skills']" placement="right" :title="(needSetup ? '④' : '③') + ' 技能：让 AI 按方法回答'">
+      <el-tour-step target="[data-nav='/skills']" placement="right" :title="(needSetup ? '④' : '③') + ' 技能库：让 AI 按方法回答'">
         <template #default>
           每个技能是一份「怎么做好这件事」的说明（如统一术语译法、检查论证漏洞）。提问时模型会判断哪个技能合用、先给你建议，由你决定用不用；也可以随时用「＋技能」手动挂载。
         </template>
@@ -135,7 +138,7 @@ const router = useRouter()
 // ⚠️ 只加 v-if 隐藏，不动任何 v-model / @click —— 项目既定的改动安全姿势。
 const isBare = computed(() => !!route.meta.bare)
 
-// 从资料详情页进入问答：把当前资料 id 作为检索范围传递过去
+// 从资料详情页进入对话：把当前资料 id 作为检索范围传递过去
 function goChat() {
   if (route.path.startsWith('/study') && route.params.id) {
     router.push({ path: '/chat', query: { material_id: route.params.id } })
@@ -211,11 +214,12 @@ watch(() => route.path, refreshDue)
 const navItems = [
   { path: '/', label: '材料库', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="2" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="2" y="9" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="9" width="5" height="5" rx="1.5" stroke="currentColor" stroke-width="1.3"/></svg>' },
   { path: '/knowledge', label: '知识库', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2.5c-1.2-.9-3-1.2-5-.8v10.6c2-.4 3.8-.1 5 .8 1.2-.9 3-1.2 5-.8V1.7c-2-.4-3.8-.1-5 .8z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 2.5v10.6" stroke="currentColor" stroke-width="1.3"/></svg>' },
-  { path: '/chat', label: 'AI 问答', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v6a1.5 1.5 0 0 1-1.5 1.5H8l-3.5 3v-3h-1A1.5 1.5 0 0 1 2 9.5v-6z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>' },
-  { path: '/skills', label: '技能', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2.4" y="3.2" width="11.2" height="9.6" rx="2" stroke="currentColor" stroke-width="1.3"/><path d="M5 6.4h6M5 8.8h6M5 11.2h3.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>' },
+  { path: '/skills', label: '技能库', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2.4" y="3.2" width="11.2" height="9.6" rx="2" stroke="currentColor" stroke-width="1.3"/><path d="M5 6.4h6M5 8.8h6M5 11.2h3.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>' },
+  { path: '/chat', label: 'AI 对话', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v6a1.5 1.5 0 0 1-1.5 1.5H8l-3.5 3v-3h-1A1.5 1.5 0 0 1 2 9.5v-6z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>' },
   { path: '/drill', label: 'AI 陪练', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.6" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="2.6" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r=".9" fill="currentColor"/></svg>' },
   { path: '/podcast', label: 'AI 播客', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.6 9.4V8a5.4 5.4 0 0 1 10.8 0v1.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><rect x="1.7" y="8.7" width="3.1" height="4.5" rx="1.55" stroke="currentColor" stroke-width="1.3"/><rect x="11.2" y="8.7" width="3.1" height="4.5" rx="1.55" stroke="currentColor" stroke-width="1.3"/></svg>' },
   { path: '/video', label: 'AI 视频', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.8" y="3.1" width="12.4" height="9.8" rx="2" stroke="currentColor" stroke-width="1.3"/><path d="M6.7 6.2l3.6 2.1-3.6 2.1V6.2z" fill="currentColor"/></svg>' },
+  { path: '/furnace', label: 'AI炼丹炉', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M6.2 1.8h3.6M7.1 1.8v3.9L3.3 12a1.9 1.9 0 0 0 1.7 2.8h6a1.9 1.9 0 0 0 1.7-2.8L8.9 5.7V1.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><circle cx="6.4" cy="11" r=".8" fill="currentColor"/><circle cx="9.4" cy="12.4" r=".6" fill="currentColor"/></svg>' },
   { path: '/review', label: '复习巩固', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M13.5 1.8v2.6h-2.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>' },
   { path: '/stats', label: '数据统计', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 13h2V8H3v5zM7 13h2V3H7v10zM11 13h2V6h-2v7z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>' },
   { path: '/settings', label: '管理中心', icon: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.3"/><path d="M8 1.8v1.7M8 12.5v1.7M1.8 8h1.7M12.5 8h1.7M3.6 3.6l1.2 1.2M11.2 11.2l1.2 1.2M12.4 3.6l-1.2 1.2M4.8 11.2l-1.2 1.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>' },
@@ -401,7 +405,7 @@ watch(() => route.path, (path) => {
   color: var(--asc-text-2); transition: background .15s ease, color .15s ease;
 }
 .update-banner-close:hover { background: rgba(0, 0, 0, .06); color: var(--asc-text); }
-/* ===== E1 全局悬浮问答入口（伴伴 IP） ===== */
+/* ===== E1 全局悬浮对话入口（伴伴 IP） ===== */
 .float-chat {
   position: fixed; right: 26px; bottom: 26px; z-index: 90;
   width: 56px; height: 56px; cursor: pointer;
